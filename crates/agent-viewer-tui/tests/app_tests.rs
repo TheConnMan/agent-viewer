@@ -1,7 +1,9 @@
 use agent_viewer_core::{BackendKind, Session, Status};
 use agent_viewer_tui::app::{
-    App, Composer, DetachTracker, GroupMode, KillStage, Row, Section, format_elapsed, row_layout,
+    App, Composer, DetachTracker, GroupKey, GroupMode, KillStage, Row, Section, format_elapsed,
+    row_layout,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd
@@ -207,7 +209,7 @@ fn toggle_group_mode_project_rows() {
     assert_eq!(project_headers(rows).len(), 1);
     assert!(rows.iter().any(|r| matches!(
         r,
-        Row::ProjectHeader { root, count: 2 } if root == &PathBuf::from("/synthetic/shared")
+        Row::ProjectHeader { root, count: 2, .. } if root == &PathBuf::from("/synthetic/shared")
     )));
     assert_eq!(session_rows(rows).len(), 2);
 
@@ -276,8 +278,7 @@ fn spacer_rows_separate_groups_but_never_bookend() {
 }
 
 #[test]
-fn arrow_wraps_around_top_and_bottom_over_headers_and_spacers() {
-    // Distinct states -> ByState view has section headers + spacers between the rows.
+fn arrow_navigation_stops_on_headers_and_wraps_at_ends() {
     let sessions = vec![
         sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
         sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
@@ -287,17 +288,35 @@ fn arrow_wraps_around_top_and_bottom_over_headers_and_spacers() {
     let mut app = App::new(sessions);
     app.toggle_group_mode();
     assert_eq!(app.group_mode(), GroupMode::ByState);
-    // Session rows top->bottom: needs, work, idle, done.
-
-    select(&mut app, "done"); // last session row
-    app.move_selection(1); // Down at the bottom wraps to the first session row
+    // Startup still lands on the first SESSION, not the first header.
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("needs"));
 
-    app.move_selection(-1); // Up at the top wraps to the last session row
+    // Up from the first session now lands ON the NEEDS INPUT header (headers are selectable).
+    app.move_selection(-1);
+    assert!(matches!(
+        app.visible()[app.selected_index()],
+        Row::SectionHeader { section: Section::NeedsInput, .. }
+    ));
+    assert!(app.selected().is_none()); // a header is not a session
+
+    // Up again from the very first row wraps to the last row ("done").
+    app.move_selection(-1);
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("done"));
 
-    // A mid-list step is a normal move (no wrap), skipping the header/spacer between sections.
+    // Down from the last row wraps back to the very first row (the NEEDS INPUT header).
+    app.move_selection(1);
+    assert!(matches!(
+        app.visible()[app.selected_index()],
+        Row::SectionHeader { section: Section::NeedsInput, .. }
+    ));
+
+    // A mid-list Down stops on the next section header before its session.
     select(&mut app, "work");
+    app.move_selection(1);
+    assert!(matches!(
+        app.visible()[app.selected_index()],
+        Row::SectionHeader { section: Section::Idle, .. }
+    ));
     app.move_selection(1);
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("idle"));
 }
@@ -328,13 +347,19 @@ fn arrow_wrap_is_scoped_to_the_filtered_rows() {
         ),
     ];
     let mut app = App::new(sessions);
-    app.set_filter("aaa".to_string()); // only alpha + gamma remain visible
+    app.set_filter("aaa".to_string()); // only alpha + gamma remain visible (two groups)
     assert_eq!(session_rows(app.visible()).len(), 2);
+    // beta is filtered out entirely.
+    assert!(!app.visible().iter().any(
+        |r| matches!(r, Row::Session { id, .. } if id == "beta")
+    ));
 
     select(&mut app, "gamma"); // last visible session row
-    app.move_selection(1); // wraps within the filtered set, not the full list
-    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("alpha"));
-    app.move_selection(-1);
+    app.move_selection(1); // Down at the bottom wraps to the FIRST visible row (aaa header)
+    assert_eq!(app.selected_index(), 0);
+    assert!(matches!(app.visible()[0], Row::ProjectHeader { .. }));
+
+    app.move_selection(-1); // Up from the first row wraps back to the last (gamma)
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("gamma"));
 }
 
@@ -888,4 +913,334 @@ fn dir_scan_helpers_handle_missing_and_present_dirs() {
     std::fs::write(dir.path().join("cmd.md"), "x").unwrap();
     assert_eq!(subdir_names(dir.path()), vec!["myskill".to_string()]);
     assert_eq!(file_stems(dir.path()), vec!["cmd".to_string()]); // ".md" stripped
+}
+
+// --- v2.5: collapse/expand a group ---
+
+/// Deterministically move the cursor onto the ProjectHeader row for `root`.
+/// selected() is None on a header, so `select` cannot be used here; we arrow
+/// from the top and stop when selected_index points at the matching header.
+fn select_project_header(app: &mut App, root: &PathBuf) {
+    app.move_selection(-100_000);
+    for _ in 0..10_000 {
+        if matches!(
+            app.visible().get(app.selected_index()),
+            Some(Row::ProjectHeader { root: r, .. }) if r == root
+        ) {
+            return;
+        }
+        app.move_selection(1);
+    }
+    panic!("project header {root:?} not selectable");
+}
+
+/// Deterministically move the cursor onto the SectionHeader row for `section`.
+fn select_section_header(app: &mut App, section: Section) {
+    app.move_selection(-100_000);
+    for _ in 0..10_000 {
+        if matches!(
+            app.visible().get(app.selected_index()),
+            Some(Row::SectionHeader { section: s, .. }) if *s == section
+        ) {
+            return;
+        }
+        app.move_selection(1);
+    }
+    panic!("section header {section:?} not selectable");
+}
+
+fn has_session(app: &App, id: &str) -> bool {
+    app.visible()
+        .iter()
+        .any(|r| matches!(r, Row::Session { id: rid, .. } if rid == id))
+}
+
+#[test]
+fn group_key_storage_roundtrip() {
+    // Project keys survive to_storage/from_storage exactly.
+    let project = GroupKey::Project(PathBuf::from("/synthetic/one"));
+    assert_eq!(
+        GroupKey::from_storage(&project.to_storage()),
+        Some(project.clone())
+    );
+
+    // Every Section variant survives too.
+    for section in [
+        Section::NeedsInput,
+        Section::Working,
+        Section::Idle,
+        Section::Done,
+    ] {
+        let key = GroupKey::State(section);
+        assert_eq!(GroupKey::from_storage(&key.to_storage()), Some(key));
+    }
+
+    // Malformed strings yield None (no panic).
+    assert_eq!(GroupKey::from_storage("garbage-no-prefix"), None);
+    assert_eq!(GroupKey::from_storage("state:bogus"), None);
+    assert_eq!(GroupKey::from_storage(""), None);
+}
+
+#[test]
+fn collapse_hides_group_rows_and_marks_header() {
+    // Two distinct project dirs. Group a is newest so it sorts first.
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    assert_eq!(app.group_mode(), GroupMode::ByProject);
+
+    let root_a = PathBuf::from("/synthetic/a");
+    let root_b = PathBuf::from("/synthetic/b");
+    select_project_header(&mut app, &root_a);
+    assert!(matches!(
+        app.visible().get(app.selected_index()),
+        Some(Row::ProjectHeader { root, .. }) if root == &root_a
+    ));
+
+    let toggled = app.toggle_selected_group();
+    assert_eq!(toggled, Some((GroupKey::Project(root_a.clone()), true)));
+
+    // Group a's session rows are gone; group b's remain.
+    assert!(!has_session(&app, "a1"));
+    assert!(has_session(&app, "b1"));
+
+    // Header a now reports collapsed; header b is still expanded.
+    assert!(app.visible().iter().any(|r| matches!(
+        r,
+        Row::ProjectHeader { root, collapsed, .. } if root == &root_a && *collapsed
+    )));
+    assert!(app.visible().iter().any(|r| matches!(
+        r,
+        Row::ProjectHeader { root, collapsed, .. } if root == &root_b && !*collapsed
+    )));
+
+    assert!(app.is_group_collapsed(&GroupKey::Project(root_a)));
+}
+
+#[test]
+fn expand_restores_group_rows() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    select_project_header(&mut app, &root_a);
+    assert_eq!(
+        app.toggle_selected_group(),
+        Some((GroupKey::Project(root_a.clone()), true))
+    );
+    assert!(!has_session(&app, "a1"));
+
+    // A second toggle (cursor still on the header) expands and restores the rows.
+    assert_eq!(
+        app.toggle_selected_group(),
+        Some((GroupKey::Project(root_a.clone()), false))
+    );
+    assert!(has_session(&app, "a1"));
+    assert!(!app.is_group_collapsed(&GroupKey::Project(root_a)));
+}
+
+#[test]
+fn selection_stays_on_header_after_toggle() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    select_project_header(&mut app, &root_a);
+    app.toggle_selected_group();
+
+    // The cursor is still on the same header, and selected() is None there.
+    assert!(matches!(
+        app.visible().get(app.selected_index()),
+        Some(Row::ProjectHeader { root, .. }) if root == &root_a
+    ));
+    assert!(app.selected().is_none());
+}
+
+#[test]
+fn navigation_skips_collapsed_group_rows() {
+    // Group a has two sessions; collapsing it must remove both from navigation.
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "a2", "/synthetic/a", 290, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    select_project_header(&mut app, &root_a);
+    assert_eq!(
+        app.toggle_selected_group(),
+        Some((GroupKey::Project(root_a.clone()), true))
+    );
+
+    // Sweep down then up over the whole list; selection must never land on a hidden row,
+    // and the surviving group's session must still be reachable.
+    let mut reached_b1 = false;
+    app.move_selection(-100_000);
+    for _ in 0..(app.visible().len() + 2) {
+        if let Some(s) = app.selected() {
+            assert_ne!(s.id, "a1");
+            assert_ne!(s.id, "a2");
+            reached_b1 |= s.id == "b1";
+        }
+        app.move_selection(1);
+    }
+    for _ in 0..(app.visible().len() + 2) {
+        if let Some(s) = app.selected() {
+            assert_ne!(s.id, "a1");
+            assert_ne!(s.id, "a2");
+            reached_b1 |= s.id == "b1";
+        }
+        app.move_selection(-1);
+    }
+    assert!(reached_b1, "the uncollapsed group's session must stay reachable");
+}
+
+#[test]
+fn headers_are_selectable_via_arrows() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+
+    // Arrow from the top until a ProjectHeader is under the cursor.
+    app.move_selection(-100_000);
+    let mut found = false;
+    for _ in 0..(app.visible().len() + 2) {
+        if matches!(
+            app.visible().get(app.selected_index()),
+            Some(Row::ProjectHeader { .. })
+        ) {
+            found = true;
+            break;
+        }
+        app.move_selection(1);
+    }
+    assert!(found, "arrows never landed on a ProjectHeader");
+
+    // On a header, selected() is None but toggle_selected_group would act.
+    assert!(app.selected().is_none());
+    assert!(app.toggle_selected_group().is_some());
+}
+
+#[test]
+fn toggle_selected_group_none_on_session_row() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    select(&mut app, "a1");
+
+    let before = app.visible().to_vec();
+    assert_eq!(app.toggle_selected_group(), None);
+    // The row model is untouched when the selected row is not a header.
+    assert_eq!(app.visible(), before.as_slice());
+}
+
+#[test]
+fn collapse_keyed_by_state_in_by_state_mode() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
+        sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
+        sess(BackendKind::Codex, "done", "/p", 300, Status::Done),
+    ];
+    let mut app = App::new(sessions);
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
+
+    select_section_header(&mut app, Section::Working);
+    let toggled = app.toggle_selected_group();
+    assert_eq!(toggled, Some((GroupKey::State(Section::Working), true)));
+
+    // The Working section's row hides; other sections keep their rows.
+    assert!(!has_session(&app, "work"));
+    assert!(has_session(&app, "needs"));
+    assert!(app.visible().iter().any(|r| matches!(
+        r,
+        Row::SectionHeader { section: Section::Working, collapsed, .. } if *collapsed
+    )));
+    assert!(app.is_group_collapsed(&GroupKey::State(Section::Working)));
+}
+
+#[test]
+fn collapsed_state_survives_refresh() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    select_project_header(&mut app, &root_a);
+    assert_eq!(
+        app.toggle_selected_group(),
+        Some((GroupKey::Project(root_a.clone()), true))
+    );
+
+    // A background refresh replaces the session list (same members, reordered).
+    app.set_sessions(vec![
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 250, Status::Working),
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+    ]);
+
+    // The collapse survives the rebuild: still collapsed, header still marked, rows still hidden.
+    assert!(app.is_group_collapsed(&GroupKey::Project(root_a.clone())));
+    assert!(app.visible().iter().any(|r| matches!(
+        r,
+        Row::ProjectHeader { root, collapsed, .. } if root == &root_a && *collapsed
+    )));
+    assert!(!has_session(&app, "a1"));
+}
+
+#[test]
+fn set_collapsed_seeds_collapsed_groups() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    let mut seed = HashSet::new();
+    seed.insert(GroupKey::Project(root_a.clone()));
+    app.set_collapsed(seed);
+
+    // The seeded group renders collapsed from the start.
+    assert!(app.is_group_collapsed(&GroupKey::Project(root_a.clone())));
+    assert!(app.collapsed().contains(&GroupKey::Project(root_a.clone())));
+    assert!(!has_session(&app, "a1"));
+    assert!(app.visible().iter().any(|r| matches!(
+        r,
+        Row::ProjectHeader { root, collapsed, .. } if root == &root_a && *collapsed
+    )));
+}
+
+#[test]
+fn spawn_target_falls_back_to_project_header_root() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let root_a = PathBuf::from("/synthetic/a");
+
+    // ByProject: a selected ProjectHeader spawns into its own root.
+    select_project_header(&mut app, &root_a);
+    assert_eq!(app.spawn_target(), Some(root_a.clone()));
+
+    // ByState: a selected SectionHeader has no spawn dir.
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
+    select_section_header(&mut app, Section::Working);
+    assert_eq!(app.spawn_target(), None);
 }

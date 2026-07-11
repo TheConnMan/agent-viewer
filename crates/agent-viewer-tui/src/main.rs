@@ -9,7 +9,7 @@ use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
-use agent_viewer_tui::app::{App, Composer, DetachTracker, Row};
+use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::mutations::MutationRunner;
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, Mode, PeekCache, Pulses};
@@ -217,8 +217,16 @@ fn main() -> io::Result<()> {
     if !notice.is_empty() {
         startup_notice.set(notice, now_ms());
     }
+    // Build the app, then seed the collapsed set from the DB so a group the user collapsed
+    // last run renders collapsed from the first paint.
+    let mut app = App::new(sessions);
+    if let Some(db) = &db
+        && let Ok(keys) = db.collapsed_groups()
+    {
+        app.set_collapsed(keys.iter().filter_map(|k| GroupKey::from_storage(k)).collect());
+    }
     let mut ui = Ui {
-        app: App::new(sessions),
+        app,
         mode: Mode::Normal,
         notice: startup_notice,
         db,

@@ -342,3 +342,32 @@ fn match_spawn_window_and_nearest() {
     ];
     assert_eq!(match_spawn(&record, &miss), None);
 }
+
+#[test]
+fn viewer_db_collapsed_groups_roundtrip() {
+    let (_dir, path) = temp_db_path();
+
+    {
+        let db = ViewerDb::open(&path).expect("open viewer db");
+
+        // Insert two collapsed keys (opaque strings; the TUI owns their meaning).
+        db.set_group_collapsed("project:/a", true).expect("set project");
+        db.set_group_collapsed("state:done", true).expect("set state");
+
+        let collapsed = db.collapsed_groups().expect("collapsed groups");
+        assert!(collapsed.contains("project:/a"));
+        assert!(collapsed.contains("state:done"));
+
+        // Clearing one removes only that key.
+        db.set_group_collapsed("project:/a", false).expect("clear project");
+        let collapsed = db.collapsed_groups().expect("collapsed groups");
+        assert!(!collapsed.contains("project:/a"));
+        assert!(collapsed.contains("state:done"));
+    }
+
+    // Reopen the same path: the surviving key persists across a restart.
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    let collapsed = db.collapsed_groups().expect("collapsed groups");
+    assert!(collapsed.contains("state:done"));
+    assert!(!collapsed.contains("project:/a"));
+}

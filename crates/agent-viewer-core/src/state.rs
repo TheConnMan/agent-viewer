@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS renames (\
   session_id TEXT NOT NULL,\
   name TEXT NOT NULL,\
   PRIMARY KEY(backend, session_id)\
-);";
+);\
+CREATE TABLE IF NOT EXISTS collapsed_groups (group_key TEXT PRIMARY KEY);";
 
 /// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
@@ -239,6 +240,34 @@ impl ViewerDb {
             rusqlite::params![backend.name(), session_id],
         )?;
         Ok(())
+    }
+
+    /// Persist a group's collapsed state: insert its key when collapsed, delete it when
+    /// expanded. The key is an opaque text form owned by the TUI's GroupKey.
+    pub fn set_group_collapsed(&self, group_key: &str, collapsed: bool) -> Result<()> {
+        if collapsed {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO collapsed_groups (group_key) VALUES (?1)",
+                rusqlite::params![group_key],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM collapsed_groups WHERE group_key = ?1",
+                rusqlite::params![group_key],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every collapsed-group key (opaque strings the TUI seeds its collapsed set from).
+    pub fn collapsed_groups(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT group_key FROM collapsed_groups")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut keys = HashSet::new();
+        for row in rows {
+            keys.insert(row?);
+        }
+        Ok(keys)
     }
 
     /// One snapshot read per tick feeding the overlay.

@@ -176,6 +176,16 @@ fn section_label(section: Section) -> &'static str {
     }
 }
 
+/// A group header line: a triangle indicator plus its member count. Expanded shows
+/// "▼ <label>  (<count>)"; collapsed shows "▶ <label>  (<count> hidden)".
+fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) -> String {
+    if collapsed {
+        format!("▶ {label}  ({count} hidden)")
+    } else {
+        format!("▼ {label}  ({count})")
+    }
+}
+
 // --- Peek cache (backend-dispatching transcript tail) ---------------------------
 
 /// Cache key: backend + transcript path + its (mtime, len) fingerprint.
@@ -767,12 +777,20 @@ fn row_to_item(
 ) -> ListItem<'static> {
     match row {
         Row::Spacer => ListItem::new(Line::from("")),
-        Row::SectionHeader { section, count } => ListItem::new(Line::from(Span::styled(
-            format!("{}  ({count})", section_label(*section)),
+        Row::SectionHeader {
+            section,
+            count,
+            collapsed,
+        } => ListItem::new(Line::from(Span::styled(
+            header_label(section_label(*section), *count, *collapsed),
             fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         ))),
-        Row::ProjectHeader { root, count } => ListItem::new(Line::from(Span::styled(
-            format!("{}  ({count})", root.display()),
+        Row::ProjectHeader {
+            root,
+            count,
+            collapsed,
+        } => ListItem::new(Line::from(Span::styled(
+            header_label(root.display(), *count, *collapsed),
             fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         ))),
         Row::Session {
@@ -1037,6 +1055,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Ctrl+]", "detach (always)"),
         ("Space", "expand peek in row"),
         ("r", "reply to a blocked session"),
+        ("Enter/Space", "collapse group (on a header)"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
