@@ -33,6 +33,9 @@ impl Backend for OpencodeBackend {
             spawn: true,
             hide: false,
             attach: true,
+            stop: true,
+            remove: true,
+            rename: true,
         }
     }
     fn list(&mut self) -> Result<Vec<Session>> {
@@ -68,12 +71,16 @@ impl Backend for OpencodeBackend {
                 } else {
                     "opencode".to_string()
                 },
+                // Stage 2 placeholders; Stream A wires companion = parent_id.is_some().
+                summary: String::new(),
+                companion: false,
+                pid: None,
                 rollout_path: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<()> {
+    fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<Option<u32>> {
         let title: String = task.chars().take(40).collect();
         let mut cmd = std::process::Command::new("opencode");
         cmd.arg("run")
@@ -84,8 +91,20 @@ impl Backend for OpencodeBackend {
             .arg(task);
         // Viewer-owned log dir; we do NOT write under ~/.local/share/opencode/.
         let log_path = crate::spawn::viewer_log_path("opencode");
-        crate::spawn::spawn_detached(cmd, &log_path)?;
-        Ok(())
+        let pid = crate::spawn::spawn_detached(cmd, &log_path)?;
+        Ok(Some(pid))
+    }
+    fn stop(&self, session: &Session) -> Result<()> {
+        let _ = session;
+        todo!("Stream A: spawn::terminate(session.pid?, \"opencode\")")
+    }
+    fn remove(&self, id: &str) -> Result<()> {
+        let _ = id;
+        todo!("Stream A: opencode session delete <id>")
+    }
+    fn rename(&self, session: &Session, name: &str) -> Result<()> {
+        let _ = (session, name);
+        todo!("Stream A: opencode db \"<rename_sql(id, name)>\"")
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         let mut cmd = std::process::Command::new("opencode");
@@ -109,13 +128,20 @@ fn live_opencode_proc() -> bool {
         .any(|p| p.name().to_string_lossy().starts_with("opencode"))
 }
 
-/// PURE status heuristic, unit-tested (the process check is injected):
-/// Running iff live_opencode_proc && (now_ms - updated_at_ms) <= 60_000; else Done.
-/// Never returns Errored.
+/// PURE three-tier status heuristic, unit-tested (the process check is injected, I-3):
+/// Working: live && age <= 60_000; Idle: live && age <= 1_800_000 (30 min);
+/// Done: otherwise. Never NeedsInput/Failed/Stopped (no signal exists — the session
+/// table has no error column; verified live 2026-07-11).
 pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64) -> Status {
-    if live_opencode_proc && (now_ms - updated_at_ms) <= 60_000 {
-        Status::Running
-    } else {
-        Status::Done
-    }
+    // Stage 2 placeholder (deliberately wrong for the three-tier contract); Stream A
+    // implements the real Working/Idle/Done tiers. Valid so list() still builds rows.
+    let _ = (live_opencode_proc, updated_at_ms, now_ms);
+    Status::Done
+}
+
+/// PURE, unit-tested: `UPDATE session SET title='<t>' WHERE id='<id>'` with single
+/// quotes doubled in both values (SQL-92 escaping).
+pub fn rename_sql(id: &str, title: &str) -> String {
+    let _ = (id, title);
+    todo!("Stream A: UPDATE session SET title=... with SQL-92 quote doubling")
 }

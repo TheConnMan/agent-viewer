@@ -41,6 +41,13 @@ impl Source {
         Source::Subagent("subagent".into())
     }
 
+    /// Companion filter (verified on the live registry 2026-07-11: cli 25 +
+    /// vscode 320 shown; exec 1671 + subagent 876 hidden). Exec | Subagent(_) -> true.
+    /// thread_source/has_user_event are UNRELIABLE — do not use them.
+    pub fn is_companion(&self) -> bool {
+        todo!("Stream A: Exec | Subagent(_) -> true")
+    }
+
     /// "cli" | "exec" | "vscode" | the Subagent label. For display.
     pub fn label(&self) -> &str {
         match self {

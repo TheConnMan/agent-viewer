@@ -92,8 +92,8 @@ fn handle_key(
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
-            KeyCode::Char('a') => app.toggle_show_hidden(),
-            KeyCode::Char(' ') => app.toggle_collapse_selected(),
+            KeyCode::Char('a') => app.toggle_show_all(),
+            // Stage 2 scaffold: Space is a no-op until Stream C wires peek.
             KeyCode::Char('/') => {
                 app.set_filter(String::new());
                 *notice = String::new();

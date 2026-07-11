@@ -47,3 +47,12 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
     let child = cmd.spawn()?;
     Ok(child.id())
 }
+
+/// SIGTERM with a pid-reuse guard: read /proc/<pid>/comm; it must start with
+/// `expected_comm_prefix` ("codex" / "opencode"), else Err(Command("comm mismatch")).
+/// If getpgid(pid) == pid (process leads its own group) send SIGTERM to the group
+/// (-pid), else to the single pid. ESRCH (already gone) -> Ok(()). Never SIGKILL in v2.
+pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
+    let _ = (pid, expected_comm_prefix);
+    todo!("Stream A: comm-guarded SIGTERM with process-group handling")
+}

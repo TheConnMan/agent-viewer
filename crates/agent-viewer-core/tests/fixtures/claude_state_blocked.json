@@ -1,0 +1,6 @@
+{
+  "state": "blocked",
+  "detail": "Waiting on the exec approval to continue.",
+  "needs": "Approve running the migration against the live DB",
+  "linkScanPath": "/home/user/.claude/jobs/block001/transcript.jsonl"
+}

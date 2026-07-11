@@ -1,0 +1,4 @@
+{"timestamp": "2026-07-11T10:00:00.000Z", "type": "session_meta", "payload": {"id": "019f-approval", "cwd": "/home/user/project", "originator": "codex_exec", "cli_version": "0.144.1", "source": "exec"}}
+{"timestamp": "2026-07-11T10:00:01.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}}
+{"timestamp": "2026-07-11T10:00:02.000Z", "type": "response_item", "payload": {"type": "message", "id": "user_msg", "role": "user", "content": [{"type": "input_text", "text": "Delete the build artifacts."}]}}
+{"timestamp": "2026-07-11T10:00:03.000Z", "type": "event_msg", "payload": {"type": "exec_approval_request", "turn_id": "turn-1", "call_id": "call_1", "command": ["rm", "-rf", "target"], "cwd": "/home/user/project"}}

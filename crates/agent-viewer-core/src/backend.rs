@@ -29,13 +29,24 @@ pub struct Capabilities {
     pub spawn: bool,
     pub hide: bool,
     pub attach: bool,
+    /// SIGTERM the live process (codex T, claude F per I-4, opencode T).
+    pub stop: bool,
+    /// Second-stage Ctrl+X hard-remove (codex T archive, claude F, opencode T delete).
+    pub remove: bool,
+    /// Rename in the backend's own store (codex T, claude T UDS best-effort, opencode T).
+    pub rename: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Six-state model (v2). `Working`/`Failed` are v1's `Running`/`Errored` renamed;
+/// `NeedsInput`, `Idle`, `Stopped` are new. `Hash` is used to key sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
-    Running,
+    Working,
+    NeedsInput,
+    Idle,
     Done,
-    Errored,
+    Failed,
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,8 +60,19 @@ pub struct Session {
     pub status: Status,
     pub hidden: bool,
     pub source_label: String,
-    /// Some for codex — path to the rollout JSONL for transcript-tail reads.
-    /// None for backends without a local transcript file (claude, opencode).
+    /// One-line dim summary for the row. codex: threads.preview; claude:
+    /// state.json needs (blocked) else detail; opencode: "".
+    pub summary: String,
+    /// True for rows the default view hides: codex source Exec|Subagent(_),
+    /// opencode parent_id NOT NULL. Claude rows are never companions.
+    /// The overlay clears this for viewer-spawned (pinned) sessions.
+    pub companion: bool,
+    /// Live PID when known — codex: the process holding the rollout fd;
+    /// claude: agents-json "pid" (present on working entries); opencode: filled
+    /// by the overlay from the viewer spawn record.
+    pub pid: Option<u32>,
+    /// Some for codex — the rollout JSONL, OR the claude session JSONL
+    /// (state.json linkScanPath) for peek. None for opencode.
     pub rollout_path: Option<std::path::PathBuf>,
 }
 
@@ -60,13 +82,31 @@ pub trait Backend {
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
     /// Sessions are returned recency-sorted (updated_at_ms DESC).
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
-    fn spawn(&self, dir: &std::path::Path, task: &str) -> crate::error::Result<()>;
+    /// Returns the direct child PID when the viewer forked it (codex, opencode);
+    /// None when the tool self-detaches its real worker (claude --bg).
+    /// The TUI records Some(pid) in the viewer DB (spawn pinning + stop).
+    fn spawn(&self, dir: &std::path::Path, task: &str) -> crate::error::Result<Option<u32>>;
     fn hide(&self, id: &str) -> crate::error::Result<()> {
         let _ = id;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
     fn unhide(&self, id: &str) -> crate::error::Result<()> {
         let _ = id;
+        Err(crate::error::Error::Unsupported(self.kind().name()))
+    }
+    /// SIGTERM the live session process (session.pid required; runtime-gated).
+    fn stop(&self, session: &Session) -> crate::error::Result<()> {
+        let _ = session;
+        Err(crate::error::Error::Unsupported(self.kind().name()))
+    }
+    /// Second-stage Ctrl+X hard-remove. Default Unsupported.
+    fn remove(&self, id: &str) -> crate::error::Result<()> {
+        let _ = id;
+        Err(crate::error::Error::Unsupported(self.kind().name()))
+    }
+    /// Rename in the backend's own store (never a raw DB write). Default Unsupported.
+    fn rename(&self, session: &Session, name: &str) -> crate::error::Result<()> {
+        let _ = (session, name);
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
     /// None when attach is unsupported. Command is built, not run (TUI suspends into it).

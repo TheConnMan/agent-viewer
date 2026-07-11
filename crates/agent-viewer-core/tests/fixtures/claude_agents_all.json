@@ -1,0 +1,74 @@
+[
+  {
+    "id": "work0001",
+    "cwd": "/home/user/proj-working",
+    "kind": "background",
+    "startedAt": 1783659603260,
+    "sessionId": "work0001-6603-4ad5-be5b-f3ad6391d595",
+    "name": "Working Task",
+    "state": "working",
+    "pid": 111
+  },
+  {
+    "id": "block001",
+    "cwd": "/home/user/proj-blocked",
+    "kind": "background",
+    "startedAt": 1783710856541,
+    "sessionId": "block001-b237-4133-a473-d3d004454c52",
+    "name": "Blocked Task",
+    "state": "blocked",
+    "pid": 222
+  },
+  {
+    "id": "idle0001",
+    "cwd": "/home/user/proj-idle",
+    "kind": "interactive",
+    "startedAt": 1783710900000,
+    "sessionId": "idle0001-1111-4133-a473-d3d004454c99",
+    "name": "Idle Task",
+    "state": "idle"
+  },
+  {
+    "id": "done0001",
+    "cwd": "/home/user/proj-done",
+    "kind": "background",
+    "startedAt": 1783708759360,
+    "sessionId": "done0001-e217-4cf7-938c-6c5fd82429d5",
+    "name": "Done Task",
+    "state": "done"
+  },
+  {
+    "id": "fail0001",
+    "cwd": "/home/user/proj-failed",
+    "kind": "background",
+    "startedAt": 1783710950000,
+    "sessionId": "fail0001-2222-4133-a473-d3d004454caa",
+    "name": "Failed Task",
+    "state": "failed"
+  },
+  {
+    "id": "stop0001",
+    "cwd": "/home/user/proj-stopped",
+    "kind": "background",
+    "startedAt": 1783710960000,
+    "sessionId": "stop0001-3333-4133-a473-d3d004454cbb",
+    "name": "Stopped Task",
+    "state": "stopped"
+  },
+  {
+    "id": "nost0001",
+    "cwd": "/home/user/proj-nostate",
+    "kind": "background",
+    "startedAt": 1783710970000,
+    "sessionId": "nost0001-4444-4133-a473-d3d004454ccc",
+    "name": "No State Task"
+  },
+  {
+    "id": "orph0001",
+    "cwd": "/home/user/proj-orphan",
+    "kind": "background",
+    "startedAt": 1783710999000,
+    "name": "Orphan Missing SessionId",
+    "state": "done"
+  }
+]

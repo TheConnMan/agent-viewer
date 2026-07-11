@@ -1,0 +1,7 @@
+{"type": "system", "subtype": "init", "content": "session initialized"}
+{"type": "user", "message": {"role": "user", "content": "first user line as a plain string"}}
+{"type": "attachment", "path": "/tmp/pasted.png"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "let me consider this"}, {"type": "text", "text": "assistant reply one"}]}}
+{"type": "queue-operation", "op": "enqueue"}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "second user line from a block list"}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {}}, {"type": "text", "text": "assistant reply two"}]}}

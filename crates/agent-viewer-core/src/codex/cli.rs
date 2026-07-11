@@ -32,3 +32,20 @@ pub fn resume_command(id: &str) -> std::process::Command {
     cmd.arg("resume").arg(id);
     cmd
 }
+
+/// PURE builder (unit-tested): one JSON-RPC 2.0 request line for
+/// `thread/name/set` {threadId, name}, serialized via serde_json (no hand-built
+/// strings — names with quotes/newlines must survive).
+pub fn name_set_request(request_id: i64, thread_id: &str, name: &str) -> String {
+    let _ = (request_id, thread_id, name);
+    todo!("Stream A: serde_json JSON-RPC 2.0 request line for thread/name/set")
+}
+
+/// Spawn `codex app-server` (stdio mode), write the initialize handshake +
+/// `name_set_request`, read until the matching response id or 5s timeout, then drop
+/// the child. LIVE VERIFICATION REQUIRED during implementation (framing + initialize
+/// shape against `codex app-server generate-json-schema`).
+pub fn rename(thread_id: &str, name: &str) -> Result<()> {
+    let _ = (thread_id, name);
+    todo!("Stream A: codex app-server JSON-RPC rename")
+}

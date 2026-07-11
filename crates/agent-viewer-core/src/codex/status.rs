@@ -1,16 +1,16 @@
 use crate::backend::Status;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// IMPURE scanner (live-e2e-verified only, no unit tests): enumerate processes via
 /// sysinfo whose name starts with "codex", read /proc/<pid>/fd/* via
-/// std::fs::read_link, collect target paths. Strip a trailing " (deleted)" suffix.
-/// Unreadable /proc entries are skipped silently (other-user procs, races).
-pub fn open_rollout_paths() -> HashSet<PathBuf> {
+/// std::fs::read_link, collect target paths -> owning codex PID. Strip a trailing
+/// " (deleted)" suffix. Unreadable /proc entries are skipped silently.
+pub fn open_rollout_paths() -> HashMap<PathBuf, u32> {
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let mut open = HashSet::new();
+    let mut open = HashMap::new();
     for (pid, process) in sys.processes() {
         if !process.name().to_string_lossy().starts_with("codex") {
             continue;
@@ -25,33 +25,23 @@ pub fn open_rollout_paths() -> HashSet<PathBuf> {
             };
             let display = target.to_string_lossy();
             let stripped = display.strip_suffix(" (deleted)").unwrap_or(&display);
-            open.insert(PathBuf::from(stripped));
+            open.insert(PathBuf::from(stripped), pid.as_u32());
         }
     }
     open
 }
 
-/// Not-running resolution from the file signal alone: Done iff the tail marks the last
-/// turn complete, else Errored (Ok(false) OR any read error, incl. missing file).
-fn tail_status(rollout_path: &Path) -> Status {
-    match super::rollout::has_task_complete_tail(rollout_path) {
-        Ok(true) => Status::Done,
-        _ => Status::Errored,
-    }
-}
-
-/// PURE resolution given the open set (all unit tests target this):
-/// 1. canonicalize rollout_path (fall back to the raw path on error);
-///    if it is in open_paths -> Running  (running wins over task_complete).
-/// 2. else has_task_complete_tail == Ok(true) -> Done.
-/// 3. else (Ok(false) OR any read error, incl. missing file) -> Errored. Never panics.
-pub fn resolve_status(rollout_path: &Path, open_paths: &HashSet<PathBuf>) -> Status {
-    let canonical =
-        std::fs::canonicalize(rollout_path).unwrap_or_else(|_| rollout_path.to_path_buf());
-    if open_paths.contains(&canonical) {
-        return Status::Running;
-    }
-    tail_status(rollout_path)
+/// PURE six-state resolution given the open map (all unit tests target this).
+/// Canonicalization exactly as v1. Rules (section 5.3):
+///   open + tail AwaitingApproval          -> NeedsInput
+///   open + tail MidTurn OR unreadable     -> Working   (spawn race: empty file)
+///   open + tail Complete                  -> Idle      (live session between turns)
+///   closed + Complete                     -> Done
+///   closed + anything else               -> Failed    (v1 Errored, renamed)
+/// Stopped is NOT resolved here — it is a viewer-DB overlay (section 5.7). Never panics.
+pub fn resolve_status(rollout_path: &Path, open_paths: &HashMap<PathBuf, u32>) -> Status {
+    let _ = (rollout_path, open_paths);
+    todo!("Stream A: six-state resolution over tail_state + open map")
 }
 
 /// Caching wrapper for the refresh loop. Cache key: (mtime, len) of rollout_path.
@@ -69,7 +59,7 @@ impl StatusResolver {
         }
     }
 
-    pub fn resolve(&mut self, rollout_path: &Path, open_paths: &HashSet<PathBuf>) -> Status {
+    pub fn resolve(&mut self, rollout_path: &Path, open_paths: &HashMap<PathBuf, u32>) -> Status {
         // canonicalize once per distinct rollout_path, then reuse across ticks. Cache ONLY
         // successful canonicalizations: an Err (path not present yet) uses the raw path for
         // this tick without caching, so a later tick retries once the file appears.
@@ -83,26 +73,27 @@ impl StatusResolver {
                 Err(_) => rollout_path.to_path_buf(),
             },
         };
-        if open_paths.contains(&canonical) {
-            return Status::Running;
-        }
+        // Open sessions always recompute (their tail changes turn-to-turn). Closed
+        // sessions reuse the (mtime, len) cache — the hot path this struct exists for
+        // (prior intent, commit 49a7c1b; 2,883 threads on this box).
+        let open = open_paths.contains_key(&canonical);
         let key = std::fs::metadata(rollout_path).ok().map(|meta| {
             (
                 meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 meta.len(),
             )
         });
-        let Some(key) = key else {
-            // No metadata (missing file): tail_status yields Errored, nothing to cache.
-            return tail_status(rollout_path);
-        };
-        if let Some((cached_key, cached_status)) = self.cache.get(rollout_path)
+        if !open
+            && let Some(key) = key
+            && let Some((cached_key, cached_status)) = self.cache.get(rollout_path)
             && *cached_key == key
         {
             return *cached_status;
         }
-        let status = tail_status(rollout_path);
-        self.cache.insert(rollout_path.to_path_buf(), (key, status));
+        let status = resolve_status(rollout_path, open_paths);
+        if let Some(key) = key {
+            self.cache.insert(rollout_path.to_path_buf(), (key, status));
+        }
         status
     }
 }

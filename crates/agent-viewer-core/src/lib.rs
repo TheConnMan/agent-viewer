@@ -4,7 +4,9 @@ pub mod codex;
 pub mod error;
 pub mod group;
 pub mod opencode;
+pub mod pty;
 pub mod spawn;
+pub mod state;
 
 pub use backend::{Backend, BackendKind, Capabilities, Session, Status};
 pub use error::{Error, Result};

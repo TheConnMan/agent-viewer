@@ -1,36 +1,73 @@
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::{BackendKind, Session, Status};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Grouping mode for the flat list. `ByState` is the startup default (Ctrl+S toggles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupMode {
+    ByState,
+    ByProject,
+}
+
+/// State sections in the ByState view. Failed + Stopped fold into Done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    NeedsInput,
+    Working,
+    Idle,
+    Done,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
-    GroupHeader {
+    /// ByState mode.
+    SectionHeader {
+        section: Section,
+        count: usize,
+    },
+    /// ByProject mode.
+    ProjectHeader {
         root: PathBuf,
-        collapsed: bool,
         count: usize,
     },
     Session {
         backend: BackendKind,
         id: String,
         title: String,
+        summary: String,
         status: Status,
         hidden: bool,
+        updated_at_ms: i64,
     },
+    /// DONE overflow "… N more" (I-5, cap 15).
+    MoreMarker {
+        hidden: usize,
+    },
+}
+
+/// Result of a two-stage Ctrl+X press.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KillStage {
+    Stop,
+    Remove,
+    Noop,
 }
 
 pub struct App {
     sessions: Vec<Session>,
     selected: usize,
     filter: String,
-    show_hidden: bool,
-    collapsed: HashSet<PathBuf>,
-    /// Cached render model. Rebuilt only when sessions/filter/show_hidden/collapse
+    show_all: bool,
+    group_mode: GroupMode,
+    /// Cached render model. Rebuilt only when sessions/filter/show_all/group_mode
     /// change; cursor movement leaves it untouched.
     rows: Vec<Row>,
     /// Memoized project_root(cwd). cwds are stable, so this survives refresh ticks
     /// and stops re-walking the filesystem for sessions we have already grouped.
     root_cache: HashMap<PathBuf, PathBuf>,
+    /// The armed (backend, id, armed_at_ms) for the two-stage Ctrl+X.
+    armed_kill: Option<(BackendKind, String, i64)>,
 }
 
 impl App {
@@ -39,10 +76,11 @@ impl App {
             sessions,
             selected: 0,
             filter: String::new(),
-            show_hidden: false,
-            collapsed: HashSet::new(),
+            show_all: false,
+            group_mode: GroupMode::ByState,
             rows: Vec::new(),
             root_cache: HashMap::new(),
+            armed_kill: None,
         };
         app.rebuild_rows();
         app
@@ -65,30 +103,46 @@ impl App {
         self.clamp_selection();
     }
 
-    /// The render model (a clone of the cached rows). Rules: hidden sessions excluded
-    /// unless show_hidden; filter = case-insensitive substring over title and cwd;
-    /// collapsed groups emit only their GroupHeader (count = sessions in group);
-    /// grouping/order matches core::group_by_project.
+    /// The render model (a clone of the cached rows).
     pub fn visible(&self) -> Vec<Row> {
         self.rows.clone()
     }
 
-    /// key 'a'
-    pub fn toggle_show_hidden(&mut self) {
-        self.show_hidden = !self.show_hidden;
+    /// key 'a' (I-2): one show-all toggle covering companions + archived rows.
+    pub fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
         self.rebuild_rows();
         self.clamp_selection();
     }
 
-    /// key ' '
-    pub fn toggle_collapse_selected(&mut self) {
-        if let Some(root) = self.selected_root() {
-            if !self.collapsed.remove(&root) {
-                self.collapsed.insert(root);
-            }
-            self.rebuild_rows();
-        }
+    /// Rows suppressed by the default view (companion or hidden, when !show_all).
+    pub fn hidden_count(&self) -> usize {
+        // Stage 2 placeholder (deliberately wrong); Stream C counts companion + hidden.
+        0
+    }
+
+    /// key Ctrl+S — toggle ByState / ByProject grouping.
+    pub fn toggle_group_mode(&mut self) {
+        self.group_mode = match self.group_mode {
+            GroupMode::ByState => GroupMode::ByProject,
+            GroupMode::ByProject => GroupMode::ByState,
+        };
+        self.rebuild_rows();
         self.clamp_selection();
+    }
+
+    pub fn group_mode(&self) -> GroupMode {
+        self.group_mode
+    }
+
+    /// Two-stage Ctrl+X (list page only). Selected session S, injected now_ms:
+    ///  - armed for (S.backend,S.id) and now-armed <= 2_000 -> clear, Remove
+    ///  - else arm (S, now): S.status in {Working, NeedsInput} -> Stop,
+    ///    else Noop (armed silently; footer shows the countdown hint)
+    pub fn kill_stage(&mut self, now_ms: i64) -> KillStage {
+        // Stage 2 placeholder (deliberately wrong); Stream C implements the arming.
+        let _ = (now_ms, &self.armed_kill);
+        KillStage::Noop
     }
 
     /// key '/'
@@ -115,7 +169,7 @@ impl App {
                 .sessions
                 .iter()
                 .find(|s| s.backend == *backend && &s.id == id),
-            Row::GroupHeader { .. } => None,
+            _ => None,
         }
     }
 
@@ -126,87 +180,8 @@ impl App {
 
     /// Project root of the group the selection sits in (header or session row).
     pub fn selected_group_root(&self) -> Option<PathBuf> {
-        self.selected_root()
-    }
-
-    pub fn filter(&self) -> &str {
-        &self.filter
-    }
-
-    /// Recompute the cached row model from sessions/filter/show_hidden/collapse.
-    /// Grouping/ordering mirrors core::group_by_project but resolves roots through
-    /// the memo so repeated cwds skip the filesystem walk.
-    fn rebuild_rows(&mut self) {
-        let needle = self.filter.to_lowercase();
-        let mut indices: Vec<usize> = Vec::new();
-        for (i, s) in self.sessions.iter().enumerate() {
-            if s.hidden && !self.show_hidden {
-                continue;
-            }
-            if !needle.is_empty() {
-                let title = s.title.to_lowercase();
-                let cwd = s.cwd.to_string_lossy().to_lowercase();
-                if !(title.contains(&needle) || cwd.contains(&needle)) {
-                    continue;
-                }
-            }
-            indices.push(i);
-        }
-
-        let mut by_root: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-        for &i in &indices {
-            let root = self.resolve_root(i);
-            by_root.entry(root).or_default().push(i);
-        }
-
-        let mut groups: Vec<(PathBuf, Vec<usize>)> = by_root.into_iter().collect();
-        for (_, idxs) in groups.iter_mut() {
-            idxs.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].updated_at_ms));
-        }
-        groups.sort_by(|a, b| {
-            let a_newest = a.1.iter().map(|&i| self.sessions[i].updated_at_ms).max();
-            let b_newest = b.1.iter().map(|&i| self.sessions[i].updated_at_ms).max();
-            b_newest.cmp(&a_newest)
-        });
-
-        let mut rows = Vec::new();
-        for (root, idxs) in groups {
-            let collapsed = self.collapsed.contains(&root);
-            rows.push(Row::GroupHeader {
-                root,
-                collapsed,
-                count: idxs.len(),
-            });
-            if collapsed {
-                continue;
-            }
-            for i in idxs {
-                let s = &self.sessions[i];
-                rows.push(Row::Session {
-                    backend: s.backend,
-                    id: s.id.clone(),
-                    title: s.title.clone(),
-                    status: s.status,
-                    hidden: s.hidden,
-                });
-            }
-        }
-        self.rows = rows;
-    }
-
-    fn resolve_root(&mut self, idx: usize) -> PathBuf {
-        let cwd = self.sessions[idx].cwd.clone();
-        if let Some(root) = self.root_cache.get(&cwd) {
-            return root.clone();
-        }
-        let root = project_root(&cwd);
-        self.root_cache.insert(cwd, root.clone());
-        root
-    }
-
-    fn selected_root(&self) -> Option<PathBuf> {
         match self.rows.get(self.selected)? {
-            Row::GroupHeader { root, .. } => Some(root.clone()),
+            Row::ProjectHeader { root, .. } => Some(root.clone()),
             Row::Session { backend, id, .. } => {
                 let session = self
                     .sessions
@@ -219,7 +194,55 @@ impl App {
                         .unwrap_or_else(|| project_root(&session.cwd)),
                 )
             }
+            _ => None,
         }
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Recompute the cached row model.
+    ///
+    /// STAGE 2 SCAFFOLD: a flat recency-sorted list of Session rows respecting the
+    /// filter and the `hidden` flag (via show_all). It deliberately omits the ByState
+    /// sections, ByProject headers, companion filtering, and the DONE overflow marker,
+    /// and stamps placeholder summary/updated_at_ms — so the v2 behavior tests fail
+    /// while the preserved filter/anchor behavior stays green. Stream C implements the
+    /// real grouped model.
+    fn rebuild_rows(&mut self) {
+        let needle = self.filter.to_lowercase();
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            if s.hidden && !self.show_all {
+                continue;
+            }
+            if !needle.is_empty() {
+                let title = s.title.to_lowercase();
+                let cwd = s.cwd.to_string_lossy().to_lowercase();
+                if !(title.contains(&needle) || cwd.contains(&needle)) {
+                    continue;
+                }
+            }
+            indices.push(i);
+        }
+        indices.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].updated_at_ms));
+
+        let mut rows = Vec::new();
+        for i in indices {
+            let s = &self.sessions[i];
+            rows.push(Row::Session {
+                backend: s.backend,
+                id: s.id.clone(),
+                title: s.title.clone(),
+                status: s.status,
+                hidden: s.hidden,
+                // Placeholder (Stream C copies from the session).
+                summary: String::new(),
+                updated_at_ms: 0,
+            });
+        }
+        self.rows = rows;
     }
 
     fn clamp_selection(&mut self) {
@@ -230,4 +253,11 @@ impl App {
             self.selected = len - 1;
         }
     }
+}
+
+/// "42s" / "17m" / "3h" / "6d" (largest whole unit, no decimals; negative -> "0s").
+pub fn format_elapsed(delta_ms: i64) -> String {
+    // Stage 2 placeholder (deliberately wrong); Stream C implements the buckets.
+    let _ = delta_ms;
+    String::new()
 }

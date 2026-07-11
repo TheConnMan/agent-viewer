@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::BufRead;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,48 +42,29 @@ pub fn read_session_meta(path: &std::path::Path) -> Result<SessionMeta> {
     })
 }
 
-/// Terminal marker check. Read at most the final 64 KiB, split to lines, and decide the
-/// last turn's outcome by event order: return true iff the LAST `task_complete` event
-/// occurs after the LAST `task_started` event (both are event_msg lines with payload.type).
-/// If no `task_started` is in the window (its turn start may predate the window), any
-/// `task_complete` still counts. A stale `task_complete` followed by a later `task_started`
-/// with no new completion (resumed-then-abandoned) resolves to false.
-pub fn has_task_complete_tail(path: &std::path::Path) -> Result<bool> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let window: u64 = 64 * 1024;
-    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut last_complete: Option<usize> = None;
-    let mut last_started: Option<usize> = None;
-    for (idx, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
-            continue;
-        }
-        match value
-            .get("payload")
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str())
-        {
-            Some("task_complete") => last_complete = Some(idx),
-            Some("task_started") => last_started = Some(idx),
-            _ => {}
-        }
-    }
-    Ok(match (last_complete, last_started) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(complete), Some(started)) => complete > started,
-    })
+/// The last-turn outcome derived from the rollout tail (replaces v1's
+/// `has_task_complete_tail`). See section 5.2 of the v2 plan for the decision order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailState {
+    Complete,
+    MidTurn,
+    AwaitingApproval,
+}
+
+/// Read at most the final 64 KiB and classify the last turn. Tracks the last line
+/// index of `task_complete`, `task_started`, and any `event_msg` whose payload.type
+/// ENDS WITH `_approval_request` (protocol names `exec_approval_request` /
+/// `apply_patch_approval_request`; suffix match absorbs future variants).
+/// Decision order:
+///   1. approval seen, after the last `task_started`, with no `task_complete` after
+///      it -> `AwaitingApproval`
+///   2. else v1's last-turn rule verbatim (prior intent, commit ae99791): last
+///      `task_complete` after last `task_started` (or complete with no started in
+///      window) -> `Complete`
+///   3. else -> `MidTurn`
+pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
+    let _ = path;
+    todo!("Stream A: 64 KiB tail scan + approval/complete/started decision order")
 }
 
 #[derive(Debug, Clone, PartialEq)]

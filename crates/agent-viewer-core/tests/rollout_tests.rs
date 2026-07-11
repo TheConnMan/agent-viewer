@@ -1,10 +1,12 @@
 mod common;
 
 use agent_viewer_core::codex::rollout::{
-    TranscriptItem, has_task_complete_tail, read_session_meta, read_transcript,
+    TailState, TranscriptItem, read_session_meta, read_transcript, tail_state,
 };
 use std::io::Write;
 use std::path::PathBuf;
+
+// --- Preserved v1 tests (unchanged behavior) ---
 
 #[test]
 fn session_meta_parses_first_line() {
@@ -28,62 +30,6 @@ fn session_meta_rejects_empty_and_garbage() {
 }
 
 #[test]
-fn task_complete_detected_in_tail() {
-    let path = common::fixture_path("rollout_complete.jsonl");
-    assert!(has_task_complete_tail(&path).expect("read tail"));
-}
-
-#[test]
-fn task_complete_absent_mid_turn() {
-    let path = common::fixture_path("rollout_midturn.jsonl");
-    assert!(!has_task_complete_tail(&path).expect("read tail"));
-}
-
-#[test]
-fn task_complete_found_when_not_last_line() {
-    // Append two trailing non-terminal events after task_complete: the check must scan a
-    // tail *window*, not just the final line.
-    let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap();
-    writeln!(
-        f,
-        r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
-    )
-    .unwrap();
-    writeln!(
-        f,
-        r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
-    )
-    .unwrap();
-    drop(f);
-    assert!(has_task_complete_tail(&path).expect("read tail"));
-}
-
-#[test]
-fn task_complete_stale_before_abandoned_resume() {
-    // Regression: a session completes a turn (task_complete), is resumed, then abandoned
-    // mid-turn. The STALE task_complete is still inside the tail window, but the resumed
-    // turn emitted a later `task_started` (plus a user message) and never a new
-    // task_complete. Done requires the last task_complete to occur AFTER the last
-    // task_started, so this must resolve to NOT done (else it is misclassified Done).
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("rollout_stale_resume.jsonl");
-    let lines = [
-        r#"{"timestamp":"2026-07-10T21:00:00.000Z","type":"session_meta","payload":{"id":"019f-stale","cwd":"/home/user/project","originator":"codex_exec","cli_version":"0.144.1","source":"exec"}}"#,
-        r#"{"type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":null}}"#,
-        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"first turn done","completed_at":1783716000,"duration_ms":1000}}"#,
-        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
-        r#"{"type":"response_item","payload":{"type":"message","id":"user_resume","role":"user","content":[{"type":"input_text","text":"Now do more work."}]}}"#,
-    ];
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-
-    assert!(!has_task_complete_tail(&path).expect("read tail"));
-}
-
-#[test]
 fn transcript_extracts_text_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
     let items = read_transcript(&path).expect("read transcript");
@@ -101,4 +47,71 @@ fn transcript_extracts_text_in_order() {
             },
         ]
     );
+}
+
+// --- v2 tail_state contract (tests 1-5) ---
+
+#[test]
+fn tail_state_complete() {
+    // task_complete present, no later task_started -> Complete.
+    let path = common::fixture_path("rollout_complete.jsonl");
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::Complete);
+}
+
+#[test]
+fn tail_state_midturn() {
+    // No task_complete, no approval -> MidTurn.
+    let path = common::fixture_path("rollout_midturn.jsonl");
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::MidTurn);
+}
+
+#[test]
+fn tail_state_stale_complete_then_started() {
+    // Regression pin of the ae991-99 last-turn rule under the new enum: a stale
+    // task_complete followed by a later task_started (resumed-then-abandoned) is NOT
+    // complete.
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-2"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","id":"user_resume","role":"user","content":[{{"type":"input_text","text":"Now do more work."}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::MidTurn);
+}
+
+#[test]
+fn tail_state_awaiting_approval() {
+    // task_started then an *_approval_request, no task_complete after -> AwaitingApproval.
+    let path = common::fixture_path("rollout_approval.jsonl");
+    assert_eq!(
+        tail_state(&path).expect("tail_state"),
+        TailState::AwaitingApproval
+    );
+}
+
+#[test]
+fn tail_state_approval_then_complete() {
+    // The approval fixture with a later token_count + task_complete appended: the
+    // approval was granted and the turn finished -> Complete (approval stops firing).
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_approval.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-1","completed_at":1,"duration_ms":1}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::Complete);
 }

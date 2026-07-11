@@ -41,3 +41,15 @@ fn parse_garbage_never_panics() {
         Source::Subagent("unknown".to_string())
     );
 }
+
+// --- v2 companion predicate (test 12) ---
+
+#[test]
+fn companion_flags_by_source() {
+    // Cli / VsCode are shown; Exec and any Subagent are companions (hidden by default).
+    assert!(!Source::Cli.is_companion());
+    assert!(!Source::VsCode.is_companion());
+    assert!(Source::Exec.is_companion());
+    assert!(Source::Subagent("review".to_string()).is_companion());
+    assert!(Source::Subagent("Aristotle".to_string()).is_companion());
+}

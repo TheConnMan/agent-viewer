@@ -64,6 +64,9 @@ impl Backend for CodexBackend {
             spawn: true,
             hide: true,
             attach: true,
+            stop: true,
+            remove: true,
+            rename: true,
         }
     }
 
@@ -83,13 +86,17 @@ impl Backend for CodexBackend {
                 status,
                 hidden: thread.archived,
                 source_label: thread.source.label().to_string(),
+                // Stage 2 placeholders; Stream A wires preview/is_companion/open pid.
+                summary: String::new(),
+                companion: false,
+                pid: None,
                 rollout_path: Some(thread.rollout_path.clone()),
             });
         }
         Ok(sessions)
     }
 
-    fn spawn(&self, dir: &Path, task: &str) -> Result<()> {
+    fn spawn(&self, dir: &Path, task: &str) -> Result<Option<u32>> {
         let mut cmd = std::process::Command::new("codex");
         cmd.arg("exec").arg("--json").arg("-C").arg(dir);
         for flag in SANDBOX_FLAG.split_whitespace() {
@@ -99,8 +106,8 @@ impl Backend for CodexBackend {
         let log_path = crate::default_codex_home()
             .join("bg-logs")
             .join(format!("{}.log", crate::spawn::now_ms()));
-        crate::spawn::spawn_detached(cmd, &log_path)?;
-        Ok(())
+        let pid = crate::spawn::spawn_detached(cmd, &log_path)?;
+        Ok(Some(pid))
     }
 
     fn hide(&self, id: &str) -> Result<()> {
@@ -109,6 +116,19 @@ impl Backend for CodexBackend {
 
     fn unhide(&self, id: &str) -> Result<()> {
         cli::unarchive(id)
+    }
+
+    fn stop(&self, session: &Session) -> Result<()> {
+        let _ = session;
+        todo!("Stream A: SIGTERM via spawn::terminate(session.pid, \"codex\")")
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        cli::archive(id)
+    }
+
+    fn rename(&self, session: &Session, name: &str) -> Result<()> {
+        cli::rename(&session.id, name)
     }
 
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {

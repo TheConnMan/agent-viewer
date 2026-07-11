@@ -161,19 +161,26 @@ fn draw_left(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn row_to_item(row: &Row) -> ListItem<'static> {
+    // STAGE 2 SCAFFOLD render (Stream C rewrites ui.rs with the v2 theme + attach).
     match row {
-        Row::GroupHeader {
-            root,
-            collapsed,
-            count,
-        } => {
-            let marker = if *collapsed { "▶" } else { "▼" };
-            let text = format!("{marker} {} ({count})", root.display());
+        Row::SectionHeader { section, count } => {
+            let text = format!("{section:?} ({count})");
             ListItem::new(Line::from(Span::styled(
                 text,
                 Style::default().add_modifier(Modifier::BOLD),
             )))
         }
+        Row::ProjectHeader { root, count } => {
+            let text = format!("{} ({count})", root.display());
+            ListItem::new(Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+        }
+        Row::MoreMarker { hidden } => ListItem::new(Line::from(Span::styled(
+            format!("… {hidden} more"),
+            Style::default().fg(Color::DarkGray),
+        ))),
         Row::Session {
             backend,
             title,
@@ -195,15 +202,18 @@ fn row_to_item(row: &Row) -> ListItem<'static> {
     }
 }
 
-/// spinner=running, green=done, gray=hidden, red=errored (SPEC glyph vocabulary).
+/// Six-state glyph vocabulary (Stream C applies the approved palette + blink).
 fn status_glyph(status: Status, hidden: bool) -> (char, Color) {
     if hidden {
         return ('○', Color::DarkGray);
     }
     match status {
-        Status::Running => ('◐', Color::Yellow),
+        Status::Working => ('✽', Color::Yellow),
+        Status::NeedsInput => ('◐', Color::Yellow),
+        Status::Idle => ('∙', Color::Gray),
         Status::Done => ('●', Color::Green),
-        Status::Errored => ('●', Color::Red),
+        Status::Failed => ('✗', Color::Red),
+        Status::Stopped => ('○', Color::DarkGray),
     }
 }
 
@@ -242,9 +252,12 @@ fn draw_right(frame: &mut Frame, app: &App, area: Rect, transcript: &TranscriptC
 
 fn metadata_lines(session: &agent_viewer_core::Session) -> Vec<Line<'static>> {
     let status = match session.status {
-        Status::Running => "running",
+        Status::Working => "working",
+        Status::NeedsInput => "needs-input",
+        Status::Idle => "idle",
         Status::Done => "done",
-        Status::Errored => "errored",
+        Status::Failed => "failed",
+        Status::Stopped => "stopped",
     };
     vec![
         Line::from(format!("{} {}", session.backend.tag(), session.title)),
