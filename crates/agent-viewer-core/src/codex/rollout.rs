@@ -128,12 +128,29 @@ pub enum PendingApproval {
     Patch { files: Vec<String> },
 }
 
+/// Single-quote-wrap an argv element that would otherwise misrepresent what runs: empty,
+/// or containing whitespace or a single quote. Embedded single quotes are escaped as the
+/// usual `'\''` (close quote, escaped quote, reopen quote). Simple args pass through bare so
+/// a plain command still renders cleanly.
+fn shell_quote(arg: &str) -> String {
+    let needs_quote = arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '\'');
+    if !needs_quote {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
 impl PendingApproval {
     /// A one-line human summary for the peek header (no "Awaiting approval:" prefix — the
-    /// caller adds it). Exec -> the joined command; Patch -> the changed files (or a generic).
+    /// caller adds it). Exec -> the joined command (each arg shell-quoted so whitespace args
+    /// are not misread); Patch -> the changed files (or a generic).
     pub fn summary(&self) -> String {
         match self {
-            PendingApproval::Exec { command, .. } => command.join(" "),
+            PendingApproval::Exec { command, .. } => command
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
             PendingApproval::Patch { files } if files.is_empty() => "apply patch".to_string(),
             PendingApproval::Patch { files } => format!("apply patch: {}", files.join(", ")),
         }

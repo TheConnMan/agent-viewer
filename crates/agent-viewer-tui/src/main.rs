@@ -145,6 +145,10 @@ struct Ui {
     /// the PTY for the agents view and presses Enter once (after a settle) to land in the
     /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
     auto_enter: Option<AutoEnter>,
+    /// The key for which `drive_auto_enter` reported an explicit SUCCESSFUL landing in the run
+    /// (its Enter opened the run, not a timeout/abort). The reply injector uses this as proof
+    /// we are in the run before writing — a timed-out `auto_enter` clear never sets it.
+    auto_enter_landed: Option<Key>,
     /// A one-shot reply injection armed by `send_reply`. While set, the run loop watches the
     /// focused PTY and writes the reply payload once it is safe (in the run, settled).
     /// Cleared on write, timeout, user takeover, or PTY prune.
@@ -173,6 +177,9 @@ impl Ui {
         self.detach_trackers.remove(key);
         if self.auto_enter.as_ref().map(|ae| &ae.key) == Some(key) {
             self.auto_enter = None;
+        }
+        if self.auto_enter_landed.as_ref() == Some(key) {
+            self.auto_enter_landed = None;
         }
         if self.pending_reply.as_ref().map(|pr| &pr.key) == Some(key) {
             self.pending_reply = None;
@@ -219,6 +226,7 @@ fn main() -> io::Result<()> {
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
         auto_enter: None,
+        auto_enter_landed: None,
         pending_reply: None,
         attached: HashMap::new(),
         focused: None,
