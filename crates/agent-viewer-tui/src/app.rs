@@ -356,6 +356,22 @@ impl App {
         self.sync_expanded();
     }
 
+    /// Mouse hit-test target: select the visible row at `idx` (an index into `visible()`),
+    /// if it exists and is selectable (a header or session row, never a Spacer). Returns
+    /// whether the selection changed to a valid row. Mirrors `move_selection`'s post-move
+    /// `sync_expanded` so a mouse-driven selection collapses a stale peek the same way a
+    /// keyboard move does.
+    pub fn select_visible_index(&mut self, idx: usize) -> bool {
+        match self.rows.get(idx) {
+            Some(r) if !matches!(r, Row::Spacer) => {
+                self.selected = idx;
+                self.sync_expanded();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The first row index at or beyond `start` (walking `step`) whose row matches `pred`.
     fn scan_from(&self, start: i32, step: i32, pred: impl Fn(&Row) -> bool) -> Option<usize> {
         let len = self.rows.len() as i32;
