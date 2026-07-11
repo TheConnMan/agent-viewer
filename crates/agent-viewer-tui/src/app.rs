@@ -619,10 +619,12 @@ impl App {
         rows
     }
 
-    /// ByProject: group by memoized project_root ACROSS backends, groups ordered by
-    /// newest session DESC, sessions within a group already recency-sorted.
+    /// ByProject: group by memoized project_root ACROSS backends. Groups are ordered by
+    /// directory path (case-insensitive) so the list stays stable — starting or updating
+    /// a session never reorders the groups. Sessions within a group are ordered by start
+    /// time (created_at_ms) DESC, newest first; start time never changes, so existing rows
+    /// don't shuffle when a session's activity updates.
     fn build_project_rows(&mut self, indices: &[usize]) -> Vec<Row> {
-        // Preserve incoming recency order inside each group by iterating `indices`.
         let mut order: Vec<PathBuf> = Vec::new();
         let mut by_root: HashMap<PathBuf, Vec<usize>> = HashMap::new();
         for &i in indices {
@@ -633,8 +635,18 @@ impl App {
             }
             by_root.entry(root).or_default().push(i);
         }
-        // `indices` is recency DESC, so the first time we see a root is its newest
-        // session — `order` is therefore already group-order (newest group first).
+        // Stable group order: sort roots by path (case-insensitive), independent of any
+        // session's recency, so a new session cannot move a group. Within each group,
+        // order by start time DESC.
+        order.sort_by(|a, b| {
+            a.to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.to_string_lossy().to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
+        for members in by_root.values_mut() {
+            members.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].created_at_ms));
+        }
         // Roots are computed above (the only &mut self borrow, via root_of); the emit loop
         // below reads self.collapsed / self.sessions immutably.
         let mut rows = Vec::new();

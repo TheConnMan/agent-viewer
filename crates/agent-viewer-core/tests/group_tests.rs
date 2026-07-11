@@ -55,36 +55,52 @@ fn project_root_falls_back_to_cwd() {
     assert_eq!(project_root(&cwd), cwd);
 }
 
+/// Session with start time and update time set independently, so a test can prove the
+/// sort keys on start time (created_at_ms) rather than activity (updated_at_ms).
+fn sess_ct(id: &str, cwd: &str, created_at_ms: i64, updated_at_ms: i64) -> Session {
+    Session {
+        created_at_ms,
+        ..sess(id, cwd, updated_at_ms)
+    }
+}
+
 #[test]
-fn group_by_project_orders_groups_by_newest_session() {
+fn group_by_project_orders_groups_by_directory_name() {
     // Two distinct roots (nonexistent paths -> project_root falls back to cwd).
+    // root-z holds the most-recently-updated session but must still sort AFTER root-a,
+    // proving group order is by directory name and does NOT jerk around with activity.
     let root_a = "/synthetic/root-a";
-    let root_b = "/synthetic/root-b";
+    let root_z = "/synthetic/root-z";
     let sessions = vec![
+        sess("z1", root_z, 999),
         sess("a1", root_a, 100),
-        sess("b3", root_b, 200),
         sess("a2", root_a, 300),
     ];
     let groups = group_by_project(sessions);
     assert_eq!(groups.len(), 2);
-    // Group order by newest session DESC: root-a (300) before root-b (200).
+    // Alphabetical by path: root-a before root-z, regardless of recency.
     assert_eq!(groups[0].root, Path::new(root_a));
-    assert_eq!(groups[1].root, Path::new(root_b));
-    // Intra-group recency DESC.
+    assert_eq!(groups[1].root, Path::new(root_z));
+}
+
+#[test]
+fn group_by_project_sorts_sessions_by_start_time_desc() {
+    let root = "/synthetic/root";
+    // s_old started first (created 100) but was updated most recently (updated 900).
+    // s_new started later (created 500) but updated earlier (updated 200).
+    // Sorting on start time DESC => s_new before s_old; sorting on updated_at would
+    // flip them, so this differential proves the key is created_at_ms.
+    let sessions = vec![
+        sess_ct("s_old", root, 100, 900),
+        sess_ct("s_new", root, 500, 200),
+    ];
+    let groups = group_by_project(sessions);
     assert_eq!(
         groups[0]
             .sessions
             .iter()
             .map(|s| s.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["a2", "a1"]
-    );
-    assert_eq!(
-        groups[1]
-            .sessions
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["b3"]
+        vec!["s_new", "s_old"]
     );
 }

@@ -40,8 +40,9 @@ pub struct ProjectGroup {
     pub sessions: Vec<crate::backend::Session>,
 }
 
-/// Group by project_root(cwd) ACROSS backends. Sort each group's sessions by
-/// updated_at_ms DESC; order groups by their newest session's updated_at_ms DESC.
+/// Group by project_root(cwd) ACROSS backends. Order groups by directory path
+/// (case-insensitive) so the list stays stable regardless of session activity;
+/// sort each group's sessions by start time (created_at_ms) DESC.
 pub fn group_by_project(sessions: Vec<crate::backend::Session>) -> Vec<ProjectGroup> {
     let mut by_root: HashMap<PathBuf, Vec<crate::backend::Session>> = HashMap::new();
     for session in sessions {
@@ -51,14 +52,17 @@ pub fn group_by_project(sessions: Vec<crate::backend::Session>) -> Vec<ProjectGr
     let mut groups: Vec<ProjectGroup> = by_root
         .into_iter()
         .map(|(root, mut sessions)| {
-            sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at_ms));
             ProjectGroup { root, sessions }
         })
         .collect();
-    // Each group is already sorted DESC, so its first session is its newest.
+    // Stable order: by directory path, case-insensitive, independent of activity.
     groups.sort_by(|a, b| {
-        let newest = |g: &ProjectGroup| g.sessions.first().map(|s| s.updated_at_ms);
-        newest(b).cmp(&newest(a))
+        a.root
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&b.root.to_string_lossy().to_lowercase())
+            .then_with(|| a.root.cmp(&b.root))
     });
     groups
 }
