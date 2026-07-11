@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 /// Find the session whose title matches. parse_agents_json now returns `Vec<Session>`
 /// with the short id folded into `Session.short_id` (no more (Session, String) tuple).
-fn by_title<'a>(parsed: &'a [agent_viewer_core::Session], title: &str) -> &'a agent_viewer_core::Session {
+fn by_title<'a>(
+    parsed: &'a [agent_viewer_core::Session],
+    title: &str,
+) -> &'a agent_viewer_core::Session {
     parsed
         .iter()
         .find(|s| s.title == title)
@@ -62,7 +65,10 @@ fn claude_parse_rejects_non_array_top_level() {
 fn parse_job_state_blocked_prefers_needs() {
     let text = common::read_fixture("claude_state_blocked.json");
     let detail = parse_job_state(&text);
-    assert_eq!(detail.summary, "Approve running the migration against the live DB");
+    assert_eq!(
+        detail.summary,
+        "Approve running the migration against the live DB"
+    );
     assert_eq!(
         detail.transcript_path,
         Some(PathBuf::from(

@@ -27,7 +27,11 @@ pub fn read_session_meta(path: &std::path::Path) -> Result<SessionMeta> {
     let payload = value
         .get("payload")
         .ok_or_else(|| Error::Command("session_meta missing payload".into()))?;
-    let field = |key: &str| crate::json_str(payload, key).unwrap_or_default().to_string();
+    let field = |key: &str| {
+        crate::json_str(payload, key)
+            .unwrap_or_default()
+            .to_string()
+    };
     Ok(SessionMeta {
         id: field("id"),
         cwd: PathBuf::from(field("cwd")),
@@ -74,7 +78,10 @@ pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
         if crate::json_str(&value, "type") != Some("event_msg") {
             continue;
         }
-        match value.get("payload").and_then(|p| crate::json_str(p, "type")) {
+        match value
+            .get("payload")
+            .and_then(|p| crate::json_str(p, "type"))
+        {
             Some("task_complete") => last_complete = Some(idx),
             Some("task_started") => last_started = Some(idx),
             Some(t) if t.ends_with("_approval_request") => last_approval = Some(idx),
