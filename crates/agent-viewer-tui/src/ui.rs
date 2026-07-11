@@ -3,6 +3,7 @@
 //! full-screen embedded-PTY attach view. The approved amber palette lives in `theme`.
 
 use crate::app::{App, Composer, Row, Section};
+use crate::peek::{self, PeekKind};
 use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
@@ -211,8 +212,12 @@ impl PeekCache {
             return;
         };
         let Some(path) = session.rollout_path.as_deref() else {
-            // opencode: no transcript file — draw_peek falls back to metadata.
-            self.clear();
+            if session.backend == BackendKind::Opencode {
+                self.refresh_opencode(session);
+            } else {
+                // No transcript file and not opencode: metadata fallback only.
+                self.clear();
+            }
             return;
         };
         let fkey = file_key(path);
@@ -233,6 +238,39 @@ impl PeekCache {
                     items.drain(0..items.len() - MAX_TRANSCRIPT_ITEMS);
                 }
                 self.items = items;
+                self.error = None;
+            }
+            Err(e) => {
+                self.items.clear();
+                self.error = Some(format!("transcript unavailable: {e}"));
+            }
+        }
+    }
+
+    /// opencode has no transcript file — the last message lives in the SQLite `message`/
+    /// `part` tables. Key off the session id + its updated_at_ms so we re-read only when the
+    /// session advances (there is no file mtime to stat). The synthetic file part of the key
+    /// is (updated_at_ms, 0).
+    fn refresh_opencode(&mut self, session: &Session) {
+        let key = Some((
+            session.backend,
+            PathBuf::from(&session.id),
+            Some((session.updated_at_ms.max(0) as u64, 0)),
+        ));
+        if self.key == key {
+            return;
+        }
+        self.key = key;
+        match agent_viewer_core::opencode::read_opencode_last_message(
+            &agent_viewer_core::opencode::default_opencode_db(),
+            &session.id,
+        ) {
+            Ok(Some(item)) => {
+                self.items = vec![item];
+                self.error = None;
+            }
+            Ok(None) => {
+                self.items.clear();
                 self.error = None;
             }
             Err(e) => {
@@ -334,7 +372,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         _ => None,
     };
     let expand_lines = match d.expanded {
-        Some(key) => expansion_lines(d.app, d.peek, key),
+        Some(key) => peek_expansion(d.app, d.peek, key, vertical[0].width as usize),
         None => Vec::new(),
     };
     let deco = ListDeco {
@@ -404,39 +442,52 @@ fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect)
 struct ListDeco<'a> {
     rename: Option<(BackendKind, &'a str, &'a str)>,
     expanded: Option<&'a (BackendKind, String)>,
-    expand_lines: &'a [String],
+    expand_lines: &'a [Line<'static>],
 }
 
-/// Up to 8 muted lines for the inline expansion of the EXPANDED row (resolved by its key,
-/// not the selection — which App keeps in sync but which could momentarily diverge): the
-/// transcript tail (codex/claude) collapsed one item per line, or metadata (opencode).
-fn expansion_lines(app: &App, peek: &PeekCache, key: &(BackendKind, String)) -> Vec<String> {
+/// The inline peek expansion for the EXPANDED row (resolved by its key, not the selection —
+/// which App keeps in sync but which could momentarily diverge): the last message word-
+/// wrapped to the panel width (peek::build), indented and color-coded per PeekKind. opencode
+/// (no transcript file) falls back to a couple of metadata lines when it has no message.
+fn peek_expansion(
+    app: &App,
+    peek: &PeekCache,
+    key: &(BackendKind, String),
+    width: usize,
+) -> Vec<Line<'static>> {
     let Some(session) = app.session_for(key) else {
         return Vec::new();
     };
-    if session.rollout_path.is_none() {
-        // opencode or no transcript file: a couple of metadata lines.
-        let mut lines = vec![format!("status: {}", status_word(session.status))];
-        if !session.summary.is_empty() {
-            lines.push(session.summary.clone());
-        }
-        lines.push(format!("cwd: {}", session.cwd.display()));
-        lines.truncate(8);
-        return lines;
-    }
-    if let Some(err) = &peek.error {
-        return vec![err.clone()];
-    }
-    let mut lines: Vec<String> = peek
-        .items
-        .iter()
-        .map(|item| format!("{}: {}", item.role, item.text.replace('\n', " ")))
-        .collect();
-    if lines.is_empty() {
-        lines.push("(no transcript yet)".to_string());
-    }
-    let start = lines.len().saturating_sub(8);
-    lines.split_off(start)
+    // Reserve the 6-column indent (matching the rename/expansion gutter).
+    let inner = width.saturating_sub(6);
+    // Metadata fallback for sessions with no transcript file (opencode) when items is empty.
+    let meta = if session.rollout_path.is_none() {
+        vec![
+            format!("status: {}", status_word(session.status)),
+            format!("cwd: {}", session.cwd.display()),
+        ]
+    } else {
+        Vec::new()
+    };
+    // Pending-ask is Part B; pass None for now.
+    let ask: Option<&str> = None;
+    let plines = peek::build(ask, &peek.items, peek.error.as_deref(), &meta, inner);
+    plines
+        .into_iter()
+        .map(|pl| {
+            let style = match pl.kind {
+                PeekKind::Ask => fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                PeekKind::Role => fg(theme::MUTED),
+                PeekKind::Body => fg(theme::TEXT),
+                PeekKind::Meta => fg(theme::MUTED),
+                PeekKind::Error => fg(theme::WARN),
+            };
+            Line::from(vec![
+                Span::raw("      "),
+                Span::styled(pl.text, style),
+            ])
+        })
+        .collect()
 }
 
 /// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
@@ -542,10 +593,8 @@ fn draw_list(
                     && id == eid
                 {
                     for line in deco.expand_lines {
-                        items.push(ListItem::new(Line::from(Span::styled(
-                            format!("      {}", truncate(line, width.saturating_sub(6))),
-                            fg(theme::FAINT),
-                        ))));
+                        // Lines are already indented + styled by peek_expansion.
+                        items.push(ListItem::new(line.clone()));
                     }
                 }
             }

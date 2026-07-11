@@ -49,6 +49,47 @@ fn transcript_extracts_text_in_order() {
     );
 }
 
+#[test]
+fn transcript_excludes_empty_text_items() {
+    // A response_item whose content has ONLY a non-text chunk extracts to "" and must be
+    // dropped, so peek never shows a blank role-only line.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("empty_item.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"role":"user","content":[{{"type":"input_text","text":"hello"}}]}}}}"#
+    )
+    .unwrap();
+    // Tool-only assistant turn: no input_text/output_text chunk -> text == "".
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"role":"assistant","content":[{{"type":"function_call"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"role":"assistant","content":[{{"type":"output_text","text":"world"}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    let items = read_transcript(&path).expect("read transcript");
+    assert_eq!(
+        items,
+        vec![
+            TranscriptItem {
+                role: "user".to_string(),
+                text: "hello".to_string(),
+            },
+            TranscriptItem {
+                role: "assistant".to_string(),
+                text: "world".to_string(),
+            },
+        ]
+    );
+}
+
 // --- v2 tail_state contract (tests 1-5) ---
 
 #[test]

@@ -2,7 +2,9 @@ mod common;
 
 use agent_viewer_core::Status;
 use agent_viewer_core::backend::{Backend, BackendKind};
-use agent_viewer_core::opencode::{OpencodeBackend, opencode_status, rename_sql};
+use agent_viewer_core::opencode::{
+    OpencodeBackend, opencode_status, read_opencode_last_message, rename_sql,
+};
 use std::path::PathBuf;
 
 // --- Preserved v1 listing shape (order / labels / hidden) ---
@@ -89,6 +91,62 @@ fn opencode_lists_companion_flag() {
     let kid = sessions.iter().find(|s| s.id == "ses_kid").unwrap();
     assert!(!root.companion); // parent_id IS NULL
     assert!(kid.companion); // parent_id set -> companion
+}
+
+// --- v2: last-message reader (peek) ---
+
+#[test]
+fn opencode_last_message_returns_newest_text_concatenated() {
+    let schema = common::read_fixture("opencode_message_schema.sql");
+    let inserts = [
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+         VALUES ('ses_1',NULL,'/home/user/oc-proj','Proj',1000,3000,NULL)",
+        // Older assistant message with a single text part.
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_old','ses_1',1000,1000,'{\"role\":\"assistant\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_old','msg_old','ses_1',1000,1000,'{\"type\":\"text\",\"text\":\"older reply\"}')",
+        // Newer assistant message: a tool part THEN a text part (tool must be skipped).
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_new','ses_1',2000,2000,'{\"role\":\"assistant\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_new_tool','msg_new','ses_1',2001,2001,'{\"type\":\"tool\",\"tool\":\"bash\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_new_text','msg_new','ses_1',2002,2002,'{\"type\":\"text\",\"text\":\"newer reply text\"}')",
+    ];
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+
+    let item = read_opencode_last_message(&path, "ses_1")
+        .expect("read ok")
+        .expect("a text message exists");
+    assert_eq!(item.role, "assistant");
+    // The NEWER message's text only, tool part skipped.
+    assert_eq!(item.text, "newer reply text");
+}
+
+#[test]
+fn opencode_last_message_none_when_no_text_message() {
+    let schema = common::read_fixture("opencode_message_schema.sql");
+    let inserts = [
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+         VALUES ('ses_1',NULL,'/home/user/oc-proj','Proj',1000,3000,NULL)",
+        // A message whose only part is a tool part -> no text -> Ok(None).
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_1','ses_1',1000,1000,'{\"role\":\"assistant\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_1','msg_1','ses_1',1000,1000,'{\"type\":\"tool\",\"tool\":\"bash\"}')",
+    ];
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+    // Also nothing for an unknown session id.
+    assert!(read_opencode_last_message(&path, "ses_1").expect("read ok").is_none());
+    assert!(read_opencode_last_message(&path, "nope").expect("read ok").is_none());
+}
+
+#[test]
+fn opencode_last_message_missing_db_is_none() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+    assert!(read_opencode_last_message(&missing, "ses_1").expect("read ok").is_none());
 }
 
 // --- v2: rename SQL escaping (test 19) ---

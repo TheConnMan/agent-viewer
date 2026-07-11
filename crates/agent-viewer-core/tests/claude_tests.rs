@@ -5,6 +5,7 @@ use agent_viewer_core::claude::{
     ClaudeBackend, parse_agents_json, parse_job_state, read_claude_transcript,
 };
 use agent_viewer_core::codex::rollout::TranscriptItem;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Find the session whose title matches. parse_agents_json now returns `Vec<Session>`
@@ -140,6 +141,47 @@ fn read_claude_transcript_extracts_text_tail() {
             TranscriptItem {
                 role: "assistant".to_string(),
                 text: "assistant reply two".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn read_claude_transcript_skips_text_empty_message() {
+    // An assistant message whose content is only a thinking/tool block extracts to "" and
+    // must be dropped (no blank role-only line in peek).
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("empty_assistant.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"user","message":{{"content":"a real user line"}}}}"#
+    )
+    .unwrap();
+    // Only thinking + tool_use blocks -> text == "" -> skipped.
+    writeln!(
+        f,
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"thinking","thinking":"hmm"}},{{"type":"tool_use","name":"bash"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"a real reply"}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    let items = read_claude_transcript(&path, 100).expect("read transcript");
+    assert_eq!(
+        items,
+        vec![
+            TranscriptItem {
+                role: "user".to_string(),
+                text: "a real user line".to_string(),
+            },
+            TranscriptItem {
+                role: "assistant".to_string(),
+                text: "a real reply".to_string(),
             },
         ]
     );

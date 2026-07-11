@@ -134,6 +134,87 @@ impl Backend for OpencodeBackend {
     }
 }
 
+/// Default opencode DB path (mirrors OpencodeBackend::new()).
+pub fn default_opencode_db() -> std::path::PathBuf {
+    crate::home_dir().join(".local/share/opencode/opencode.db")
+}
+
+/// The most recent opencode message that has text, as a TranscriptItem (role + concatenated
+/// text parts). Reads the `message`/`part` tables read-only. Ok(None) when the DB is missing
+/// or the session has no text message. Never creates/writes the DB.
+pub fn read_opencode_last_message(
+    db_path: &std::path::Path,
+    session_id: &str,
+) -> Result<Option<crate::codex::rollout::TranscriptItem>> {
+    use crate::codex::rollout::TranscriptItem;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = crate::open_readonly(db_path)?;
+    // Rows arrive grouped by message (most-recent message first), parts in creation order.
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.data, p.data FROM message m JOIN part p ON p.message_id = m.id \
+         WHERE m.session_id = ?1 ORDER BY m.time_created DESC, m.id DESC, p.time_created ASC",
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        let mid: String = row.get(0)?;
+        let mdata: String = row.get(1)?;
+        let pdata: String = row.get(2)?;
+        Ok((mid, mdata, pdata))
+    })?;
+
+    // Walk the grouped rows, accumulating each message's text parts. Return the first
+    // (most-recent) message whose accumulated text is non-empty.
+    let mut cur_id: Option<String> = None;
+    let mut cur_role = String::from("assistant");
+    let mut cur_text = String::new();
+    for row in rows {
+        let (mid, mdata, pdata) = row?;
+        if cur_id.as_deref() != Some(mid.as_str()) {
+            // Boundary: the previous message is complete — return it if it had text.
+            if cur_id.is_some() && !cur_text.is_empty() {
+                return Ok(Some(TranscriptItem {
+                    role: cur_role,
+                    text: cur_text,
+                }));
+            }
+            cur_id = Some(mid);
+            cur_role = parsed_role(&mdata);
+            cur_text = String::new();
+        }
+        if let Some(text) = parsed_text_part(&pdata) {
+            cur_text.push_str(&text);
+        }
+    }
+    // The final message (no boundary follows it).
+    if cur_id.is_some() && !cur_text.is_empty() {
+        return Ok(Some(TranscriptItem {
+            role: cur_role,
+            text: cur_text,
+        }));
+    }
+    Ok(None)
+}
+
+/// message.data JSON "role" (defaulting to "assistant" when absent/unparseable).
+fn parsed_role(mdata: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(mdata)
+        .ok()
+        .as_ref()
+        .and_then(|v| crate::json_str(v, "role").map(String::from))
+        .unwrap_or_else(|| "assistant".to_string())
+}
+
+/// part.data JSON text, only for `{"type":"text","text":...}` parts (else None so
+/// tool/step-start/step-finish parts are skipped). Returns an owned String.
+fn parsed_text_part(pdata: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(pdata).ok()?;
+    if crate::json_str(&value, "type") != Some("text") {
+        return None;
+    }
+    crate::json_str(&value, "text").map(String::from)
+}
+
 /// IMPURE process check (live-verified only): does any process named `opencode*` exist.
 /// All opencode sessions share one process, so this is a single best-effort signal.
 fn live_opencode_proc() -> bool {
