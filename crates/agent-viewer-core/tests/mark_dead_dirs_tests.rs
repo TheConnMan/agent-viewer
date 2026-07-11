@@ -22,6 +22,7 @@ fn sess(cwd: PathBuf, companion: bool) -> Session {
         companion,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 

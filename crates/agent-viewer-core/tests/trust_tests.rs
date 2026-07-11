@@ -91,6 +91,20 @@ fn ensure_trusted_errs_and_preserves_a_malformed_config() {
 }
 
 #[test]
+fn ensure_trusted_errs_on_non_object_root() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("claude.json");
+    // Valid JSON but not an object (a bare array) — must not panic on the object accessors,
+    // and must not overwrite the file.
+    std::fs::write(&path, "[]").unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let result = ensure_trusted(&path, Path::new("/work/proj"));
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn ensure_trusted_creates_missing_config() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("does-not-exist.json");

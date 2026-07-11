@@ -2,5 +2,10 @@
   "state": "blocked",
   "detail": "Waiting on the exec approval to continue.",
   "needs": "Approve running the migration against the live DB",
-  "linkScanPath": "/home/user/.claude/jobs/block001/transcript.jsonl"
+  "linkScanPath": "/home/user/.claude/jobs/block001/transcript.jsonl",
+  "children": [
+    { "id": "315", "href": "https://github.com/acme/repo/pull/315", "kind": "pr" },
+    { "id": "note-1", "href": "https://example.com/n", "kind": "note" },
+    { "id": "318", "href": "https://github.com/acme/repo/pull/318", "kind": "pr" }
+  ]
 }

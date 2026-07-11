@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, all_backends};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
@@ -28,6 +28,19 @@ const POLL: Duration = Duration::from_millis(100);
 const FAST_POLL: Duration = Duration::from_millis(120);
 /// The spawn bloom lasts ~400ms; a pulse older than this is garbage-collected.
 const PULSE_MS: i64 = 400;
+/// How long to keep watching a live claude attach for the agents view before giving up on
+/// the one-shot auto-Enter. Generous because `claude agents` can take 8-15s+ to boot
+/// (plugin/MCP startup); harmless while armed since any user key disarms it.
+const AUTO_ENTER_TIMEOUT: Duration = Duration::from_secs(45);
+/// The marker must stay visible this long before we press Enter, so we land when claude is
+/// actually accepting input rather than on the first painted (still-initializing) frame.
+const AUTO_ENTER_SETTLE: Duration = Duration::from_millis(500);
+/// Stage-1 marker: the agents list is up and the preselected row is ready.
+const CLAUDE_AGENTS_MARKER: &str = "describe a task for a new session";
+/// Stage-2 markers (fallback only): if the first Enter merely expanded a collapsed row
+/// rather than opening the run, either collapse-hint variant shows and a second Enter opens.
+const CLAUDE_EXPANDED_MARKER: &str = "enter to collapse";
+const CLAUDE_EXPANDED_MARKER_ALT: &str = "space to reply";
 /// Abandoned spawn records (no matching session after this long) are deleted.
 const SPAWN_ABANDON_MS: i64 = 600_000;
 
@@ -117,6 +130,26 @@ impl NoticeState {
     }
 }
 
+/// Two-stage auto-Enter: `CLAUDE_AGENTS_SELECT` preselects the row but does not expand it,
+/// so opening the run takes two returns — one to expand, one to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEnterStage {
+    /// Waiting for the agents list; a settled Enter expands the preselected row.
+    AwaitingList,
+    /// Row expanded; a settled Enter on the collapse hint opens the run, then disarms.
+    AwaitingExpanded,
+}
+
+/// One-shot auto-Enter state for a live claude attach: which PTY, when it was armed, which
+/// stage we are on, and when the current stage's marker was first seen (settle debounce).
+#[derive(Debug, Clone)]
+struct AutoEnter {
+    key: Key,
+    armed_at: Instant,
+    stage: AutoEnterStage,
+    marker_since: Option<Instant>,
+}
+
 /// Everything the run loop mutates, threaded through the key/tick handlers.
 struct Ui {
     app: App,
@@ -137,6 +170,12 @@ struct Ui {
     mutations: MutationRunner,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
     pulses: Pulses,
+    /// The row expanded in place for an inline peek (one at a time), or None.
+    expanded: Option<Key>,
+    /// A one-shot auto-Enter armed on a live claude attach. While set, the run loop watches
+    /// the PTY for the agents view and presses Enter once (after a settle) to land in the
+    /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
+    auto_enter: Option<AutoEnter>,
     /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
     /// on quit — conversation state persists in each backend's own store.
     attached: HashMap<Key, PtySession>,
@@ -156,6 +195,9 @@ impl Ui {
 }
 
 fn main() -> io::Result<()> {
+    // Read the ASCII-marks fallback once, before any rendering.
+    ui::set_ascii_marks(std::env::var("AGENT_VIEWER_ASCII_MARKS").as_deref() == Ok("1"));
+
     let mut list_backends = all_backends();
     let db = ViewerDb::open_default().ok();
 
@@ -190,6 +232,8 @@ fn main() -> io::Result<()> {
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
+        expanded: None,
+        auto_enter: None,
         attached: HashMap::new(),
         focused: None,
         focused_session: None,
@@ -252,6 +296,9 @@ fn run(
             None => false,
         };
 
+        // Drive the one-shot auto-Enter for a live claude attach (lands us in the run).
+        drive_auto_enter(ui);
+
         // Build the attach view (if focused) before borrowing the frame.
         let attach = build_attach_view(ui);
         terminal.draw(|frame| {
@@ -264,6 +311,7 @@ fn run(
                     peek: &ui.peek,
                     composer: &ui.composer,
                     pulses: &ui.pulses,
+                    expanded: ui.expanded.as_ref(),
                     now_ms: now,
                     attach,
                 },
@@ -312,6 +360,73 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
             }
         )
     })
+}
+
+/// While a live claude attach is armed, watch its PTY for the agents view and press Enter
+/// once so we land IN the preselected run rather than sitting on the agents list (the
+/// internal autoOpenJobId is not reachable via env/flag). Give up after a timeout; the
+/// arming is cleared on any user key or when the PTY is pruned.
+fn drive_auto_enter(ui: &mut Ui) {
+    let Some(state) = ui.auto_enter.clone() else {
+        return;
+    };
+    // Only drive the currently focused attach.
+    if ui.focused.as_ref() != Some(&state.key) {
+        return;
+    }
+    if state.armed_at.elapsed() > AUTO_ENTER_TIMEOUT {
+        ui.auto_enter = None;
+        return;
+    }
+    let Some(pty) = ui.attached.get_mut(&state.key) else {
+        return;
+    };
+    // Each stage watches its own marker(s); the settle timer is per-stage. The expanded
+    // row's hint renders as one of two variants depending on how the view drew it.
+    let visible = pty.with_screen(|screen| {
+        let contents = screen.contents();
+        match state.stage {
+            AutoEnterStage::AwaitingList => contents.contains(CLAUDE_AGENTS_MARKER),
+            AutoEnterStage::AwaitingExpanded => {
+                contents.contains(CLAUDE_EXPANDED_MARKER)
+                    || contents.contains(CLAUDE_EXPANDED_MARKER_ALT)
+            }
+        }
+    });
+    if !visible {
+        // Marker not up yet (or flickered away) — restart this stage's settle timer.
+        if let Some(ae) = &mut ui.auto_enter {
+            ae.marker_since = None;
+        }
+        return;
+    }
+    match state.marker_since {
+        // First frame this stage's marker appears: start the settle debounce, do not press.
+        None => {
+            if let Some(ae) = &mut ui.auto_enter {
+                ae.marker_since = Some(Instant::now());
+            }
+        }
+        Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => match state.stage {
+            // Stage 1: with real preselection (CLAUDE_AGENTS_SELECT now reaches the child)
+            // the row comes up pre-expanded, so this Enter opens the run directly — stage 2's
+            // marker never appears. Advance anyway as a harmless fallback for a collapsed
+            // variant where the first Enter only expands.
+            AutoEnterStage::AwaitingList => {
+                let _ = pty.write_input(b"\r");
+                if let Some(ae) = &mut ui.auto_enter {
+                    ae.stage = AutoEnterStage::AwaitingExpanded;
+                    ae.marker_since = None;
+                }
+            }
+            // Stage 2 (fallback only): a second Enter opens the expanded row, then disarm.
+            AutoEnterStage::AwaitingExpanded => {
+                let _ = pty.write_input(b"\r");
+                ui.auto_enter = None;
+            }
+        },
+        Some(_) => {}
+    }
 }
 
 /// Assemble the `AttachView` for the focused session, if any.
@@ -409,6 +524,9 @@ fn prune_exited(ui: &mut Ui) {
         if ui.attached.get_mut(&key).is_some_and(|pty| pty.is_exited()) {
             ui.attached.remove(&key);
             ui.detach_trackers.remove(&key);
+            if ui.auto_enter.as_ref().map(|ae| &ae.key) == Some(&key) {
+                ui.auto_enter = None;
+            }
         }
     }
 }
@@ -537,11 +655,6 @@ fn handle_key(
         Mode::Attached => handle_attached_key(key, ui),
         Mode::Normal => return handle_normal_key(key, ctrl, backends, refresher, ui, terminal),
         Mode::Filter => handle_filter_key(key.code, ui),
-        Mode::Peek => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char(' ')) {
-                ui.mode = Mode::Normal;
-            }
-        }
         Mode::Help => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 ui.mode = Mode::Normal;
@@ -572,9 +685,15 @@ fn handle_normal_key(
     }
 
     match key.code {
-        // Arrows navigate/act at all times.
-        KeyCode::Down => ui.app.move_selection(1),
-        KeyCode::Up => ui.app.move_selection(-1),
+        // Arrows navigate/act at all times. Moving the cursor collapses any inline peek.
+        KeyCode::Down => {
+            ui.expanded = None;
+            ui.app.move_selection(1);
+        }
+        KeyCode::Up => {
+            ui.expanded = None;
+            ui.app.move_selection(-1);
+        }
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
         // Tab cycles the composer's target backend at any time.
         KeyCode::Tab => ui.composer.cycle_backend(),
@@ -600,7 +719,8 @@ fn handle_normal_key(
                     'h' => hide_selected(backends, ui, true),
                     'u' => hide_selected(backends, ui, false),
                     '?' => ui.mode = Mode::Help,
-                    ' ' if ui.app.selected().is_some() => ui.mode = Mode::Peek,
+                    // Space toggles the inline peek expansion of the selected row.
+                    ' ' if ui.app.selected().is_some() => toggle_expand(ui),
                     '/' => {
                         ui.app.set_filter(String::new());
                         ui.notice.clear();
@@ -627,6 +747,9 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         ui.mode = Mode::Normal;
         return;
     };
+
+    // Any key here is the user taking over, so cancel a pending auto-Enter on this attach.
+    ui.auto_enter = None;
 
     // Ctrl+] always detaches (PTY lives on in the map). Terminals send Ctrl+] as raw byte
     // 0x1D, which crossterm's legacy unix parser maps to Char('5')+CTRL (it folds 0x1C..=0x1F
@@ -683,6 +806,19 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
 fn detach_to_list(ui: &mut Ui) {
     ui.mode = Mode::Normal;
     ui.focused = None;
+}
+
+/// Toggle the inline peek expansion of the selected row (only one expands at a time).
+fn toggle_expand(ui: &mut Ui) {
+    let Some(session) = ui.app.selected() else {
+        return;
+    };
+    let key = (session.backend, session.id.clone());
+    if ui.expanded.as_ref() == Some(&key) {
+        ui.expanded = None;
+    } else {
+        ui.expanded = Some(key);
+    }
 }
 
 fn handle_filter_key(code: KeyCode, ui: &mut Ui) {
@@ -884,6 +1020,16 @@ fn attach_selected(
                 ui.attached.insert(key.clone(), pty);
                 // Fresh Left-gate: a brand-new PTY starts with an empty input line.
                 ui.detach_trackers.insert(key.clone(), DetachTracker::new());
+                // A live claude attach opens the agents view; arm the one-shot auto-Enter
+                // to land in the preselected run (only on a fresh spawn, never a re-attach).
+                if session.backend == BackendKind::Claude && claude_live {
+                    ui.auto_enter = Some(AutoEnter {
+                        key: key.clone(),
+                        armed_at: Instant::now(),
+                        stage: AutoEnterStage::AwaitingList,
+                        marker_since: None,
+                    });
+                }
             }
             Err(e) => {
                 ui.set_notice(format!("attach failed: {e}"));

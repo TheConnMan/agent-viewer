@@ -11,6 +11,7 @@ fn spec(program: &str, args: &[&str], rows: u16, cols: u16) -> PtySpec {
         program: program.to_string(),
         args: args.iter().map(|a| a.to_string()).collect(),
         cwd: None,
+        envs: Vec::new(),
         rows,
         cols,
     }
@@ -36,6 +37,22 @@ fn pty_captures_output() {
     assert!(
         wait_for_screen(&session, Duration::from_secs(5), "hello-pty"),
         "expected 'hello-pty' to render through the vt100 parser"
+    );
+    session.kill();
+}
+
+#[test]
+fn pty_spawn_passes_env_from_command() {
+    // The env set on a std Command must reach the PTY child (regression: spec_from_command
+    // dropped envs, so CLAUDE_AGENTS_SELECT never reached the embedded `claude agents`).
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg("printf %s \"$SMOKE_VAR\"; sleep 30");
+    cmd.env("SMOKE_VAR", "env-reached-child");
+    let mut session = PtySession::spawn(agent_viewer_core::pty::spec_from_command(&cmd, 24, 80))
+        .expect("spawn pty");
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "env-reached-child"),
+        "expected the child to see SMOKE_VAR through the PTY"
     );
     session.kill();
 }

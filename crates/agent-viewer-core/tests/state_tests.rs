@@ -21,6 +21,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: S
         companion: false,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 

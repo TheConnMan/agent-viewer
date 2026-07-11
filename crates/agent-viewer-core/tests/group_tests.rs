@@ -18,6 +18,7 @@ fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         companion: false,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 

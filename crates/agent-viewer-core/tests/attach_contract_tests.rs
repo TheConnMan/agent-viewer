@@ -24,6 +24,7 @@ fn claude_session(short_id: Option<&str>, cwd: PathBuf, pid: Option<u32>, status
         companion: false,
         pid,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 
@@ -43,6 +44,7 @@ fn opencode_session(cwd: PathBuf) -> Session {
         companion: false,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 

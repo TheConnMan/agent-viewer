@@ -95,6 +95,7 @@ impl Backend for CodexBackend {
                 companion,
                 pid,
                 rollout_path: Some(thread.rollout_path),
+                pr_refs: Vec::new(),
             });
         }
         Ok(sessions)

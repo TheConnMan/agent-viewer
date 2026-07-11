@@ -78,6 +78,9 @@ pub struct Session {
     /// Some for codex — the rollout JSONL, OR the claude session JSONL
     /// (state.json linkScanPath) for peek. None for opencode.
     pub rollout_path: Option<std::path::PathBuf>,
+    /// Associated PR references (claude jobs `state.json` children where kind=="pr");
+    /// rendered as a right-aligned badge. Empty for codex/opencode.
+    pub pr_refs: Vec<String>,
 }
 
 /// `Send` so the TUI can move the listing backends onto a dedicated refresh thread

@@ -62,6 +62,15 @@ fn parse_job_state_blocked_prefers_needs() {
             "/home/user/.claude/jobs/block001/transcript.jsonl"
         ))
     );
+    // children[kind=="pr"].id only — the "note" child is skipped, order preserved.
+    assert_eq!(detail.prs, vec!["315".to_string(), "318".to_string()]);
+}
+
+#[test]
+fn parse_job_state_no_children_has_empty_prs() {
+    let text = common::read_fixture("claude_state_working.json");
+    let detail = parse_job_state(&text);
+    assert!(detail.prs.is_empty());
 }
 
 #[test]

@@ -26,6 +26,7 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tui-term",
+ "unicode-width",
 ]
 
 [[package]]

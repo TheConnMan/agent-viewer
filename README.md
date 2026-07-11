@@ -34,9 +34,19 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✗` failed — exited with an error.
 - `○` stopped — stopped from the viewer.
 
+Each row is prefixed by its backend's brand mark in the backend's color — `✳` Claude
+(terracotta), `⬡` Codex (teal), `▣` opencode (green) — and spells the state as a word in the
+state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`, `Stopped`) followed by a
+muted one-line summary. Claude jobs with associated pull requests show a right-aligned badge
+just left of the elapsed time — `#315` for one PR, `2 PRs` for several.
+
+If the marks don't render in your font, set `AGENT_VIEWER_ASCII_MARKS=1` to fall back to the
+textual `[cc]`/`[cx]`/`[oc]` tags (still in their brand colors).
+
 The default list groups by project directory; `Ctrl+S` regroups by state (needs-input,
 working, idle, done, with failed and stopped folding into done). Every row renders — the
-list is uncapped and scrolls with the selection to fill the terminal height.
+list is uncapped and scrolls with the selection to fill the terminal height. A blank line
+separates each group/section, and rows sit flush-left under their group header.
 
 Working rows shimmer their glyph, needs-input rows breathe between muted and bright, and a
 session you just spawned blooms once when its row first appears.
@@ -53,13 +63,20 @@ have marked them a companion.
 
 ## Inline spawn composer
 
-The list view carries a persistent one-line composer above the footer:
-`[cc] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the target agent
-(claude code `[cc]` → codex `[cx]` → opencode `[oc]`), and `Enter` spawns it detached. The
-target directory is the selected row's project root (by-project view) or its exact cwd
-(by-state view). While the composer is empty, the single-letter command keys below still
-fire; once you have typed anything, every printable key (and space) is task text, and `Esc`
-clears it.
+The list view carries a persistent composer in a rounded box between the list and the
+footer: `⬡ codex ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the
+target agent (Claude `✳` → Codex `⬡` → opencode `▣`, each in its brand color), and `Enter`
+spawns it detached. The target directory is the selected row's project root (by-project
+view) or its exact cwd (by-state view). While the composer is empty, the single-letter
+command keys below still fire; once you have typed anything, every printable key (and space)
+is task text, and `Esc` clears it.
+
+## Inline peek and rename
+
+`Space` expands the selected row in place, showing its recent transcript tail (or metadata
+for opencode) as a few indented lines under the row; `Space` again or moving the cursor
+collapses it. `Ctrl+R` turns the selected row itself into an edit field prefilled with the
+title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 
 ## Keys
 
@@ -67,8 +84,8 @@ clears it.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
 - `Tab` — cycle the composer's target agent.
-- `Space` — peek the transcript tail (Codex/Claude) or session metadata (opencode).
-- `Ctrl+R` — rename the selected session.
+- `Space` — expand the selected row in place to peek its transcript tail / metadata.
+- `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `a` — show all (companions + archived + deleted-dir rows).
@@ -84,10 +101,11 @@ never freezes the list; a `…` notice shows while the action is in flight.
 
 `→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
 full-screen embedded terminal. Codex runs `codex resume`; opencode runs `opencode -s`;
-Claude opens its live agents view for a running background job (preselecting it) or
-`claude -r` to resume a finished one. `←` returns to the list when the input line is empty
-(otherwise it moves the child's cursor), and `Ctrl+]` always detaches. The attached PTY
-stays alive in the background so re-attaching is instant.
+Claude opens its live agents view for a running background job — the viewer then presses
+Enter for you once the view is ready so you land directly in that job's run, not on the
+agents list — or `claude -r` to resume a finished one. `←` returns to the list when the
+input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
+The attached PTY stays alive in the background so re-attaching is instant.
 
 Quitting the viewer (`q`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

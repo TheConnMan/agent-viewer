@@ -80,6 +80,7 @@ impl Backend for ClaudeBackend {
                 if let Some(detail) = detail {
                     session.summary = detail.summary;
                     session.rollout_path = detail.transcript_path;
+                    session.pr_refs = detail.prs;
                     if let Ok(since) = key.0.duration_since(std::time::UNIX_EPOCH) {
                         session.updated_at_ms = since.as_millis() as i64;
                     }
@@ -177,6 +178,12 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e.into()),
     };
+
+    // A valid-but-non-object root (`[]`, `"str"`, a number) is not a claude config; return
+    // Err WITHOUT writing rather than panicking on the object accessors below.
+    if !config.is_object() {
+        return Err(Error::Command("claude config is not a JSON object".into()));
+    }
 
     // Already trusted if cwd or any ancestor has hasTrustDialogAccepted == true.
     if let Some(projects) = config.get("projects").and_then(|p| p.as_object()) {
@@ -295,6 +302,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             companion: false,
             pid,
             rollout_path: None,
+            pr_refs: Vec::new(),
         });
     }
     Ok(sessions)
@@ -309,6 +317,8 @@ pub struct JobDetail {
     pub updated_at_ms: Option<i64>,
     /// linkScanPath (verified field).
     pub transcript_path: Option<std::path::PathBuf>,
+    /// `children[].id` where `kind == "pr"` — the associated pull requests.
+    pub prs: Vec<String>,
 }
 
 /// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath;
@@ -319,6 +329,7 @@ pub fn parse_job_state(text: &str) -> JobDetail {
             summary: String::new(),
             updated_at_ms: None,
             transcript_path: None,
+            prs: Vec::new(),
         };
     };
     let state = value.get("state").and_then(|v| v.as_str());
@@ -337,10 +348,23 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         .get("linkScanPath")
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from);
+    // children: [{id, href, kind}] — keep the ids of the kind=="pr" entries.
+    let prs = value
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|children| {
+            children
+                .iter()
+                .filter(|c| c.get("kind").and_then(|k| k.as_str()) == Some("pr"))
+                .filter_map(|c| c.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     JobDetail {
         summary,
         updated_at_ms: None,
         transcript_path,
+        prs,
     }
 }
 

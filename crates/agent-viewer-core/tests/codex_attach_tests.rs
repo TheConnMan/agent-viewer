@@ -21,6 +21,7 @@ fn session_with_cwd(cwd: PathBuf) -> Session {
         companion: false,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 

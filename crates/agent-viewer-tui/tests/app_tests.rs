@@ -22,6 +22,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, updated_at_ms: i64, status: S
         companion: false,
         pid: None,
         rollout_path: None,
+        pr_refs: Vec::new(),
     }
 }
 
@@ -188,6 +189,39 @@ fn toggle_group_mode_project_rows() {
 }
 
 #[test]
+fn spacer_rows_separate_groups_but_never_bookend() {
+    // Two distinct project groups -> exactly one spacer, sitting BETWEEN their headers.
+    let sessions = vec![
+        sess(BackendKind::Codex, "a", "/synthetic/one", 300, Status::Working),
+        sess(BackendKind::Codex, "b", "/synthetic/two", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    assert_eq!(app.group_mode(), GroupMode::ByProject);
+    let rows = app.visible();
+
+    let spacers = rows.iter().filter(|r| matches!(r, Row::Spacer)).count();
+    assert_eq!(spacers, 1); // one gap for two groups
+    assert!(!matches!(rows.first(), Some(Row::Spacer))); // never leads
+    assert!(!matches!(rows.last(), Some(Row::Spacer))); // never trails
+
+    let headers: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| matches!(r, Row::ProjectHeader { .. }).then_some(i))
+        .collect();
+    let spacer_at = rows.iter().position(|r| matches!(r, Row::Spacer)).unwrap();
+    assert!(headers[0] < spacer_at && spacer_at < headers[1]);
+
+    // A single group has no spacer at all.
+    let solo = App::new(vec![sess(BackendKind::Codex, "s", "/synthetic/one", 1, Status::Working)]);
+    assert!(!solo.visible().iter().any(|r| matches!(r, Row::Spacer)));
+
+    // Selection still lands only on session rows (spacers are skipped like headers).
+    select(&mut app, "b");
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("b"));
+}
+
+#[test]
 fn show_all_covers_companions_and_archived() {
     let mut companion = sess(BackendKind::Codex, "comp", "/p", 300, Status::Idle);
     companion.companion = true;
@@ -298,37 +332,56 @@ fn row_layout_reserves_elapsed_for_long_titles() {
     let tag_len = 2;
     let elapsed_len = 2; // e.g. "3h"
     let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
-    let (name, summary, pad) = row_layout(width, tag_len, long, "", elapsed_len);
+    let (name, detail, pad) = row_layout(width, tag_len, long, "", 0, elapsed_len);
     // The title is truncated rather than clipping the right-aligned elapsed.
     assert!(name.chars().count() < long.chars().count());
-    assert!(summary.is_empty());
-    // The whole row (fixed left + name + pad + elapsed) fits exactly in width, so the
+    assert!(detail.is_empty());
+    // The whole row (flush left + name + pad + elapsed) fits exactly in width, so the
     // elapsed field is never pushed off the line.
-    let left_fixed = 4 + tag_len;
+    let left_fixed = 3 + tag_len;
     assert_eq!(left_fixed + name.chars().count() + pad + elapsed_len, width);
 }
 
 #[test]
-fn row_layout_fits_name_and_summary_with_flush_elapsed() {
+fn row_layout_reserves_pr_badge_left_of_elapsed() {
+    let width = 40;
+    let tag_len = 2;
+    let elapsed_len = 2; // "3h"
+    let pr_len = 4; // "#315"
+    let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
+    let (name, detail, pad) = row_layout(width, tag_len, long, "Working", pr_len, elapsed_len);
+    assert!(name.chars().count() < long.chars().count()); // truncated
+    assert!(detail.is_empty()); // no room for the status word beside a long title
+    // Flush left + name + pad + PR badge (+gap) + elapsed fills the row exactly, so the
+    // badge sits immediately left of elapsed and is never clipped.
+    let left_fixed = 3 + tag_len;
+    assert_eq!(
+        left_fixed + name.chars().count() + pad + (pr_len + 1) + elapsed_len,
+        width
+    );
+}
+
+#[test]
+fn row_layout_fits_name_and_detail_with_flush_elapsed() {
     let width = 60;
     let tag_len = 2;
     let elapsed_len = 3; // "10s"
-    let (name, summary, pad) = row_layout(width, tag_len, "sess", "a short summary", elapsed_len);
+    let (name, detail, pad) = row_layout(width, tag_len, "sess", "Working · summary", 0, elapsed_len);
     assert_eq!(name, "sess");
-    assert_eq!(summary, "a short summary");
-    let used = (4 + tag_len) + name.chars().count() + 2 + summary.chars().count();
+    assert_eq!(detail, "Working · summary");
+    let used = (3 + tag_len) + name.chars().count() + 2 + detail.chars().count();
     assert_eq!(used + pad + elapsed_len, width);
 }
 
 #[test]
-fn row_layout_drops_summary_when_no_room() {
-    // Width fits the name and the reserved elapsed but leaves nothing for a summary.
+fn row_layout_drops_detail_when_no_room() {
+    // Width fits the name and the reserved elapsed but leaves nothing for a detail.
     let tag_len = 2;
     let elapsed_len = 3;
-    let width = (4 + tag_len) + 4 + 1 + elapsed_len; // left_fixed + name(4) + gap + elapsed
-    let (name, summary, pad) = row_layout(width, tag_len, "sess", "wont fit", elapsed_len);
+    let width = (3 + tag_len) + 4 + 1 + elapsed_len; // left_fixed + name(4) + gap + elapsed
+    let (name, detail, pad) = row_layout(width, tag_len, "sess", "wont fit", 0, elapsed_len);
     assert_eq!(name, "sess");
-    assert!(summary.is_empty());
+    assert!(detail.is_empty());
     assert!(pad >= 1);
 }
 

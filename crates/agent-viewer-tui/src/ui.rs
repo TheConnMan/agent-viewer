@@ -10,7 +10,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tui_term::widget::PseudoTerminal;
@@ -35,6 +37,56 @@ pub mod theme {
     pub const WARN: Color = Color::Rgb(0xd9, 0xa9, 0x3f);
     pub const ERR: Color = Color::Rgb(0xcf, 0x6a, 0x52);
     pub const STOPPED: Color = Color::Rgb(0x85, 0x7e, 0x6a);
+    // Per-backend brand marks (row + composer): Claude terracotta, Codex teal, opencode green.
+    pub const BRAND_CLAUDE: Color = Color::Rgb(0xd9, 0x77, 0x57);
+    pub const BRAND_CODEX: Color = Color::Rgb(0x74, 0xaa, 0x9c);
+    pub const BRAND_OPENCODE: Color = Color::Rgb(0x9e, 0xcb, 0x6a);
+}
+
+/// Startup-read (once, never per-frame): when true, list rows + composer fall back from the
+/// brand glyphs to the textual `[cc]`/`[cx]`/`[oc]` tags — for terminals whose font lacks the
+/// glyphs. Set from `AGENT_VIEWER_ASCII_MARKS=1`.
+static ASCII_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Set the ASCII-marks fallback once at startup (idempotent; later calls are ignored).
+pub fn set_ascii_marks(on: bool) {
+    let _ = ASCII_MARKS.set(on);
+}
+
+fn ascii_marks() -> bool {
+    *ASCII_MARKS.get().unwrap_or(&false)
+}
+
+/// The mark for a backend on list rows + the composer: the brand glyph, or the textual
+/// `[cc]`/`[cx]`/`[oc]` tag under the ASCII fallback. `BackendKind::tag()` is also used
+/// directly for help/notices regardless of this setting. The codex glyph is "⬡" (U+2B21,
+/// unicode-width 1, renders cleanly under ratatui — verified); the approved fallback order
+/// if a font lacks it is "⬢" then "◆".
+fn backend_mark(backend: BackendKind) -> &'static str {
+    if ascii_marks() {
+        return backend.tag();
+    }
+    match backend {
+        BackendKind::Claude => "✳",
+        BackendKind::Codex => "⬡",
+        BackendKind::Opencode => "▣",
+    }
+}
+
+/// The brand color for a backend's mark.
+fn backend_mark_color(backend: BackendKind) -> ratatui::style::Color {
+    match backend {
+        BackendKind::Claude => theme::BRAND_CLAUDE,
+        BackendKind::Codex => theme::BRAND_CODEX,
+        BackendKind::Opencode => theme::BRAND_OPENCODE,
+    }
+}
+
+/// Terminal display width of a mark glyph (measured, not assumed 1 — some marks are
+/// ambiguous-width). Falls back to 1 for a zero/absent width.
+fn mark_width(mark: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    mark.width().max(1)
 }
 
 /// Working shimmer: the glyph cycles this frame table at ~120ms/frame.
@@ -196,7 +248,8 @@ fn file_key(path: &Path) -> Option<(u64, u64)> {
 
 // --- Modals / modes -------------------------------------------------------------
 
-/// The `Ctrl+R` rename modal (prefilled with the current title).
+/// The `Ctrl+R` inline-rename state (prefilled with the current title). Rendered in the
+/// selected row itself, not a modal.
 #[derive(Debug, Clone)]
 pub struct RenameModal {
     pub backend: BackendKind,
@@ -204,13 +257,12 @@ pub struct RenameModal {
     pub buffer: String,
 }
 
-/// Top-level input mode driving key routing and what the footer/overlay shows. The
-/// inline spawn composer is not a mode — it lives on the Normal list view at all times.
+/// Top-level input mode driving key routing and what the footer shows. The inline spawn
+/// composer, inline rename, and inline peek expansion all live on the Normal list view.
 pub enum Mode {
     Normal,
     Filter,
     Rename(RenameModal),
-    Peek,
     Help,
     Attached,
 }
@@ -232,6 +284,9 @@ pub struct Draw<'a> {
     pub peek: &'a PeekCache,
     pub composer: &'a Composer,
     pub pulses: &'a Pulses,
+    /// The currently inline-expanded row (peek), if any — its transcript tail renders
+    /// indented beneath it.
+    pub expanded: Option<&'a (BackendKind, String)>,
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
 }
@@ -248,26 +303,79 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         return;
     }
 
-    // list · persistent composer input line · footer.
+    // list · blank gap · bordered composer box (3 rows) · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
-    draw_list(frame, d.app, d.pulses, d.now_ms, vertical[0]);
-    draw_composer(frame, d.app, d.composer, vertical[1]);
-    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[2]);
+    // Inline rename edits the selected row in place; inline peek expands it downward.
+    let rename = match d.mode {
+        Mode::Rename(m) => Some((m.backend, m.id.as_str(), m.buffer.as_str())),
+        _ => None,
+    };
+    let expand_lines = if d.expanded.is_some() {
+        expansion_lines(d.app, d.peek)
+    } else {
+        Vec::new()
+    };
+    let deco = ListDeco {
+        rename,
+        expanded: d.expanded,
+        expand_lines: &expand_lines,
+    };
 
-    match d.mode {
-        Mode::Rename(modal) => draw_rename_modal(frame, modal, frame.area()),
-        Mode::Help => draw_help(frame, frame.area()),
-        Mode::Peek => draw_peek(frame, d.app, d.peek, frame.area()),
-        _ => {}
+    draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[0]);
+    draw_composer(frame, d.app, d.composer, vertical[2]);
+    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[3]);
+
+    if matches!(d.mode, Mode::Help) {
+        draw_help(frame, frame.area());
     }
+}
+
+/// Per-row decorations layered over the list model: an in-place rename edit field and the
+/// inline peek expansion under one row.
+struct ListDeco<'a> {
+    rename: Option<(BackendKind, &'a str, &'a str)>,
+    expanded: Option<&'a (BackendKind, String)>,
+    expand_lines: &'a [String],
+}
+
+/// Up to 8 muted lines for the inline expansion of the selected row: the transcript tail
+/// (codex/claude) collapsed one item per line, or metadata (opencode / no transcript).
+fn expansion_lines(app: &App, peek: &PeekCache) -> Vec<String> {
+    let Some(session) = app.selected() else {
+        return Vec::new();
+    };
+    if session.rollout_path.is_none() {
+        // opencode or no transcript file: a couple of metadata lines.
+        let mut lines = vec![format!("status: {}", status_word(session.status))];
+        if !session.summary.is_empty() {
+            lines.push(session.summary.clone());
+        }
+        lines.push(format!("cwd: {}", session.cwd.display()));
+        lines.truncate(8);
+        return lines;
+    }
+    if let Some(err) = &peek.error {
+        return vec![err.clone()];
+    }
+    let mut lines: Vec<String> = peek
+        .items
+        .iter()
+        .map(|item| format!("{}: {}", item.role, item.text.replace('\n', " ")))
+        .collect();
+    if lines.is_empty() {
+        lines.push("(no transcript yet)".to_string());
+    }
+    let start = lines.len().saturating_sub(8);
+    lines[start..].to_vec()
 }
 
 /// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
@@ -282,17 +390,27 @@ fn abbreviate_dir(dir: &Path) -> String {
     s
 }
 
-/// Persistent inline spawn composer: `[cc] ~/git/foo ❯ <text>`, or a muted placeholder
-/// when empty. The tag is accent, the target dir muted.
+/// Persistent inline spawn composer inside a rounded, faint-bordered box (Claude Code's
+/// input-box feel): `⬡ codex ~/git/foo ❯ <text>`, or a muted placeholder when empty. The
+/// brand mark + backend name are in the backend's color, the target dir muted.
 fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) {
-    // Same tag as the row prefix ([cc]/[cx]/[oc]) now that Claude's row tag is [cc].
-    let tag = composer.backend().tag();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::FAINT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let backend = composer.backend();
     let dir = app
         .spawn_target()
         .map(|d| abbreviate_dir(&d))
         .unwrap_or_default();
     let mut spans = vec![
-        Span::styled(format!(" {tag} "), Style::default().fg(theme::ACCENT)),
+        Span::styled(
+            format!("{} {} ", backend_mark(backend), backend.name()),
+            Style::default().fg(backend_mark_color(backend)),
+        ),
         Span::styled(format!("{dir} "), Style::default().fg(theme::MUTED)),
         Span::styled("❯ ", Style::default().fg(theme::ACCENT)),
     ];
@@ -307,18 +425,45 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) 
             Style::default().fg(theme::TEXT),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // --- Main list ------------------------------------------------------------------
 
-fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, area: Rect) {
+fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: ListDeco, area: Rect) {
     let width = area.width as usize;
     let rows = app.visible();
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|r| row_to_item(r, pulses, now_ms, width))
-        .collect();
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    // The selection index only shifts if expansion lines are inserted BEFORE the selected
+    // row; expansion always sits under the (selected) expanded row, so it stays aligned.
+    for row in &rows {
+        match row {
+            Row::Session { backend, id, .. } => {
+                // In-place rename edit field replaces the row while renaming it.
+                if let Some((rb, rid, buf)) = deco.rename
+                    && *backend == rb
+                    && id == rid
+                {
+                    items.push(rename_row_item(*backend, buf, width));
+                } else {
+                    items.push(row_to_item(row, pulses, now_ms, width));
+                }
+                // Inline peek expansion: indented muted transcript tail under the row.
+                if let Some((eb, eid)) = deco.expanded
+                    && backend == eb
+                    && id == eid
+                {
+                    for line in deco.expand_lines {
+                        items.push(ListItem::new(Line::from(Span::styled(
+                            format!("      {}", truncate(line, width.saturating_sub(6))),
+                            Style::default().fg(theme::FAINT),
+                        ))));
+                    }
+                }
+            }
+            _ => items.push(row_to_item(row, pulses, now_ms, width)),
+        }
+    }
     let list = List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
     let mut state = ListState::default();
     if !rows.is_empty() {
@@ -327,8 +472,25 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, area: R
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// The selected row rendered as an inline rename edit field: `✎ <mark> buffer_`, the mark
+/// in the backend's brand color and the edited title in accent.
+fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled("✎ ", Style::default().fg(theme::ACCENT)),
+        Span::styled(
+            format!("{} ", backend_mark(backend)),
+            Style::default().fg(backend_mark_color(backend)),
+        ),
+        Span::styled(
+            format!("{}_", truncate(buffer, width.saturating_sub(6))),
+            Style::default().fg(theme::ACCENT),
+        ),
+    ]))
+}
+
 fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListItem<'static> {
     match row {
+        Row::Spacer => ListItem::new(Line::from("")),
         Row::SectionHeader { section, count } => ListItem::new(Line::from(Span::styled(
             format!("{}  ({count})", section_label(*section)),
             Style::default()
@@ -348,6 +510,7 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
             status,
             title,
             updated_at_ms,
+            pr_refs,
             ..
         } => {
             // A live spawn bloom overrides the glyph and flashes the row background.
@@ -359,15 +522,18 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
                 None => status_glyph(*status, now_ms),
             };
             let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
-            let line = session_line(
+            let line = session_line(SessionRow {
                 glyph,
                 gcolor,
-                backend.tag(),
-                title,
+                mark: backend_mark(*backend),
+                mark_color: backend_mark_color(*backend),
+                name: title,
+                status: *status,
                 summary,
-                &elapsed,
+                pr: &pr_badge(pr_refs),
+                elapsed: &elapsed,
                 width,
-            );
+            });
             if bloom.is_some() {
                 ListItem::new(line).style(Style::default().bg(theme::SEL_BG))
             } else {
@@ -377,37 +543,101 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
     }
 }
 
-/// `state glyph · [tag] · name · dim summary · right-aligned elapsed`, padded so the
-/// elapsed sits flush right. Widths approximated by char count (glyphs are single-cell).
-fn session_line(
-    glyph: &str,
+/// Title-case status word for a row (Claude Code style).
+fn status_display_word(status: Status) -> &'static str {
+    match status {
+        Status::Working => "Working",
+        Status::NeedsInput => "Needs input",
+        Status::Idle => "Idle",
+        Status::Done => "Done",
+        Status::Failed => "Failed",
+        Status::Stopped => "Stopped",
+    }
+}
+
+/// The state's theme color for its status word.
+fn status_color(status: Status) -> ratatui::style::Color {
+    match status {
+        Status::Working => theme::ACCENT,
+        Status::NeedsInput => theme::WARN,
+        Status::Idle => theme::MUTED,
+        Status::Done => theme::OK,
+        Status::Failed => theme::ERR,
+        Status::Stopped => theme::STOPPED,
+    }
+}
+
+/// The right-aligned PR badge: "" (none), "#315" (one), or "2 PRs" (many).
+fn pr_badge(pr_refs: &[String]) -> String {
+    match pr_refs {
+        [] => String::new(),
+        [one] => format!("#{one}"),
+        many => format!("{} PRs", many.len()),
+    }
+}
+
+/// One session row's fields, bundled so `session_line` stays one argument wide.
+struct SessionRow<'a> {
+    glyph: &'a str,
     gcolor: ratatui::style::Color,
-    tag: &str,
-    name: &str,
-    summary: &str,
-    elapsed: &str,
+    mark: &'a str,
+    mark_color: ratatui::style::Color,
+    name: &'a str,
+    status: Status,
+    summary: &'a str,
+    pr: &'a str,
+    elapsed: &'a str,
     width: usize,
-) -> Line<'static> {
-    // Reserve the elapsed slot first so a long title truncates instead of clipping it.
-    let (name_out, summary_out, pad) =
-        crate::app::row_layout(width, tag.chars().count(), name, summary, elapsed.chars().count());
+}
+
+/// `glyph mark name  Word · summary <pad> [#pr] elapsed`, flush-left (glyph in column 0),
+/// with the brand mark in the backend's color, the status word in the state's color,
+/// "· summary" muted, and a right-aligned PR badge just left of the elapsed.
+fn session_line(r: SessionRow) -> Line<'static> {
+    let word = status_display_word(r.status);
+    // The status word plus an optional "· summary" is the one truncatable detail field.
+    let detail = if r.summary.is_empty() {
+        word.to_string()
+    } else {
+        format!("{word} · {}", r.summary)
+    };
+    let (name_out, detail_out, pad) = crate::app::row_layout(
+        r.width,
+        mark_width(r.mark),
+        r.name,
+        &detail,
+        r.pr.chars().count(),
+        r.elapsed.chars().count(),
+    );
     let mut spans = vec![
+        Span::styled(r.glyph.to_string(), Style::default().fg(r.gcolor)),
         Span::raw(" "),
-        Span::styled(glyph.to_string(), Style::default().fg(gcolor)),
-        Span::raw(" "),
-        Span::styled(tag.to_string(), Style::default().fg(theme::MUTED)),
+        Span::styled(r.mark.to_string(), Style::default().fg(r.mark_color)),
         Span::raw(" "),
         Span::styled(name_out, Style::default().fg(theme::TEXT)),
     ];
-    if !summary_out.is_empty() {
+    if !detail_out.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(summary_out, Style::default().fg(theme::FAINT)));
+        // Color the leading status word; the "· summary" remainder is muted.
+        if let Some(rest) = detail_out.strip_prefix(word) {
+            spans.push(Span::styled(
+                word.to_string(),
+                Style::default().fg(status_color(r.status)),
+            ));
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), Style::default().fg(theme::MUTED)));
+            }
+        } else {
+            // Truncation cut into the word itself — render what's left in the word color.
+            spans.push(Span::styled(detail_out, Style::default().fg(status_color(r.status))));
+        }
     }
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        elapsed.to_string(),
-        Style::default().fg(theme::MUTED),
-    ));
+    if !r.pr.is_empty() {
+        spans.push(Span::styled(r.pr.to_string(), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(r.elapsed.to_string(), Style::default().fg(theme::MUTED)));
     Line::from(spans)
 }
 
@@ -416,9 +646,8 @@ fn session_line(
 fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: i64, area: Rect) {
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
-        Mode::Rename(_) => Line::from("rename — Enter apply · Esc cancel"),
+        Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Help => Line::from("help — Esc/? to close"),
-        Mode::Peek => Line::from("peek — Esc/Space to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
             if !notice.is_empty() {
@@ -449,71 +678,6 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
         }
     };
     frame.render_widget(Paragraph::new(line), area);
-}
-
-// --- Peek overlay ---------------------------------------------------------------
-
-fn draw_peek(frame: &mut Frame, app: &App, peek: &PeekCache, area: Rect) {
-    let Some(session) = app.selected() else {
-        return;
-    };
-    let popup = bottom_rect(40, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::FAINT))
-        .title(format!("peek — {} {}", session.backend.tag(), session.title));
-
-    // opencode (no transcript file) or a read error -> metadata lines.
-    if session.rollout_path.is_none() || peek.error.is_some() {
-        let mut lines = metadata_lines(session);
-        if let Some(err) = &peek.error {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                err.clone(),
-                Style::default().fg(theme::ERR),
-            )));
-        }
-        frame.render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
-            popup,
-        );
-        return;
-    }
-
-    let inner_height = popup.height.saturating_sub(2) as usize;
-    let inner_width = popup.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    for item in &peek.items {
-        lines.push(Line::from(Span::styled(
-            format!("{}:", item.role),
-            Style::default().fg(theme::ACCENT),
-        )));
-        for segment in item.text.split('\n') {
-            lines.push(Line::from(Span::styled(
-                truncate(segment, inner_width),
-                Style::default().fg(theme::TEXT),
-            )));
-        }
-    }
-    // Pin to the bottom so the newest turn is visible.
-    let scroll = lines.len().saturating_sub(inner_height) as u16;
-    frame.render_widget(
-        Paragraph::new(lines).block(block).scroll((scroll, 0)),
-        popup,
-    );
-}
-
-fn metadata_lines(session: &Session) -> Vec<Line<'static>> {
-    vec![
-        Line::from(format!("{} {}", session.backend.tag(), session.title)),
-        Line::from(""),
-        Line::from(format!("backend : {}", session.backend.name())),
-        Line::from(format!("id      : {}", session.id)),
-        Line::from(format!("status  : {}", status_word(session.status))),
-        Line::from(format!("source  : {}", session.source_label)),
-        Line::from(format!("cwd     : {}", session.cwd.display())),
-    ]
 }
 
 fn truncate(s: &str, width: usize) -> String {
@@ -578,34 +742,7 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
     );
 }
 
-// --- Modals ---------------------------------------------------------------------
-
-fn draw_rename_modal(frame: &mut Frame, modal: &RenameModal, area: Rect) {
-    let popup = centered_rect(60, 20, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
-        .title(format!("rename {}", modal.backend.tag()));
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("name: ", Style::default().fg(theme::MUTED)),
-            Span::styled(
-                format!("{}_", modal.buffer),
-                Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter apply · Esc cancel",
-            Style::default().fg(theme::FAINT),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
-        popup,
-    );
-}
+// --- Help overlay ---------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(56, 70, area);
@@ -621,8 +758,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Enter", "spawn composed task"),
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
-        ("Space", "peek transcript tail"),
-        ("Ctrl+R", "rename session"),
+        ("Space", "expand peek in row"),
+        ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
         ("a", "show all (companions + archived)"),
@@ -663,17 +800,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-/// Bottom `percent`-height strip of `area` (peek overlay).
-fn bottom_rect(percent: u16, area: Rect) -> Rect {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(100 - percent),
-            Constraint::Percentage(percent),
-        ])
-        .split(area)[1]
 }
 
 #[cfg(test)]

@@ -39,7 +39,10 @@ pub enum Row {
         status: Status,
         hidden: bool,
         updated_at_ms: i64,
+        pr_refs: Vec<String>,
     },
+    /// A blank spacer line between groups/sections. Never selectable (skipped like headers).
+    Spacer,
 }
 
 /// Result of a two-stage Ctrl+X press.
@@ -303,6 +306,7 @@ impl App {
             status: s.status,
             hidden: s.hidden,
             updated_at_ms: s.updated_at_ms,
+            pr_refs: s.pr_refs.clone(),
         }
     }
 
@@ -346,6 +350,10 @@ impl App {
             if members.is_empty() {
                 continue;
             }
+            // A blank spacer between sections (not before the first).
+            if !rows.is_empty() {
+                rows.push(Row::Spacer);
+            }
             rows.push(Row::SectionHeader {
                 section,
                 count: members.len(),
@@ -376,6 +384,10 @@ impl App {
         let mut rows = Vec::new();
         for root in order {
             let members = &by_root[&root];
+            // A blank spacer between project groups (not before the first).
+            if !rows.is_empty() {
+                rows.push(Row::Spacer);
+            }
             rows.push(Row::ProjectHeader {
                 root: root.clone(),
                 count: members.len(),
@@ -435,35 +447,40 @@ fn truncate_to(s: &str, width: usize) -> String {
 
 /// Width math for one session row, kept pure so it is unit-testable.
 ///
-/// The row is `<space><glyph><space><tag><space><name>[<2sp><summary>]<pad><elapsed>`.
-/// The elapsed field is reserved on the right FIRST (plus a one-space minimum gap), so a
-/// long title truncates instead of clipping the right-aligned elapsed off the line. Any
-/// content room left after the name (and a two-space gap) goes to a truncated summary.
-/// Returns the visible name, the visible summary (empty if none fits), and the pad width.
+/// The row is `<glyph><space><mark><space><name>[<2sp><detail>]<pad>[<pr><space>]<elapsed>`,
+/// flush-left (glyph in column 0). `mark_width` is the measured display width of the brand
+/// mark (some marks are ambiguous-width — the caller measures, never assumes 1). The elapsed
+/// slot and, when present, a PR badge are reserved on the right FIRST (plus a one-space
+/// minimum gap), so a long title truncates instead of clipping them off the line. `detail`
+/// is the status-word-plus-summary field; any room left after the name (and a two-space gap)
+/// goes to a truncated `detail`. Returns the visible name, the visible detail, and the pad.
 pub fn row_layout(
     width: usize,
-    tag_len: usize,
+    mark_width: usize,
     name: &str,
-    summary: &str,
+    detail: &str,
+    pr_len: usize,
     elapsed_len: usize,
 ) -> (String, String, usize) {
-    // Fixed left decorations before the name: space + glyph + space + tag + space.
-    let left_fixed = 4 + tag_len;
-    // Reserve the elapsed slot plus at least one space of separation.
-    let content = width.saturating_sub(left_fixed + elapsed_len + 1);
+    // Fixed left decorations before the name: glyph + space + mark + space (flush, no indent).
+    let left_fixed = 3 + mark_width;
+    // Right reservation folded into content: PR badge (+1 gap) when present, then elapsed.
+    let pr_reserve = if pr_len > 0 { pr_len + 1 } else { 0 };
+    // Reserve the elapsed slot plus at least one space of separation, and the PR badge.
+    let content = width.saturating_sub(left_fixed + pr_reserve + elapsed_len + 1);
 
     let name_out = truncate_to(name, content);
     let name_len = name_out.chars().count();
 
-    let mut summary_out = String::new();
-    if !summary.is_empty() && content > name_len + 2 {
-        summary_out = truncate_to(summary, content - name_len - 2);
+    let mut detail_out = String::new();
+    if !detail.is_empty() && content > name_len + 2 {
+        detail_out = truncate_to(detail, content - name_len - 2);
     }
-    let summary_len = summary_out.chars().count();
+    let detail_len = detail_out.chars().count();
 
-    let used = left_fixed + name_len + if summary_len > 0 { 2 + summary_len } else { 0 };
-    let pad = width.saturating_sub(used + elapsed_len).max(1);
-    (name_out, summary_out, pad)
+    let used = left_fixed + name_len + if detail_len > 0 { 2 + detail_len } else { 0 };
+    let pad = width.saturating_sub(used + pr_reserve + elapsed_len).max(1);
+    (name_out, detail_out, pad)
 }
 
 /// Inline spawn composer (item 8): a persistent one-line input above the footer. Holds

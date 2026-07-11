@@ -77,6 +77,7 @@ impl Backend for OpencodeBackend {
                 // Overlay fills the pid for viewer-spawned opencode sessions.
                 pid: None,
                 rollout_path: None,
+                pr_refs: Vec::new(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

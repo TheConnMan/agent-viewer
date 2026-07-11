@@ -15,12 +15,16 @@ pub struct PtySpec {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<std::path::PathBuf>,
+    /// Extra env vars to set on the child (e.g. CLAUDE_AGENTS_SELECT). Applied ON TOP of the
+    /// inherited environment — the child still sees the viewer's env plus these.
+    pub envs: Vec<(String, String)>,
     pub rows: u16,
     pub cols: u16,
 }
 
-/// Read program/args/cwd off a built `Command` via the stable getters
-/// (get_program/get_args/get_current_dir). rows/cols clamped to >= 1.
+/// Read program/args/cwd/envs off a built `Command` via the stable getters
+/// (get_program/get_args/get_current_dir/get_envs). rows/cols clamped to >= 1. Env entries
+/// with a None value (an explicit unset) are dropped — only set-values carry over.
 pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> PtySpec {
     PtySpec {
         program: cmd.get_program().to_string_lossy().into_owned(),
@@ -29,6 +33,12 @@ pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> P
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),
         cwd: cmd.get_current_dir().map(|p| p.to_path_buf()),
+        envs: cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            })
+            .collect(),
         rows: rows.max(1),
         cols: cols.max(1),
     }
@@ -69,6 +79,9 @@ impl PtySession {
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
+        }
+        for (key, value) in &spec.envs {
+            cmd.env(key, value);
         }
 
         let mut child = pair
@@ -223,5 +236,25 @@ impl Drop for PtySession {
         // Viewer quit kills owned children; backends resume by ID, so conversation
         // state survives (documented). Idempotent with an explicit kill().
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spec_from_command;
+
+    #[test]
+    fn spec_from_command_copies_env_pairs() {
+        let mut cmd = std::process::Command::new("claude");
+        cmd.arg("agents").env("CLAUDE_AGENTS_SELECT", "work0001");
+        let spec = spec_from_command(&cmd, 24, 80);
+        assert_eq!(spec.program, "claude");
+        assert_eq!(spec.args, vec!["agents".to_string()]);
+        assert!(
+            spec.envs
+                .contains(&("CLAUDE_AGENTS_SELECT".to_string(), "work0001".to_string())),
+            "spec_from_command must carry the env pair, got {:?}",
+            spec.envs
+        );
     }
 }
