@@ -10,6 +10,7 @@ use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
+use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::mutations::MutationRunner;
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, Mode, PeekCache, Pulses};
@@ -165,6 +166,9 @@ struct Ui {
     /// Whether the focused PTY's child has exited (refreshed each frame; drives the
     /// "process exited" header). Read-only during draw so the render path stays `&`.
     focused_exited: bool,
+    /// The brand-logo protocols, Some only when AGENT_VIEWER_LOGO_MARKS=1 and the startup
+    /// graphics probe succeeded. Borrowed immutably each frame by the render path.
+    logos: Option<LogoMarks>,
 }
 
 impl Ui {
@@ -193,6 +197,21 @@ impl Ui {
 fn main() -> io::Result<()> {
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
     ui::set_glyph_marks(std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1"));
+
+    // AGENT_VIEWER_LOGO_MARKS=1 opts into inline brand-logo images. The probe queries the
+    // terminal (stdin raw-mode toggle) so it runs BEFORE ratatui::init() takes the alt screen;
+    // on a non-tty or unsupported terminal the build fails and the textual marks stay.
+    let logos = if std::env::var("AGENT_VIEWER_LOGO_MARKS").as_deref() == Ok("1") {
+        match LogoMarks::build() {
+            Ok(l) => {
+                ui::set_logo_marks(true);
+                Some(l)
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
 
     let mut list_backends = all_backends();
     let db = ViewerDb::open_default().ok();
@@ -244,6 +263,7 @@ fn main() -> io::Result<()> {
         focused: None,
         focused_session: None,
         focused_exited: false,
+        logos,
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate cheap set
@@ -336,6 +356,7 @@ fn run(
                     now_ms: now,
                     attach,
                     pr_status: &ui.pr_status,
+                    logos: ui.logos.as_ref(),
                 },
             );
         })?;

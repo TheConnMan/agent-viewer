@@ -4,6 +4,7 @@
 
 use crate::app::{App, Composer, Row, Section};
 use crate::peek::{self, PeekKind};
+use crate::logos::LogoMarks;
 use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
@@ -14,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
+use ratatui_image::Image;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tui_term::widget::PseudoTerminal;
@@ -59,10 +61,30 @@ fn glyph_marks() -> bool {
     *GLYPH_MARKS.get().unwrap_or(&false)
 }
 
+/// Startup-read (once): when true, the mark slot is left blank (two reserved columns) and a
+/// brand-logo image is overlaid there by the render path. Set from `AGENT_VIEWER_LOGO_MARKS=1`
+/// only after the terminal-graphics probe (`LogoMarks::build`) succeeds — so the flag being on
+/// implies a live `LogoMarks`. Takes precedence over the glyph marks.
+static LOGO_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Enable the brand-logo marks once at startup (idempotent; later calls are ignored).
+pub fn set_logo_marks(on: bool) {
+    let _ = LOGO_MARKS.set(on);
+}
+
+pub fn logo_marks() -> bool {
+    *LOGO_MARKS.get().unwrap_or(&false)
+}
+
 /// The mark for a backend on list rows + the composer (single source of truth for every
 /// mark call site): by DEFAULT the textual `[cc]`/`[cx]`/`[oc]` tag, or the brand glyph when
 /// `AGENT_VIEWER_GLYPH_MARKS=1`. `BackendKind::tag()` is also used directly for help/notices.
 fn backend_mark(backend: BackendKind) -> &'static str {
+    // Logo mode blanks the slot (two reserved columns) for the image overlay; it wins over
+    // glyph mode. Two spaces keep `mark_width` == 2 so every row/composer layout math holds.
+    if logo_marks() {
+        return "  ";
+    }
     mark_for(backend, glyph_marks())
 }
 
@@ -380,6 +402,9 @@ pub struct Draw<'a> {
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
     pub pr_status: &'a crate::pr_cache::PrStatusCache,
+    /// The brand-logo protocols, present only when `AGENT_VIEWER_LOGO_MARKS=1` and the
+    /// startup graphics probe succeeded. Overlaid on the reserved mark slot during render.
+    pub logos: Option<&'a LogoMarks>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -424,7 +449,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     draw_header(frame, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
-    draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, vertical[1]);
+    draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, d.logos, vertical[1]);
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
     // force-expanded peek above it); every other mode shows the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
@@ -439,6 +464,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             frame,
             d.app,
             d.composer,
+            d.logos,
             vertical[3],
             matches!(d.mode, Mode::Normal),
         );
@@ -569,7 +595,14 @@ fn abbreviate_dir(dir: &Path) -> String {
 /// brand mark + backend name are in the backend's color, the target dir muted. When
 /// `show_cursor` (list view, Normal mode), the terminal's native cursor is placed at the
 /// end of the typed text so it blinks there.
-fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, show_cursor: bool) {
+fn draw_composer(
+    frame: &mut Frame,
+    app: &App,
+    composer: &Composer,
+    logos: Option<&LogoMarks>,
+    area: Rect,
+    show_cursor: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -607,6 +640,18 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
         spans.push(Span::styled(composer.text().to_string(), fg(theme::TEXT)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+
+    // Logo mode: the mark prefix rendered as two blank columns above; overlay the brand image
+    // onto them. inner.x is the mark slot (no leading status glyph in the composer).
+    if let Some(logos) = logos
+        && logo_marks()
+        && inner.width >= 2
+    {
+        frame.render_widget(
+            Image::new(logos.image(backend)),
+            Rect { x: inner.x, y: inner.y, width: 2, height: 1 },
+        );
+    }
 
     if show_cursor && inner.width > 0 {
         // Cursor at the end of the typed text, clamped inside the box. The prefix mirrors
@@ -683,24 +728,32 @@ fn draw_list(
     now_ms: i64,
     pr_status: &crate::pr_cache::PrStatusCache,
     deco: ListDeco,
+    logos: Option<&LogoMarks>,
     area: Rect,
 ) {
     let width = area.width as usize;
     let rows = app.visible();
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    // Parallel to `items`: the backend of each pushed item that is a session row (None for
+    // headers/spacers/rename/expansion lines), so the logo overlay can find its rows by
+    // item index after the List has laid them out.
+    let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
     // The selection index only shifts if expansion lines are inserted BEFORE the selected
     // row; expansion always sits under the (selected) expanded row, so it stays aligned.
     for row in rows {
         match row {
             Row::Session { backend, id, .. } => {
-                // In-place rename edit field replaces the row while renaming it.
+                // In-place rename edit field replaces the row while renaming it. The rename row
+                // has no logo (its layout differs), so it carries no backend in the overlay vec.
                 if let Some((rb, rid, buf)) = deco.rename
                     && *backend == rb
                     && id == rid
                 {
                     items.push(rename_row_item(*backend, buf, width));
+                    item_backends.push(None);
                 } else {
                     items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                    item_backends.push(Some(*backend));
                 }
                 // Inline peek expansion: indented muted transcript tail under the row.
                 if let Some((eb, eid)) = deco.expanded
@@ -710,10 +763,14 @@ fn draw_list(
                     for line in deco.expand_lines {
                         // Lines are already indented + styled by peek_expansion.
                         items.push(ListItem::new(line.clone()));
+                        item_backends.push(None);
                     }
                 }
             }
-            _ => items.push(row_to_item(row, pulses, now_ms, pr_status, width)),
+            _ => {
+                items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                item_backends.push(None);
+            }
         }
     }
     let list =
@@ -735,6 +792,30 @@ fn draw_list(
         }
     }
     frame.render_stateful_widget(list, area, &mut state);
+
+    // Logo overlay: for each on-screen session item, draw its brand image over the two blank
+    // mark columns (x+2 = after the status glyph + its trailing space). Only the visible
+    // window [offset, offset+height) is drawn; y is clamped inside the list area.
+    if let Some(logos) = logos
+        && logo_marks()
+    {
+        let offset = state.offset();
+        let height = area.height as usize;
+        for (j, backend) in item_backends.iter().enumerate() {
+            let Some(backend) = backend else { continue };
+            if j < offset || j >= offset + height {
+                continue;
+            }
+            let y = area.y + (j - offset) as u16;
+            if y >= area.y + area.height || area.width < 4 {
+                continue;
+            }
+            frame.render_widget(
+                Image::new(logos.image(*backend)),
+                Rect { x: area.x + 2, y, width: 2, height: 1 },
+            );
+        }
+    }
 
     // Place the terminal's native cursor at the end of the inline rename buffer (its row is
     // the selection, so it is always on screen). Prefix is `✎ `(2) + `<mark> `(mark_width+1).
@@ -1115,6 +1196,18 @@ mod tests {
         assert_eq!(mark_for(BackendKind::Claude, true), "✳");
         assert_eq!(mark_for(BackendKind::Codex, true), "◆");
         assert_eq!(mark_for(BackendKind::Opencode, true), "■");
+    }
+
+    #[test]
+    fn logo_marks_blank_the_mark_slot_to_two_columns() {
+        // Logo mode wins over glyph/tag and reserves exactly two blank columns for the image
+        // overlay, keeping mark_width == 2 so all row/composer layout math is unchanged.
+        set_logo_marks(true);
+        assert!(logo_marks());
+        for b in [BackendKind::Claude, BackendKind::Codex, BackendKind::Opencode] {
+            assert_eq!(backend_mark(b), "  ");
+            assert_eq!(mark_width(backend_mark(b)), 2);
+        }
     }
 
     #[test]

@@ -767,6 +767,7 @@ mod tests {
             focused: None,
             focused_session: None,
             focused_exited: false,
+            logos: None,
         }
     }
 
