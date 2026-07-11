@@ -109,6 +109,7 @@ pub(crate) fn drive_auto_enter(ui: &mut Ui) {
             // Stage-1's Enter opened the run: the list marker is gone -> we've left the list,
             // so disarm without pressing (never queue a stray Enter into the opened run).
             if !list_present {
+                ui.auto_enter_landed = Some(state.key.clone());
                 ui.auto_enter = None;
                 return;
             }
@@ -133,6 +134,7 @@ pub(crate) fn drive_auto_enter(ui: &mut Ui) {
                 }
                 Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => {
                     let _ = pty.write_input(b"\r");
+                    ui.auto_enter_landed = Some(state.key.clone());
                     ui.auto_enter = None;
                 }
                 Some(_) => {}

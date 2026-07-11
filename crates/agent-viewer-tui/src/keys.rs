@@ -606,6 +606,9 @@ fn attach_session(
                         marker_since: None,
                         expanded_absent_seen: false,
                     });
+                    // A fresh attach has not landed yet: clear any stale landing signal so the
+                    // reply injector waits for THIS attach's explicit success.
+                    ui.auto_enter_landed = None;
                 }
             }
             Err(e) => {
@@ -687,6 +690,7 @@ mod tests {
             mutations: MutationRunner::new(),
             pulses: Pulses::new(),
             auto_enter: None,
+            auto_enter_landed: None,
             pending_reply: None,
             attached: HashMap::new(),
             focused: None,

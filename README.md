@@ -82,8 +82,12 @@ highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-i
 
 ## Inline peek and rename
 
-`Space` expands the selected row in place, showing its recent transcript tail (or metadata
-for opencode) as a few indented lines under the row; `Space` again or moving the cursor
+`Space` expands the selected row in place. The peek shows the session's last message
+word-wrapped to the panel width with its newlines preserved, and a short recent-tail of the
+prior items collapsed to one line each above it. A blocked (needs-input) row leads with a
+prominent header: `Awaiting approval: <command/patch>` for Codex or `Awaiting input:
+<question>` for Claude. opencode previews its own real last message from its SQLite store,
+falling back to status and cwd only when it has none. `Space` again or moving the cursor
 collapses it. `Ctrl+R` turns the selected row itself into an edit field prefilled with the
 title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 
@@ -93,7 +97,10 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
 - `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's model.
-- `Space` — expand the selected row in place to peek its transcript tail / metadata.
+- `Space` — expand the selected row in place to peek its last message / metadata.
+- `r` — reply to the selected needs-input session (an input opens in the composer area;
+  `Enter` sends, `Esc` cancels). Capability-gated: unsupported backends (opencode) and
+  non-blocked rows are a no-op with a footer notice.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
 - `Ctrl+S` — toggle grouping by project / by state.
@@ -115,6 +122,14 @@ Enter for you once the view is ready so you land directly in that job's run, not
 agents list — or `claude -r` to resume a finished one. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
+
+Replies (`r`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
+into the run once the viewer has navigated into it (not while still on the agents list). A
+Codex approval reply maps yes / no to the approval keystroke; any free-text reply where only
+yes or no is valid instead attaches you with focus so you can finish it by hand. Delivery is
+best-effort: the auto-inject rides on detecting when the child is ready to accept input, and
+if that detection does not land, the reply is not sent blindly. In that case you are left
+attached in the session to type it yourself, and a footer notice says so.
 
 Quitting the viewer (`q`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

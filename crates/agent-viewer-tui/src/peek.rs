@@ -99,8 +99,8 @@ fn truncate(s: &str, width: usize) -> String {
     s.chars().take(width).collect()
 }
 
-/// The first non-empty source line of `text` with inner newlines collapsed to spaces — the
-/// one-line form for a prior (tail) item.
+/// Collapse every newline in `text` to a space, folding it into a single-line summary for a
+/// prior (tail) item (the caller then char-truncates it to the panel width).
 fn first_line_collapsed(text: &str) -> String {
     text.replace('\n', " ")
 }

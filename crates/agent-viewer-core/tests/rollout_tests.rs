@@ -181,6 +181,22 @@ fn pending_approval_parses_exec() {
 }
 
 #[test]
+fn exec_summary_quotes_whitespace_args() {
+    // A whitespace-containing arg is single-quoted so the summary reflects what runs.
+    let approval = PendingApproval::Exec {
+        command: vec!["echo".to_string(), "a b".to_string()],
+        cwd: None,
+    };
+    assert_eq!(approval.summary(), "echo 'a b'");
+    // Plain args stay bare.
+    let plain = PendingApproval::Exec {
+        command: vec!["rm".to_string(), "-rf".to_string(), "target".to_string()],
+        cwd: None,
+    };
+    assert_eq!(plain.summary(), "rm -rf target");
+}
+
+#[test]
 fn pending_approval_parses_patch_with_sorted_files() {
     let path = common::fixture_path("rollout_patch_approval.jsonl");
     let pending = pending_approval(&path).expect("pending_approval");
