@@ -392,19 +392,26 @@ impl App {
     /// rows, the substring filter, then either ByState sections (fixed order, empty
     /// sections omitted, all rows uncapped) or ByProject headers.
     fn rebuild_rows(&mut self) {
+        // While a filter is active, search covers hidden/companion rows too (otherwise a
+        // search could never surface the archived sessions the user is looking for). The
+        // hidden/companion exclusion therefore applies only when the filter is empty.
+        let filtering = !self.filter.is_empty();
+        let include_all = self.show_all || filtering;
+
         // Visible session indices (exclusion + filter), recency DESC.
         let mut indices: Vec<usize> = self
             .sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| self.show_all || !(s.hidden || s.companion))
+            .filter(|(_, s)| include_all || !(s.hidden || s.companion))
             .filter(|(_, s)| self.passes_filter(s))
             .map(|(i, _)| i)
             .collect();
         indices.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].updated_at_ms));
 
         // Cache the suppressed-row count alongside the rows (same inputs, same lifetime).
-        self.hidden_rows = if self.show_all {
+        // While filtering, every match is shown, so nothing that matches is hidden.
+        self.hidden_rows = if include_all {
             0
         } else {
             self.sessions
@@ -573,6 +580,19 @@ pub fn row_layout(
 pub struct Composer {
     text: String,
     backend: BackendKind,
+    /// Index into `models_for(self.backend)` — the per-spawn model choice (Shift+Tab cycles;
+    /// reset to 0 whenever the backend changes).
+    model_idx: usize,
+}
+
+/// The per-backend model cycle. Single-entry lists make Shift+Tab a no-op there. The leading
+/// entry is the default; codex/opencode expose only "default" (no model flag on spawn).
+pub fn models_for(backend: BackendKind) -> &'static [&'static str] {
+    match backend {
+        BackendKind::Claude => &["opus[1m]", "sonnet", "fable"],
+        BackendKind::Codex => &["default"],
+        BackendKind::Opencode => &["default"],
+    }
 }
 
 impl Default for Composer {
@@ -582,11 +602,12 @@ impl Default for Composer {
 }
 
 impl Composer {
-    /// Fresh composer: empty text, Claude backend.
+    /// Fresh composer: empty text, Claude backend, its first model.
     pub fn new() -> Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
+            model_idx: 0,
         }
     }
 
@@ -596,6 +617,11 @@ impl Composer {
 
     pub fn backend(&self) -> BackendKind {
         self.backend
+    }
+
+    /// The currently-selected model for the composer's backend.
+    pub fn model(&self) -> &'static str {
+        models_for(self.backend)[self.model_idx]
     }
 
     pub fn is_empty(&self) -> bool {
@@ -615,13 +641,19 @@ impl Composer {
         self.text.clear();
     }
 
-    /// Tab: Claude -> Codex -> Opencode -> Claude.
+    /// Tab: Claude -> Codex -> Opencode -> Claude. Resets the model to the new backend's first.
     pub fn cycle_backend(&mut self) {
         self.backend = match self.backend {
             BackendKind::Claude => BackendKind::Codex,
             BackendKind::Codex => BackendKind::Opencode,
             BackendKind::Opencode => BackendKind::Claude,
         };
+        self.model_idx = 0;
+    }
+
+    /// Shift+Tab: cycle the model for the current backend (a no-op for single-entry cycles).
+    pub fn cycle_model(&mut self) {
+        self.model_idx = (self.model_idx + 1) % models_for(self.backend).len();
     }
 }
 

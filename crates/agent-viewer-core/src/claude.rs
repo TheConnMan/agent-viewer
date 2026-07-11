@@ -45,6 +45,26 @@ impl Default for ClaudeBackend {
     }
 }
 
+/// Build the `claude --bg` spawn command (extracted so the model-flag wiring is unit-
+/// testable). `model` None falls back to the opus[1m] default.
+fn claude_spawn_command(
+    binary: &str,
+    dir: &std::path::Path,
+    task: &str,
+    model: Option<&str>,
+) -> std::process::Command {
+    let name: String = task.chars().take(40).collect();
+    let mut cmd = std::process::Command::new(binary);
+    cmd.current_dir(dir)
+        .arg("--bg")
+        .arg("--model")
+        .arg(model.unwrap_or("opus[1m]"))
+        .arg("--name")
+        .arg(&name)
+        .arg(task);
+    cmd
+}
+
 impl Backend for ClaudeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Claude
@@ -87,18 +107,10 @@ impl Backend for ClaudeBackend {
         }
         Ok(sessions)
     }
-    fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<Option<u32>> {
+    fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         // Detach like the other backends so the TUI key handler returns immediately
         // (`claude --bg` still self-detaches; setsid + no wait keeps it off this thread).
-        let name: String = task.chars().take(40).collect();
-        let mut cmd = std::process::Command::new(&self.binary);
-        cmd.current_dir(dir)
-            .arg("--bg")
-            .arg("--model")
-            .arg("opus[1m]")
-            .arg("--name")
-            .arg(&name)
-            .arg(task);
+        let cmd = claude_spawn_command(&self.binary, dir, task, model);
         let log_path = crate::spawn::viewer_log_path("claude");
         crate::spawn::spawn_detached(cmd, &log_path)?;
         // The forked pid is the dispatcher CLI, not the worker; claude rows are never
@@ -406,4 +418,34 @@ pub fn read_claude_transcript(
         items = items.split_off(items.len() - max_items);
     }
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_spawn_command;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    fn args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn claude_spawn_command_carries_model_flag() {
+        // A non-default model is passed through as `--model <m>`.
+        let cmd = claude_spawn_command("claude", Path::new("/tmp"), "do a thing", Some("fable"));
+        assert_eq!(cmd.get_program(), OsStr::new("claude"));
+        let a = args(&cmd);
+        let i = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[i + 1], "fable");
+        assert!(a.contains(&"do a thing".to_string())); // task still the final arg
+
+        // None falls back to the opus[1m] default (never a missing --model).
+        let cmd = claude_spawn_command("claude", Path::new("/tmp"), "t", None);
+        let a = args(&cmd);
+        let i = a.iter().position(|x| x == "--model").expect("--model present");
+        assert_eq!(a[i + 1], "opus[1m]");
+    }
 }

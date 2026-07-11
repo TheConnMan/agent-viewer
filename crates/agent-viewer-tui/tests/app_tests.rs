@@ -603,3 +603,83 @@ fn detach_tracker_left_gates_on_empty_input() {
     t.on_enter();
     assert!(t.detach_on_left());
 }
+
+// --- v2.4: "/" to composer, hidden search, per-spawn model ---
+
+#[test]
+fn composer_accepts_slash_command_as_text() {
+    // "/" is no longer a filter hotkey — it (and a full slash command) is plain task text
+    // that spawns as the prompt.
+    let mut c = Composer::new();
+    for ch in "/implement RS-123".chars() {
+        c.push_char(ch);
+    }
+    assert_eq!(c.text(), "/implement RS-123");
+    assert!(!c.is_empty());
+}
+
+#[test]
+fn filter_search_covers_hidden_and_companion_sessions() {
+    let mut hidden = sess(BackendKind::Codex, "archived-match", "/p", 300, Status::Done);
+    hidden.hidden = true;
+    let mut companion = sess(BackendKind::Codex, "companion-match", "/p", 250, Status::Idle);
+    companion.companion = true;
+    let visible = sess(BackendKind::Codex, "plain-match", "/p", 200, Status::Working);
+    let mut app = App::new(vec![hidden, companion, visible]);
+
+    // Default view hides the archived + companion rows (only the plain one shows).
+    let shown = |a: &App| -> Vec<String> {
+        session_rows(a.visible())
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(shown(&app), vec!["plain-match".to_string()]);
+    assert_eq!(app.hidden_count(), 2);
+
+    // A filter that matches all three surfaces the hidden + companion ones too.
+    app.set_filter("match".to_string());
+    let ids = shown(&app);
+    assert!(ids.contains(&"archived-match".to_string()));
+    assert!(ids.contains(&"companion-match".to_string()));
+    assert!(ids.contains(&"plain-match".to_string()));
+    assert_eq!(app.hidden_count(), 0); // while filtering, nothing matching is hidden
+
+    // Clearing the filter re-hides them.
+    app.set_filter(String::new());
+    assert_eq!(shown(&app), vec!["plain-match".to_string()]);
+    assert_eq!(app.hidden_count(), 2);
+}
+
+#[test]
+fn composer_cycles_model_and_resets_on_backend_change() {
+    let mut c = Composer::new();
+    // Claude starts on its first model.
+    assert_eq!(c.backend(), BackendKind::Claude);
+    assert_eq!(c.model(), "opus[1m]");
+    // Shift+Tab cycles the claude models opus[1m] -> sonnet -> fable -> opus[1m].
+    c.cycle_model();
+    assert_eq!(c.model(), "sonnet");
+    c.cycle_model();
+    assert_eq!(c.model(), "fable");
+    c.cycle_model();
+    assert_eq!(c.model(), "opus[1m]");
+
+    // Move off the default model, then Tab to codex resets the model slot.
+    c.cycle_model(); // sonnet
+    assert_eq!(c.model(), "sonnet");
+    c.cycle_backend(); // -> codex, model reset
+    assert_eq!(c.backend(), BackendKind::Codex);
+    assert_eq!(c.model(), "default");
+    // codex has a single-entry cycle: Shift+Tab stays put.
+    c.cycle_model();
+    assert_eq!(c.model(), "default");
+    // Back to claude resets to its first model, not the previous sonnet.
+    c.cycle_backend(); // opencode
+    c.cycle_backend(); // claude
+    assert_eq!(c.backend(), BackendKind::Claude);
+    assert_eq!(c.model(), "opus[1m]");
+}

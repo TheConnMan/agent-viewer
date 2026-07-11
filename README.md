@@ -64,12 +64,14 @@ have marked them a companion.
 ## Inline spawn composer
 
 The list view carries a persistent composer in a rounded box between the list and the
-footer: `◆ codex ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the
-target agent (Claude `✳` → Codex `◆` → opencode `■`, each in its brand color), and `Enter`
-spawns it detached. The target directory is the selected row's project root (by-project
-view) or its exact cwd (by-state view). While the composer is empty, the single-letter
-command keys below still fire; once you have typed anything, every printable key (and space)
-is task text, and `Esc` clears it.
+footer: `✳ claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task (a slash
+command like `/implement RS-123` is just task text); `Tab` cycles the target agent (Claude
+`✳` → Codex `◆` → opencode `■`, each in its brand color), `Shift+Tab` cycles that agent's
+model (Claude: `opus[1m]` → `sonnet` → `fable`; codex/opencode have a single default that
+shows nothing), and `Enter` spawns it detached with that model. The target directory is the
+selected row's project root (by-project view) or its exact cwd (by-state view). While the
+composer is empty, the single-letter command keys below still fire; once you have typed
+anything, every printable key (and space) is task text, and `Esc` clears it.
 
 ## Inline peek and rename
 
@@ -83,14 +85,14 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `↑`/`↓` — move selection.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
-- `Tab` — cycle the composer's target agent.
+- `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's model.
 - `Space` — expand the selected row in place to peek its transcript tail / metadata.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `a` — show all (companions + archived + deleted-dir rows).
 - `h` / `u` — archive / unarchive (Codex only).
-- `/` — filter by title or directory.
+- `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `?` — key help.
 - `q` — quit.
 

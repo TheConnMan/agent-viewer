@@ -427,31 +427,36 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
         .spawn_target()
         .map(|d| abbreviate_dir(&d))
         .unwrap_or_default();
-    let mut spans = vec![
-        Span::styled(
-            format!("{} {} ", backend_mark(backend), backend.name()),
-            fg(backend_mark_color(backend)),
-        ),
-        Span::styled(format!("{dir} "), fg(theme::MUTED)),
-        Span::styled("❯ ", fg(theme::ACCENT)),
-    ];
+    // The model shows after the backend name, muted; "default" (codex/opencode) shows nothing.
+    let model = composer.model();
+    let model_seg = if model == "default" {
+        String::new()
+    } else {
+        format!("{model} ")
+    };
+    let mut spans = vec![Span::styled(
+        format!("{} {} ", backend_mark(backend), backend.name()),
+        fg(backend_mark_color(backend)),
+    )];
+    if !model_seg.is_empty() {
+        spans.push(Span::styled(model_seg.clone(), fg(theme::MUTED)));
+    }
+    spans.push(Span::styled(format!("{dir} "), fg(theme::MUTED)));
+    spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
     if composer.is_empty() {
         spans.push(Span::styled(
             "describe a task · tab to switch agent",
             fg(theme::FAINT),
         ));
     } else {
-        spans.push(Span::styled(
-            composer.text().to_string(),
-            fg(theme::TEXT),
-        ));
+        spans.push(Span::styled(composer.text().to_string(), fg(theme::TEXT)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
     if show_cursor && inner.width > 0 {
         // Cursor at the end of the typed text, clamped inside the box. The prefix mirrors
-        // the fixed spans above: `<mark> <backend> <dir> ❯ `.
-        let prefix = format!("{} {} {dir} ❯ ", backend_mark(backend), backend.name());
+        // the fixed spans above: `<mark> <backend> [<model> ]<dir> ❯ `.
+        let prefix = format!("{} {} {model_seg}{dir} ❯ ", backend_mark(backend), backend.name());
         let col = display_width(&prefix) + display_width(composer.text());
         let x = inner.x + (col as u16).min(inner.width - 1);
         frame.set_cursor_position((x, inner.y));
@@ -724,7 +729,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · / filter · ? help · q quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -809,6 +814,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("↑/↓  j/k", "move selection"),
         ("→ / Enter", "attach selected (empty composer)"),
         ("type · Tab", "compose task · switch agent"),
+        ("Shift+Tab", "cycle agent model"),
         ("Enter", "spawn composed task"),
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
@@ -818,7 +824,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Ctrl+S", "group by state / by project"),
         ("a", "show all (companions + archived)"),
         ("h / u", "archive / unarchive"),
-        ("/", "filter"),
+        ("Ctrl+F", "filter (searches hidden too)"),
         ("?", "this help"),
         ("q", "quit"),
     ];

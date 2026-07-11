@@ -101,10 +101,13 @@ impl Backend for CodexBackend {
         Ok(sessions)
     }
 
-    fn spawn(&self, dir: &Path, task: &str) -> Result<Option<u32>> {
+    fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         let mut cmd = std::process::Command::new("codex");
         cmd.arg("exec").arg("--json").arg("-C").arg(dir);
         cmd.args(SANDBOX_ARGS);
+        if let Some(model) = model {
+            cmd.arg("-m").arg(model);
+        }
         cmd.arg(task);
         let log_path = crate::default_codex_home()
             .join("bg-logs")

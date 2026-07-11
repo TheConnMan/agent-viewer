@@ -81,15 +81,14 @@ impl Backend for OpencodeBackend {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<Option<u32>> {
+    fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         let title: String = task.chars().take(40).collect();
         let mut cmd = std::process::Command::new("opencode");
-        cmd.arg("run")
-            .arg("--dir")
-            .arg(dir)
-            .arg("--title")
-            .arg(&title)
-            .arg(task);
+        cmd.arg("run").arg("--dir").arg(dir).arg("--title").arg(&title);
+        if let Some(model) = model {
+            cmd.arg("-m").arg(model);
+        }
+        cmd.arg(task);
         // Viewer-owned log dir; we do NOT write under ~/.local/share/opencode/.
         let log_path = crate::spawn::viewer_log_path("opencode");
         let pid = crate::spawn::spawn_detached(cmd, &log_path)?;

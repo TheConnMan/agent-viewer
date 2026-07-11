@@ -67,7 +67,7 @@ fn codex_spawn_running_then_done() {
     // 2. Spawn a trivial background codex exec.
     let spawn_at = Instant::now();
     backend
-        .spawn(&repo, "Reply with exactly the word DONE.")
+        .spawn(&repo, "Reply with exactly the word DONE.", None)
         .expect("spawn codex exec");
 
     // 3. Session appears in the list (spec ~1s, done-when ~2s; assert within 15s).
@@ -137,7 +137,7 @@ fn embedded_attach_live() {
 
     let mut backend = CodexBackend::new(default_codex_home());
     backend
-        .spawn(&repo, "Reply with exactly the word DONE.")
+        .spawn(&repo, "Reply with exactly the word DONE.", None)
         .expect("spawn codex exec");
 
     let canon = std::fs::canonicalize(&repo).unwrap_or(repo.clone());

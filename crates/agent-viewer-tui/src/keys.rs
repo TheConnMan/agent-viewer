@@ -56,6 +56,7 @@ fn handle_normal_key(
             KeyCode::Char('s') => ui.app.toggle_group_mode(),
             KeyCode::Char('r') => open_rename(ui),
             KeyCode::Char('x') => kill_selected(backends, ui),
+            KeyCode::Char('f') => open_filter(ui),
             _ => {}
         }
         return Ok(false);
@@ -66,8 +67,9 @@ fn handle_normal_key(
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
-        // Tab cycles the composer's target backend at any time.
+        // Tab cycles the composer's target backend; Shift+Tab cycles that backend's model.
         KeyCode::Tab => ui.composer.cycle_backend(),
+        KeyCode::BackTab => ui.composer.cycle_model(),
         KeyCode::Backspace => ui.composer.backspace(),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
@@ -92,11 +94,8 @@ fn handle_normal_key(
                     '?' => ui.mode = Mode::Help,
                     // Space toggles the inline peek expansion of the selected row.
                     ' ' if ui.app.selected().is_some() => ui.app.toggle_expanded(),
-                    '/' => {
-                        ui.app.set_filter(String::new());
-                        ui.notice.clear();
-                        ui.mode = Mode::Filter;
-                    }
+                    // '/' is no longer a filter hotkey — it types into the composer so a
+                    // slash command like `/implement RS-123` spawns as the task prompt.
                     _ => ui.composer.push_char(c),
                 }
             } else {
@@ -218,6 +217,13 @@ fn handle_rename_key(code: KeyCode, ui: &mut Ui) {
 }
 
 // --- Actions --------------------------------------------------------------------
+
+/// Ctrl+F — enter filter mode with a fresh, empty query.
+fn open_filter(ui: &mut Ui) {
+    ui.app.set_filter(String::new());
+    ui.notice.clear();
+    ui.mode = Mode::Filter;
+}
 
 /// Open the rename modal for the selected session (claude falls back to the local
 /// name override on apply, so it opens regardless of the backend's rename capability).
@@ -421,15 +427,22 @@ fn spawn_from_composer(
         return;
     }
     let task = ui.composer.text().to_string();
-    match backend.spawn(&target, &task) {
+    // "default" (codex/opencode) passes no model flag; any other value is a real model.
+    let model_str = ui.composer.model();
+    let model = (model_str != "default").then_some(model_str);
+    let notice = match model {
+        Some(m) => format!("spawned on {} {m}", backend_kind.name()),
+        None => format!("spawned on {}", backend_kind.name()),
+    };
+    match backend.spawn(&target, &task, model) {
         Ok(Some(pid)) => {
             // Record the spawn so the overlay can pin (and later stop) the session.
             if let Some(db) = &ui.db {
                 let _ = db.record_spawn(backend_kind, &target, pid, now_ms());
             }
-            ui.set_notice(format!("spawned on {}", backend_kind.name()));
+            ui.set_notice(notice);
         }
-        Ok(None) => ui.set_notice(format!("spawned on {}", backend_kind.name())),
+        Ok(None) => ui.set_notice(notice),
         Err(e) => {
             // Keep the composer text so the user can retry.
             ui.set_notice(format!("spawn failed: {e}"));
@@ -440,4 +453,43 @@ fn spawn_from_composer(
     // Hasten the next listing so the spawned row (and its bloom) appears promptly; the
     // notice survives until the 1s clear cadence since apply_snapshot preserves it.
     refresher.force();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_filter;
+    use crate::{NoticeState, Ui};
+    use agent_viewer_tui::app::{App, Composer};
+    use agent_viewer_tui::mutations::MutationRunner;
+    use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
+    use std::collections::HashMap;
+
+    fn test_ui() -> Ui {
+        Ui {
+            app: App::new(Vec::new()),
+            mode: Mode::Normal,
+            notice: NoticeState::default(),
+            db: None,
+            peek: PeekCache::new(),
+            composer: Composer::new(),
+            detach_trackers: HashMap::new(),
+            last_backend_error: String::new(),
+            mutations: MutationRunner::new(),
+            pulses: Pulses::new(),
+            auto_enter: None,
+            attached: HashMap::new(),
+            focused: None,
+            focused_session: None,
+            focused_exited: false,
+        }
+    }
+
+    #[test]
+    fn ctrl_f_open_filter_enters_filter_mode() {
+        let mut ui = test_ui();
+        assert!(matches!(ui.mode, Mode::Normal));
+        open_filter(&mut ui);
+        assert!(matches!(ui.mode, Mode::Filter));
+        assert_eq!(ui.app.filter(), ""); // opens with a fresh, empty query
+    }
 }

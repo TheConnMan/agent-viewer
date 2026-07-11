@@ -94,7 +94,14 @@ pub trait Backend: Send {
     /// Returns the direct child PID when the viewer forked it (codex, opencode);
     /// None when the tool self-detaches its real worker (claude --bg).
     /// The TUI records Some(pid) in the viewer DB (spawn pinning + stop).
-    fn spawn(&self, dir: &std::path::Path, task: &str) -> crate::error::Result<Option<u32>>;
+    /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
+    /// None uses the backend's own default.
+    fn spawn(
+        &self,
+        dir: &std::path::Path,
+        task: &str,
+        model: Option<&str>,
+    ) -> crate::error::Result<Option<u32>>;
     fn hide(&self, id: &str) -> crate::error::Result<()> {
         let _ = id;
         Err(crate::error::Error::Unsupported(self.kind().name()))
