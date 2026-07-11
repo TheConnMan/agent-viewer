@@ -35,6 +35,9 @@ pub struct Capabilities {
     pub remove: bool,
     /// Rename in the backend's own store (codex T, claude T UDS best-effort, opencode T).
     pub rename: bool,
+    /// Reply into a blocked/live session (codex approval keystroke T, claude text T,
+    /// opencode F).
+    pub reply: bool,
 }
 
 /// Six-state model (v2). `Working`/`Failed` are v1's `Running`/`Errored` renamed;

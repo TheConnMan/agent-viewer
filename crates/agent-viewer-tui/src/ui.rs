@@ -326,12 +326,22 @@ pub struct RenameModal {
     pub buffer: String,
 }
 
+/// The reply-compose state: a small input focused over the composer area to answer a
+/// blocked session. Mirrors `RenameModal`; the delivery target is keyed by (backend, id).
+#[derive(Debug, Clone)]
+pub struct ReplyModal {
+    pub backend: BackendKind,
+    pub id: String,
+    pub buffer: String,
+}
+
 /// Top-level input mode driving key routing and what the footer shows. The inline spawn
 /// composer, inline rename, and inline peek expansion all live on the Normal list view.
 pub enum Mode {
     Normal,
     Filter,
     Rename(RenameModal),
+    Reply(ReplyModal),
     Help,
     Attached,
 }
@@ -401,13 +411,24 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[0]);
-    draw_composer(
-        frame,
-        d.app,
-        d.composer,
-        vertical[2],
-        matches!(d.mode, Mode::Normal),
-    );
+    // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
+    // force-expanded peek above it); every other mode shows the persistent spawn composer.
+    if let Mode::Reply(m) = d.mode {
+        let title = d
+            .app
+            .session_for(&(m.backend, m.id.clone()))
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        draw_reply(frame, m, vertical[2], &title);
+    } else {
+        draw_composer(
+            frame,
+            d.app,
+            d.composer,
+            vertical[2],
+            matches!(d.mode, Mode::Normal),
+        );
+    }
     draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[3]);
 
     // Slash-command completion popup, floating just above the composer box.
@@ -582,6 +603,46 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
             backend.name()
         );
         let col = display_width(&prefix) + display_width(composer.text());
+        let x = inner.x + (col as u16).min(inner.width - 1);
+        frame.set_cursor_position((x, inner.y));
+    }
+}
+
+/// The reply-compose input, occupying the composer box: an accent-bordered rounded box with
+/// `↳ reply <title> ❯ <buffer>` (title muted, prompt accent, text bright), a muted
+/// placeholder when empty, and the native cursor at the end of the buffer (as draw_composer).
+fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(theme::ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let title_seg = if session_title.is_empty() {
+        String::new()
+    } else {
+        format!("{session_title} ")
+    };
+    let mut spans = vec![Span::styled("↳ reply ", fg(theme::ACCENT))];
+    if !title_seg.is_empty() {
+        spans.push(Span::styled(title_seg.clone(), fg(theme::MUTED)));
+    }
+    spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
+    if modal.buffer.is_empty() {
+        spans.push(Span::styled(
+            "type a reply · Enter send · Esc cancel",
+            fg(theme::FAINT),
+        ));
+    } else {
+        spans.push(Span::styled(modal.buffer.clone(), fg(theme::TEXT)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+
+    if inner.width > 0 {
+        // Cursor at the end of the typed reply. Prefix mirrors the fixed spans above.
+        let prefix = format!("↳ reply {title_seg}❯ ");
+        let col = display_width(&prefix) + display_width(&modal.buffer);
         let x = inner.x + (col as u16).min(inner.width - 1);
         frame.set_cursor_position((x, inner.y));
     }
@@ -830,6 +891,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
+        Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -937,6 +999,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
         ("Space", "expand peek in row"),
+        ("r", "reply to a blocked session"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),

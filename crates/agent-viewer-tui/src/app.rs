@@ -254,6 +254,12 @@ impl App {
         }
     }
 
+    /// Force the selected row's inline peek open (so the ask above a reply input is visible).
+    /// No-op-safe: leaves the expansion unset when nothing selectable is under the cursor.
+    pub fn expand_selected(&mut self) {
+        self.expanded = self.selected_key();
+    }
+
     /// Space: toggle the inline peek expansion of the selected row (one at a time).
     pub fn toggle_expanded(&mut self) {
         let key = self.selected_key();
@@ -567,6 +573,31 @@ pub fn row_layout(
     (name_out, detail_out, pad)
 }
 
+/// Whether a reply may be delivered to a session at all: the backend must support reply AND
+/// the session must actually be waiting for input. The sole safety gate against sending to a
+/// non-blocked session. Pure.
+pub fn reply_allowed(caps_reply: bool, status: Status) -> bool {
+    caps_reply && matches!(status, Status::NeedsInput)
+}
+
+/// How a typed codex approval reply maps to a decision. Approve/Deny inject the single
+/// approval keystroke; Freeform (anything else, including empty) attaches with focus so the
+/// user finishes manually rather than guessing. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexReply {
+    Approve,
+    Deny,
+    Freeform,
+}
+
+pub fn codex_reply_keystroke(input: &str) -> CodexReply {
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" | "approve" | "a" | "ok" => CodexReply::Approve,
+        "n" | "no" | "deny" | "d" | "reject" => CodexReply::Deny,
+        _ => CodexReply::Freeform,
+    }
+}
+
 /// Inline spawn composer (item 8): a persistent one-line input above the footer. Holds
 /// the task text plus the target backend, which Tab cycles Claude -> Codex -> Opencode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,4 +865,41 @@ pub fn format_elapsed(delta_ms: i64) -> String {
         return format!("{hours}h");
     }
     format!("{}d", hours / 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexReply, codex_reply_keystroke, reply_allowed};
+    use agent_viewer_core::Status;
+
+    #[test]
+    fn reply_allowed_only_for_capable_and_blocked() {
+        // Both conditions must hold: backend supports reply AND the session is blocked.
+        assert!(reply_allowed(true, Status::NeedsInput));
+        // Capable backend but the session is not blocked -> never.
+        for s in [
+            Status::Working,
+            Status::Idle,
+            Status::Done,
+            Status::Failed,
+            Status::Stopped,
+        ] {
+            assert!(!reply_allowed(true, s));
+        }
+        // Blocked session but the backend cannot reply -> never.
+        assert!(!reply_allowed(false, Status::NeedsInput));
+    }
+
+    #[test]
+    fn codex_reply_keystroke_maps_yes_no_and_freeform() {
+        for a in ["y", "yes", "approve", "a", "ok", " YES "] {
+            assert_eq!(codex_reply_keystroke(a), CodexReply::Approve);
+        }
+        for d in ["n", "no", "deny", "d", "reject"] {
+            assert_eq!(codex_reply_keystroke(d), CodexReply::Deny);
+        }
+        for f in ["", "maybe", "do it later"] {
+            assert_eq!(codex_reply_keystroke(f), CodexReply::Freeform);
+        }
+    }
 }

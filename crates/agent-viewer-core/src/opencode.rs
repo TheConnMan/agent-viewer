@@ -35,6 +35,7 @@ impl Backend for OpencodeBackend {
             stop: true,
             remove: true,
             rename: true,
+            reply: false,
         }
     }
     fn list(&mut self) -> Result<Vec<Session>> {

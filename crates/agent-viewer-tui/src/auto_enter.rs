@@ -14,8 +14,9 @@ const AUTO_ENTER_TIMEOUT: Duration = Duration::from_secs(45);
 /// The marker must stay visible this long before we press Enter, so we land when claude is
 /// actually accepting input rather than on the first painted (still-initializing) frame.
 const AUTO_ENTER_SETTLE: Duration = Duration::from_millis(500);
-/// Stage-1 marker: the agents list is up and the preselected row is ready.
-const CLAUDE_AGENTS_MARKER: &str = "describe a task for a new session";
+/// Stage-1 marker: the agents list is up and the preselected row is ready. Also used by the
+/// pending-reply injector to prove we have left the list into the run before typing a reply.
+pub(crate) const CLAUDE_AGENTS_MARKER: &str = "describe a task for a new session";
 /// Stage-2 markers (fallback only): if the first Enter merely expanded a collapsed row
 /// rather than opening the run, either collapse-hint variant shows and a second Enter opens.
 const CLAUDE_EXPANDED_MARKER: &str = "enter to collapse";

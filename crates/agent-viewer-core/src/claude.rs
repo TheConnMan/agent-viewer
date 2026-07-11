@@ -81,6 +81,7 @@ impl Backend for ClaudeBackend {
             stop: false,
             remove: false,
             rename: true,
+            reply: true,
         }
     }
     fn list(&mut self) -> Result<Vec<Session>> {

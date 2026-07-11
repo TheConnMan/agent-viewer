@@ -18,8 +18,10 @@ use crossterm::event::{self, Event, KeyEventKind};
 mod auto_enter;
 mod keys;
 mod ops;
+mod pending_reply;
 
 use auto_enter::AutoEnter;
+use pending_reply::PendingReply;
 
 /// How often the refresh worker re-lists the backends (off the UI thread).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
@@ -143,6 +145,10 @@ struct Ui {
     /// the PTY for the agents view and presses Enter once (after a settle) to land in the
     /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
     auto_enter: Option<AutoEnter>,
+    /// A one-shot reply injection armed by `send_reply`. While set, the run loop watches the
+    /// focused PTY and writes the reply payload once it is safe (in the run, settled).
+    /// Cleared on write, timeout, user takeover, or PTY prune.
+    pending_reply: Option<PendingReply>,
     /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
     /// on quit — conversation state persists in each backend's own store.
     attached: HashMap<Key, PtySession>,
@@ -167,6 +173,9 @@ impl Ui {
         self.detach_trackers.remove(key);
         if self.auto_enter.as_ref().map(|ae| &ae.key) == Some(key) {
             self.auto_enter = None;
+        }
+        if self.pending_reply.as_ref().map(|pr| &pr.key) == Some(key) {
+            self.pending_reply = None;
         }
     }
 }
@@ -210,6 +219,7 @@ fn main() -> io::Result<()> {
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
         auto_enter: None,
+        pending_reply: None,
         attached: HashMap::new(),
         focused: None,
         focused_session: None,
@@ -274,6 +284,8 @@ fn run(
 
         // Drive the one-shot auto-Enter for a live claude attach (lands us in the run).
         auto_enter::drive_auto_enter(ui);
+        // Then drive any armed one-shot reply injection into the just-landed run.
+        pending_reply::drive_pending_reply(ui);
 
         // Build the attach view (if focused) before borrowing the frame.
         let attach = build_attach_view(ui);
