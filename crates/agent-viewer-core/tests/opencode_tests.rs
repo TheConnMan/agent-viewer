@@ -164,15 +164,27 @@ fn opencode_last_message_none_when_no_text_message() {
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
     // Also nothing for an unknown session id.
-    assert!(read_opencode_last_message(&path, "ses_1").expect("read ok").is_none());
-    assert!(read_opencode_last_message(&path, "nope").expect("read ok").is_none());
+    assert!(
+        read_opencode_last_message(&path, "ses_1")
+            .expect("read ok")
+            .is_none()
+    );
+    assert!(
+        read_opencode_last_message(&path, "nope")
+            .expect("read ok")
+            .is_none()
+    );
 }
 
 #[test]
 fn opencode_last_message_missing_db_is_none() {
     let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
-    assert!(read_opencode_last_message(&missing, "ses_1").expect("read ok").is_none());
+    assert!(
+        read_opencode_last_message(&missing, "ses_1")
+            .expect("read ok")
+            .is_none()
+    );
 }
 
 // --- v2: rename SQL escaping (test 19) ---

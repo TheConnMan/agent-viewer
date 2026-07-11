@@ -3,8 +3,8 @@
 //! full-screen embedded-PTY attach view. The approved amber palette lives in `theme`.
 
 use crate::app::{App, Composer, Row, Section};
-use crate::peek::{self, PeekKind};
 use crate::logos::LogoMarks;
+use crate::peek::{self, PeekKind};
 use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
@@ -449,7 +449,16 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     draw_header(frame, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
-    draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, d.logos, vertical[1]);
+    draw_list(
+        frame,
+        d.app,
+        d.pulses,
+        d.now_ms,
+        d.pr_status,
+        deco,
+        d.logos,
+        vertical[1],
+    );
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
     // force-expanded peek above it); every other mode shows the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
@@ -559,7 +568,13 @@ fn peek_expansion(
     } else {
         None
     };
-    let plines = peek::build(ask.as_deref(), &peek.items, peek.error.as_deref(), &meta, inner);
+    let plines = peek::build(
+        ask.as_deref(),
+        &peek.items,
+        peek.error.as_deref(),
+        &meta,
+        inner,
+    );
     plines
         .into_iter()
         .map(|pl| {
@@ -570,10 +585,7 @@ fn peek_expansion(
                 PeekKind::Meta => fg(theme::MUTED),
                 PeekKind::Error => fg(theme::WARN),
             };
-            Line::from(vec![
-                Span::raw("      "),
-                Span::styled(pl.text, style),
-            ])
+            Line::from(vec![Span::raw("      "), Span::styled(pl.text, style)])
         })
         .collect()
 }
@@ -649,7 +661,12 @@ fn draw_composer(
     {
         frame.render_widget(
             Image::new(logos.image(backend)),
-            Rect { x: inner.x, y: inner.y, width: 2, height: 1 },
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: 2,
+                height: 1,
+            },
         );
     }
 
@@ -714,13 +731,16 @@ fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let title = Line::from(Span::styled(
         " Agent Viewer",
-        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(vec![Line::default(), title]), area);
 }
 
 // --- Main list ------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn draw_list(
     frame: &mut Frame,
     app: &App,
@@ -812,7 +832,12 @@ fn draw_list(
             }
             frame.render_widget(
                 Image::new(logos.image(*backend)),
-                Rect { x: area.x + 2, y, width: 2, height: 1 },
+                Rect {
+                    x: area.x + 2,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
             );
         }
     }
@@ -1204,7 +1229,11 @@ mod tests {
         // overlay, keeping mark_width == 2 so all row/composer layout math is unchanged.
         set_logo_marks(true);
         assert!(logo_marks());
-        for b in [BackendKind::Claude, BackendKind::Codex, BackendKind::Opencode] {
+        for b in [
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Opencode,
+        ] {
             assert_eq!(backend_mark(b), "  ");
             assert_eq!(mark_width(backend_mark(b)), 2);
         }

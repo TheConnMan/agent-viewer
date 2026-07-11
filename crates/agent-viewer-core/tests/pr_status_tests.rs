@@ -3,10 +3,10 @@
 //! placeholder bodies (parse returns None, colors return Default). The next pass
 //! implements the logic to make them pass.
 
-use agent_viewer_core::pr_status::{
-    aggregate_color, parse_pr_url, pr_color, rollup_check_state, CheckState, PrStatusFacts,
-};
 use agent_viewer_core::PrBadgeColor;
+use agent_viewer_core::pr_status::{
+    CheckState, PrStatusFacts, aggregate_color, parse_pr_url, pr_color, rollup_check_state,
+};
 
 // Build PrStatusFacts with sane defaults (open, no CI, not draft, no review), so each
 // test overrides only the fields it exercises.
@@ -75,7 +75,10 @@ fn parse_pr_url_dots_and_dashes_in_names() {
 
 #[test]
 fn parse_pr_url_issues_is_not_pull() {
-    assert_eq!(parse_pr_url("https://github.com/acme/repo/issues/315"), None);
+    assert_eq!(
+        parse_pr_url("https://github.com/acme/repo/issues/315"),
+        None
+    );
 }
 
 #[test]
@@ -287,7 +290,10 @@ fn pr_color_state_lowercase_closed() {
 #[test]
 fn rollup_empty_is_none() {
     let arr = serde_json::json!([]);
-    assert_eq!(rollup_check_state(arr.as_array().unwrap()), CheckState::None);
+    assert_eq!(
+        rollup_check_state(arr.as_array().unwrap()),
+        CheckState::None
+    );
 }
 
 #[test]

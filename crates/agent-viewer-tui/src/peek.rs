@@ -261,11 +261,19 @@ mod tests {
         let spaced = "\u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57}";
         let lines = wrap(spaced, 5);
         assert!(lines.len() > 1);
-        assert!(lines.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 5));
+        assert!(
+            lines
+                .iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 5)
+        );
         // Hard-split path: a single overlong wide word, no char lost.
         let solid = "\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}";
         let split = wrap(solid, 5);
-        assert!(split.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 5));
+        assert!(
+            split
+                .iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 5)
+        );
         assert_eq!(split.concat(), solid);
     }
 
@@ -322,14 +330,26 @@ mod tests {
 
     #[test]
     fn build_error_yields_error_lines() {
-        let lines = build(None, &[item("user", "hi")], Some("transcript unavailable"), &[], 40);
+        let lines = build(
+            None,
+            &[item("user", "hi")],
+            Some("transcript unavailable"),
+            &[],
+            40,
+        );
         assert!(!lines.is_empty());
         assert!(lines.iter().all(|l| l.kind == PeekKind::Error));
     }
 
     #[test]
     fn build_ask_is_first_line() {
-        let lines = build(Some("Approve the migration?"), &[item("assistant", "done")], None, &[], 40);
+        let lines = build(
+            Some("Approve the migration?"),
+            &[item("assistant", "done")],
+            None,
+            &[],
+            40,
+        );
         assert_eq!(lines[0].kind, PeekKind::Ask);
         assert!(lines[0].text.contains("Approve"));
     }
@@ -337,7 +357,10 @@ mod tests {
     #[test]
     fn build_caps_at_max_lines_with_trailing_ellipsis() {
         // A body that word-wraps into far more than MAX_PEEK_LINES lines.
-        let body = (0..100).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let body = (0..100)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let lines = build(None, &[item("assistant", &body)], None, &[], 6);
         assert_eq!(lines.len(), MAX_PEEK_LINES);
         assert_eq!(lines.last().unwrap().text, "…");

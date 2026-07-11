@@ -295,7 +295,10 @@ fn arrow_navigation_stops_on_headers_and_wraps_at_ends() {
     app.move_selection(-1);
     assert!(matches!(
         app.visible()[app.selected_index()],
-        Row::SectionHeader { section: Section::NeedsInput, .. }
+        Row::SectionHeader {
+            section: Section::NeedsInput,
+            ..
+        }
     ));
     assert!(app.selected().is_none()); // a header is not a session
 
@@ -307,7 +310,10 @@ fn arrow_navigation_stops_on_headers_and_wraps_at_ends() {
     app.move_selection(1);
     assert!(matches!(
         app.visible()[app.selected_index()],
-        Row::SectionHeader { section: Section::NeedsInput, .. }
+        Row::SectionHeader {
+            section: Section::NeedsInput,
+            ..
+        }
     ));
 
     // A mid-list Down stops on the next section header before its session.
@@ -315,7 +321,10 @@ fn arrow_navigation_stops_on_headers_and_wraps_at_ends() {
     app.move_selection(1);
     assert!(matches!(
         app.visible()[app.selected_index()],
-        Row::SectionHeader { section: Section::Idle, .. }
+        Row::SectionHeader {
+            section: Section::Idle,
+            ..
+        }
     ));
     app.move_selection(1);
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("idle"));
@@ -350,9 +359,11 @@ fn arrow_wrap_is_scoped_to_the_filtered_rows() {
     app.set_filter("aaa".to_string()); // only alpha + gamma remain visible (two groups)
     assert_eq!(session_rows(app.visible()).len(), 2);
     // beta is filtered out entirely.
-    assert!(!app.visible().iter().any(
-        |r| matches!(r, Row::Session { id, .. } if id == "beta")
-    ));
+    assert!(
+        !app.visible()
+            .iter()
+            .any(|r| matches!(r, Row::Session { id, .. } if id == "beta"))
+    );
 
     select(&mut app, "gamma"); // last visible session row
     app.move_selection(1); // Down at the bottom wraps to the FIRST visible row (aaa header)
@@ -985,8 +996,20 @@ fn group_key_storage_roundtrip() {
 fn collapse_hides_group_rows_and_marks_header() {
     // Two distinct project dirs. Group a is newest so it sorts first.
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     assert_eq!(app.group_mode(), GroupMode::ByProject);
@@ -1022,8 +1045,20 @@ fn collapse_hides_group_rows_and_marks_header() {
 #[test]
 fn expand_restores_group_rows() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");
@@ -1047,8 +1082,20 @@ fn expand_restores_group_rows() {
 #[test]
 fn selection_stays_on_header_after_toggle() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");
@@ -1068,9 +1115,27 @@ fn selection_stays_on_header_after_toggle() {
 fn navigation_skips_collapsed_group_rows() {
     // Group a has two sessions; collapsing it must remove both from navigation.
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "a2", "/synthetic/a", 290, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "a2",
+            "/synthetic/a",
+            290,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");
@@ -1101,14 +1166,29 @@ fn navigation_skips_collapsed_group_rows() {
         }
         app.move_selection(-1);
     }
-    assert!(reached_b1, "the uncollapsed group's session must stay reachable");
+    assert!(
+        reached_b1,
+        "the uncollapsed group's session must stay reachable"
+    );
 }
 
 #[test]
 fn headers_are_selectable_via_arrows() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
 
@@ -1135,8 +1215,20 @@ fn headers_are_selectable_via_arrows() {
 #[test]
 fn toggle_selected_group_none_on_session_row() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     select(&mut app, "a1");
@@ -1175,8 +1267,20 @@ fn collapse_keyed_by_state_in_by_state_mode() {
 #[test]
 fn collapsed_state_survives_refresh() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");
@@ -1189,8 +1293,20 @@ fn collapsed_state_survives_refresh() {
 
     // A background refresh replaces the session list (same members, reordered).
     app.set_sessions(vec![
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 250, Status::Working),
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            250,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
     ]);
 
     // The collapse survives the rebuild: still collapsed, header still marked, rows still hidden.
@@ -1205,8 +1321,20 @@ fn collapsed_state_survives_refresh() {
 #[test]
 fn set_collapsed_seeds_collapsed_groups() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");
@@ -1228,8 +1356,20 @@ fn set_collapsed_seeds_collapsed_groups() {
 #[test]
 fn spawn_target_falls_back_to_project_header_root() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a1", "/synthetic/a", 300, Status::Working),
-        sess(BackendKind::Codex, "b1", "/synthetic/b", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a1",
+            "/synthetic/a",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b1",
+            "/synthetic/b",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let root_a = PathBuf::from("/synthetic/a");

@@ -190,11 +190,7 @@ fn exec_summary_quotes_whitespace_args() {
     assert_eq!(approval.summary(), "echo 'a b'");
     // Shell metacharacters are quoted too, so the summary never misstates the argv.
     let meta = PendingApproval::Exec {
-        command: vec![
-            "$HOME".to_string(),
-            "a;b".to_string(),
-            "*.rs".to_string(),
-        ],
+        command: vec!["$HOME".to_string(), "a;b".to_string(), "*.rs".to_string()],
         cwd: None,
     };
     assert_eq!(meta.summary(), "'$HOME' 'a;b' '*.rs'");

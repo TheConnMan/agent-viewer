@@ -849,7 +849,10 @@ mod tests {
         let key1 = ui.composer.commands_key().cloned();
         assert_eq!(
             key1,
-            Some((BackendKind::Claude, Some("/tmp/agentviewer-target-a".into())))
+            Some((
+                BackendKind::Claude,
+                Some("/tmp/agentviewer-target-a".into())
+            ))
         );
 
         // The selected session (and thus spawn target) changes WITHOUT going through the
@@ -863,7 +866,10 @@ mod tests {
         ensure_completions(&mut ui);
         assert_eq!(
             ui.composer.commands_key(),
-            Some(&(BackendKind::Claude, Some("/tmp/agentviewer-target-b".into())))
+            Some(&(
+                BackendKind::Claude,
+                Some("/tmp/agentviewer-target-b".into())
+            ))
         );
     }
 

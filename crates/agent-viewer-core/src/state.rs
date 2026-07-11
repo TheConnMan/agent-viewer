@@ -261,7 +261,9 @@ impl ViewerDb {
 
     /// Every collapsed-group key (opaque strings the TUI seeds its collapsed set from).
     pub fn collapsed_groups(&self) -> Result<HashSet<String>> {
-        let mut stmt = self.conn.prepare("SELECT group_key FROM collapsed_groups")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_key FROM collapsed_groups")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut keys = HashSet::new();
         for row in rows {
