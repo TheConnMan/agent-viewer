@@ -41,6 +41,10 @@ pub struct PtySession {
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     reader_thread: Option<JoinHandle<()>>,
+    /// True once the child has been reaped (via is_exited or kill). After reap the
+    /// numeric pid may be recycled by an unrelated process, so NO signal path (group
+    /// SIGKILL or child.kill) may run once this is set — it would hit a stranger.
+    exited: bool,
 }
 
 impl PtySession {
@@ -120,6 +124,7 @@ impl PtySession {
             writer,
             parser,
             reader_thread: Some(reader_thread),
+            exited: false,
         })
     }
 
@@ -157,7 +162,15 @@ impl PtySession {
     }
 
     pub fn is_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        // try_wait reaps on Ok(Some): once observed exited, latch it so kill() never
+        // signals the (now potentially recycled) pid.
+        if self.exited {
+            return true;
+        }
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.exited = true;
+        }
+        self.exited
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -166,22 +179,29 @@ impl PtySession {
 
     /// Kill + reap the child, join the reader. Idempotent.
     pub fn kill(&mut self) {
-        // SIGKILL the child's whole process group first: a backgrounded grandchild in the
-        // same group can keep the pty slave open after the direct child is reaped, leaving
-        // the master reader blocked on read() forever. portable-pty spawns the child as a
-        // session/group leader (setsid), so its pid is the pgid.
-        if let Some(pid) = self.child.process_id() {
-            let pid = pid as libc::pid_t;
-            // Safety: getpgid/kill are simple libc calls; a negative pgid targets the group.
-            unsafe {
-                let pgid = libc::getpgid(pid);
-                if pgid > 0 {
-                    libc::kill(-pgid, libc::SIGKILL);
+        // Signal ONLY while the child is still ours to signal. Once reaped (self.exited),
+        // its pid may have been recycled by an unrelated process, so both the group SIGKILL
+        // and child.kill() below would target a stranger — skip all of it and just clean up
+        // the reader thread.
+        if !self.exited {
+            // SIGKILL the child's whole process group first: a backgrounded grandchild in
+            // the same group can keep the pty slave open after the direct child is reaped,
+            // leaving the master reader blocked on read() forever. portable-pty spawns the
+            // child as a session/group leader (setsid), so its pid is the pgid.
+            if let Some(pid) = self.child.process_id() {
+                let pid = pid as libc::pid_t;
+                // Safety: getpgid/kill are simple libc calls; a negative pgid targets the group.
+                unsafe {
+                    let pgid = libc::getpgid(pid);
+                    if pgid > 0 {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
                 }
             }
+            let _ = self.child.kill();
+            let _ = self.child.wait(); // reap the zombie
+            self.exited = true;
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait(); // reap the zombie
         if let Some(handle) = self.reader_thread.take() {
             // The group kill closes the slave for the common case, so join returns at once.
             // A grandchild that escaped the group (its own setsid session) can still hold

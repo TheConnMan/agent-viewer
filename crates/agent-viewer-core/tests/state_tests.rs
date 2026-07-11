@@ -165,29 +165,65 @@ fn apply_viewer_state_pins_renames_pids() {
 }
 
 #[test]
-fn viewer_db_prunes_resolved_spawns_older_than_7_days() {
+fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
     let (_dir, path) = temp_db_path();
     let now = agent_viewer_core::spawn::now_ms();
     let eight_days = 8 * 24 * 60 * 60 * 1000;
+    let db = ViewerDb::open(&path).expect("open viewer db");
 
-    {
-        let db = ViewerDb::open(&path).expect("open viewer db");
-        // An old resolved pin (stale) and a recent resolved pin (should survive).
-        let old = db
-            .record_spawn(BackendKind::Codex, &PathBuf::from("/p/old"), 1, now - eight_days)
-            .expect("record old");
-        db.resolve_spawn(old, "old-sess").expect("resolve old");
-        let recent = db
-            .record_spawn(BackendKind::Codex, &PathBuf::from("/p/new"), 2, now)
-            .expect("record recent");
-        db.resolve_spawn(recent, "recent-sess").expect("resolve recent");
-    }
+    // Old + live (session still exists): must survive despite its age.
+    let old_live = db
+        .record_spawn(BackendKind::Codex, &PathBuf::from("/p/live"), 1, now - eight_days)
+        .expect("record old-live");
+    db.resolve_spawn(old_live, "old-live-sess").expect("resolve");
+    // Old + dead (session gone): the only row that should be pruned.
+    let old_dead = db
+        .record_spawn(BackendKind::Codex, &PathBuf::from("/p/dead"), 2, now - eight_days)
+        .expect("record old-dead");
+    db.resolve_spawn(old_dead, "old-dead-sess").expect("resolve");
+    // Young + dead (session gone but row still fresh): survives (under the cutoff).
+    let young_dead = db
+        .record_spawn(BackendKind::Codex, &PathBuf::from("/p/young"), 3, now)
+        .expect("record young-dead");
+    db.resolve_spawn(young_dead, "young-dead-sess").expect("resolve");
 
-    // Reopening runs the on-open prune.
-    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    // Only old-live-sess is present in the live set.
+    let mut live = HashSet::new();
+    live.insert((BackendKind::Codex, "old-live-sess".to_string()));
+    db.prune_resolved_missing(&live).expect("prune");
+
     let pinned = db.viewer_state().expect("viewer state").pinned;
-    assert!(!pinned.contains(&(BackendKind::Codex, "old-sess".to_string())));
-    assert!(pinned.contains(&(BackendKind::Codex, "recent-sess".to_string())));
+    assert!(
+        pinned.contains(&(BackendKind::Codex, "old-live-sess".to_string())),
+        "old row whose session is still live must keep its pin"
+    );
+    assert!(
+        !pinned.contains(&(BackendKind::Codex, "old-dead-sess".to_string())),
+        "old row absent from live must be pruned"
+    );
+    assert!(
+        pinned.contains(&(BackendKind::Codex, "young-dead-sess".to_string())),
+        "young row must survive even when absent from live"
+    );
+}
+
+#[test]
+fn clear_name_override_removes_rename() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    db.set_name_override(BackendKind::Claude, "abc", "Local Name")
+        .expect("set name");
+    db.clear_name_override(BackendKind::Claude, "abc")
+        .expect("clear name");
+
+    assert!(
+        !db.viewer_state()
+            .unwrap()
+            .renames
+            .contains_key(&(BackendKind::Claude, "abc".to_string())),
+        "cleared override must leave no rename for the key"
+    );
 }
 
 #[test]

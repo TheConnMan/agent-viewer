@@ -91,6 +91,38 @@ fn pty_kill_returns_when_grandchild_holds_slave() {
 }
 
 #[test]
+fn pty_kill_after_reap_never_signals() {
+    // is_exited() reaps the child via try_wait; a later kill() must NOT re-signal the
+    // (now potentially recycled) numeric pid. The `exited` latch guards every signal
+    // path in kill() by construction — see pty.rs::kill, whose group-SIGKILL and
+    // child.kill() both sit behind `if !self.exited`. Here we assert the observable half:
+    // once is_exited() latches, kill() returns promptly without panicking.
+    let mut session =
+        PtySession::spawn(spec("sh", &["-c", "exit 0"], 24, 80)).expect("spawn pty");
+
+    let start = Instant::now();
+    while !session.is_exited() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "child `exit 0` never observed exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // kill() on a reaped session takes the no-signal path; run it on a helper thread so a
+    // regression (a hang) surfaces as a timeout rather than blocking the test forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        session.kill();
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "kill() after reap did not return promptly"
+    );
+}
+
+#[test]
 fn pty_child_survives_detach_dies_on_drop() {
     let mut session =
         PtySession::spawn(spec("sleep", &["30"], 24, 80)).expect("spawn pty");

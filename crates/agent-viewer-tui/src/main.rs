@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -161,6 +161,14 @@ fn tick_refresh(
     let (mut sessions, notice, _ok) = refresh(backends, last);
     if let Some(db) = &ui.db {
         overlay(db, &mut sessions);
+        // Prune stale resolved pins now that we know which sessions are live: a >7-day
+        // resolved row whose session no longer appears is dead weight, but one still in
+        // the fresh list keeps its pin regardless of age.
+        let live: HashSet<Key> = sessions
+            .iter()
+            .map(|s| (s.backend, s.id.clone()))
+            .collect();
+        let _ = db.prune_resolved_missing(&live);
     }
     // Update the focused-session header snapshot from the fresh list.
     if let Some(key) = &ui.focused
@@ -440,14 +448,11 @@ fn apply_rename(backends: &mut [Box<dyn Backend>], ui: &mut Ui) {
     };
     match backend.rename(&session, &name) {
         Ok(()) => {
-            // A prior daemon-down rename may have left a claude name override with the
-            // OLD name; the overlay applies it unconditionally and would shadow this
-            // native rename. Re-point the override at the new name (core-free: the
-            // override now equals the native title, so it is a no-op on display).
-            if backend_kind == BackendKind::Claude
-                && let Some(db) = &ui.db
-            {
-                let _ = db.set_name_override(backend_kind, &id, &name);
+            // A prior daemon-down rename may have left a name override with the OLD name;
+            // the overlay applies it unconditionally and would shadow this native rename.
+            // Clear the override so the native title shows through.
+            if let Some(db) = &ui.db {
+                let _ = db.clear_name_override(backend_kind, &id);
             }
             ui.notice = format!("renamed {}", backend_kind.name());
         }

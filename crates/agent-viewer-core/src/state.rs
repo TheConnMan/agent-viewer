@@ -95,16 +95,43 @@ impl ViewerDb {
         // WAL so two concurrent viewers coexist (last-writer-wins on advisory state).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
-        // Prune resolved spawn rows older than 7 days on open: they are always-visible
-        // pins whose sessions are long gone, so left unpruned they grow the table and the
-        // per-tick overlay scan without bound. Unresolved rows are handled by the caller's
-        // 10-minute abandonment rule.
-        let cutoff = crate::spawn::now_ms() - 7 * 24 * 60 * 60 * 1000;
-        conn.execute(
-            "DELETE FROM spawned WHERE session_id IS NOT NULL AND spawned_at_ms < ?1",
-            rusqlite::params![cutoff],
-        )?;
         Ok(ViewerDb { conn })
+    }
+
+    /// Prune resolved spawn rows older than 7 days whose (backend, session_id) is NOT in
+    /// `live`. Resolved rows are always-visible pins; once their session is gone AND the
+    /// row is stale they only grow the table and the per-tick overlay scan. The live check
+    /// is the safety belt: a still-existing session keeps its pin no matter how old the row
+    /// is, so a long-running spawned session never loses its always-visible status.
+    /// (Unresolved rows are handled by the caller's abandonment rule.)
+    pub fn prune_resolved_missing(&self, live: &HashSet<(BackendKind, String)>) -> Result<()> {
+        let cutoff = crate::spawn::now_ms() - 7 * 24 * 60 * 60 * 1000;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, backend, session_id FROM spawned \
+             WHERE session_id IS NOT NULL AND spawned_at_ms < ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut doomed = Vec::new();
+        for row in rows {
+            let (rowid, backend, session_id) = row?;
+            let Some(backend) = backend_from_str(&backend) else {
+                continue;
+            };
+            if !live.contains(&(backend, session_id)) {
+                doomed.push(rowid);
+            }
+        }
+        for rowid in doomed {
+            self.conn
+                .execute("DELETE FROM spawned WHERE id = ?1", rusqlite::params![rowid])?;
+        }
+        Ok(())
     }
 
     pub fn record_spawn(
@@ -198,6 +225,16 @@ impl ViewerDb {
         self.conn.execute(
             "INSERT OR REPLACE INTO renames (backend, session_id, name) VALUES (?1, ?2, ?3)",
             rusqlite::params![backend.name(), session_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Drop any name override for this session. Called on a successful native rename so a
+    /// stale override (left by an earlier daemon-down fallback) cannot shadow the real name.
+    pub fn clear_name_override(&self, backend: BackendKind, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM renames WHERE backend = ?1 AND session_id = ?2",
+            rusqlite::params![backend.name(), session_id],
         )?;
         Ok(())
     }
