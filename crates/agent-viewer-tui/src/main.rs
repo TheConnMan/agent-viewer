@@ -126,8 +126,13 @@ struct Ui {
     peek: PeekCache,
     /// Inline spawn composer (persistent on the list view).
     composer: Composer,
-    /// Left-arrow detach gate while attached (reset on each attach).
-    detach: DetachTracker,
+    /// Per-PTY left-arrow detach gate, keyed like `attached`. Reset only when a new PTY is
+    /// spawned; a re-attach reuses the previous pending count (the child's input line may
+    /// still hold text). Pruned alongside its PTY.
+    detach_trackers: HashMap<Key, DetachTracker>,
+    /// The last backend-error string surfaced as a notice (dedup memo, so a recurring error
+    /// neither restamps nor starves action notices).
+    last_backend_error: String,
     /// Blocking backend mutations run off the render thread.
     mutations: MutationRunner,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
@@ -181,7 +186,8 @@ fn main() -> io::Result<()> {
         db,
         peek: PeekCache::new(),
         composer: Composer::new(),
-        detach: DetachTracker::new(),
+        detach_trackers: HashMap::new(),
+        last_backend_error: String::new(),
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
         attached: HashMap::new(),
@@ -359,11 +365,36 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
         ui.focused_session = Some(s.clone());
     }
     ui.app.set_sessions(sessions);
-    // Only surface a real backend-error notice; never clobber an action notice with empty.
-    if !notice.is_empty() && matches!(ui.mode, Mode::Normal) {
+    // Surface a backend-error notice, but do not let a per-second recurring error restamp
+    // (which would starve spawn/mutation feedback and make the error effectively permanent):
+    // show it only when it CHANGED and the footer is free (empty/expired, or already the old
+    // error). Reset the memo when the error clears so a later recurrence shows again.
+    if notice.is_empty() {
+        ui.last_backend_error.clear();
+    } else if matches!(ui.mode, Mode::Normal)
+        && backend_error_should_show(
+            &notice,
+            ui.notice.text(),
+            ui.notice.expired(now_ms()),
+            &ui.last_backend_error,
+        )
+    {
+        ui.last_backend_error = notice.clone();
         ui.set_notice(notice);
     }
     prune_exited(ui);
+}
+
+/// Whether a snapshot's backend-error `err` should replace the current footer notice, given
+/// the current notice text, whether it has expired, and the last error already shown. A blank
+/// or unchanged error never shows (so a recurring error neither restamps nor starves an action
+/// notice); a changed error shows only when the footer is free (empty/expired) or is itself
+/// the previous backend error.
+fn backend_error_should_show(err: &str, current: &str, current_expired: bool, last_error: &str) -> bool {
+    if err.is_empty() || err == last_error {
+        return false;
+    }
+    current.is_empty() || current_expired || current == last_error
 }
 
 /// Drop PTYs whose child has exited, EXCEPT the focused one (its final screen stays
@@ -377,6 +408,7 @@ fn prune_exited(ui: &mut Ui) {
         }
         if ui.attached.get_mut(&key).is_some_and(|pty| pty.is_exited()) {
             ui.attached.remove(&key);
+            ui.detach_trackers.remove(&key);
         }
     }
 }
@@ -445,10 +477,20 @@ fn run_mutation(m: Mutation) -> Result<String, String> {
             }
             Err(e) => Err(format!("stop failed: {e}")),
         },
-        Mutation::Remove(s) => fresh_backend(s.backend)
-            .remove(&s.id)
-            .map(|()| format!("removed — {}", s.title))
-            .map_err(|e| format!("remove failed: {e}")),
+        Mutation::Remove(s) => {
+            // Terminate the live process FIRST, inside this same thread, before archiving or
+            // deleting. Two-stage Ctrl+X submits `stop` then `remove` on different dedup keys,
+            // so the two race; killing here guarantees ordering within the remove op and makes
+            // a concurrent `stop` harmless — terminate is idempotent (ESRCH/gone -> Ok) and
+            // pid-guarded by comm prefix, so it never signals a recycled pid.
+            if let Some(pid) = s.pid {
+                let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
+            }
+            fresh_backend(s.backend)
+                .remove(&s.id)
+                .map(|()| format!("removed — {}", s.title))
+                .map_err(|e| format!("remove failed: {e}"))
+        }
         Mutation::Rename(s, name) => match fresh_backend(s.backend).rename(&s, &name) {
             Ok(()) => {
                 // A prior daemon-down rename may have left a stale override; clear it so
@@ -595,7 +637,7 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         return;
     }
 
-    // If the child has exited, any key drops the dead PTY and returns to the list.
+    // If the child has exited, any key drops the dead PTY (and its tracker) and returns.
     let exited = ui
         .attached
         .get_mut(&fkey)
@@ -603,22 +645,31 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         .unwrap_or(true);
     if exited {
         ui.attached.remove(&fkey);
+        ui.detach_trackers.remove(&fkey);
         detach_to_list(ui);
         return;
     }
 
-    // Left detaches only when nothing is half-typed; otherwise forward it as cursor motion.
-    if matches!(key.code, KeyCode::Left) && ui.detach.detach_on_left() {
+    // Left detaches only when this PTY's input line is empty; otherwise forward it as cursor
+    // motion. The tracker is per-PTY so a re-attach preserves any half-typed line.
+    if matches!(key.code, KeyCode::Left)
+        && ui
+            .detach_trackers
+            .get(&fkey)
+            .is_none_or(|t| t.detach_on_left())
+    {
         detach_to_list(ui);
         return;
     }
 
     // Track pending input so the Left-gate knows whether the line is mid-edit.
-    match key.code {
-        KeyCode::Char(_) => ui.detach.on_char(),
-        KeyCode::Backspace => ui.detach.on_backspace(),
-        KeyCode::Enter => ui.detach.on_enter(),
-        _ => {}
+    if let Some(tracker) = ui.detach_trackers.get_mut(&fkey) {
+        match key.code {
+            KeyCode::Char(_) => tracker.on_char(),
+            KeyCode::Backspace => tracker.on_backspace(),
+            KeyCode::Enter => tracker.on_enter(),
+            _ => {}
+        }
     }
 
     if let Some(bytes) = key_to_bytes(key)
@@ -809,8 +860,10 @@ fn attach_selected(
     let cols = size.width.max(1);
 
     if let Some(pty) = ui.attached.get_mut(&key) {
-        // Re-attach: reuse the live PTY, resizing it to the current content area.
+        // Re-attach: reuse the live PTY, resizing it to the current content area. The
+        // per-PTY detach tracker is preserved so a half-typed input line still gates Left.
         let _ = pty.resize(rows, cols);
+        ui.detach_trackers.entry(key.clone()).or_default();
     } else {
         // Pre-accept the trust dialog before a claude RESUME attach into a fresh project
         // (best-effort; the live agents-view path and other backends never need it).
@@ -829,6 +882,8 @@ fn attach_selected(
         match PtySession::spawn(spec) {
             Ok(pty) => {
                 ui.attached.insert(key.clone(), pty);
+                // Fresh Left-gate: a brand-new PTY starts with an empty input line.
+                ui.detach_trackers.insert(key.clone(), DetachTracker::new());
             }
             Err(e) => {
                 ui.set_notice(format!("attach failed: {e}"));
@@ -837,7 +892,6 @@ fn attach_selected(
         }
     }
 
-    ui.detach = DetachTracker::new(); // fresh Left-gate for this attach
     ui.focused = Some(key);
     ui.focused_session = Some(session);
     ui.mode = Mode::Attached;
@@ -912,7 +966,23 @@ fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTICE_MS, NoticeState};
+    use super::{NOTICE_MS, NoticeState, backend_error_should_show};
+
+    #[test]
+    fn backend_error_show_dedups_and_respects_action_notice() {
+        // A blank error never shows.
+        assert!(!backend_error_should_show("", "", false, ""));
+        // A new error over an empty footer shows.
+        assert!(backend_error_should_show("boom", "", false, ""));
+        // The SAME recurring error does not re-show (no restamp -> no starvation).
+        assert!(!backend_error_should_show("boom", "boom", false, "boom"));
+        // A live (non-expired) action notice is not clobbered by an error.
+        assert!(!backend_error_should_show("boom", "spawned on codex", false, ""));
+        // Once that action notice has expired, the error may take the footer.
+        assert!(backend_error_should_show("boom", "spawned on codex", true, ""));
+        // A CHANGED error replaces the previous backend error currently on screen.
+        assert!(backend_error_should_show("boom2", "boom", false, "boom"));
+    }
 
     #[test]
     fn notice_expires_only_after_notice_ms() {

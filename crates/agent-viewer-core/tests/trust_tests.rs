@@ -76,6 +76,21 @@ fn ensure_trusted_merges_and_preserves_all_keys() {
 }
 
 #[test]
+fn ensure_trusted_errs_and_preserves_a_malformed_config() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("claude.json");
+    // A real ~/.claude.json holds the account, projects, MCP config; if it is unparseable we
+    // must NEVER overwrite it with a fresh minimal object.
+    std::fs::write(&path, "{ this is not valid json ").unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let result = ensure_trusted(&path, Path::new("/work/proj"));
+    assert!(result.is_err()); // parse failure -> Err, never a silent wipe
+    // The user's (unparseable) config is left byte-for-byte intact.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn ensure_trusted_creates_missing_config() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("does-not-exist.json");

@@ -168,10 +168,14 @@ impl Backend for ClaudeBackend {
 /// own sanctioned field — its error text instructs setting exactly `hasTrustDialogAccepted`
 /// for non-interactive use.
 pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> Result<bool> {
+    // Only a MISSING file may be created fresh. A read error or a parse failure returns Err
+    // WITHOUT writing — substituting an empty object and renaming over the original would
+    // erase the user's whole claude config (account, projects, MCP). The TUI caller treats
+    // Err as best-effort and just proceeds with the attach.
     let mut config: serde_json::Value = match std::fs::read_to_string(config_path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
-        // Missing file -> start from a minimal structure and create it.
-        Err(_) => serde_json::json!({}),
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
     };
 
     // Already trusted if cwd or any ancestor has hasTrustDialogAccepted == true.
