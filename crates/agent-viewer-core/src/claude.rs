@@ -420,6 +420,11 @@ pub fn read_claude_transcript(
             }
             _ => continue,
         };
+        // A message whose content is only thinking/tool blocks extracts to "" — skip it
+        // so peek never shows a blank role-only line.
+        if text.is_empty() {
+            continue;
+        }
         items.push(TranscriptItem {
             role: role.to_string(),
             text,

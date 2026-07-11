@@ -149,10 +149,14 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
                 text.push_str(t);
             }
         }
-        items.push(TranscriptItem {
-            role: role.to_string(),
-            text,
-        });
+        // Tool-only response_items extract to "" — skip them so peek never shows a
+        // blank role-only line.
+        if !text.is_empty() {
+            items.push(TranscriptItem {
+                role: role.to_string(),
+                text,
+            });
+        }
     }
     Ok(items)
 }
