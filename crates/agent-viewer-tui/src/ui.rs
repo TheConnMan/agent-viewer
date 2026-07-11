@@ -382,10 +382,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         return;
     }
 
-    // list · blank gap · bordered composer box (3 rows) · footer.
+    // header (blank gap + title) · list · blank gap · bordered composer box (3 rows) · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -408,9 +409,10 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         expand_lines: &expand_lines,
     };
 
+    draw_header(frame, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
-    draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[0]);
+    draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[1]);
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
     // force-expanded peek above it); every other mode shows the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
@@ -419,21 +421,21 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             .session_for(&(m.backend, m.id.clone()))
             .map(|s| s.title.clone())
             .unwrap_or_default();
-        draw_reply(frame, m, vertical[2], &title);
+        draw_reply(frame, m, vertical[3], &title);
     } else {
         draw_composer(
             frame,
             d.app,
             d.composer,
-            vertical[2],
+            vertical[3],
             matches!(d.mode, Mode::Normal),
         );
     }
-    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[3]);
+    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[4]);
 
     // Slash-command completion popup, floating just above the composer box.
     if matches!(d.mode, Mode::Normal) {
-        draw_slash_popup(frame, d.composer, vertical[2]);
+        draw_slash_popup(frame, d.composer, vertical[3]);
     }
 
     if matches!(d.mode, Mode::Help) {
@@ -646,6 +648,18 @@ fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: 
         let x = inner.x + (col as u16).min(inner.width - 1);
         frame.set_cursor_position((x, inner.y));
     }
+}
+
+// --- Header ---------------------------------------------------------------------
+
+/// The app title with a little breathing room: a blank line on top, then `Agent Viewer`
+/// in accent on the second row. `area` is the 2-row header slice from the main layout.
+fn draw_header(frame: &mut Frame, area: Rect) {
+    let title = Line::from(Span::styled(
+        " Agent Viewer",
+        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(vec![Line::default(), title]), area);
 }
 
 // --- Main list ------------------------------------------------------------------
