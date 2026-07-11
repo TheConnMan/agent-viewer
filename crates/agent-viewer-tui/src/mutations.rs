@@ -30,12 +30,11 @@ impl MutationRunner {
     }
 
     /// Run `op` on a worker thread under `key`. Returns false (a no-op) when `key` is
-    /// already in flight. `label` is advisory — the caller uses it for the submit notice.
-    pub fn submit<F>(&mut self, key: String, label: String, op: F) -> bool
+    /// already in flight.
+    pub fn submit<F>(&mut self, key: String, op: F) -> bool
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
-        let _ = label;
         if self.in_flight.contains(&key) {
             return false;
         }

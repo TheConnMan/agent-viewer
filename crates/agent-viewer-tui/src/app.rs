@@ -53,6 +53,9 @@ pub enum KillStage {
     Noop,
 }
 
+/// How long an armed Ctrl+X stays live before the second press re-arms instead of removing.
+const KILL_ARM_WINDOW_MS: i64 = 2_000;
+
 pub struct App {
     sessions: Vec<Session>,
     selected: usize,
@@ -71,6 +74,9 @@ pub struct App {
     /// rebuild path can centrally collapse it the moment the selection diverges from it
     /// (regroup / show-all / filter / cursor move), never rendering the wrong transcript.
     expanded: Option<(BackendKind, String)>,
+    /// Cached `hidden_count()` value, recomputed with the rows (it depends on exactly the
+    /// same inputs), so the per-frame footer never re-filters the session list.
+    hidden_rows: usize,
 }
 
 impl App {
@@ -85,6 +91,7 @@ impl App {
             root_cache: HashMap::new(),
             armed_kill: None,
             expanded: None,
+            hidden_rows: 0,
         };
         app.rebuild_rows();
         app.clamp_selection();
@@ -97,21 +104,17 @@ impl App {
         let anchor = self.selected().map(|s| (s.backend, s.id.clone()));
         self.sessions = sessions;
         self.rebuild_rows();
-        if let Some((backend, id)) = anchor
-            && let Some(idx) = self.rows.iter().position(|r| {
-                matches!(r, Row::Session { backend: b, id: rid, .. } if *b == backend && rid == &id)
-            })
+        if let Some(anchor) = anchor
+            && self.select_by_key(&anchor)
         {
-            self.selected = idx;
-            self.sync_expanded();
             return;
         }
         self.clamp_selection();
     }
 
-    /// The render model (a clone of the cached rows).
-    pub fn visible(&self) -> Vec<Row> {
-        self.rows.clone()
+    /// The render model (borrows the cached rows; rendered fresh every frame).
+    pub fn visible(&self) -> &[Row] {
+        &self.rows
     }
 
     /// key 'a' (I-2): one show-all toggle covering companions + archived rows.
@@ -126,14 +129,9 @@ impl App {
     }
 
     /// Rows suppressed by the default view (companion or archived, when !show_all).
+    /// Cached at rebuild time — see `hidden_rows`.
     pub fn hidden_count(&self) -> usize {
-        if self.show_all {
-            return 0;
-        }
-        self.sessions
-            .iter()
-            .filter(|s| (s.hidden || s.companion) && self.passes_filter(s))
-            .count()
+        self.hidden_rows
     }
 
     /// key Ctrl+S — toggle ByState / ByProject grouping.
@@ -165,7 +163,7 @@ impl App {
         if let Some((armed_backend, armed_id, armed_at)) = &self.armed_kill
             && *armed_backend == backend
             && armed_id == &id
-            && now_ms.saturating_sub(*armed_at) <= 2_000
+            && now_ms.saturating_sub(*armed_at) <= KILL_ARM_WINDOW_MS
         {
             self.armed_kill = None;
             return KillStage::Remove;
@@ -185,7 +183,8 @@ impl App {
             return false;
         };
         matches!(&self.armed_kill, Some((b, id, at))
-            if *b == session.backend && id == &session.id && now_ms.saturating_sub(*at) <= 2_000)
+            if *b == session.backend && id == &session.id
+                && now_ms.saturating_sub(*at) <= KILL_ARM_WINDOW_MS)
     }
 
     /// key '/'
@@ -244,10 +243,7 @@ impl App {
 
     pub fn selected(&self) -> Option<&Session> {
         match self.rows.get(self.selected)? {
-            Row::Session { backend, id, .. } => self
-                .sessions
-                .iter()
-                .find(|s| s.backend == *backend && &s.id == id),
+            Row::Session { backend, id, .. } => self.find_session(*backend, id),
             _ => None,
         }
     }
@@ -284,9 +280,14 @@ impl App {
     /// EXPANDED key rather than the selection, which may have since diverged, and for the
     /// rename flow which must target the row by id even after a reorder).
     pub fn session_for(&self, key: &(BackendKind, String)) -> Option<&Session> {
+        self.find_session(key.0, &key.1)
+    }
+
+    /// Linear lookup of a session by (backend, id).
+    fn find_session(&self, backend: BackendKind, id: &str) -> Option<&Session> {
         self.sessions
             .iter()
-            .find(|s| s.backend == key.0 && s.id == key.1)
+            .find(|s| s.backend == backend && s.id == id)
     }
 
     /// Pin the selection onto the row for `key` if it is currently visible (used to keep the
@@ -320,16 +321,8 @@ impl App {
         match self.rows.get(self.selected)? {
             Row::ProjectHeader { root, .. } => Some(root.clone()),
             Row::Session { backend, id, .. } => {
-                let session = self
-                    .sessions
-                    .iter()
-                    .find(|s| s.backend == *backend && &s.id == id)?;
-                Some(
-                    self.root_cache
-                        .get(&session.cwd)
-                        .cloned()
-                        .unwrap_or_else(|| project_root(&session.cwd)),
-                )
+                let session = self.find_session(*backend, id)?;
+                Some(self.cached_root(&session.cwd))
             }
             _ => None,
         }
@@ -343,14 +336,18 @@ impl App {
     pub fn spawn_target(&self) -> Option<PathBuf> {
         let session = self.selected()?;
         match self.group_mode {
-            GroupMode::ByProject => Some(
-                self.root_cache
-                    .get(&session.cwd)
-                    .cloned()
-                    .unwrap_or_else(|| project_root(&session.cwd)),
-            ),
+            GroupMode::ByProject => Some(self.cached_root(&session.cwd)),
             GroupMode::ByState => Some(session.cwd.clone()),
         }
+    }
+
+    /// `project_root(cwd)` via the memo when possible. Read-only (`&self`), so a miss is
+    /// recomputed but not inserted — the ByProject rebuild is what populates the cache.
+    fn cached_root(&self, cwd: &Path) -> PathBuf {
+        self.root_cache
+            .get(cwd)
+            .cloned()
+            .unwrap_or_else(|| project_root(cwd))
     }
 
     pub fn filter(&self) -> &str {
@@ -405,6 +402,16 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         indices.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].updated_at_ms));
+
+        // Cache the suppressed-row count alongside the rows (same inputs, same lifetime).
+        self.hidden_rows = if self.show_all {
+            0
+        } else {
+            self.sessions
+                .iter()
+                .filter(|s| (s.hidden || s.companion) && self.passes_filter(s))
+                .count()
+        };
 
         self.rows = match self.group_mode {
             GroupMode::ByState => self.build_state_rows(&indices),
@@ -494,23 +501,12 @@ impl App {
         }
         if !matches!(self.rows.get(self.selected), Some(Row::Session { .. })) {
             // Snap onto the nearest Session row: search forward from here, then backward.
-            let mut found = None;
-            for i in self.selected..len {
-                if matches!(self.rows[i], Row::Session { .. }) {
-                    found = Some(i);
-                    break;
-                }
-            }
-            if found.is_none() {
-                for i in (0..self.selected).rev() {
-                    if matches!(self.rows[i], Row::Session { .. }) {
-                        found = Some(i);
-                        break;
-                    }
-                }
-            }
-            if let Some(f) = found {
-                self.selected = f;
+            let here = self.selected as i32;
+            if let Some(found) = self
+                .session_from(here, 1)
+                .or_else(|| self.session_from(here - 1, -1))
+            {
+                self.selected = found;
             }
         }
         self.sync_expanded();

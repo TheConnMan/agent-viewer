@@ -68,25 +68,25 @@ fn filter_matches_title_and_cwd_case_insensitive() {
         sess(BackendKind::Codex, "beta", "/synthetic/bananas", 200, Status::Done),
     ];
     let mut app = App::new(sessions);
-    assert_eq!(session_rows(&app.visible()).len(), 2);
+    assert_eq!(session_rows(app.visible()).len(), 2);
 
     // Case-insensitive title match ("alpha" == title of the first session).
     app.set_filter("ALPHA".to_string());
     let rows = app.visible();
-    let sr = session_rows(&rows);
+    let sr = session_rows(rows);
     assert_eq!(sr.len(), 1);
     assert!(matches!(sr[0], Row::Session { id, .. } if id == "alpha"));
 
     // Case-insensitive cwd match.
     app.set_filter("BANANAS".to_string());
     let rows = app.visible();
-    let sr = session_rows(&rows);
+    let sr = session_rows(rows);
     assert_eq!(sr.len(), 1);
     assert!(matches!(sr[0], Row::Session { id, .. } if id == "beta"));
 
     // Clearing restores.
     app.set_filter(String::new());
-    assert_eq!(session_rows(&app.visible()).len(), 2);
+    assert_eq!(session_rows(app.visible()).len(), 2);
 }
 
 // --- v2 list model (tests 31-37) ---
@@ -109,7 +109,7 @@ fn state_sections_order_and_fold() {
 
     // Section headers appear in the fixed order; Failed/Stopped have no headers.
     assert_eq!(
-        section_headers(&rows),
+        section_headers(rows),
         vec![Section::NeedsInput, Section::Working, Section::Idle, Section::Done]
     );
     // Failed and Stopped rows keep their own status and sit in the Done section.
@@ -129,7 +129,7 @@ fn state_sections_order_and_fold() {
         Status::Working,
     )]);
     only_working.toggle_group_mode();
-    assert_eq!(section_headers(&only_working.visible()), vec![Section::Working]);
+    assert_eq!(section_headers(only_working.visible()), vec![Section::Working]);
 }
 
 #[test]
@@ -152,8 +152,8 @@ fn done_section_is_uncapped() {
     assert_eq!(app.group_mode(), GroupMode::ByState);
     let rows = app.visible();
 
-    assert_eq!(section_headers(&rows), vec![Section::Done]);
-    assert_eq!(session_rows(&rows).len(), 20);
+    assert_eq!(section_headers(rows), vec![Section::Done]);
+    assert_eq!(session_rows(rows).len(), 20);
 }
 
 #[test]
@@ -167,25 +167,25 @@ fn toggle_group_mode_project_rows() {
     // v2.1 startup default is ByProject: one ProjectHeader (cross-backend merge), no sections.
     assert_eq!(app.group_mode(), GroupMode::ByProject);
     let rows = app.visible();
-    assert!(section_headers(&rows).is_empty());
-    assert_eq!(project_headers(&rows).len(), 1);
+    assert!(section_headers(rows).is_empty());
+    assert_eq!(project_headers(rows).len(), 1);
     assert!(rows.iter().any(|r| matches!(
         r,
         Row::ProjectHeader { root, count: 2 } if root == &PathBuf::from("/synthetic/shared")
     )));
-    assert_eq!(session_rows(&rows).len(), 2);
+    assert_eq!(session_rows(rows).len(), 2);
 
     // Ctrl+S -> ByState: section headers, no project headers.
     app.toggle_group_mode();
     assert_eq!(app.group_mode(), GroupMode::ByState);
-    assert!(project_headers(&app.visible()).is_empty());
-    assert!(!section_headers(&app.visible()).is_empty());
+    assert!(project_headers(app.visible()).is_empty());
+    assert!(!section_headers(app.visible()).is_empty());
 
     // Toggle back -> ByProject again.
     app.toggle_group_mode();
     assert_eq!(app.group_mode(), GroupMode::ByProject);
-    assert!(!project_headers(&app.visible()).is_empty());
-    assert!(section_headers(&app.visible()).is_empty());
+    assert!(!project_headers(app.visible()).is_empty());
+    assert!(section_headers(app.visible()).is_empty());
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn arrow_wrap_is_scoped_to_the_filtered_rows() {
     ];
     let mut app = App::new(sessions);
     app.set_filter("aaa".to_string()); // only alpha + gamma remain visible
-    assert_eq!(session_rows(&app.visible()).len(), 2);
+    assert_eq!(session_rows(app.visible()).len(), 2);
 
     select(&mut app, "gamma"); // last visible session row
     app.move_selection(1); // wraps within the filtered set, not the full list
@@ -336,7 +336,7 @@ fn show_all_covers_companions_and_archived() {
     let mut app = App::new(vec![companion, archived, visible]);
 
     // Default view hides both the companion and the archived row.
-    let ids: Vec<String> = session_rows(&app.visible())
+    let ids: Vec<String> = session_rows(app.visible())
         .iter()
         .filter_map(|r| match r {
             Row::Session { id, .. } => Some(id.clone()),
@@ -348,7 +348,7 @@ fn show_all_covers_companions_and_archived() {
 
     // 'a' reveals both hidden classes.
     app.toggle_show_all();
-    let shown: Vec<String> = session_rows(&app.visible())
+    let shown: Vec<String> = session_rows(app.visible())
         .iter()
         .filter_map(|r| match r {
             Row::Session { id, .. } => Some(id.clone()),

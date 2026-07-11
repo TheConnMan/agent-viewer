@@ -83,6 +83,11 @@ fn backend_mark_color(backend: BackendKind) -> ratatui::style::Color {
     }
 }
 
+/// Shorthand for the ubiquitous foreground-only span style.
+fn fg(color: ratatui::style::Color) -> Style {
+    Style::default().fg(color)
+}
+
 /// Terminal display width of a string (measured, not assumed — some glyphs are
 /// ambiguous/wide).
 fn display_width(s: &str) -> usize {
@@ -389,7 +394,7 @@ fn expansion_lines(app: &App, peek: &PeekCache, key: &(BackendKind, String)) -> 
         lines.push("(no transcript yet)".to_string());
     }
     let start = lines.len().saturating_sub(8);
-    lines[start..].to_vec()
+    lines.split_off(start)
 }
 
 /// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
@@ -413,7 +418,7 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::FAINT));
+        .border_style(fg(theme::FAINT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -422,31 +427,31 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
         .spawn_target()
         .map(|d| abbreviate_dir(&d))
         .unwrap_or_default();
-    // The fixed prefix before the input: `<mark> <backend> <dir> ❯ `.
-    let prefix = format!("{} {} {dir} ❯ ", backend_mark(backend), backend.name());
     let mut spans = vec![
         Span::styled(
             format!("{} {} ", backend_mark(backend), backend.name()),
-            Style::default().fg(backend_mark_color(backend)),
+            fg(backend_mark_color(backend)),
         ),
-        Span::styled(format!("{dir} "), Style::default().fg(theme::MUTED)),
-        Span::styled("❯ ", Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("{dir} "), fg(theme::MUTED)),
+        Span::styled("❯ ", fg(theme::ACCENT)),
     ];
     if composer.is_empty() {
         spans.push(Span::styled(
             "describe a task · tab to switch agent",
-            Style::default().fg(theme::FAINT),
+            fg(theme::FAINT),
         ));
     } else {
         spans.push(Span::styled(
             composer.text().to_string(),
-            Style::default().fg(theme::TEXT),
+            fg(theme::TEXT),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
     if show_cursor && inner.width > 0 {
-        // Cursor at the end of the typed text, clamped inside the box.
+        // Cursor at the end of the typed text, clamped inside the box. The prefix mirrors
+        // the fixed spans above: `<mark> <backend> <dir> ❯ `.
+        let prefix = format!("{} {} {dir} ❯ ", backend_mark(backend), backend.name());
         let col = display_width(&prefix) + display_width(composer.text());
         let x = inner.x + (col as u16).min(inner.width - 1);
         frame.set_cursor_position((x, inner.y));
@@ -461,7 +466,7 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     // The selection index only shifts if expansion lines are inserted BEFORE the selected
     // row; expansion always sits under the (selected) expanded row, so it stays aligned.
-    for row in &rows {
+    for row in rows {
         match row {
             Row::Session { backend, id, .. } => {
                 // In-place rename edit field replaces the row while renaming it.
@@ -481,7 +486,7 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
                     for line in deco.expand_lines {
                         items.push(ListItem::new(Line::from(Span::styled(
                             format!("      {}", truncate(line, width.saturating_sub(6))),
-                            Style::default().fg(theme::FAINT),
+                            fg(theme::FAINT),
                         ))));
                     }
                 }
@@ -531,14 +536,14 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
 /// of the buffer is the terminal's native cursor, placed by `draw_list`.
 fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
-        Span::styled("✎ ", Style::default().fg(theme::ACCENT)),
+        Span::styled("✎ ", fg(theme::ACCENT)),
         Span::styled(
             format!("{} ", backend_mark(backend)),
-            Style::default().fg(backend_mark_color(backend)),
+            fg(backend_mark_color(backend)),
         ),
         Span::styled(
             truncate(buffer, width.saturating_sub(6)),
-            Style::default().fg(theme::ACCENT),
+            fg(theme::ACCENT),
         ),
     ]))
 }
@@ -548,15 +553,11 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
         Row::Spacer => ListItem::new(Line::from("")),
         Row::SectionHeader { section, count } => ListItem::new(Line::from(Span::styled(
             format!("{}  ({count})", section_label(*section)),
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
+            fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         ))),
         Row::ProjectHeader { root, count } => ListItem::new(Line::from(Span::styled(
             format!("{}  ({count})", root.display()),
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
+            fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         ))),
         Row::Session {
             backend,
@@ -569,9 +570,12 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
             ..
         } => {
             // A live spawn bloom overrides the glyph and flashes the row background.
+            // Linear scan instead of `get(&(_, id.clone()))`: pulses is almost always
+            // empty, and the map lookup would clone the id every row every frame.
             let bloom = pulses
-                .get(&(*backend, id.clone()))
-                .and_then(|start| bloom_glyph(now_ms - *start));
+                .iter()
+                .find(|((b, pid), _)| b == backend && pid == id)
+                .and_then(|(_, start)| bloom_glyph(now_ms - *start));
             let (glyph, gcolor) = match bloom {
                 Some(g) => (g, theme::ACCENT),
                 None => status_glyph(*status, now_ms),
@@ -666,28 +670,28 @@ fn session_line(r: SessionRow) -> Line<'static> {
         right.chars().count(),
     );
     let mut spans = vec![
-        Span::styled(r.glyph.to_string(), Style::default().fg(r.gcolor)),
+        Span::styled(r.glyph.to_string(), fg(r.gcolor)),
         Span::raw(" "),
-        Span::styled(r.mark.to_string(), Style::default().fg(r.mark_color)),
+        Span::styled(r.mark.to_string(), fg(r.mark_color)),
         Span::raw(" "),
-        Span::styled(name_out, Style::default().fg(theme::TEXT)),
+        Span::styled(name_out, fg(theme::TEXT)),
     ];
     if !summary_out.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(summary_out, Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(summary_out, fg(theme::MUTED)));
     }
     spans.push(Span::raw(" ".repeat(pad)));
     // Right cluster: <pr> <status word> <time>.
     if !r.pr.is_empty() {
-        spans.push(Span::styled(r.pr.to_string(), Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled(r.pr.to_string(), fg(theme::ACCENT)));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(
         word.to_string(),
-        Style::default().fg(status_color(r.status)),
+        fg(status_color(r.status)),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(r.elapsed.to_string(), Style::default().fg(theme::MUTED)));
+    spans.push(Span::styled(r.elapsed.to_string(), fg(theme::MUTED)));
     Line::from(spans)
 }
 
@@ -703,12 +707,12 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
             if !notice.is_empty() {
                 Line::from(Span::styled(
                     notice.to_string(),
-                    Style::default().fg(theme::WARN),
+                    fg(theme::WARN),
                 ))
             } else if app.is_armed(now_ms) {
                 Line::from(Span::styled(
                     "[press Ctrl+X again to remove]",
-                    Style::default().fg(theme::ERR),
+                    fg(theme::ERR),
                 ))
             } else {
                 let hidden = app.hidden_count();
@@ -722,7 +726,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                     format!(
                         "{hidden_txt}{showing}type task · Tab agent · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · / filter · ? help · q quit"
                     ),
-                    Style::default().fg(theme::MUTED),
+                    fg(theme::MUTED),
                 ))
             }
         }
@@ -774,16 +778,16 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
     let line = Line::from(vec![
         Span::styled(
             format!(" {glyph}"),
-            Style::default().fg(gcolor),
+            fg(gcolor),
         ),
         Span::styled(
             left_trunc.chars().skip(2).collect::<String>(),
-            Style::default().fg(theme::TEXT),
+            fg(theme::TEXT),
         ),
         Span::raw(" ".repeat(pad)),
         Span::styled(
             right.to_string(),
-            Style::default().fg(if exited { theme::ERR } else { theme::MUTED }),
+            fg(if exited { theme::ERR } else { theme::MUTED }),
         ),
     ]);
     frame.render_widget(
@@ -799,7 +803,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(fg(theme::ACCENT))
         .title("keys");
     let entries = [
         ("↑/↓  j/k", "move selection"),
@@ -821,8 +825,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let mut lines = Vec::new();
     for (k, v) in entries {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<12}"), Style::default().fg(theme::ACCENT)),
-            Span::styled(v.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled(format!("  {k:<12}"), fg(theme::ACCENT)),
+            Span::styled(v.to_string(), fg(theme::TEXT)),
         ]));
     }
     frame.render_widget(

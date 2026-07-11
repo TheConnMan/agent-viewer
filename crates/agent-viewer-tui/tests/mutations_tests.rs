@@ -22,7 +22,7 @@ fn poll_until(runner: &mut MutationRunner, timeout: Duration) -> Option<Result<S
 fn mutation_runner_runs_op_and_drains_result() {
     let mut runner = MutationRunner::new();
     // A sleep-free op that returns immediately.
-    let accepted = runner.submit("k1".to_string(), "rename".to_string(), || Ok("renamed".to_string()));
+    let accepted = runner.submit("k1".to_string(), || Ok("renamed".to_string()));
     assert!(accepted);
 
     let result = poll_until(&mut runner, Duration::from_secs(2)).expect("op should complete");
@@ -37,7 +37,7 @@ fn mutation_runner_runs_op_and_drains_result() {
 fn mutation_runner_dedups_in_flight_key() {
     let mut runner = MutationRunner::new();
     // A short-sleep op keeps the key in flight long enough to observe.
-    let accepted = runner.submit("k2".to_string(), "stop".to_string(), || {
+    let accepted = runner.submit("k2".to_string(), || {
         std::thread::sleep(Duration::from_millis(100));
         Ok("stopped".to_string())
     });
@@ -45,7 +45,7 @@ fn mutation_runner_dedups_in_flight_key() {
     assert!(runner.in_flight("k2"));
 
     // Submitting the SAME key while it is in flight is a no-op (returns false).
-    let duplicate = runner.submit("k2".to_string(), "stop".to_string(), || Ok("dup".to_string()));
+    let duplicate = runner.submit("k2".to_string(), || Ok("dup".to_string()));
     assert!(!duplicate);
 
     let result = poll_until(&mut runner, Duration::from_secs(2)).expect("slow op completes");
@@ -54,7 +54,7 @@ fn mutation_runner_dedups_in_flight_key() {
 
     // After the result has been drained, the key can be submitted again — and errors
     // propagate through poll() as Err.
-    let reaccepted = runner.submit("k2".to_string(), "stop".to_string(), || Err("boom".to_string()));
+    let reaccepted = runner.submit("k2".to_string(), || Err("boom".to_string()));
     assert!(reaccepted);
     let err = poll_until(&mut runner, Duration::from_secs(2)).expect("second op completes");
     assert_eq!(err, Err("boom".to_string()));
