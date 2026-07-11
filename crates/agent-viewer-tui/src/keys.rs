@@ -733,6 +733,7 @@ mod tests {
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
             pulses: Pulses::new(),
+            pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
             auto_enter: None,
             auto_enter_landed: None,
             pending_reply: None,

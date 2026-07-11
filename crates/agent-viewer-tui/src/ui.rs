@@ -6,7 +6,7 @@ use crate::app::{App, Composer, Row, Section};
 use crate::peek::{self, PeekKind};
 use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
-use agent_viewer_core::{BackendKind, Session, Status};
+use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -38,6 +38,7 @@ pub mod theme {
     pub const WARN: Color = Color::Rgb(0xd9, 0xa9, 0x3f);
     pub const ERR: Color = Color::Rgb(0xcf, 0x6a, 0x52);
     pub const STOPPED: Color = Color::Rgb(0x85, 0x7e, 0x6a);
+    pub const PR_MERGED: Color = Color::Rgb(0xb0, 0x8a, 0xc9);
     // Per-backend brand marks (row + composer): Claude terracotta, Codex teal, opencode green.
     pub const BRAND_CLAUDE: Color = Color::Rgb(0xd9, 0x77, 0x57);
     pub const BRAND_CODEX: Color = Color::Rgb(0x74, 0xaa, 0x9c);
@@ -368,6 +369,7 @@ pub struct Draw<'a> {
     pub expanded: Option<&'a (BackendKind, String)>,
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
+    pub pr_status: &'a crate::pr_cache::PrStatusCache,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -412,7 +414,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     draw_header(frame, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
-    draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[1]);
+    draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, vertical[1]);
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
     // force-expanded peek above it); every other mode shows the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
@@ -669,6 +671,7 @@ fn draw_list(
     app: &App,
     pulses: &Pulses,
     now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
     deco: ListDeco,
     area: Rect,
 ) {
@@ -687,7 +690,7 @@ fn draw_list(
                 {
                     items.push(rename_row_item(*backend, buf, width));
                 } else {
-                    items.push(row_to_item(row, pulses, now_ms, width));
+                    items.push(row_to_item(row, pulses, now_ms, pr_status, width));
                 }
                 // Inline peek expansion: indented muted transcript tail under the row.
                 if let Some((eb, eid)) = deco.expanded
@@ -700,7 +703,7 @@ fn draw_list(
                     }
                 }
             }
-            _ => items.push(row_to_item(row, pulses, now_ms, width)),
+            _ => items.push(row_to_item(row, pulses, now_ms, pr_status, width)),
         }
     }
     let list =
@@ -755,7 +758,13 @@ fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem
     ]))
 }
 
-fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListItem<'static> {
+fn row_to_item(
+    row: &Row,
+    pulses: &Pulses,
+    now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    width: usize,
+) -> ListItem<'static> {
     match row {
         Row::Spacer => ListItem::new(Line::from("")),
         Row::SectionHeader { section, count } => ListItem::new(Line::from(Span::styled(
@@ -788,6 +797,7 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
                 None => status_glyph(*status, now_ms),
             };
             let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
+            let pr_color = pr_badge_theme_color(pr_status.badge_color(pr_refs));
             let line = session_line(SessionRow {
                 glyph,
                 gcolor,
@@ -797,6 +807,7 @@ fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListIte
                 status: *status,
                 summary,
                 pr: &pr_badge(pr_refs),
+                pr_color,
                 elapsed: &elapsed,
                 width,
             });
@@ -834,11 +845,22 @@ fn status_color(status: Status) -> ratatui::style::Color {
 }
 
 /// The right-aligned PR badge: "" (none), "#315" (one), or "2 PRs" (many).
-fn pr_badge(pr_refs: &[String]) -> String {
+fn pr_badge(pr_refs: &[PrRef]) -> String {
     match pr_refs {
         [] => String::new(),
-        [one] => format!("#{one}"),
+        [one] => format!("#{}", one.id),
         many => format!("{} PRs", many.len()),
+    }
+}
+
+/// The theme color for a PR badge's live-status bucket.
+fn pr_badge_theme_color(c: PrBadgeColor) -> ratatui::style::Color {
+    match c {
+        PrBadgeColor::Default => theme::ACCENT,
+        PrBadgeColor::Attention => theme::WARN,
+        PrBadgeColor::Passed => theme::OK,
+        PrBadgeColor::Merged => theme::PR_MERGED,
+        PrBadgeColor::Muted => theme::MUTED,
     }
 }
 
@@ -852,6 +874,7 @@ struct SessionRow<'a> {
     status: Status,
     summary: &'a str,
     pr: &'a str,
+    pr_color: ratatui::style::Color,
     elapsed: &'a str,
     width: usize,
 }
@@ -890,7 +913,7 @@ fn session_line(r: SessionRow) -> Line<'static> {
     spans.push(Span::raw(" ".repeat(pad)));
     // Right cluster: <pr> <status word> <time>.
     if !r.pr.is_empty() {
-        spans.push(Span::styled(r.pr.to_string(), fg(theme::ACCENT)));
+        spans.push(Span::styled(r.pr.to_string(), fg(r.pr_color)));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(word.to_string(), fg(status_color(r.status))));

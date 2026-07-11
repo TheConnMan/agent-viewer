@@ -1,5 +1,5 @@
 use agent_viewer_core::group::project_root;
-use agent_viewer_core::{BackendKind, Session, Status};
+use agent_viewer_core::{BackendKind, PrRef, Session, Status};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ pub enum Row {
         status: Status,
         hidden: bool,
         updated_at_ms: i64,
-        pr_refs: Vec<String>,
+        pr_refs: Vec<PrRef>,
     },
     /// A blank spacer line between groups/sections. Never selectable (skipped like headers).
     Spacer,
