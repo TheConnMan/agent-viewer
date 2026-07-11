@@ -84,7 +84,11 @@ impl Backend for OpencodeBackend {
     fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         let title: String = task.chars().take(40).collect();
         let mut cmd = std::process::Command::new("opencode");
-        cmd.arg("run").arg("--dir").arg(dir).arg("--title").arg(&title);
+        cmd.arg("run")
+            .arg("--dir")
+            .arg(dir)
+            .arg("--title")
+            .arg(&title);
         if let Some(model) = model {
             cmd.arg("-m").arg(model);
         }

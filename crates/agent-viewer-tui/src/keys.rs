@@ -320,14 +320,29 @@ fn kill_selected(backends: &[Box<dyn Backend>], ui: &mut Ui) {
                 ui.set_notice(format!("{} does not support stop", session.backend.name()));
                 return;
             }
-            submit_mutation(ui, &session, "stop", "stopping", Mutation::Stop(session.clone()));
+            submit_mutation(
+                ui,
+                &session,
+                "stop",
+                "stopping",
+                Mutation::Stop(session.clone()),
+            );
         }
         KillStage::Remove => {
             if !caps.remove {
-                ui.set_notice(format!("{} does not support remove", session.backend.name()));
+                ui.set_notice(format!(
+                    "{} does not support remove",
+                    session.backend.name()
+                ));
                 return;
             }
-            submit_mutation(ui, &session, "remove", "removing", Mutation::Remove(session.clone()));
+            submit_mutation(
+                ui,
+                &session,
+                "remove",
+                "removing",
+                Mutation::Remove(session.clone()),
+            );
         }
         KillStage::Noop => {
             if !caps.stop {
@@ -347,9 +362,21 @@ fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bool) {
         return;
     }
     if hide {
-        submit_mutation(ui, &session, "hide", "archiving", Mutation::Hide(session.clone()));
+        submit_mutation(
+            ui,
+            &session,
+            "hide",
+            "archiving",
+            Mutation::Hide(session.clone()),
+        );
     } else {
-        submit_mutation(ui, &session, "unhide", "unarchiving", Mutation::Unhide(session.clone()));
+        submit_mutation(
+            ui,
+            &session,
+            "unhide",
+            "unarchiving",
+            Mutation::Unhide(session.clone()),
+        );
     }
 }
 
@@ -413,8 +440,8 @@ fn attach_selected(
     } else {
         // Pre-accept the trust dialog before a claude RESUME attach into a fresh project
         // (best-effort; the live agents-view path and other backends never need it).
-        let claude_live = session.pid.is_some()
-            || matches!(session.status, Status::Working | Status::NeedsInput);
+        let claude_live =
+            session.pid.is_some() || matches!(session.status, Status::Working | Status::NeedsInput);
         if session.backend == BackendKind::Claude && !claude_live {
             let home = std::env::var("HOME").unwrap_or_default();
             let config = std::path::PathBuf::from(&home).join(".claude.json");
@@ -457,11 +484,7 @@ fn attach_selected(
 
 /// Spawn the composed task into the current spawn target, record it for pinning, and
 /// clear the composer. The spawn itself is detached (fast); only its record persists.
-fn spawn_from_composer(
-    backends: &[Box<dyn Backend>],
-    refresher: &Refresher,
-    ui: &mut Ui,
-) {
+fn spawn_from_composer(backends: &[Box<dyn Backend>], refresher: &Refresher, ui: &mut Ui) {
     let Some(target) = ui.app.spawn_target() else {
         ui.set_notice("no target directory".to_string());
         return;

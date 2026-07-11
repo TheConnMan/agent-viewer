@@ -22,15 +22,9 @@ pub enum Section {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     /// ByState mode.
-    SectionHeader {
-        section: Section,
-        count: usize,
-    },
+    SectionHeader { section: Section, count: usize },
     /// ByProject mode.
-    ProjectHeader {
-        root: PathBuf,
-        count: usize,
-    },
+    ProjectHeader { root: PathBuf, count: usize },
     Session {
         backend: BackendKind,
         id: String,
@@ -153,9 +147,8 @@ impl App {
     ///  - else arm (S, now): S.status in {Working, NeedsInput} -> Stop,
     ///    else Noop (armed silently; footer shows the countdown hint)
     pub fn kill_stage(&mut self, now_ms: i64) -> KillStage {
-        let Some((backend, id, status)) = self
-            .selected()
-            .map(|s| (s.backend, s.id.clone(), s.status))
+        let Some((backend, id, status)) =
+            self.selected().map(|s| (s.backend, s.id.clone(), s.status))
         else {
             return KillStage::Noop;
         };
@@ -626,7 +619,12 @@ pub fn file_stems(dir: &Path) -> Vec<String> {
     entries
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(String::from))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        })
         .collect()
 }
 

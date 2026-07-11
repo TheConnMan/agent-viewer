@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::error::{Error, Result};
 
@@ -36,7 +36,12 @@ pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> P
         envs: cmd
             .get_envs()
             .filter_map(|(k, v)| {
-                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
             })
             .collect(),
         rows: rows.max(1),

@@ -71,7 +71,10 @@ fn tail_state_stale_complete_then_started() {
     // task_complete followed by a later task_started (resumed-then-abandoned) is NOT
     // complete.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(
         f,
         r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-2"}}}}"#
@@ -101,7 +104,10 @@ fn tail_state_approval_then_complete() {
     // The approval fixture with a later token_count + task_complete appended: the
     // approval was granted and the turn finished -> Complete (approval stops firing).
     let (_dir, path) = common::copy_fixture_to_temp("rollout_approval.jsonl");
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(
         f,
         r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
