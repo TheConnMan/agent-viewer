@@ -1,4 +1,4 @@
-use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
+use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, Status};
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -330,7 +330,7 @@ pub struct JobDetail {
     /// linkScanPath (verified field).
     pub transcript_path: Option<std::path::PathBuf>,
     /// `children[].id` where `kind == "pr"` — the associated pull requests.
-    pub prs: Vec<String>,
+    pub prs: Vec<PrRef>,
 }
 
 /// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath;
@@ -350,7 +350,7 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         String::new()
     };
     let transcript_path = crate::json_str(&value, "linkScanPath").map(std::path::PathBuf::from);
-    // children: [{id, href, kind}] — keep the ids of the kind=="pr" entries.
+    // children: [{id, href, kind}] — keep the kind=="pr" entries as PrRef.
     let prs = value
         .get("children")
         .and_then(|v| v.as_array())
@@ -358,7 +358,12 @@ pub fn parse_job_state(text: &str) -> JobDetail {
             children
                 .iter()
                 .filter(|c| crate::json_str(c, "kind") == Some("pr"))
-                .filter_map(|c| crate::json_str(c, "id").map(String::from))
+                .filter_map(|c| {
+                    crate::json_str(c, "id").map(|id| PrRef {
+                        id: id.to_string(),
+                        href: crate::json_str(c, "href").map(String::from),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();

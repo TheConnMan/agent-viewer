@@ -52,6 +52,15 @@ pub enum Status {
     Stopped,
 }
 
+/// A pull request associated with a session, from a claude jobs state.json child
+/// (kind=="pr"). `id` is the display ref (e.g. "315"); `href` is the full GitHub URL
+/// when present, used to resolve owner/repo/number for a live status lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRef {
+    pub id: String,
+    pub href: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub backend: BackendKind,
@@ -83,7 +92,7 @@ pub struct Session {
     pub rollout_path: Option<std::path::PathBuf>,
     /// Associated PR references (claude jobs `state.json` children where kind=="pr");
     /// rendered as a right-aligned badge. Empty for codex/opencode.
-    pub pr_refs: Vec<String>,
+    pub pr_refs: Vec<PrRef>,
 }
 
 /// `Send` so the TUI can move the listing backends onto a dedicated refresh thread

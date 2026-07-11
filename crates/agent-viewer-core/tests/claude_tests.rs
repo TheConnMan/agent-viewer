@@ -1,6 +1,6 @@
 mod common;
 
-use agent_viewer_core::backend::{Backend, BackendKind, Status};
+use agent_viewer_core::backend::{Backend, BackendKind, PrRef, Status};
 use agent_viewer_core::claude::{
     ClaudeBackend, parse_agents_json, parse_job_state, read_claude_transcript,
 };
@@ -76,8 +76,21 @@ fn parse_job_state_blocked_prefers_needs() {
             "/home/user/.claude/jobs/block001/transcript.jsonl"
         ))
     );
-    // children[kind=="pr"].id only — the "note" child is skipped, order preserved.
-    assert_eq!(detail.prs, vec!["315".to_string(), "318".to_string()]);
+    // children[kind=="pr"] only — the "note" child is skipped, order preserved. Each
+    // carries its id and github href.
+    assert_eq!(
+        detail.prs,
+        vec![
+            PrRef {
+                id: "315".to_string(),
+                href: Some("https://github.com/acme/repo/pull/315".to_string()),
+            },
+            PrRef {
+                id: "318".to_string(),
+                href: Some("https://github.com/acme/repo/pull/318".to_string()),
+            },
+        ]
+    );
 }
 
 #[test]

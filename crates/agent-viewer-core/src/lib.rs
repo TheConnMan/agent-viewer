@@ -4,12 +4,14 @@ pub mod codex;
 pub mod error;
 pub mod group;
 pub mod opencode;
+pub mod pr_status;
 pub mod pty;
 pub mod spawn;
 pub mod state;
 
-pub use backend::{Backend, BackendKind, Capabilities, Session, Status};
+pub use backend::{Backend, BackendKind, Capabilities, PrRef, Session, Status};
 pub use error::{Error, Result};
+pub use pr_status::PrBadgeColor;
 
 /// Flag any session whose cwd is a non-empty path that no longer exists on disk as a
 /// companion, so the default view hides deleted-dir noise (e.g. agentos /tmp sessions).

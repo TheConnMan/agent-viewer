@@ -39,7 +39,10 @@ tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) —
 the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`,
 `Stopped`) and a muted one-line summary. The status word and time sit right-aligned; Claude
 jobs with associated pull requests show a badge just left of the time — `#315` for one PR,
-`2 PRs` for several.
+`2 PRs` for several. The badge is colored by the PR's live GitHub status: yellow when checks
+are pending or failing or a review is requested, green when checks have passed, purple when
+merged, grey when a draft or closed, and the flat accent color when the status is unknown or
+unresolvable.
 
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
 `✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).

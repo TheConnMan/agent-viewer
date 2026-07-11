@@ -11,6 +11,7 @@ use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, Row};
 use agent_viewer_tui::mutations::MutationRunner;
+use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, Mode, PeekCache, Pulses};
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -141,6 +142,8 @@ struct Ui {
     mutations: MutationRunner,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
     pulses: Pulses,
+    /// Background PR-status cache: colors the right-aligned PR badge by live GitHub state.
+    pr_status: PrStatusCache,
     /// A one-shot auto-Enter armed on a live claude attach. While set, the run loop watches
     /// the PTY for the agents view and presses Enter once (after a settle) to land in the
     /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
@@ -225,6 +228,7 @@ fn main() -> io::Result<()> {
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
+        pr_status: PrStatusCache::new(),
         auto_enter: None,
         auto_enter_landed: None,
         pending_reply: None,
@@ -255,6 +259,19 @@ fn run(
     loop {
         let now = now_ms();
         ui.peek.refresh(ui.app.selected());
+
+        // Drain completed PR-status fetches, then request statuses for the visible rows.
+        // app and pr_status are disjoint fields; destructuring borrows them separately so
+        // the request pass needs no per-frame clone of the rows' pr_refs.
+        ui.pr_status.poll(now);
+        {
+            let Ui { app, pr_status, .. } = &mut *ui;
+            for row in app.visible() {
+                if let Row::Session { pr_refs, .. } = row {
+                    pr_status.request_refs(pr_refs, now);
+                }
+            }
+        }
 
         // Drain completed background mutations: show the result and hasten a fresh listing.
         let mut mutation_completed = false;
@@ -310,6 +327,7 @@ fn run(
                     expanded: ui.app.expanded(),
                     now_ms: now,
                     attach,
+                    pr_status: &ui.pr_status,
                 },
             );
         })?;
