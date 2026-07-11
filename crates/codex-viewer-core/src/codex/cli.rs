@@ -1,20 +1,34 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+// NOTE: `codex app-server` (thread/subscribe, thread/list, command/exec/terminate) is the
+// experimental JSON-RPC daemon and the v2 upgrade path for these mutations. v1 shells out
+// to the stable `codex archive|unarchive|resume` subcommands, which touch the same state.
 
 /// Run `codex archive <id>`; capture output; non-zero exit -> Err(Error::Command(stderr)).
 /// Never touch the DB directly.
 pub fn archive(id: &str) -> Result<()> {
-    let _ = id;
-    todo!()
+    run_codex(&["archive", id])
 }
 
 /// Run `codex unarchive <id>`; capture output; non-zero exit -> Err(Error::Command(stderr)).
 pub fn unarchive(id: &str) -> Result<()> {
-    let _ = id;
-    todo!()
+    run_codex(&["unarchive", id])
+}
+
+fn run_codex(args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("codex").args(args).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Command(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
 }
 
 /// Build (do not run) `codex resume <id>` with inherited stdio.
 pub fn resume_command(id: &str) -> std::process::Command {
-    let _ = id;
-    todo!()
+    let mut cmd = std::process::Command::new("codex");
+    cmd.arg("resume").arg(id);
+    cmd
 }

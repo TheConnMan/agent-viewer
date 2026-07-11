@@ -8,11 +8,19 @@ pub enum BackendKind {
 impl BackendKind {
     /// "codex" | "claude" | "opencode"
     pub fn name(self) -> &'static str {
-        todo!()
+        match self {
+            BackendKind::Codex => "codex",
+            BackendKind::Claude => "claude",
+            BackendKind::Opencode => "opencode",
+        }
     }
     /// "[cx]" | "[cl]" | "[oc]"  (row prefix)
     pub fn tag(self) -> &'static str {
-        todo!()
+        match self {
+            BackendKind::Codex => "[cx]",
+            BackendKind::Claude => "[cl]",
+            BackendKind::Opencode => "[oc]",
+        }
     }
 }
 
@@ -65,5 +73,9 @@ pub trait Backend {
 /// The fixed v1 roster: Codex (default_codex_home), Claude ("claude" on PATH),
 /// Opencode (~/.local/share/opencode/opencode.db). No config surface.
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
-    todo!()
+    vec![
+        Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
+        Box::new(crate::claude::ClaudeBackend::new()),
+        Box::new(crate::opencode::OpencodeBackend::new()),
+    ]
 }

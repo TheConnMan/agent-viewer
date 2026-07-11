@@ -11,5 +11,9 @@ pub use error::{Error, Result};
 
 /// $CODEX_HOME if set, else $HOME/.codex.
 pub fn default_codex_home() -> std::path::PathBuf {
-    todo!()
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        return std::path::PathBuf::from(codex_home);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".codex")
 }
