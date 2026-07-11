@@ -187,6 +187,9 @@ pub struct PeekCache {
     key: Option<PeekKey>,
     items: Vec<TranscriptItem>,
     error: Option<String>,
+    /// Codex pending-approval summary (the "what is this waiting on" ask), when the focused
+    /// session has one. None for non-codex backends and when nothing is pending.
+    ask: Option<String>,
 }
 
 impl Default for PeekCache {
@@ -201,6 +204,7 @@ impl PeekCache {
             key: None,
             items: Vec::new(),
             error: None,
+            ask: None,
         }
     }
 
@@ -239,10 +243,21 @@ impl PeekCache {
                 }
                 self.items = items;
                 self.error = None;
+                // Codex surfaces the pending approval (if any) as the ask; other backends
+                // derive their ask elsewhere (claude from session.summary, opencode none).
+                self.ask = if session.backend == BackendKind::Codex {
+                    agent_viewer_core::codex::rollout::pending_approval(path)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.summary())
+                } else {
+                    None
+                };
             }
             Err(e) => {
                 self.items.clear();
                 self.error = Some(format!("transcript unavailable: {e}"));
+                self.ask = None;
             }
         }
     }
@@ -261,6 +276,7 @@ impl PeekCache {
             return;
         }
         self.key = key;
+        self.ask = None;
         match agent_viewer_core::opencode::read_opencode_last_message(
             &agent_viewer_core::opencode::default_opencode_db(),
             &session.id,
@@ -284,6 +300,7 @@ impl PeekCache {
         self.key = None;
         self.items.clear();
         self.error = None;
+        self.ask = None;
     }
 }
 
@@ -469,9 +486,19 @@ fn peek_expansion(
     } else {
         Vec::new()
     };
-    // Pending-ask is Part B; pass None for now.
-    let ask: Option<&str> = None;
-    let plines = peek::build(ask, &peek.items, peek.error.as_deref(), &meta, inner);
+    // Surface WHAT a blocked session is waiting on: codex from the parsed pending approval,
+    // claude from its state.json needs (session.summary), opencode has no needs-input signal.
+    let ask: Option<String> = if session.status == Status::NeedsInput {
+        match session.backend {
+            BackendKind::Codex => peek.ask.as_ref().map(|s| format!("Awaiting approval: {s}")),
+            BackendKind::Claude => (!session.summary.is_empty())
+                .then(|| format!("Awaiting input: {}", session.summary)),
+            BackendKind::Opencode => None,
+        }
+    } else {
+        None
+    };
+    let plines = peek::build(ask.as_deref(), &peek.items, peek.error.as_deref(), &meta, inner);
     plines
         .into_iter()
         .map(|pl| {

@@ -1,7 +1,8 @@
 //! Pure peek-panel model: turns the focused session's last message (plus optional pending
 //! ask / error / metadata fallback) into a flat list of width-wrapped, kind-tagged lines the
 //! renderer maps straight to styled rows. No ratatui types here so the whole thing is unit-
-//! tested. The `ask` argument is a hook for Part B (pending-ask); callers pass None for now.
+//! tested. The `ask` argument carries the pending-ask header (what a blocked session is
+//! waiting on), rendered as a bold ACCENT line above the transcript tail.
 
 use agent_viewer_core::codex::rollout::TranscriptItem;
 
