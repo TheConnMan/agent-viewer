@@ -32,6 +32,14 @@ pub(crate) fn handle_key(
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl+C kills the whole viewer (like `claude agents`) from every mode except an active
+    // attach — there Ctrl+C must reach the child as an interrupt (0x03) so a runaway agent can
+    // be stopped without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as
+    // copy and never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
+    if is_quit_chord(key, ctrl, &ui.mode) {
+        ui.attached.clear(); // drop = kill owned children, same teardown as `q`
+        return Ok(true);
+    }
     match &mut ui.mode {
         Mode::Attached => handle_attached_key(key, ui),
         Mode::Normal => return handle_normal_key(key, ctrl, backends, refresher, ui, terminal),
@@ -45,6 +53,13 @@ pub(crate) fn handle_key(
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
     }
     Ok(false)
+}
+
+/// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
+/// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
+/// decision is unit-testable without a live terminal.
+fn is_quit_chord(key: KeyEvent, ctrl: bool, mode: &Mode) -> bool {
+    ctrl && matches!(key.code, KeyCode::Char('c')) && !matches!(mode, Mode::Attached)
 }
 
 fn handle_normal_key(
@@ -693,14 +708,18 @@ fn spawn_from_composer(backends: &[Box<dyn Backend>], refresher: &Refresher, ui:
 
 #[cfg(test)]
 mod tests {
-    use super::open_filter;
-    use super::ensure_completions;
+    use super::{ensure_completions, is_quit_chord, open_filter};
     use crate::{NoticeState, Ui};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer};
     use agent_viewer_tui::mutations::MutationRunner;
     use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
 
     fn test_ui_with(sessions: Vec<Session>) -> Ui {
         Ui {
@@ -818,5 +837,30 @@ mod tests {
             ui.composer.commands_key(),
             Some(&(BackendKind::Claude, Some("/tmp/agentviewer-target-b".into())))
         );
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_list_and_transient_modes() {
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        // The list and every transient modal treat Ctrl+C as "kill the viewer".
+        assert!(is_quit_chord(ctrl_c, true, &Mode::Normal));
+        assert!(is_quit_chord(ctrl_c, true, &Mode::Filter));
+        assert!(is_quit_chord(ctrl_c, true, &Mode::Help));
+    }
+
+    #[test]
+    fn ctrl_c_does_not_quit_while_attached() {
+        // Attached, Ctrl+C must reach the child as an interrupt, not tear down the viewer.
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!is_quit_chord(ctrl_c, true, &Mode::Attached));
+    }
+
+    #[test]
+    fn plain_c_and_other_ctrl_chords_are_not_quit() {
+        // A bare 'c' types into the composer; other Ctrl-chords keep their own actions.
+        let plain_c = key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(!is_quit_chord(plain_c, false, &Mode::Normal));
+        let ctrl_x = key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(!is_quit_chord(ctrl_x, true, &Mode::Normal));
     }
 }

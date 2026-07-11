@@ -926,7 +926,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q/Ctrl+C quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -1021,7 +1021,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("h / u", "archive / unarchive"),
         ("Ctrl+F", "filter (searches hidden too)"),
         ("?", "this help"),
-        ("q", "quit"),
+        ("q / Ctrl+C", "quit"),
     ];
     let mut lines = Vec::new();
     for (k, v) in entries {
