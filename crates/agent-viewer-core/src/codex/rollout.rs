@@ -128,12 +128,15 @@ pub enum PendingApproval {
     Patch { files: Vec<String> },
 }
 
-/// Single-quote-wrap an argv element that would otherwise misrepresent what runs: empty,
-/// or containing whitespace or a single quote. Embedded single quotes are escaped as the
-/// usual `'\''` (close quote, escaped quote, reopen quote). Simple args pass through bare so
-/// a plain command still renders cleanly.
+/// Single-quote-wrap an argv element that would otherwise misrepresent what runs. Quote
+/// anything not in a conservative shell-safe allowlist (`[A-Za-z0-9._/=:@,+-]`) or empty, so
+/// metacharacters like `$`, `;`, `*` and whitespace are shown quoted rather than bare (which
+/// would misstate the argv the user approves against). Embedded single quotes are escaped as
+/// the usual `'\''` (close quote, escaped quote, reopen quote). Plain args pass through bare so
+/// a simple command still renders cleanly.
 fn shell_quote(arg: &str) -> String {
-    let needs_quote = arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '\'');
+    let safe = |c: char| c.is_ascii_alphanumeric() || "._/=:@,+-".contains(c);
+    let needs_quote = arg.is_empty() || !arg.chars().all(safe);
     if !needs_quote {
         return arg.to_string();
     }

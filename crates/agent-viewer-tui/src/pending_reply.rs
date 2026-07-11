@@ -16,18 +16,23 @@ const REPLY_SETTLE: Duration = Duration::from_millis(600);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// One-shot reply-injection state: which PTY to write into, the bytes to write, whether we
-/// must confirm we have left the claude agents list into the run first, when it was armed,
-/// and when the ready-to-write state was first observed (settle debounce).
+/// must confirm we have left the claude agents list into the run first, whether this attach
+/// was a fresh list-attach (vs a reused in-run PTY), when it was armed, and when the
+/// ready-to-write state was first observed (settle debounce).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingReply {
     pub(crate) key: Key,
     pub(crate) payload: Vec<u8>,
-    /// Claude: hold until auto_enter reports an explicit SUCCESSFUL landing for this key (its
-    /// Enter opened the run) before injecting — proof we are in the run, not the list, so a
-    /// failed/timed-out landing (which clears auto_enter WITHOUT setting the landed signal)
-    /// never types the reply into the wrong place. Codex: false (codex resume opens straight
-    /// into the pending prompt).
+    /// Claude: the run-view gate applies (we must confirm we are in the run, not the agents
+    /// list, before injecting). Codex: false (codex resume opens straight into the pending
+    /// prompt). How the gate is satisfied depends on `fresh_attach` (see below).
     pub(crate) require_run_view: bool,
+    /// True when THIS attach armed auto_enter and must wait for the explicit landing signal
+    /// (a fresh live-claude list attach). False when the PTY was reused (already attached
+    /// earlier, already in the run): auto_enter is never armed, so run-view is instead
+    /// confirmed by the agents-list marker being ABSENT on the pty screen. Ignored when
+    /// `require_run_view` is false (codex).
+    pub(crate) fresh_attach: bool,
     pub(crate) armed_at: Instant,
     pub(crate) ready_since: Option<Instant>,
 }
@@ -54,16 +59,16 @@ pub(crate) enum ReplyStep {
 /// Pure gate for the injector. `focused` = the reply target is the focused PTY; `elapsed` =
 /// since armed; `exited` = the PTY's child has exited; `still_blocked` = the session is still
 /// NeedsInput at write time (re-checked from the live list, not just when armed);
-/// `require_run_view` = the claude run-view gate applies; `landed` = auto_enter reported an
-/// explicit successful landing in the run for this key; `ready_since` = elapsed since the
-/// ready state was first observed, if any.
+/// `run_view_ready` = we are confirmed in the run (not the agents list) so it is safe to type
+/// — the driver precomputes this per backend/attach kind (codex: always; fresh claude: the
+/// explicit landing signal; reused claude: the agents-list marker being absent); `ready_since`
+/// = elapsed since the ready state was first observed, if any.
 pub(crate) fn reply_step(
     focused: bool,
     elapsed: Duration,
     exited: bool,
     still_blocked: bool,
-    require_run_view: bool,
-    landed: bool,
+    run_view_ready: bool,
     ready_since: Option<Duration>,
 ) -> ReplyStep {
     if !focused {
@@ -78,7 +83,7 @@ pub(crate) fn reply_step(
     if !still_blocked {
         return ReplyStep::Abort;
     }
-    if require_run_view && !landed {
+    if !run_view_ready {
         return ReplyStep::Wait;
     }
     match ready_since {
@@ -103,24 +108,39 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
 
     // Re-check the safety gate at write time (not just when armed): the refresh worker keeps
     // `ui.app` fresh even while attached, so another client resolving the prompt shows up here
-    // as the session leaving NeedsInput (or disappearing). Landing is proven by the explicit
-    // success signal auto_enter records, never by a timed-out clear.
+    // as the session leaving NeedsInput (or disappearing).
     let still_blocked = ui
         .app
         .session_for(&state.key)
         .is_some_and(|s| matches!(s.status, agent_viewer_core::Status::NeedsInput));
-    let landed = ui.auto_enter_landed.as_ref() == Some(&state.key);
 
-    // The only PTY-observable input we still need is the child's exit; read it under the
-    // borrow, then drop it before mutating `ui.pending_reply`. When focused but the PTY entry
-    // is missing, keep the current early-return (return without disarm).
-    let exited = if focused {
+    // The PTY-observable inputs: the child's exit (always) and, only for a reused-run-PTY
+    // run-view gate, whether the agents-list marker is on screen. Read both under the borrow,
+    // then drop it before mutating `ui.pending_reply`. When focused but the PTY entry is
+    // missing, keep the current early-return (return without disarm).
+    let need_marker = state.require_run_view && !state.fresh_attach;
+    let (exited, marker_present) = if focused {
         let Some(pty) = ui.attached.get_mut(&state.key) else {
             return;
         };
-        pty.is_exited()
+        let exited = pty.is_exited();
+        let marker_present = need_marker
+            && pty.with_screen(|s| s.contents().contains(crate::auto_enter::CLAUDE_AGENTS_MARKER));
+        (exited, marker_present)
     } else {
-        false
+        (false, false)
+    };
+
+    // Precompute the run-view gate: codex never waits (resume opens straight into the prompt);
+    // a fresh claude attach waits for auto_enter's explicit successful landing (never a
+    // timed-out clear); a reused claude PTY is ready once the agents-list marker is absent
+    // (we are in the run, not sitting on the list).
+    let run_view_ready = if !state.require_run_view {
+        true
+    } else if state.fresh_attach {
+        ui.auto_enter_landed.as_ref() == Some(&state.key)
+    } else {
+        !marker_present
     };
 
     let ready_since = state.ready_since.map(|since| since.elapsed());
@@ -129,8 +149,7 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
         elapsed,
         exited,
         still_blocked,
-        state.require_run_view,
-        landed,
+        run_view_ready,
         ready_since,
     ) {
         ReplyStep::Skip => {}
@@ -173,13 +192,16 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
 mod tests {
     use super::*;
 
-    // Small, PTY-free durations proving the safety invariants of the pure gate.
+    // Small, PTY-free durations proving the safety invariants of the pure gate. The gate
+    // takes a single precomputed `run_view_ready`; the fresh-vs-reused distinction (fresh
+    // claude waits for the landing signal, reused claude waits for the agents-list marker to
+    // clear, codex is always ready) is resolved into that bool by `drive_pending_reply`.
     const SHORT: Duration = Duration::from_millis(10);
 
     #[test]
     fn not_focused_skips() {
         assert_eq!(
-            reply_step(false, SHORT, false, true, false, false, None),
+            reply_step(false, SHORT, false, true, false, None),
             ReplyStep::Skip
         );
     }
@@ -187,7 +209,7 @@ mod tests {
     #[test]
     fn past_timeout_drops() {
         assert_eq!(
-            reply_step(true, REPLY_TIMEOUT + SHORT, false, true, false, false, None),
+            reply_step(true, REPLY_TIMEOUT + SHORT, false, true, false, None),
             ReplyStep::Drop
         );
     }
@@ -195,7 +217,7 @@ mod tests {
     #[test]
     fn exited_child_drops() {
         assert_eq!(
-            reply_step(true, SHORT, true, true, false, false, None),
+            reply_step(true, SHORT, true, true, false, None),
             ReplyStep::Drop
         );
     }
@@ -204,39 +226,30 @@ mod tests {
     fn no_longer_blocked_aborts() {
         // The prompt was resolved elsewhere while we attached/settled: never write.
         assert_eq!(
-            reply_step(true, SHORT, false, false, false, false, None),
+            reply_step(true, SHORT, false, false, false, None),
             ReplyStep::Abort
         );
     }
 
     #[test]
-    fn run_view_waits_until_landed() {
-        // require_run_view = true but auto_enter has not reported a successful landing yet.
+    fn not_run_view_ready_waits() {
+        // The run-view gate has not resolved yet (fresh landing not seen, or the agents-list
+        // marker still present for a reused PTY): keep waiting.
         assert_eq!(
-            reply_step(true, SHORT, false, true, true, false, None),
+            reply_step(true, SHORT, false, true, false, None),
             ReplyStep::Wait
         );
     }
 
     #[test]
-    fn run_view_gate_skipped_when_not_required() {
-        // require_run_view = false: landing never blocks, so we settle regardless.
+    fn run_view_ready_settles_then_writes() {
+        // Gate passed: ready_since drives the settle-then-write progression.
         assert_eq!(
-            reply_step(true, SHORT, false, true, false, false, None),
-            ReplyStep::Settle
-        );
-    }
-
-    #[test]
-    fn run_view_landed_settles_then_writes() {
-        // require_run_view = true AND landed: the gate is passed, so ready_since drives the
-        // settle-then-write progression.
-        assert_eq!(
-            reply_step(true, SHORT, false, true, true, true, None),
+            reply_step(true, SHORT, false, true, true, None),
             ReplyStep::Settle
         );
         assert_eq!(
-            reply_step(true, SHORT, false, true, true, true, Some(REPLY_SETTLE + SHORT)),
+            reply_step(true, SHORT, false, true, true, Some(REPLY_SETTLE + SHORT)),
             ReplyStep::Write
         );
     }
@@ -244,7 +257,7 @@ mod tests {
     #[test]
     fn ready_since_none_settles() {
         assert_eq!(
-            reply_step(true, SHORT, false, true, false, false, None),
+            reply_step(true, SHORT, false, true, true, None),
             ReplyStep::Settle
         );
     }
@@ -252,7 +265,7 @@ mod tests {
     #[test]
     fn ready_since_before_settle_keeps_settling() {
         assert_eq!(
-            reply_step(true, SHORT, false, true, false, false, Some(REPLY_SETTLE - SHORT)),
+            reply_step(true, SHORT, false, true, true, Some(REPLY_SETTLE - SHORT)),
             ReplyStep::Settle
         );
     }
@@ -260,7 +273,7 @@ mod tests {
     #[test]
     fn ready_since_past_settle_writes() {
         assert_eq!(
-            reply_step(true, SHORT, false, true, false, false, Some(REPLY_SETTLE + SHORT)),
+            reply_step(true, SHORT, false, true, true, Some(REPLY_SETTLE + SHORT)),
             ReplyStep::Write
         );
     }

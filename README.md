@@ -125,8 +125,12 @@ The attached PTY stays alive in the background so re-attaching is instant.
 
 Replies (`r`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
 into the run once the viewer has navigated into it (not while still on the agents list). A
-Codex approval reply maps yes / no to the approval keystroke; any free-text reply where only
-yes or no is valid instead attaches you with focus so you can finish it by hand. Delivery is
+A Codex approval reply of yes auto-sends the approve key; a denial or any free-text reply
+instead attaches you with focus so you can confirm it by hand (the Codex reject key is
+version and config specific, so denials are left to you). Codex needs-input is inferred from
+the transcript tail, which can briefly still show an already-answered approval until the turn
+advances, so a Codex reply is best-effort and should be sent only when the row is genuinely
+waiting. Delivery is
 best-effort: the auto-inject rides on detecting when the child is ready to accept input, and
 if that detection does not land, the reply is not sent blindly. In that case you are left
 attached in the session to type it yourself, and a footer notice says so.

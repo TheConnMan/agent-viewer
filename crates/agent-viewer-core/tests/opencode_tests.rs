@@ -125,6 +125,32 @@ fn opencode_last_message_returns_newest_text_concatenated() {
 }
 
 #[test]
+fn opencode_last_message_skips_whitespace_only_newest() {
+    let schema = common::read_fixture("opencode_message_schema.sql");
+    let inserts = [
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+         VALUES ('ses_1',NULL,'/home/user/oc-proj','Proj',1000,3000,NULL)",
+        // Older assistant message with real text.
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_old','ses_1',1000,1000,'{\"role\":\"assistant\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_old','msg_old','ses_1',1000,1000,'{\"type\":\"text\",\"text\":\"real prior message\"}')",
+        // Newest message whose only text part is whitespace (newline-only around a tool
+        // transition) -> it must be skipped so the real prior message surfaces.
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_new','ses_1',2000,2000,'{\"role\":\"assistant\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_new','msg_new','ses_1',2000,2000,'{\"type\":\"text\",\"text\":\"\\n\\n\"}')",
+    ];
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+
+    let item = read_opencode_last_message(&path, "ses_1")
+        .expect("read ok")
+        .expect("a text message exists");
+    assert_eq!(item.text, "real prior message");
+}
+
+#[test]
 fn opencode_last_message_none_when_no_text_message() {
     let schema = common::read_fixture("opencode_message_schema.sql");
     let inserts = [
