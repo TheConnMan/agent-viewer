@@ -37,6 +37,7 @@ fn opencode_lists_rows_hidden_and_order() {
     assert_eq!(parent.updated_at_ms, 3000);
     assert_eq!(parent.source_label, "opencode");
     assert!(!parent.hidden);
+    assert_eq!(parent.short_id, None); // opencode sessions carry no claude short id
 
     assert_eq!(sessions[1].source_label, "subagent"); // parent_id non-NULL
     assert!(!sessions[1].hidden);

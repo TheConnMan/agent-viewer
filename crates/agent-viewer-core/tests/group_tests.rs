@@ -6,6 +6,7 @@ fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
     Session {
         backend: BackendKind::Codex,
         id: id.to_string(),
+        short_id: None,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
         created_at_ms: updated_at_ms,

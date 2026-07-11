@@ -9,6 +9,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: S
     Session {
         backend,
         id: id.to_string(),
+        short_id: None,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
         created_at_ms,

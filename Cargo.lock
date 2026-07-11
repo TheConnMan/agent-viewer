@@ -24,6 +24,7 @@ dependencies = [
  "agent-viewer-core",
  "crossterm",
  "ratatui",
+ "tempfile",
  "tui-term",
 ]
 

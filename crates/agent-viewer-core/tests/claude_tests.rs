@@ -7,14 +7,12 @@ use agent_viewer_core::claude::{
 use agent_viewer_core::codex::rollout::TranscriptItem;
 use std::path::PathBuf;
 
-/// Find the (session, short_id) pair whose session title matches.
-fn by_title<'a>(
-    parsed: &'a [(agent_viewer_core::Session, String)],
-    title: &str,
-) -> &'a (agent_viewer_core::Session, String) {
+/// Find the session whose title matches. parse_agents_json now returns `Vec<Session>`
+/// with the short id folded into `Session.short_id` (no more (Session, String) tuple).
+fn by_title<'a>(parsed: &'a [agent_viewer_core::Session], title: &str) -> &'a agent_viewer_core::Session {
     parsed
         .iter()
-        .find(|(s, _)| s.title == title)
+        .find(|s| s.title == title)
         .unwrap_or_else(|| panic!("no session titled {title}"))
 }
 
@@ -24,9 +22,9 @@ fn claude_parse_maps_six_states_and_pid() {
     let parsed = parse_agents_json(&json).expect("parse agents json");
     // 7 valid entries (the malformed missing-sessionId entry is skipped).
     assert_eq!(parsed.len(), 7);
-    assert!(parsed.iter().all(|(s, _)| s.title != "Orphan Missing SessionId"));
+    assert!(parsed.iter().all(|s| s.title != "Orphan Missing SessionId"));
 
-    let (working, working_short) = by_title(&parsed, "Working Task");
+    let working = by_title(&parsed, "Working Task");
     assert_eq!(working.backend, BackendKind::Claude);
     assert_eq!(working.id, "work0001-6603-4ad5-be5b-f3ad6391d595"); // id = sessionId
     assert_eq!(working.cwd, PathBuf::from("/home/user/proj-working"));
@@ -37,18 +35,20 @@ fn claude_parse_maps_six_states_and_pid() {
     assert!(!working.companion); // claude rows are never companions
     assert_eq!(working.status, Status::Working);
     assert_eq!(working.pid, Some(111));
-    assert_eq!(working_short, "work0001"); // short id = entry "id"
+    // short id (entry "id") is now folded into the Session itself.
+    assert_eq!(working.short_id, Some("work0001".to_string()));
 
-    assert_eq!(by_title(&parsed, "Blocked Task").0.status, Status::NeedsInput);
-    assert_eq!(by_title(&parsed, "Idle Task").0.status, Status::Idle);
-    assert_eq!(by_title(&parsed, "Done Task").0.status, Status::Done);
-    assert_eq!(by_title(&parsed, "Failed Task").0.status, Status::Failed);
-    assert_eq!(by_title(&parsed, "Stopped Task").0.status, Status::Stopped);
+    assert_eq!(by_title(&parsed, "Blocked Task").status, Status::NeedsInput);
+    assert_eq!(by_title(&parsed, "Idle Task").status, Status::Idle);
+    assert_eq!(by_title(&parsed, "Done Task").status, Status::Done);
+    assert_eq!(by_title(&parsed, "Failed Task").status, Status::Failed);
+    assert_eq!(by_title(&parsed, "Stopped Task").status, Status::Stopped);
 
     // Missing state field -> Idle (verified live occurrence), pid absent -> None.
-    let (nostate, _) = by_title(&parsed, "No State Task");
+    let nostate = by_title(&parsed, "No State Task");
     assert_eq!(nostate.status, Status::Idle);
     assert_eq!(nostate.pid, None);
+    assert_eq!(nostate.short_id, Some("nost0001".to_string()));
 }
 
 #[test]

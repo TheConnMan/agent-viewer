@@ -9,6 +9,7 @@ fn session_with_cwd(cwd: PathBuf) -> Session {
     Session {
         backend: BackendKind::Codex,
         id: "thread-123".to_string(),
+        short_id: None,
         title: "t".to_string(),
         cwd,
         created_at_ms: 0,

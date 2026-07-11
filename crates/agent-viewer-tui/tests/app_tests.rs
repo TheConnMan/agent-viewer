@@ -1,5 +1,7 @@
 use agent_viewer_core::{BackendKind, Session, Status};
-use agent_viewer_tui::app::{App, GroupMode, KillStage, Row, Section, format_elapsed, row_layout};
+use agent_viewer_tui::app::{
+    App, Composer, DetachTracker, GroupMode, KillStage, Row, Section, format_elapsed, row_layout,
+};
 use std::path::PathBuf;
 
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd
@@ -8,6 +10,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, updated_at_ms: i64, status: S
     Session {
         backend,
         id: id.to_string(),
+        short_id: None,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
         created_at_ms: updated_at_ms,
@@ -97,7 +100,10 @@ fn state_sections_order_and_fold() {
         sess(BackendKind::Codex, "failed", "/p", 200, Status::Failed),
         sess(BackendKind::Codex, "stopped", "/p", 100, Status::Stopped),
     ];
-    let app = App::new(sessions);
+    // v2.1 default is ByProject; toggle into ByState to inspect the state sections.
+    let mut app = App::new(sessions);
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
     let rows = app.visible();
 
     // Section headers appear in the fixed order; Failed/Stopped have no headers.
@@ -114,18 +120,19 @@ fn state_sections_order_and_fold() {
     ));
 
     // Empty sections are omitted: a Working-only app has only the Working header.
-    let only_working = App::new(vec![sess(
+    let mut only_working = App::new(vec![sess(
         BackendKind::Codex,
         "w",
         "/p",
         1,
         Status::Working,
     )]);
+    only_working.toggle_group_mode();
     assert_eq!(section_headers(&only_working.visible()), vec![Section::Working]);
 }
 
 #[test]
-fn done_overflow_more_marker() {
+fn done_section_is_uncapped() {
     let sessions: Vec<Session> = (0..20)
         .map(|i| {
             sess(
@@ -137,15 +144,15 @@ fn done_overflow_more_marker() {
             )
         })
         .collect();
-    let app = App::new(sessions);
+    // ByState view: the Done section now lists every session (the 15-cap + MoreMarker
+    // are gone in v2.1).
+    let mut app = App::new(sessions);
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
     let rows = app.visible();
 
-    // 15 Done session rows + a "… 5 more" marker, no 16th session row.
-    assert_eq!(session_rows(&rows).len(), 15);
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r, Row::MoreMarker { hidden: 5 }))
-    );
+    assert_eq!(section_headers(&rows), vec![Section::Done]);
+    assert_eq!(session_rows(&rows).len(), 20);
 }
 
 #[test]
@@ -156,10 +163,7 @@ fn toggle_group_mode_project_rows() {
         sess(BackendKind::Opencode, "oc", "/synthetic/shared", 200, Status::Done),
     ];
     let mut app = App::new(sessions);
-    assert_eq!(app.group_mode(), GroupMode::ByState);
-
-    // Ctrl+S -> ByProject: one ProjectHeader (cross-backend merge), no SectionHeaders.
-    app.toggle_group_mode();
+    // v2.1 startup default is ByProject: one ProjectHeader (cross-backend merge), no sections.
     assert_eq!(app.group_mode(), GroupMode::ByProject);
     let rows = app.visible();
     assert!(section_headers(&rows).is_empty());
@@ -170,11 +174,17 @@ fn toggle_group_mode_project_rows() {
     )));
     assert_eq!(session_rows(&rows).len(), 2);
 
-    // Toggle back -> sections again.
+    // Ctrl+S -> ByState: section headers, no project headers.
     app.toggle_group_mode();
     assert_eq!(app.group_mode(), GroupMode::ByState);
     assert!(project_headers(&app.visible()).is_empty());
     assert!(!section_headers(&app.visible()).is_empty());
+
+    // Toggle back -> ByProject again.
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByProject);
+    assert!(!project_headers(&app.visible()).is_empty());
+    assert!(section_headers(&app.visible()).is_empty());
 }
 
 #[test]
@@ -353,4 +363,104 @@ fn rows_carry_summary_and_updated() {
         }
         _ => unreachable!(),
     }
+}
+
+// --- v2.1 inline spawn composer (item 8) ---
+
+#[test]
+fn composer_edit_and_backend_cycle() {
+    let mut c = Composer::new();
+    // Fresh composer: empty text, defaults to the Claude backend.
+    assert!(c.is_empty());
+    assert_eq!(c.text(), "");
+    assert_eq!(c.backend(), BackendKind::Claude);
+
+    c.push_char('h');
+    c.push_char('i');
+    assert_eq!(c.text(), "hi");
+    assert!(!c.is_empty());
+
+    c.backspace();
+    assert_eq!(c.text(), "h");
+    c.backspace();
+    c.backspace(); // backspace on empty is a no-op, not a panic.
+    assert!(c.is_empty());
+
+    // Tab cycles Claude -> Codex -> Opencode -> Claude.
+    c.cycle_backend();
+    assert_eq!(c.backend(), BackendKind::Codex);
+    c.cycle_backend();
+    assert_eq!(c.backend(), BackendKind::Opencode);
+    c.cycle_backend();
+    assert_eq!(c.backend(), BackendKind::Claude);
+
+    c.push_char('x');
+    c.clear();
+    assert!(c.is_empty());
+    assert_eq!(c.text(), "");
+}
+
+#[test]
+fn spawn_target_by_project_is_group_root_by_state_is_cwd() {
+    // A real git-marked project so project_root(sub) folds up to the repo root, letting the
+    // two grouping modes yield different spawn targets.
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let cwd = repo.join("sub");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut app = App::new(vec![sess(
+        BackendKind::Codex,
+        "s",
+        cwd.to_str().unwrap(),
+        100,
+        Status::Working,
+    )]);
+
+    // Default ByProject: a session row's spawn target is its project group root (the repo).
+    assert_eq!(app.group_mode(), GroupMode::ByProject);
+    select(&mut app, "s");
+    assert_eq!(app.spawn_target(), Some(repo.clone()));
+
+    // ByState: the spawn target is the selected session's own cwd (the subdir).
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
+    select(&mut app, "s");
+    assert_eq!(app.spawn_target(), Some(cwd.clone()));
+}
+
+#[test]
+fn spawn_target_none_when_list_empty() {
+    let app = App::new(Vec::new());
+    assert_eq!(app.spawn_target(), None);
+}
+
+// --- v2.1 detach tracker (item 9) ---
+
+#[test]
+fn detach_tracker_left_gates_on_empty_input() {
+    let mut t = DetachTracker::new();
+    // Fresh: nothing pending -> left detaches.
+    assert!(t.detach_on_left());
+
+    // Type two chars -> left is forwarded to the pty, not a detach.
+    t.on_char();
+    t.on_char();
+    assert!(!t.detach_on_left());
+
+    // Backspace twice clears the buffer -> left detaches again.
+    t.on_backspace();
+    t.on_backspace();
+    assert!(t.detach_on_left());
+
+    // Backspace saturates at zero (no underflow) -> still detaches.
+    t.on_backspace();
+    assert!(t.detach_on_left());
+
+    // Type then Enter (submit) resets pending to zero -> left detaches.
+    t.on_char();
+    assert!(!t.detach_on_left());
+    t.on_enter();
+    assert!(t.detach_on_left());
 }
