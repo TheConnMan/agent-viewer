@@ -19,6 +19,19 @@ use std::path::Path;
 /// to complete unattended, switch to ["--dangerously-bypass-approvals-and-sandbox"].
 const SANDBOX_ARGS: &[&str] = &["--sandbox", "workspace-write"];
 
+/// Build the `codex exec` spawn command (extracted so the model-flag wiring is unit-
+/// testable). `model` Some adds `-m <m>`; None uses codex's own default.
+fn codex_spawn_command(dir: &Path, task: &str, model: Option<&str>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("codex");
+    cmd.arg("exec").arg("--json").arg("-C").arg(dir);
+    cmd.args(SANDBOX_ARGS);
+    if let Some(model) = model {
+        cmd.arg("-m").arg(model);
+    }
+    cmd.arg(task);
+    cmd
+}
+
 pub struct CodexBackend {
     codex_home: std::path::PathBuf,
     registry: Option<Registry>,
@@ -102,13 +115,7 @@ impl Backend for CodexBackend {
     }
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
-        let mut cmd = std::process::Command::new("codex");
-        cmd.arg("exec").arg("--json").arg("-C").arg(dir);
-        cmd.args(SANDBOX_ARGS);
-        if let Some(model) = model {
-            cmd.arg("-m").arg(model);
-        }
-        cmd.arg(task);
+        let cmd = codex_spawn_command(dir, task, model);
         let log_path = crate::default_codex_home()
             .join("bg-logs")
             .join(format!("{}.log", crate::spawn::now_ms()));
@@ -148,5 +155,31 @@ impl Backend for CodexBackend {
             cmd.current_dir(&session.cwd);
         }
         Some(cmd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::codex_spawn_command;
+    use std::path::Path;
+
+    fn args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn codex_spawn_command_carries_model_flag() {
+        // A non-default model becomes `-m <model>`, before the task arg.
+        let cmd = codex_spawn_command(Path::new("/tmp"), "do a thing", Some("gpt-5.3-codex"));
+        let a = args(&cmd);
+        let i = a.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(a[i + 1], "gpt-5.3-codex");
+        assert_eq!(a.last().map(String::as_str), Some("do a thing"));
+
+        // None (the "default" model) adds no -m flag.
+        let cmd = codex_spawn_command(Path::new("/tmp"), "t", None);
+        assert!(!args(&cmd).iter().any(|x| x == "-m"));
     }
 }

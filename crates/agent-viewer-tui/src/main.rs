@@ -172,8 +172,8 @@ impl Ui {
 }
 
 fn main() -> io::Result<()> {
-    // Read the ASCII-marks fallback once, before any rendering.
-    ui::set_ascii_marks(std::env::var("AGENT_VIEWER_ASCII_MARKS").as_deref() == Ok("1"));
+    // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
+    ui::set_glyph_marks(std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1"));
 
     let mut list_backends = all_backends();
     let db = ViewerDb::open_default().ok();

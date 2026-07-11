@@ -10,7 +10,7 @@ use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::{Session, Status};
-use agent_viewer_tui::app::{DetachTracker, KillStage};
+use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::ui::{Mode, RenameModal};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -62,15 +62,25 @@ fn handle_normal_key(
         return Ok(false);
     }
 
+    // While the slash-command popup is open, Up/Down/Tab/Esc drive it instead of the list.
+    let suggesting = ui.composer.suggestions_active();
     match key.code {
+        KeyCode::Down if suggesting => ui.composer.move_suggestion(1),
+        KeyCode::Up if suggesting => ui.composer.move_suggestion(-1),
         // Arrows navigate/act at all times (App collapses any inline peek on the move).
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
-        // Tab cycles the composer's target backend; Shift+Tab cycles that backend's model.
+        // Tab accepts the highlighted suggestion while the popup is open, else cycles the
+        // target backend; Shift+Tab cycles that backend's model.
+        KeyCode::Tab if suggesting => {
+            ui.composer.accept_suggestion();
+        }
         KeyCode::Tab => ui.composer.cycle_backend(),
         KeyCode::BackTab => ui.composer.cycle_model(),
         KeyCode::Backspace => ui.composer.backspace(),
+        // Esc dismisses an open popup first; a second Esc clears the composer as before.
+        KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
             if ui.composer.is_empty() {
@@ -105,6 +115,8 @@ fn handle_normal_key(
         }
         _ => {}
     }
+    // Refresh the slash-command list for the (possibly new) backend/target and text.
+    ensure_completions(ui);
     Ok(false)
 }
 
@@ -223,6 +235,42 @@ fn open_filter(ui: &mut Ui) {
     ui.app.set_filter(String::new());
     ui.notice.clear();
     ui.mode = Mode::Filter;
+}
+
+/// The slash-command names for a backend (scanned from disk; missing dir -> empty, no error).
+/// claude: skill dir names under ~/.claude/skills plus <target>/.claude/skills (project
+/// skills). opencode: file stems under ~/.config/opencode/command. codex: file stems under
+/// ~/.codex/prompts. All home paths go through core's `home_dir`.
+fn scan_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<String> {
+    let home = agent_viewer_core::home_dir();
+    let mut cmds = match backend {
+        BackendKind::Claude => {
+            let mut v = subdir_names(&home.join(".claude/skills"));
+            if let Some(t) = target {
+                v.extend(subdir_names(&t.join(".claude/skills")));
+            }
+            v
+        }
+        BackendKind::Opencode => file_stems(&home.join(".config/opencode/command")),
+        BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
+    };
+    cmds.sort();
+    cmds.dedup();
+    cmds
+}
+
+/// Keep the composer's slash-command list current: re-scan the filesystem only when the
+/// text is a "/…" command AND the (backend, spawn target) it was scanned for has changed.
+fn ensure_completions(ui: &mut Ui) {
+    if !ui.composer.text().starts_with('/') {
+        return;
+    }
+    let target = ui.app.spawn_target();
+    let key = (ui.composer.backend(), target.clone());
+    if ui.composer.commands_key() != Some(&key) {
+        let cmds = scan_commands(key.0, target.as_deref());
+        ui.composer.set_commands(cmds, key);
+    }
 }
 
 /// Open the rename modal for the selected session (claude falls back to the local

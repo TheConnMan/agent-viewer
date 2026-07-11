@@ -39,7 +39,7 @@ pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
 }
 
 /// $HOME as a PathBuf (empty if unset — never panics; downstream opens just fail).
-pub(crate) fn home_dir() -> std::path::PathBuf {
+pub fn home_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 

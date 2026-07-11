@@ -43,30 +43,33 @@ pub mod theme {
     pub const BRAND_OPENCODE: Color = Color::Rgb(0x9e, 0xcb, 0x6a);
 }
 
-/// Startup-read (once, never per-frame): when true, list rows + composer fall back from the
-/// brand glyphs to the textual `[cc]`/`[cx]`/`[oc]` tags — for terminals whose font lacks the
-/// glyphs. Set from `AGENT_VIEWER_ASCII_MARKS=1`.
-static ASCII_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Startup-read (once, never per-frame): when true, list rows + composer use the brand
+/// glyphs (✳/◆/■) instead of the DEFAULT textual `[cc]`/`[cx]`/`[oc]` tags — an opt-in for
+/// terminals whose font renders them. Set from `AGENT_VIEWER_GLYPH_MARKS=1`.
+static GLYPH_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Set the ASCII-marks fallback once at startup (idempotent; later calls are ignored).
-pub fn set_ascii_marks(on: bool) {
-    let _ = ASCII_MARKS.set(on);
+/// Enable the brand-glyph marks once at startup (idempotent; later calls are ignored).
+pub fn set_glyph_marks(on: bool) {
+    let _ = GLYPH_MARKS.set(on);
 }
 
-fn ascii_marks() -> bool {
-    *ASCII_MARKS.get().unwrap_or(&false)
+fn glyph_marks() -> bool {
+    *GLYPH_MARKS.get().unwrap_or(&false)
 }
 
 /// The mark for a backend on list rows + the composer (single source of truth for every
-/// mark call site): the brand glyph, or the textual `[cc]`/`[cx]`/`[oc]` tag under the ASCII
-/// fallback. `BackendKind::tag()` is also used directly for help/notices regardless of this
-/// setting. Glyphs are all core Geometric Shapes (same coverage class as the status dots):
-/// claude "✳", codex "◆" (U+25C6), opencode "■" (U+25A0). `AGENT_VIEWER_ASCII_MARKS=1` is
-/// the escape hatch for fonts lacking them.
+/// mark call site): by DEFAULT the textual `[cc]`/`[cx]`/`[oc]` tag, or the brand glyph when
+/// `AGENT_VIEWER_GLYPH_MARKS=1`. `BackendKind::tag()` is also used directly for help/notices.
 fn backend_mark(backend: BackendKind) -> &'static str {
-    if ascii_marks() {
+    mark_for(backend, glyph_marks())
+}
+
+/// Pure mark selector (testable without the startup OnceLock): glyph vs textual tag.
+fn mark_for(backend: BackendKind, glyph: bool) -> &'static str {
+    if !glyph {
         return backend.tag();
     }
+    // Brand glyphs — all core Geometric Shapes (same coverage class as the status dots).
     match backend {
         BackendKind::Claude => "✳",
         BackendKind::Codex => "◆",
@@ -352,9 +355,48 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     );
     draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[3]);
 
+    // Slash-command completion popup, floating just above the composer box.
+    if matches!(d.mode, Mode::Normal) {
+        draw_slash_popup(frame, d.composer, vertical[2]);
+    }
+
     if matches!(d.mode, Mode::Help) {
         draw_help(frame, frame.area());
     }
+}
+
+/// Render the slash-command suggestions as a few muted lines directly above the composer
+/// box (the highlighted row in accent). Nothing renders when there are no suggestions.
+fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
+    let suggestions = composer.suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let height = (suggestions.len() as u16).min(composer_area.y);
+    if height == 0 {
+        return;
+    }
+    let area = Rect {
+        x: composer_area.x,
+        y: composer_area.y - height,
+        width: composer_area.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let highlight = composer.suggestion_highlight();
+    let items: Vec<ListItem> = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == highlight {
+                fg(theme::ACCENT)
+            } else {
+                fg(theme::MUTED)
+            };
+            ListItem::new(Line::from(Span::styled(format!(" /{name}"), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(items), area);
 }
 
 /// Per-row decorations layered over the list model: an in-place rename edit field and the
@@ -865,6 +907,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_for_defaults_to_tags_and_opts_into_glyphs() {
+        // Default (glyph = false): the textual tags.
+        assert_eq!(mark_for(BackendKind::Claude, false), "[cc]");
+        assert_eq!(mark_for(BackendKind::Codex, false), "[cx]");
+        assert_eq!(mark_for(BackendKind::Opencode, false), "[oc]");
+        // Opt-in (glyph = true): the brand glyphs.
+        assert_eq!(mark_for(BackendKind::Claude, true), "✳");
+        assert_eq!(mark_for(BackendKind::Codex, true), "◆");
+        assert_eq!(mark_for(BackendKind::Opencode, true), "■");
+    }
 
     #[test]
     fn shimmer_cycles_frames_on_120ms() {

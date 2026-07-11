@@ -583,6 +583,14 @@ pub struct Composer {
     /// Index into `models_for(self.backend)` — the per-spawn model choice (Shift+Tab cycles;
     /// reset to 0 whenever the backend changes).
     model_idx: usize,
+    /// Slash-command names available for the current backend/target (scanned by the caller
+    /// via `set_commands`), with the (backend, target) they were scanned for so the caller
+    /// only re-scans on a change.
+    commands: Vec<String>,
+    commands_key: Option<(BackendKind, Option<PathBuf>)>,
+    /// Highlighted suggestion index, and whether the popup was Esc-dismissed for this word.
+    suggest_idx: usize,
+    suggest_dismissed: bool,
 }
 
 /// The per-backend model cycle. Single-entry lists make Shift+Tab a no-op there. The leading
@@ -590,9 +598,36 @@ pub struct Composer {
 pub fn models_for(backend: BackendKind) -> &'static [&'static str] {
     match backend {
         BackendKind::Claude => &["opus[1m]", "sonnet", "fable"],
-        BackendKind::Codex => &["default"],
+        // gpt-5.1-codex-max is deliberately omitted: it 400s on ChatGPT-account auth.
+        BackendKind::Codex => &["default", "gpt-5.3-codex", "gpt-5.2-codex"],
         BackendKind::Opencode => &["default"],
     }
+}
+
+/// Names of the immediate subdirectories of `dir` (claude skills). A missing/unreadable dir
+/// yields an empty list, never an error.
+pub fn subdir_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// File stems (name without the final extension) of the files directly under `dir`
+/// (opencode/codex commands). A missing/unreadable dir yields an empty list.
+pub fn file_stems(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect()
 }
 
 impl Default for Composer {
@@ -608,6 +643,10 @@ impl Composer {
             text: String::new(),
             backend: BackendKind::Claude,
             model_idx: 0,
+            commands: Vec::new(),
+            commands_key: None,
+            suggest_idx: 0,
+            suggest_dismissed: false,
         }
     }
 
@@ -630,15 +669,22 @@ impl Composer {
 
     pub fn push_char(&mut self, c: char) {
         self.text.push(c);
+        // Editing the command word re-opens a dismissed popup and resets the highlight.
+        self.suggest_dismissed = false;
+        self.suggest_idx = 0;
     }
 
     /// Backspace on empty is a no-op (not a panic).
     pub fn backspace(&mut self) {
         self.text.pop();
+        self.suggest_dismissed = false;
+        self.suggest_idx = 0;
     }
 
     pub fn clear(&mut self) {
         self.text.clear();
+        self.suggest_idx = 0;
+        self.suggest_dismissed = false;
     }
 
     /// Tab: Claude -> Codex -> Opencode -> Claude. Resets the model to the new backend's first.
@@ -654,6 +700,89 @@ impl Composer {
     /// Shift+Tab: cycle the model for the current backend (a no-op for single-entry cycles).
     pub fn cycle_model(&mut self) {
         self.model_idx = (self.model_idx + 1) % models_for(self.backend).len();
+    }
+
+    // --- Slash-command completion (v2.5) -----------------------------------------
+
+    /// The (backend, target) the current command list was scanned for; the caller re-scans
+    /// via `set_commands` only when this changes.
+    pub fn commands_key(&self) -> Option<&(BackendKind, Option<PathBuf>)> {
+        self.commands_key.as_ref()
+    }
+
+    /// Install the available slash-command names for the given (backend, target) scan key.
+    pub fn set_commands(&mut self, commands: Vec<String>, key: (BackendKind, Option<PathBuf>)) {
+        self.commands = commands;
+        self.commands_key = Some(key);
+        self.suggest_idx = 0;
+    }
+
+    /// The typed command word: text after a leading "/" up to the first space, or None when
+    /// the text is not a bare "/word" (no slash, or a space already committed the command).
+    fn command_word(&self) -> Option<&str> {
+        let rest = self.text.strip_prefix('/')?;
+        if rest.contains(' ') {
+            return None; // a space means the command is chosen; stop completing
+        }
+        Some(rest)
+    }
+
+    /// Slash-command suggestions for the current word (prefix match, case-insensitive, capped
+    /// at 8). Empty when the popup is dismissed or the text is not a bare "/word".
+    pub fn suggestions(&self) -> Vec<&str> {
+        if self.suggest_dismissed {
+            return Vec::new();
+        }
+        let Some(word) = self.command_word() else {
+            return Vec::new();
+        };
+        let word = word.to_lowercase();
+        self.commands
+            .iter()
+            .filter(|c| c.to_lowercase().starts_with(&word))
+            .map(String::as_str)
+            .take(8)
+            .collect()
+    }
+
+    pub fn suggestions_active(&self) -> bool {
+        !self.suggestions().is_empty()
+    }
+
+    /// The clamped highlight index into the current suggestions.
+    pub fn suggestion_highlight(&self) -> usize {
+        self.suggest_idx
+            .min(self.suggestions().len().saturating_sub(1))
+    }
+
+    /// Up/Down within the popup: wrap the highlight over the suggestions.
+    pub fn move_suggestion(&mut self, delta: i32) {
+        let n = self.suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.suggestion_highlight() as i32;
+        self.suggest_idx = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    /// Tab within the popup: replace the text with "/name " for the highlighted command.
+    /// Returns false when there is nothing to accept.
+    pub fn accept_suggestion(&mut self) -> bool {
+        let Some(name) = self
+            .suggestions()
+            .get(self.suggestion_highlight())
+            .map(|s| s.to_string())
+        else {
+            return false;
+        };
+        self.text = format!("/{name} ");
+        self.suggest_idx = 0;
+        true
+    }
+
+    /// Esc within the popup: hide it without clearing the text (a second Esc clears as usual).
+    pub fn dismiss_suggestions(&mut self) {
+        self.suggest_dismissed = true;
     }
 }
 

@@ -668,18 +668,111 @@ fn composer_cycles_model_and_resets_on_backend_change() {
     c.cycle_model();
     assert_eq!(c.model(), "opus[1m]");
 
-    // Move off the default model, then Tab to codex resets the model slot.
+    // Move off the default model, then Tab to codex resets the model slot to its first.
     c.cycle_model(); // sonnet
     assert_eq!(c.model(), "sonnet");
     c.cycle_backend(); // -> codex, model reset
     assert_eq!(c.backend(), BackendKind::Codex);
     assert_eq!(c.model(), "default");
-    // codex has a single-entry cycle: Shift+Tab stays put.
+    // Opencode has a single-entry cycle: Shift+Tab stays put.
+    c.cycle_backend(); // -> opencode
+    assert_eq!(c.backend(), BackendKind::Opencode);
+    assert_eq!(c.model(), "default");
     c.cycle_model();
     assert_eq!(c.model(), "default");
-    // Back to claude resets to its first model, not the previous sonnet.
-    c.cycle_backend(); // opencode
+    // Back to claude resets to its first model, not any previously-cycled one.
     c.cycle_backend(); // claude
     assert_eq!(c.backend(), BackendKind::Claude);
     assert_eq!(c.model(), "opus[1m]");
+}
+
+// --- v2.5: codex models, slash-command completion ---
+
+#[test]
+fn composer_codex_model_cycle_order() {
+    let mut c = Composer::new();
+    c.cycle_backend(); // claude -> codex
+    assert_eq!(c.backend(), BackendKind::Codex);
+    assert_eq!(c.model(), "default");
+    c.cycle_model();
+    assert_eq!(c.model(), "gpt-5.3-codex");
+    c.cycle_model();
+    assert_eq!(c.model(), "gpt-5.2-codex");
+    c.cycle_model();
+    assert_eq!(c.model(), "default"); // wraps
+}
+
+#[test]
+fn composer_slash_suggestions_prefix_filter() {
+    let mut c = Composer::new();
+    c.set_commands(
+        vec!["implement".into(), "improve".into(), "review".into()],
+        (BackendKind::Claude, None),
+    );
+    // Non-slash text: no suggestions at all.
+    for ch in "hello".chars() {
+        c.push_char(ch);
+    }
+    assert!(c.suggestions().is_empty());
+    assert!(!c.suggestions_active());
+
+    // "/i" narrows to the two i-prefixed commands (order preserved).
+    c.clear();
+    for ch in "/i".chars() {
+        c.push_char(ch);
+    }
+    assert_eq!(c.suggestions(), vec!["implement", "improve"]);
+    // "/impl" narrows further to just implement.
+    for ch in "mpl".chars() {
+        c.push_char(ch);
+    }
+    assert_eq!(c.suggestions(), vec!["implement"]);
+    // A space commits the command word -> popup closes.
+    for ch in "ement ".chars() {
+        c.push_char(ch);
+    }
+    assert!(c.suggestions().is_empty());
+}
+
+#[test]
+fn composer_tab_accepts_suggestion_only_when_popup_open() {
+    let mut c = Composer::new();
+    c.set_commands(vec!["implement".into(), "improve".into()], (BackendKind::Claude, None));
+    // No slash: popup closed (Tab would cycle the backend in the key handler).
+    assert!(!c.suggestions_active());
+    assert!(!c.accept_suggestion());
+    // Type "/im": popup open; Tab accepts the highlighted (first) command as "/name ".
+    for ch in "/im".chars() {
+        c.push_char(ch);
+    }
+    assert!(c.suggestions_active());
+    assert!(c.accept_suggestion());
+    assert_eq!(c.text(), "/implement ");
+    assert!(!c.suggestions_active()); // the trailing space closes the popup
+
+    // Esc-dismiss hides the popup without clearing the text; editing re-opens it.
+    c.clear();
+    for ch in "/im".chars() {
+        c.push_char(ch);
+    }
+    c.dismiss_suggestions();
+    assert!(!c.suggestions_active());
+    assert_eq!(c.text(), "/im"); // text intact
+    c.push_char('p');
+    assert!(c.suggestions_active()); // editing re-opens
+}
+
+#[test]
+fn dir_scan_helpers_handle_missing_and_present_dirs() {
+    use agent_viewer_tui::app::{file_stems, subdir_names};
+    // Missing dir -> empty, never an error.
+    let missing = std::path::Path::new("/nonexistent/xyz-does-not-exist-agentviewer");
+    assert!(subdir_names(missing).is_empty());
+    assert!(file_stems(missing).is_empty());
+    // A real dir with one subdir and one file: subdir_names sees the dir, file_stems the file.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("myskill")).unwrap();
+    std::fs::write(dir.path().join("cmd.md"), "x").unwrap();
+    assert_eq!(subdir_names(dir.path()), vec!["myskill".to_string()]);
+    assert_eq!(file_stems(dir.path()), vec!["cmd".to_string()]); // ".md" stripped
 }

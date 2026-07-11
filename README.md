@@ -34,14 +34,15 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✗` failed — exited with an error.
 - `○` stopped — stopped from the viewer.
 
-Each row is prefixed by its backend's brand mark in the backend's color — `✳` Claude
-(terracotta), `◆` Codex (teal), `■` opencode (green) — and spells the state as a word in the
-state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`, `Stopped`) followed by a
-muted one-line summary. Claude jobs with associated pull requests show a right-aligned badge
-just left of the elapsed time — `#315` for one PR, `2 PRs` for several.
+Each row is prefixed by its backend's mark in the backend's color — by default the textual
+tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) — followed by
+the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`,
+`Stopped`) and a muted one-line summary. The status word and time sit right-aligned; Claude
+jobs with associated pull requests show a badge just left of the time — `#315` for one PR,
+`2 PRs` for several.
 
-If the marks don't render in your font, set `AGENT_VIEWER_ASCII_MARKS=1` to fall back to the
-textual `[cc]`/`[cx]`/`[oc]` tags (still in their brand colors).
+Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
+`✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
 
 The default list groups by project directory; `Ctrl+S` regroups by state (needs-input,
 working, idle, done, with failed and stopped folding into done). Every row renders — the
@@ -64,14 +65,20 @@ have marked them a companion.
 ## Inline spawn composer
 
 The list view carries a persistent composer in a rounded box between the list and the
-footer: `✳ claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task (a slash
-command like `/implement RS-123` is just task text); `Tab` cycles the target agent (Claude
-`✳` → Codex `◆` → opencode `■`, each in its brand color), `Shift+Tab` cycles that agent's
-model (Claude: `opus[1m]` → `sonnet` → `fable`; codex/opencode have a single default that
-shows nothing), and `Enter` spawns it detached with that model. The target directory is the
-selected row's project root (by-project view) or its exact cwd (by-state view). While the
-composer is empty, the single-letter command keys below still fire; once you have typed
-anything, every printable key (and space) is task text, and `Esc` clears it.
+footer: `[cc] claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab`
+cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model
+(Claude: `opus[1m]` → `sonnet` → `fable`; Codex: `default` → `gpt-5.3-codex` → `gpt-5.2-codex`;
+opencode: a single default), and `Enter` spawns it detached with that model. The target
+directory is the selected row's project root (by-project view) or its exact cwd (by-state
+view). While the composer is empty, the single-letter command keys below still fire; once you
+have typed anything, every printable key (and space) is task text, and `Esc` clears it.
+
+Typing a slash command shows a completion popup above the box: the available commands for the
+selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
+opencode commands under `~/.config/opencode/command`; codex prompts under `~/.codex/prompts`),
+prefix-filtered live. While it is open, `↑`/`↓` move the highlight, `Tab` inserts the
+highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-is (so
+`/implement RS-123` runs that slash command as the task prompt).
 
 ## Inline peek and rename
 
