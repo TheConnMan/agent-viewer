@@ -55,6 +55,12 @@ fn handle_normal_key(
     ui: &mut Ui,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<bool> {
+    // Refresh the slash-command list up front (keyed on backend+target, so a no-op unless
+    // they changed) BEFORE anything reads `suggestions_active` — otherwise a Ctrl+S regroup
+    // or a background snapshot that moved the selected session/target could leave `suggesting`
+    // (and a subsequent Tab accept) reading commands scanned for the PREVIOUS target.
+    ensure_completions(ui);
+
     // Ctrl-chords always act, regardless of composer state.
     if ctrl {
         match key.code {
@@ -688,15 +694,17 @@ fn spawn_from_composer(backends: &[Box<dyn Backend>], refresher: &Refresher, ui:
 #[cfg(test)]
 mod tests {
     use super::open_filter;
+    use super::ensure_completions;
     use crate::{NoticeState, Ui};
+    use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer};
     use agent_viewer_tui::mutations::MutationRunner;
     use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
     use std::collections::HashMap;
 
-    fn test_ui() -> Ui {
+    fn test_ui_with(sessions: Vec<Session>) -> Ui {
         Ui {
-            app: App::new(Vec::new()),
+            app: App::new(sessions),
             mode: Mode::Normal,
             notice: NoticeState::default(),
             db: None,
@@ -716,9 +724,29 @@ mod tests {
         }
     }
 
+    fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
+        Session {
+            backend: BackendKind::Claude,
+            id: id.into(),
+            short_id: None,
+            title: id.into(),
+            cwd: std::path::PathBuf::from(cwd),
+            created_at_ms: updated_at_ms,
+            updated_at_ms,
+            status: Status::Done,
+            hidden: false,
+            source_label: "test".into(),
+            summary: String::new(),
+            companion: false,
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+        }
+    }
+
     #[test]
     fn ctrl_f_open_filter_enters_filter_mode() {
-        let mut ui = test_ui();
+        let mut ui = test_ui_with(Vec::new());
         assert!(matches!(ui.mode, Mode::Normal));
         open_filter(&mut ui);
         assert!(matches!(ui.mode, Mode::Filter));
@@ -732,7 +760,7 @@ mod tests {
         use agent_viewer_tui::ui::ReplyModal;
         use crossterm::event::KeyCode;
 
-        let mut ui = test_ui();
+        let mut ui = test_ui_with(Vec::new());
         ui.mode = Mode::Reply(ReplyModal {
             backend: BackendKind::Claude,
             id: "s1".to_string(),
@@ -757,5 +785,38 @@ mod tests {
         // Esc cancels back to Normal.
         edit_reply(KeyCode::Esc, &mut ui);
         assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn completions_refresh_for_new_target_before_a_stale_accept() {
+        // Two claude sessions in DIFFERENT project dirs -> distinct spawn targets.
+        let mut ui = test_ui_with(vec![
+            sess("a", "/tmp/agentviewer-target-a", 200),
+            sess("b", "/tmp/agentviewer-target-b", 100),
+        ]);
+        // Type a "/…" command and scan completions for the first target.
+        for ch in "/x".chars() {
+            ui.composer.push_char(ch);
+        }
+        ensure_completions(&mut ui);
+        let key1 = ui.composer.commands_key().cloned();
+        assert_eq!(
+            key1,
+            Some((BackendKind::Claude, Some("/tmp/agentviewer-target-a".into())))
+        );
+
+        // The selected session (and thus spawn target) changes WITHOUT going through the
+        // composer — as a Ctrl+S regroup or a background snapshot would. The cache is now
+        // stale: a Tab here would accept a suggestion computed for the OLD target.
+        ui.app.move_selection(1);
+        assert_eq!(ui.composer.commands_key(), key1.as_ref()); // still the old key
+
+        // The top-of-handler refresh re-scans for the NEW target, so `suggestions_active`
+        // (and any subsequent Tab accept) reflects it, never the stale previous list.
+        ensure_completions(&mut ui);
+        assert_eq!(
+            ui.composer.commands_key(),
+            Some(&(BackendKind::Claude, Some("/tmp/agentviewer-target-b".into())))
+        );
     }
 }
