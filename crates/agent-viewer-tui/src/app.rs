@@ -196,7 +196,8 @@ impl App {
     }
 
     /// j/k/arrows — cursor only, never rebuilds the row cache. Lands on Session rows,
-    /// skipping headers/markers in the direction of travel.
+    /// skipping headers/spacers in the direction of travel. A single-step move (±1) off the
+    /// last/first session row WRAPS to the first/last one; larger deltas clamp as before.
     pub fn move_selection(&mut self, delta: i32) {
         let len = self.rows.len();
         if len == 0 {
@@ -204,33 +205,41 @@ impl App {
             self.sync_expanded();
             return;
         }
-        let target = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
         let step: i32 = if delta >= 0 { 1 } else { -1 };
-        // Walk from the clamped target toward the travel direction for a Session row;
-        // if none that way (target sat past the last session), fall back the other way.
-        let mut chosen = None;
-        let mut idx = target;
-        while (0..len as i32).contains(&idx) {
+        let target = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
+        // Nearest Session row from `target` in the travel direction, else the other way.
+        let chosen = self
+            .session_from(target, step)
+            .or_else(|| self.session_from(target, -step));
+
+        if let Some(c) = chosen {
+            // A single arrow press that can't advance means we are on the first/last session
+            // row — wrap to the opposite end.
+            if delta == step && c == self.selected {
+                let wrapped = if step > 0 {
+                    self.session_from(0, 1)
+                } else {
+                    self.session_from(len as i32 - 1, -1)
+                };
+                self.selected = wrapped.unwrap_or(c);
+            } else {
+                self.selected = c;
+            }
+        }
+        self.sync_expanded();
+    }
+
+    /// The first Session-row index at or beyond `start` walking in `step` direction, if any.
+    fn session_from(&self, start: i32, step: i32) -> Option<usize> {
+        let len = self.rows.len() as i32;
+        let mut idx = start;
+        while (0..len).contains(&idx) {
             if matches!(self.rows[idx as usize], Row::Session { .. }) {
-                chosen = Some(idx as usize);
-                break;
+                return Some(idx as usize);
             }
             idx += step;
         }
-        if chosen.is_none() {
-            let mut idx = target;
-            while (0..len as i32).contains(&idx) {
-                if matches!(self.rows[idx as usize], Row::Session { .. }) {
-                    chosen = Some(idx as usize);
-                    break;
-                }
-                idx -= step;
-            }
-        }
-        if let Some(c) = chosen {
-            self.selected = c;
-        }
-        self.sync_expanded();
+        None
     }
 
     pub fn selected(&self) -> Option<&Session> {

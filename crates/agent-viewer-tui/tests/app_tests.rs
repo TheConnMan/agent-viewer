@@ -222,6 +222,51 @@ fn spacer_rows_separate_groups_but_never_bookend() {
 }
 
 #[test]
+fn arrow_wraps_around_top_and_bottom_over_headers_and_spacers() {
+    // Distinct states -> ByState view has section headers + spacers between the rows.
+    let sessions = vec![
+        sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
+        sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
+        sess(BackendKind::Codex, "idle", "/p", 400, Status::Idle),
+        sess(BackendKind::Codex, "done", "/p", 300, Status::Done),
+    ];
+    let mut app = App::new(sessions);
+    app.toggle_group_mode();
+    assert_eq!(app.group_mode(), GroupMode::ByState);
+    // Session rows top->bottom: needs, work, idle, done.
+
+    select(&mut app, "done"); // last session row
+    app.move_selection(1); // Down at the bottom wraps to the first session row
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("needs"));
+
+    app.move_selection(-1); // Up at the top wraps to the last session row
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("done"));
+
+    // A mid-list step is a normal move (no wrap), skipping the header/spacer between sections.
+    select(&mut app, "work");
+    app.move_selection(1);
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("idle"));
+}
+
+#[test]
+fn arrow_wrap_is_scoped_to_the_filtered_rows() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "alpha", "/synthetic/aaa", 300, Status::Working),
+        sess(BackendKind::Codex, "beta", "/synthetic/bbb", 200, Status::Working),
+        sess(BackendKind::Codex, "gamma", "/synthetic/aaa-more", 100, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    app.set_filter("aaa".to_string()); // only alpha + gamma remain visible
+    assert_eq!(session_rows(&app.visible()).len(), 2);
+
+    select(&mut app, "gamma"); // last visible session row
+    app.move_selection(1); // wraps within the filtered set, not the full list
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("alpha"));
+    app.move_selection(-1);
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("gamma"));
+}
+
+#[test]
 fn rename_resolves_target_by_key_after_reorder() {
     // Regression: rename must resolve its target by (backend, id), never by selection — the
     // background refresh reorders rows while the user types, drifting selection off the row.
