@@ -10,13 +10,17 @@ use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::{Session, Status};
-use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
+use agent_viewer_tui::app::{
+    CodexReply, DetachTracker, KillStage, codex_reply_keystroke, file_stems, reply_allowed,
+    subdir_names,
+};
 use agent_viewer_tui::attach::key_to_bytes;
-use agent_viewer_tui::ui::{Mode, RenameModal};
+use agent_viewer_tui::ui::{Mode, RenameModal, ReplyModal};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::auto_enter::{AutoEnter, AutoEnterStage};
 use crate::ops::{Mutation, run_mutation};
+use crate::pending_reply::PendingReply;
 use crate::{Key, Refresher, Ui};
 
 /// Returns `true` when the app should quit.
@@ -38,6 +42,7 @@ pub(crate) fn handle_key(
             }
         }
         Mode::Rename(_) => handle_rename_key(key.code, ui),
+        Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
     }
     Ok(false)
 }
@@ -101,6 +106,7 @@ fn handle_normal_key(
                     'a' => ui.app.toggle_show_all(),
                     'h' => hide_selected(backends, ui, true),
                     'u' => hide_selected(backends, ui, false),
+                    'r' => open_reply(backends, ui),
                     '?' => ui.mode = Mode::Help,
                     // Space toggles the inline peek expansion of the selected row.
                     ' ' if ui.app.selected().is_some() => ui.app.toggle_expanded(),
@@ -130,8 +136,10 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         return;
     };
 
-    // Any key here is the user taking over, so cancel a pending auto-Enter on this attach.
+    // Any key here is the user taking over, so cancel a pending auto-Enter or reply injection
+    // on this attach (do not type our queued reply in behind the user's own input).
     ui.auto_enter = None;
+    ui.pending_reply = None;
 
     // Ctrl+] always detaches (PTY lives on in the map). Terminals send Ctrl+] as raw byte
     // 0x1D, which crossterm's legacy unix parser maps to Char('5')+CTRL (it folds 0x1C..=0x1F
@@ -228,6 +236,42 @@ fn handle_rename_key(code: KeyCode, ui: &mut Ui) {
     }
 }
 
+/// Reply-compose key handling: Enter delivers (and attaches); every other key edits the
+/// buffer or cancels. Enter is split out because delivery needs the terminal + backends.
+fn handle_reply_key(
+    code: KeyCode,
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> io::Result<()> {
+    match code {
+        KeyCode::Enter => {
+            send_reply(backends, ui, terminal)?;
+            // send_reply attaches on success (Mode::Attached); if it bailed, drop to Normal.
+            if !matches!(ui.mode, Mode::Attached) {
+                ui.mode = Mode::Normal;
+            }
+        }
+        other => edit_reply(other, ui),
+    }
+    Ok(())
+}
+
+/// The pure reply-compose state machine: Esc cancels, Backspace/Char edit the buffer.
+fn edit_reply(code: KeyCode, ui: &mut Ui) {
+    let Mode::Reply(modal) = &mut ui.mode else {
+        return;
+    };
+    match code {
+        KeyCode::Esc => ui.mode = Mode::Normal,
+        KeyCode::Backspace => {
+            modal.buffer.pop();
+        }
+        KeyCode::Char(c) => modal.buffer.push(c),
+        _ => {}
+    }
+}
+
 // --- Actions --------------------------------------------------------------------
 
 /// Ctrl+F — enter filter mode with a fresh, empty query.
@@ -284,6 +328,87 @@ fn open_rename(ui: &mut Ui) {
         id: session.id.clone(),
         buffer: session.title.clone(),
     });
+}
+
+/// `r` on an empty composer — focus a reply input for the selected session, gated on the
+/// backend supporting reply AND the session actually being blocked (the sole safety gate).
+/// Force the peek open so the pending ask stays visible above the input.
+fn open_reply(backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    let Some(session) = ui.app.selected().cloned() else {
+        return;
+    };
+    let caps = caps_of(backends, session.backend);
+    if !reply_allowed(caps.reply, session.status) {
+        ui.set_notice(if !caps.reply {
+            format!("{} does not support reply", session.backend.name())
+        } else {
+            "only a needs-input session can be replied to".to_string()
+        });
+        return;
+    }
+    ui.app.expand_selected();
+    ui.mode = Mode::Reply(ReplyModal {
+        backend: session.backend,
+        id: session.id.clone(),
+        buffer: String::new(),
+    });
+}
+
+/// Deliver the composed reply: re-resolve the target, re-check the safety gate (state may
+/// have changed while typing), attach (reusing the auto-Enter landing path), then arm the
+/// one-shot injector to write the payload once we are safely in the run. Claude sends the
+/// text + Enter; codex maps y/n approvals to a single keystroke and otherwise attaches with
+/// focus for the user to finish; opencode is gated out upstream.
+fn send_reply(
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> io::Result<()> {
+    let Mode::Reply(modal) = &ui.mode else {
+        return Ok(());
+    };
+    let backend_kind = modal.backend;
+    let id = modal.id.clone();
+    let buffer = modal.buffer.clone();
+
+    // Re-resolve by (backend, id), NOT selected() — the background refresh reorders rows.
+    let Some(session) = ui.app.session_for(&(backend_kind, id.clone())).cloned() else {
+        ui.set_notice("session is gone".to_string());
+        return Ok(());
+    };
+    // Safety re-check: never send to a session that is no longer waiting for input.
+    if !reply_allowed(caps_of(backends, backend_kind).reply, session.status) {
+        ui.set_notice("session is no longer waiting for input".to_string());
+        return Ok(());
+    }
+
+    // Decide the payload (bytes, require_run_view) per backend; None attaches with focus only.
+    let payload: Option<(Vec<u8>, bool)> = match backend_kind {
+        BackendKind::Claude => Some((format!("{buffer}\r").into_bytes(), true)),
+        BackendKind::Codex => match codex_reply_keystroke(&buffer) {
+            CodexReply::Approve => Some((b"y".to_vec(), false)),
+            CodexReply::Deny => Some((b"n".to_vec(), false)),
+            CodexReply::Freeform => {
+                ui.set_notice("type your reply in the attached session".to_string());
+                None
+            }
+        },
+        BackendKind::Opencode => None,
+    };
+
+    if !attach_session(backends, ui, terminal, &session)? {
+        return Ok(());
+    }
+    if let Some((payload, require_run_view)) = payload {
+        ui.pending_reply = Some(PendingReply {
+            key: (backend_kind, id),
+            payload,
+            require_run_view,
+            armed_at: Instant::now(),
+            ready_since: None,
+        });
+    }
+    Ok(())
 }
 
 /// Submit the rename to the background runner (the app-server/UDS rename can take 1-2s).
@@ -408,6 +533,7 @@ fn caps_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Capabilities {
             stop: false,
             remove: false,
             rename: false,
+            reply: false,
         })
 }
 
@@ -419,12 +545,25 @@ fn attach_selected(
     let Some(session) = ui.app.selected().cloned() else {
         return Ok(());
     };
+    attach_session(backends, ui, terminal, &session)?;
+    Ok(())
+}
+
+/// Attach a GIVEN session (shared by `attach_selected` and the reply delivery path): reuse a
+/// live PTY (resize) or spawn one, arm the live-claude auto-Enter, and focus it. Returns true
+/// when it ended attached (Mode::Attached), false when it bailed with a notice.
+fn attach_session(
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::DefaultTerminal,
+    session: &Session,
+) -> io::Result<bool> {
     let Some(backend) = backend_of(backends, session.backend) else {
-        return Ok(());
+        return Ok(false);
     };
     if !backend.capabilities().attach {
         ui.set_notice(format!("{} does not support attach", backend.kind().name()));
-        return Ok(());
+        return Ok(false);
     }
 
     let key: Key = (session.backend, session.id.clone());
@@ -447,9 +586,9 @@ fn attach_selected(
             let config = std::path::PathBuf::from(&home).join(".claude.json");
             let _ = ensure_trusted(&config, &session.cwd);
         }
-        let Some(command) = backend.attach_command(&session) else {
+        let Some(command) = backend.attach_command(session) else {
             ui.set_notice(format!("{} does not support attach", backend.kind().name()));
-            return Ok(());
+            return Ok(false);
         };
         let spec = spec_from_command(&command, rows, cols);
         match PtySession::spawn(spec) {
@@ -471,15 +610,15 @@ fn attach_selected(
             }
             Err(e) => {
                 ui.set_notice(format!("attach failed: {e}"));
-                return Ok(());
+                return Ok(false);
             }
         }
     }
 
     ui.focused = Some(key);
-    ui.focused_session = Some(session);
+    ui.focused_session = Some(session.clone());
     ui.mode = Mode::Attached;
-    Ok(())
+    Ok(true)
 }
 
 /// Spawn the composed task into the current spawn target, record it for pinning, and
@@ -548,6 +687,7 @@ mod tests {
             mutations: MutationRunner::new(),
             pulses: Pulses::new(),
             auto_enter: None,
+            pending_reply: None,
             attached: HashMap::new(),
             focused: None,
             focused_session: None,
@@ -562,5 +702,39 @@ mod tests {
         open_filter(&mut ui);
         assert!(matches!(ui.mode, Mode::Filter));
         assert_eq!(ui.app.filter(), ""); // opens with a fresh, empty query
+    }
+
+    #[test]
+    fn reply_compose_edits_buffer_and_esc_cancels() {
+        use super::edit_reply;
+        use agent_viewer_core::BackendKind;
+        use agent_viewer_tui::ui::ReplyModal;
+        use crossterm::event::KeyCode;
+
+        let mut ui = test_ui();
+        ui.mode = Mode::Reply(ReplyModal {
+            backend: BackendKind::Claude,
+            id: "s1".to_string(),
+            buffer: String::new(),
+        });
+
+        // Chars append to the buffer.
+        edit_reply(KeyCode::Char('h'), &mut ui);
+        edit_reply(KeyCode::Char('i'), &mut ui);
+        match &ui.mode {
+            Mode::Reply(m) => assert_eq!(m.buffer, "hi"),
+            _ => panic!("expected reply mode"),
+        }
+
+        // Backspace removes the last char.
+        edit_reply(KeyCode::Backspace, &mut ui);
+        match &ui.mode {
+            Mode::Reply(m) => assert_eq!(m.buffer, "h"),
+            _ => panic!("expected reply mode"),
+        }
+
+        // Esc cancels back to Normal.
+        edit_reply(KeyCode::Esc, &mut ui);
+        assert!(matches!(ui.mode, Mode::Normal));
     }
 }

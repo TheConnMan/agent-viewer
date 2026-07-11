@@ -80,6 +80,7 @@ impl Backend for CodexBackend {
             stop: true,
             remove: true,
             rename: true,
+            reply: true,
         }
     }
 
