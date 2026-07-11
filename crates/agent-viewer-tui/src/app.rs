@@ -789,9 +789,13 @@ pub fn codex_reply_keystroke(input: &str) -> CodexReply {
 pub struct Composer {
     text: String,
     backend: BackendKind,
-    /// Index into `models_for(self.backend)` — the per-spawn model choice (Shift+Tab cycles;
-    /// reset to 0 whenever the backend changes).
-    model_idx: usize,
+    /// The current per-spawn model selection for `self.backend`.
+    model: String,
+    /// Discovered model list for the current backend (default-first), caller-installed via
+    /// `set_models`. Shift+Tab cycles it; `/model` filters it. Mirrors `commands`.
+    models: Vec<String>,
+    /// The backend the `models` list was installed for; the caller re-installs on a change.
+    models_key: Option<BackendKind>,
     /// Slash-command names available for the current backend/target (scanned by the caller
     /// via `set_commands`), with the (backend, target) they were scanned for so the caller
     /// only re-scans on a change.
@@ -800,17 +804,6 @@ pub struct Composer {
     /// Highlighted suggestion index, and whether the popup was Esc-dismissed for this word.
     suggest_idx: usize,
     suggest_dismissed: bool,
-}
-
-/// The per-backend model cycle. Single-entry lists make Shift+Tab a no-op there. The leading
-/// entry is the default; codex/opencode expose only "default" (no model flag on spawn).
-pub fn models_for(backend: BackendKind) -> &'static [&'static str] {
-    match backend {
-        BackendKind::Claude => &["opus[1m]", "sonnet", "fable"],
-        // gpt-5.1-codex-max is deliberately omitted: it 400s on ChatGPT-account auth.
-        BackendKind::Codex => &["default", "gpt-5.3-codex", "gpt-5.2-codex"],
-        BackendKind::Opencode => &["default"],
-    }
 }
 
 /// Names of the immediate subdirectories of `dir` (claude skills). A missing/unreadable dir
@@ -851,12 +844,15 @@ impl Default for Composer {
 }
 
 impl Composer {
-    /// Fresh composer: empty text, Claude backend, its first model.
+    /// Fresh composer: empty text, Claude backend, its default model. `models_key` is None so
+    /// the first `ensure_models` call installs the real discovered Claude list.
     pub fn new() -> Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
-            model_idx: 0,
+            model: "opus[1m]".to_string(),
+            models: vec!["opus[1m]".to_string()],
+            models_key: None,
             commands: Vec::new(),
             commands_key: None,
             suggest_idx: 0,
@@ -873,8 +869,24 @@ impl Composer {
     }
 
     /// The currently-selected model for the composer's backend.
-    pub fn model(&self) -> &'static str {
-        models_for(self.backend)[self.model_idx]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The backend the current `models` list was installed for; the caller re-installs via
+    /// `set_models` only when this changes (mirrors `commands_key`).
+    pub fn models_key(&self) -> Option<BackendKind> {
+        self.models_key
+    }
+
+    /// Install the discovered model list (default-first) for `backend`, selecting index 0.
+    pub fn set_models(&mut self, models: Vec<String>, backend: BackendKind) {
+        self.model = models
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        self.models = models;
+        self.models_key = Some(backend);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -901,19 +913,30 @@ impl Composer {
         self.suggest_dismissed = false;
     }
 
-    /// Tab: Claude -> Codex -> Opencode -> Claude. Resets the model to the new backend's first.
+    /// Tab: Claude -> Codex -> Opencode -> Claude. The model list is left stale for this one
+    /// step — `ensure_models` reinstalls (and resets to the default) at the end of the key
+    /// handler before any render, so nothing observes the stale list.
     pub fn cycle_backend(&mut self) {
         self.backend = match self.backend {
             BackendKind::Claude => BackendKind::Codex,
             BackendKind::Codex => BackendKind::Opencode,
             BackendKind::Opencode => BackendKind::Claude,
         };
-        self.model_idx = 0;
     }
 
-    /// Shift+Tab: cycle the model for the current backend (a no-op for single-entry cycles).
+    /// Shift+Tab: advance to the next discovered model after the current one, wrapping. A
+    /// no-op for opencode (its list is huge — use the `/model` picker) or a <2-entry list.
     pub fn cycle_model(&mut self) {
-        self.model_idx = (self.model_idx + 1) % models_for(self.backend).len();
+        if self.backend == BackendKind::Opencode || self.models.len() < 2 {
+            return;
+        }
+        let cur = self
+            .models
+            .iter()
+            .position(|m| m == &self.model)
+            .unwrap_or(0);
+        let next = (cur + 1) % self.models.len();
+        self.model = self.models[next].clone();
     }
 
     // --- Slash-command completion (v2.5) -----------------------------------------
@@ -944,7 +967,9 @@ impl Composer {
     /// Slash-command suggestions for the current word (prefix match, case-insensitive, capped
     /// at 8). Empty when the popup is dismissed or the text is not a bare "/word".
     pub fn suggestions(&self) -> Vec<&str> {
-        if self.suggest_dismissed {
+        // "/model" is the model meta-command: the slash popup stays closed so the two popups
+        // never both show (the model picker takes over).
+        if self.suggest_dismissed || self.is_model_command() {
             return Vec::new();
         }
         let Some(word) = self.command_word() else {
@@ -963,20 +988,80 @@ impl Composer {
         !self.suggestions().is_empty()
     }
 
-    /// The clamped highlight index into the current suggestions.
-    pub fn suggestion_highlight(&self) -> usize {
-        self.suggest_idx
-            .min(self.suggestions().len().saturating_sub(1))
+    /// The length of whichever popup is currently active (slash-command or `/model` picker),
+    /// so the shared highlight math tracks the right list.
+    fn active_suggestion_len(&self) -> usize {
+        if self.is_model_command() {
+            self.model_suggestions().len()
+        } else {
+            self.suggestions().len()
+        }
     }
 
-    /// Up/Down within the popup: wrap the highlight over the suggestions.
+    /// The clamped highlight index into the active popup's suggestions.
+    pub fn suggestion_highlight(&self) -> usize {
+        self.suggest_idx
+            .min(self.active_suggestion_len().saturating_sub(1))
+    }
+
+    /// Up/Down within the active popup: wrap the highlight over its suggestions.
     pub fn move_suggestion(&mut self, delta: i32) {
-        let n = self.suggestions().len();
+        let n = self.active_suggestion_len();
         if n == 0 {
             return;
         }
         let cur = self.suggestion_highlight() as i32;
         self.suggest_idx = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    // --- /model picker (v2.6) ----------------------------------------------------
+
+    /// Whether the composer text is the `/model` meta-command (bare or with a filter).
+    pub fn is_model_command(&self) -> bool {
+        self.text == "/model" || self.text.starts_with("/model ")
+    }
+
+    /// The filter typed after `/model` (empty for the bare command).
+    fn model_filter(&self) -> &str {
+        self.text
+            .strip_prefix("/model")
+            .map(str::trim)
+            .unwrap_or("")
+    }
+
+    /// The discovered models matching the `/model` filter (case-insensitive substring, capped
+    /// at 8). Empty unless the text is the `/model` command; an empty filter yields all.
+    pub fn model_suggestions(&self) -> Vec<String> {
+        if !self.is_model_command() {
+            return Vec::new();
+        }
+        let filter = self.model_filter().to_lowercase();
+        self.models
+            .iter()
+            .filter(|m| filter.is_empty() || m.to_lowercase().contains(&filter))
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the `/model` picker is currently showing suggestions.
+    pub fn model_picking(&self) -> bool {
+        !self.model_suggestions().is_empty()
+    }
+
+    /// Enter/Tab within the picker: set the model to the highlighted suggestion and clear the
+    /// composer. Returns false when there is nothing to accept.
+    pub fn accept_model(&mut self) -> bool {
+        let Some(model) = self
+            .model_suggestions()
+            .get(self.suggestion_highlight())
+            .cloned()
+        else {
+            return false;
+        };
+        self.model = model;
+        self.clear();
+        true
     }
 
     /// Tab within the popup: replace the text with "/name " for the highlighted command.

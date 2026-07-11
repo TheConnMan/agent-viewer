@@ -31,6 +31,44 @@ pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
     }
 }
 
+/// Run `cmd`, returning captured stdout as a String if it exits 0 within `timeout`.
+/// On timeout the child is killed; any failure (spawn error, non-zero exit, timeout,
+/// non-utf8 stdout) returns None. Poll-based (no new deps): spawn with piped stdout and
+/// null stderr, then loop `try_wait()` with a short sleep until the deadline. Used to
+/// bound the best-effort model-discovery shell-outs (`codex debug models`,
+/// `opencode models`) so a hung CLI cannot freeze the caller indefinitely.
+pub(crate) fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read;
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut buf = String::new();
+                child.stdout.take()?.read_to_string(&mut buf).ok()?;
+                return Some(buf);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Shared detached-spawn helper (codex + opencode; claude self-detaches):
 /// unsafe pre_exec calling libc::setsid() (new session, no ctty); stdin Stdio::null();
 /// stdout+stderr appended to log_path (parent dir created if missing); do NOT wait.
@@ -90,5 +128,41 @@ pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Command(format!("kill failed: {err}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_with_timeout;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn run_with_timeout_captures_stdout_on_success() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf hi");
+        assert_eq!(
+            run_with_timeout(cmd, Duration::from_secs(3)),
+            Some("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_none_on_nonzero_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 1");
+        assert_eq!(run_with_timeout(cmd, Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn run_with_timeout_kills_and_returns_none_past_deadline() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 5");
+        let start = Instant::now();
+        let out = run_with_timeout(cmd, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert_eq!(out, None);
+        // The child must be killed well before its own 5s sleep would end.
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 }

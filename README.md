@@ -69,15 +69,21 @@ have marked them a companion.
 
 The list view carries a persistent composer in a rounded box between the list and the
 footer: `[cc] claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab`
-cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model
-(Claude: `opus[1m]` → `sonnet` → `fable`; Codex: `default` → `gpt-5.3-codex` → `gpt-5.2-codex`;
-opencode: a single default), and `Enter` spawns it detached with that model. The target
-directory is the selected row's project root (by-project view) or its exact cwd (by-state
-view). While the composer is empty, the single-letter command keys below still fire; once you
-have typed anything, every printable key (and space) is task text, and `Esc` clears it.
+cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model,
+and `Enter` spawns it detached with that model. The models are discovered live from each
+agent's CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
+opencode: `opencode models`), default first. `Shift+Tab` cycles the Claude/Codex lists;
+opencode has too many models to cycle, so it stays on its default there (use `/model`). The
+target directory is the selected row's project root (by-project view) or its exact cwd
+(by-state view). While the composer is empty, the single-letter command keys below still fire;
+once you have typed anything, every printable key (and space) is task text, and `Esc` clears it.
 
-Typing a slash command shows a completion popup above the box: the available commands for the
-selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
+Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
+model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
+`Enter` picks the model (and clears the composer), `Esc` closes it.
+
+Typing any other slash command shows a completion popup above the box: the available commands
+for the selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
 opencode commands under `~/.config/opencode/command`; codex prompts under `~/.codex/prompts`),
 prefix-filtered live. While it is open, `↑`/`↓` move the highlight, `Tab` inserts the
 highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-is (so
@@ -99,7 +105,10 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `↑`/`↓` — move selection.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
-- `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's model.
+- `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's discovered models
+  (Claude and Codex; opencode has too many, so use `/model` there).
+- `/model` — open a filterable picker of every available model for the target agent
+  (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
 - `Space` — expand the selected row in place to peek its last message / metadata.
 - `r` — reply to the selected needs-input session (an input opens in the composer area;
   `Enter` sends, `Esc` cancels). Capability-gated: unsupported backends (opencode) and

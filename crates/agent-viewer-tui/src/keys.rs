@@ -75,6 +75,7 @@ fn handle_normal_key(
     // or a background snapshot that moved the selected session/target could leave `suggesting`
     // (and a subsequent Tab accept) reading commands scanned for the PREVIOUS target.
     ensure_completions(ui);
+    ensure_models(ui, backends);
 
     // Ctrl-chords always act, regardless of composer state.
     if ctrl {
@@ -88,19 +89,30 @@ fn handle_normal_key(
         return Ok(false);
     }
 
-    // While the slash-command popup is open, Up/Down/Tab/Esc drive it instead of the list.
+    // While either popup (slash-command or /model picker) is open, Up/Down/Tab/Esc drive it
+    // instead of the list. For /model the guard is `is_model_command()` (not `model_picking`):
+    // an active `/model <no-match>` command must still capture these keys, otherwise Tab would
+    // cycle the backend and Up/Down would move the session selection mid-command. The
+    // underlying composer ops (`move_suggestion`, `accept_model`) are safe no-ops when the
+    // active list is empty.
     let suggesting = ui.composer.suggestions_active();
+    let model_cmd = ui.composer.is_model_command();
     match key.code {
-        KeyCode::Down if suggesting => ui.composer.move_suggestion(1),
-        KeyCode::Up if suggesting => ui.composer.move_suggestion(-1),
+        KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
+        KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
         // Arrows navigate/act at all times (App collapses any inline peek on the move).
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
-        // Tab accepts the highlighted suggestion while the popup is open, else cycles the
+        // Tab accepts the highlighted suggestion/model while a popup is open, else cycles the
         // target backend; Shift+Tab cycles that backend's model.
         KeyCode::Tab if suggesting => {
             ui.composer.accept_suggestion();
+        }
+        KeyCode::Tab if model_cmd => {
+            // No-op when there is nothing to pick (a `/model <no-match>` command), but still
+            // captures Tab so it does not fall through to `cycle_backend`.
+            ui.composer.accept_model();
         }
         KeyCode::Tab => ui.composer.cycle_backend(),
         KeyCode::BackTab => ui.composer.cycle_model(),
@@ -109,7 +121,12 @@ fn handle_normal_key(
         KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
-            if ui.composer.is_empty() {
+            if ui.composer.model_picking() {
+                // A /model picker is up: Enter picks the highlighted model.
+                ui.composer.accept_model();
+            } else if ui.composer.is_model_command() {
+                // A /model command with no matches: a meta-command, nothing to spawn.
+            } else if ui.composer.is_empty() {
                 // On a group header, Enter collapses/expands the group (and persists) instead
                 // of attaching; on a session it attaches as before.
                 if !toggle_group_if_header(ui) {
@@ -158,6 +175,7 @@ fn handle_normal_key(
     }
     // Refresh the slash-command list for the (possibly new) backend/target and text.
     ensure_completions(ui);
+    ensure_models(ui, backends);
     Ok(false)
 }
 
@@ -361,6 +379,19 @@ fn ensure_completions(ui: &mut Ui) {
     if ui.composer.commands_key() != Some(&key) {
         let cmds = scan_commands(key.0, target.as_deref());
         ui.composer.set_commands(cmds, key);
+    }
+}
+
+/// Keep the composer's discovered model list current: re-install from the backend's
+/// `available_models()` only when the composer's backend has changed (mirrors
+/// `ensure_completions`). Degrades to just "default" when the backend is absent.
+fn ensure_models(ui: &mut Ui, backends: &[Box<dyn Backend>]) {
+    let backend = ui.composer.backend();
+    if ui.composer.models_key() != Some(backend) {
+        let models = backend_of(backends, backend)
+            .map(|b| b.available_models())
+            .unwrap_or_else(|| vec!["default".to_string()]);
+        ui.composer.set_models(models, backend);
     }
 }
 
@@ -691,6 +722,11 @@ fn attach_session(
 /// Spawn the composed task into the current spawn target, record it for pinning, and
 /// clear the composer. The spawn itself is detached (fast); only its record persists.
 fn spawn_from_composer(backends: &[Box<dyn Backend>], refresher: &Refresher, ui: &mut Ui) {
+    // Defense-in-depth: never spawn the /model meta-command as a task (Enter routing already
+    // avoids this, but keep the spawn path safe).
+    if ui.composer.is_model_command() {
+        return;
+    }
     let Some(target) = ui.app.spawn_target() else {
         ui.set_notice("no target directory".to_string());
         return;
@@ -887,6 +923,40 @@ mod tests {
         // Attached, Ctrl+C must reach the child as an interrupt, not tear down the viewer.
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(!is_quit_chord(ctrl_c, true, &Mode::Attached));
+    }
+
+    #[test]
+    fn model_command_with_no_matches_still_captures_picker_keys() {
+        // Regression: an active `/model <no-match>` must keep the picker keys captured
+        // (Tab/Up/Down) even though zero suggestions match. `handle_normal_key` guards
+        // Down/Up/Tab on `is_model_command()`, NOT `model_picking()`, precisely so a
+        // zero-match filter does not fall through to backend-cycle (Tab) or list-nav
+        // (Up/Down). The full key handler needs a live `DefaultTerminal`, so this asserts
+        // the composer-level predicates the routing branches on plus that the ops the
+        // handler routes to are safe no-ops in this state.
+        let mut composer = Composer::new();
+        composer.set_models(
+            vec!["default".to_string(), "gpt-5".to_string()],
+            BackendKind::Codex,
+        );
+        for ch in "/model zzzznomatch".chars() {
+            composer.push_char(ch);
+        }
+        // The command is active (so the new `model_cmd` guard captures the keys) but with
+        // models installed nothing matches the filter, so the picker itself is empty.
+        assert!(composer.is_model_command());
+        assert!(composer.model_suggestions().is_empty());
+        assert!(!composer.model_picking());
+        // The slash-command popup is closed for `/model`, so the handler's `suggesting`
+        // guard is false; only `is_model_command()` keeps the keys captured here.
+        assert!(!composer.suggestions_active());
+        // The routed ops are safe no-ops: accept_model does not change the selected model
+        // and Tab therefore never cycles the backend in this state.
+        let before_model = composer.model().to_string();
+        let before_backend = composer.backend();
+        assert!(!composer.accept_model());
+        assert_eq!(composer.model(), before_model);
+        assert_eq!(composer.backend(), before_backend);
     }
 
     #[test]

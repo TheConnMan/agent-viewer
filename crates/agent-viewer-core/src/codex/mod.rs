@@ -32,10 +32,65 @@ fn codex_spawn_command(dir: &Path, task: &str, model: Option<&str>) -> std::proc
     cmd
 }
 
+/// Run `codex debug models` and parse its catalog. Any failure (spawn error, non-zero
+/// exit, unparseable stdout) is a quiet empty Vec — discovery is best-effort.
+fn codex_catalog_via_cli() -> Vec<String> {
+    let mut cmd = std::process::Command::new("codex");
+    cmd.arg("debug").arg("models");
+    match crate::spawn::run_with_timeout(cmd, std::time::Duration::from_secs(3)) {
+        Some(stdout) => parse_codex_catalog(&stdout),
+        None => Vec::new(),
+    }
+}
+
+/// PURE parse of `codex debug models` JSON stdout. Keep only `visibility == "list"`
+/// entries, sort by `priority` ascending (a missing priority sorts last), and return each
+/// entry's `slug`. Malformed/missing JSON -> empty Vec (never panics).
+pub fn parse_codex_catalog(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(models) = value.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    // (priority, slug) with missing priority forced last; stable sort keeps input order
+    // among equal priorities.
+    let mut listed: Vec<(i64, String)> = models
+        .iter()
+        .filter(|m| crate::json_str(m, "visibility") == Some("list"))
+        .filter_map(|m| {
+            let slug = crate::json_str(m, "slug")?.to_string();
+            let priority = m
+                .get("priority")
+                .and_then(|p| p.as_i64())
+                .unwrap_or(i64::MAX);
+            Some((priority, slug))
+        })
+        .collect();
+    listed.sort_by_key(|(priority, _)| *priority);
+    listed.into_iter().map(|(_, slug)| slug).collect()
+}
+
+/// Best-effort fallback: the distinct models the codex registry has seen, most-used first.
+/// Opens a throwaway read-only connection (this runs on `&self`, so it cannot touch
+/// `self.registry`). Any error -> empty Vec.
+fn codex_models_via_registry(home: &Path) -> Vec<String> {
+    let Ok(db) = registry::find_state_db(home) else {
+        return Vec::new();
+    };
+    let Ok(reg) = Registry::open(&db) else {
+        return Vec::new();
+    };
+    reg.distinct_models().unwrap_or_default()
+}
+
 pub struct CodexBackend {
     codex_home: std::path::PathBuf,
     registry: Option<Registry>,
     resolver: StatusResolver,
+    /// Discovered model catalog, computed once and reused (best-effort; degrades to the
+    /// default when both the CLI probe and the registry fallback come up empty).
+    models_cache: std::sync::OnceLock<Vec<String>>,
 }
 
 impl CodexBackend {
@@ -44,6 +99,7 @@ impl CodexBackend {
             codex_home,
             registry: None,
             resolver: StatusResolver::new(),
+            models_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -113,6 +169,21 @@ impl Backend for CodexBackend {
             });
         }
         Ok(sessions)
+    }
+
+    fn available_models(&self) -> Vec<String> {
+        // default first, then the CLI catalog, falling back to the registry's used models.
+        self.models_cache
+            .get_or_init(|| {
+                let mut discovered = codex_catalog_via_cli();
+                if discovered.is_empty() {
+                    discovered = codex_models_via_registry(&self.codex_home);
+                }
+                let mut models = vec!["default".to_string()];
+                models.extend(discovered);
+                crate::backend::dedup_preserve(models)
+            })
+            .clone()
     }
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {

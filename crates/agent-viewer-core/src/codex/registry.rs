@@ -86,4 +86,17 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(threads)
     }
+
+    /// Distinct non-empty `model` values across all threads, most-used first (bare slugs,
+    /// no provider prefix). Best-effort discovery source for the model picker fallback.
+    pub fn distinct_models(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model FROM threads WHERE model IS NOT NULL AND model != '' \
+             GROUP BY model ORDER BY COUNT(*) DESC",
+        )?;
+        let models = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(models)
+    }
 }
