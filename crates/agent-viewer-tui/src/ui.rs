@@ -9,7 +9,7 @@ use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -419,11 +419,12 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         return;
     }
 
-    // header (blank gap + title) · list · blank gap · bordered composer box (3 rows) · footer.
+    // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
+    // (3 rows) · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -446,7 +447,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         expand_lines: &expand_lines,
     };
 
-    draw_header(frame, vertical[0]);
+    draw_header(frame, d.app, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     draw_list(
@@ -766,16 +767,48 @@ fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: 
 
 // --- Header ---------------------------------------------------------------------
 
-/// The app title with a little breathing room: a blank line on top, then `Agent Viewer`
-/// in accent on the second row. `area` is the 2-row header slice from the main layout.
-fn draw_header(frame: &mut Frame, area: Rect) {
-    let title = Line::from(Span::styled(
+/// The app title with airy padding plus a right-aligned status summary. `area` is the 4-row
+/// header slice from the main layout: row 0 is a blank spacer, row 1 carries `Agent Viewer`
+/// in accent on the left and the `N running · M needs input` summary (muted) right-aligned on
+/// the same row, and rows 2-3 are blank spacers so the list below has breathing room. The
+/// status is dropped on terminals too narrow to hold it beside the title, so the title wins.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let title_row = rows[1];
+
+    let title = Span::styled(
         " Agent Viewer",
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(vec![Line::default(), title]), area);
+        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+    );
+    let running = app.running_count();
+    let needs = app.needs_input_count();
+    let status = format!("{running} running · {needs} needs input ");
+    let status_w = display_width(&status) as u16;
+
+    // Reserve the status region only when it fits beside the title (13 cols for " Agent
+    // Viewer" plus a one-column gap); otherwise the title claims the whole row.
+    if title_row.width > 13 + status_w + 1 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(status_w)])
+            .split(title_row);
+        frame.render_widget(Paragraph::new(Line::from(title)), cols[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(status, fg(theme::MUTED))))
+                .alignment(Alignment::Right),
+            cols[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new(Line::from(title)), title_row);
+    }
 }
 
 // --- Main list ------------------------------------------------------------------

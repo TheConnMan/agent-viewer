@@ -202,6 +202,22 @@ impl App {
         self.hidden_rows
     }
 
+    /// Sessions actively working right now (header status summary).
+    pub fn running_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| matches!(s.status, Status::Working))
+            .count()
+    }
+
+    /// Sessions waiting on the user for input right now (header status summary).
+    pub fn needs_input_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| matches!(s.status, Status::NeedsInput))
+            .count()
+    }
+
     /// key Ctrl+S — toggle ByState / ByProject grouping.
     pub fn toggle_group_mode(&mut self) {
         self.group_mode = match self.group_mode {
