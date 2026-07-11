@@ -49,6 +49,18 @@ pub enum TailState {
     AwaitingApproval,
 }
 
+/// Read at most the final 64 KiB of `path` as text (lossy UTF-8). Shared by
+/// `tail_state` and `pending_approval` so both classify over the identical window.
+fn tail_window(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let window: u64 = 64 * 1024;
+    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Read at most the final 64 KiB and classify the last turn. Tracks the last line
 /// index of `task_complete`, `task_started`, and any `event_msg` whose payload.type
 /// ENDS WITH `_approval_request` (protocol names `exec_approval_request` /
@@ -61,13 +73,7 @@ pub enum TailState {
 ///      window) -> `Complete`
 ///   3. else -> `MidTurn`
 pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let window: u64 = 64 * 1024;
-    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
+    let text = tail_window(path)?;
     let mut last_complete: Option<usize> = None;
     let mut last_started: Option<usize> = None;
     let mut last_approval: Option<usize> = None;
@@ -107,6 +113,95 @@ pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
     } else {
         Ok(TailState::MidTurn)
     }
+}
+
+/// A pending approval request parsed from the rollout tail (the "what is this session
+/// waiting on" surfaced in the peek header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingApproval {
+    /// A shell command awaiting approval (exec_approval_request).
+    Exec {
+        command: Vec<String>,
+        cwd: Option<String>,
+    },
+    /// A patch awaiting approval (apply_patch_approval_request); `files` are the changed paths.
+    Patch { files: Vec<String> },
+}
+
+impl PendingApproval {
+    /// A one-line human summary for the peek header (no "Awaiting approval:" prefix — the
+    /// caller adds it). Exec -> the joined command; Patch -> the changed files (or a generic).
+    pub fn summary(&self) -> String {
+        match self {
+            PendingApproval::Exec { command, .. } => command.join(" "),
+            PendingApproval::Patch { files } if files.is_empty() => "apply patch".to_string(),
+            PendingApproval::Patch { files } => format!("apply patch: {}", files.join(", ")),
+        }
+    }
+}
+
+/// Parse the LAST still-pending approval request from the rollout tail. Uses the same 64 KiB
+/// tail window and the same "pending" rule as `tail_state` rule 1 (an approval after the last
+/// `task_started` with no later `task_complete`). Ok(None) when nothing is pending or the
+/// approval type is unrecognized. Recognizes `exec_approval_request` (payload.command []string,
+/// payload.cwd string) and `apply_patch_approval_request` (payload.changes is a map of changed
+/// path -> change; the keys are the files). Never panics.
+pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval>> {
+    let text = tail_window(path)?;
+    let mut last_complete: Option<usize> = None;
+    let mut last_started: Option<usize> = None;
+    // (line index, parsed content) — Some for a recognized type, None for any other
+    // `*_approval_request`, so an exotic type still trips the pending gate but yields None.
+    let mut last_approval: Option<(usize, Option<PendingApproval>)> = None;
+    for (idx, line) in text.lines().enumerate() {
+        let Some(value) = crate::parse_json_line(line) else {
+            continue;
+        };
+        if crate::json_str(&value, "type") != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match crate::json_str(payload, "type") {
+            Some("task_complete") => last_complete = Some(idx),
+            Some("task_started") => last_started = Some(idx),
+            Some("exec_approval_request") => {
+                let command = payload
+                    .get("command")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cwd = crate::json_str(payload, "cwd").map(|s| s.to_string());
+                last_approval = Some((idx, Some(PendingApproval::Exec { command, cwd })));
+            }
+            Some("apply_patch_approval_request") => {
+                let mut files: Vec<String> = payload
+                    .get("changes")
+                    .and_then(|c| c.as_object())
+                    .map(|map| map.keys().cloned().collect())
+                    .unwrap_or_default();
+                files.sort();
+                last_approval = Some((idx, Some(PendingApproval::Patch { files })));
+            }
+            Some(t) if t.ends_with("_approval_request") => last_approval = Some((idx, None)),
+            _ => {}
+        }
+    }
+    // Same pending gate as tail_state rule 1: an approval after the last task_started with
+    // no later task_complete.
+    if let Some((approval_idx, content)) = last_approval {
+        let after_started = last_started.is_none_or(|s| approval_idx > s);
+        let no_complete_after = last_complete.is_none_or(|c| c < approval_idx);
+        if after_started && no_complete_after {
+            return Ok(content);
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq)]

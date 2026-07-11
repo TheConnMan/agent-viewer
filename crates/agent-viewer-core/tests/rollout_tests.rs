@@ -1,7 +1,8 @@
 mod common;
 
 use agent_viewer_core::codex::rollout::{
-    TailState, TranscriptItem, read_session_meta, read_transcript, tail_state,
+    PendingApproval, TailState, TranscriptItem, pending_approval, read_session_meta,
+    read_transcript, tail_state,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -161,4 +162,69 @@ fn tail_state_approval_then_complete() {
     .unwrap();
     drop(f);
     assert_eq!(tail_state(&path).expect("tail_state"), TailState::Complete);
+}
+
+// --- pending_approval contract ---
+
+#[test]
+fn pending_approval_parses_exec() {
+    let path = common::fixture_path("rollout_approval.jsonl");
+    let pending = pending_approval(&path).expect("pending_approval");
+    assert_eq!(
+        pending,
+        Some(PendingApproval::Exec {
+            command: vec!["rm".to_string(), "-rf".to_string(), "target".to_string()],
+            cwd: Some("/home/user/project".to_string()),
+        })
+    );
+    assert_eq!(pending.unwrap().summary(), "rm -rf target");
+}
+
+#[test]
+fn pending_approval_parses_patch_with_sorted_files() {
+    let path = common::fixture_path("rollout_patch_approval.jsonl");
+    let pending = pending_approval(&path).expect("pending_approval");
+    assert_eq!(
+        pending,
+        Some(PendingApproval::Patch {
+            files: vec!["README.md".to_string(), "src/main.rs".to_string()],
+        })
+    );
+    assert_eq!(
+        pending.unwrap().summary(),
+        "apply patch: README.md, src/main.rs"
+    );
+}
+
+#[test]
+fn pending_approval_none_when_complete() {
+    // No approval in the tail -> None.
+    let path = common::fixture_path("rollout_complete.jsonl");
+    assert_eq!(pending_approval(&path).expect("pending_approval"), None);
+}
+
+#[test]
+fn pending_approval_none_when_resolved() {
+    // task_started, an exec_approval_request, THEN a task_complete after it: the approval was
+    // granted and the turn finished -> not pending.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("resolved_approval.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-1"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"exec_approval_request","turn_id":"turn-1","command":["rm","-rf","target"],"cwd":"/tmp"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-1","completed_at":1,"duration_ms":1}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    assert_eq!(pending_approval(&path).expect("pending_approval"), None);
 }
