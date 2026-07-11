@@ -13,8 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 agent-viewer-core = { version = "0.1.0", path = "../agent-viewer-core" }
+anyhow = "1"
 crossterm = "0.29.0"
+image = { version = "0.25", default-features = false }
 ratatui = "0.30.2"
+# default-features off to drop the chafa (libchafa-dev) system-C dependency; we only need
+# the built-in kitty/iterm2/sixel/half-blocks protocols and the crossterm backend.
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+resvg = "0.45"
 tui-term = "0.3.4"
 unicode-width = "0.2"
 
