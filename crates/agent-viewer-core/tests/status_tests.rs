@@ -86,7 +86,10 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
     assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Failed);
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(
         f,
         r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"t","completed_at":1,"duration_ms":1}}}}"#

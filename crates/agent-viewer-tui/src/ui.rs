@@ -498,7 +498,11 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
     if show_cursor && inner.width > 0 {
         // Cursor at the end of the typed text, clamped inside the box. The prefix mirrors
         // the fixed spans above: `<mark> <backend> [<model> ]<dir> ❯ `.
-        let prefix = format!("{} {} {model_seg}{dir} ❯ ", backend_mark(backend), backend.name());
+        let prefix = format!(
+            "{} {} {model_seg}{dir} ❯ ",
+            backend_mark(backend),
+            backend.name()
+        );
         let col = display_width(&prefix) + display_width(composer.text());
         let x = inner.x + (col as u16).min(inner.width - 1);
         frame.set_cursor_position((x, inner.y));
@@ -507,7 +511,14 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, 
 
 // --- Main list ------------------------------------------------------------------
 
-fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: ListDeco, area: Rect) {
+fn draw_list(
+    frame: &mut Frame,
+    app: &App,
+    pulses: &Pulses,
+    now_ms: i64,
+    deco: ListDeco,
+    area: Rect,
+) {
     let width = area.width as usize;
     let rows = app.visible();
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
@@ -541,7 +552,8 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
             _ => items.push(row_to_item(row, pulses, now_ms, width)),
         }
     }
-    let list = List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
+    let list =
+        List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
     let mut state = ListState::default();
     if !rows.is_empty() {
         let sel = app.selected_index().min(rows.len() - 1);
@@ -588,10 +600,7 @@ fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem
             format!("{} ", backend_mark(backend)),
             fg(backend_mark_color(backend)),
         ),
-        Span::styled(
-            truncate(buffer, width.saturating_sub(6)),
-            fg(theme::ACCENT),
-        ),
+        Span::styled(truncate(buffer, width.saturating_sub(6)), fg(theme::ACCENT)),
     ]))
 }
 
@@ -733,10 +742,7 @@ fn session_line(r: SessionRow) -> Line<'static> {
         spans.push(Span::styled(r.pr.to_string(), fg(theme::ACCENT)));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled(
-        word.to_string(),
-        fg(status_color(r.status)),
-    ));
+    spans.push(Span::styled(word.to_string(), fg(status_color(r.status))));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(r.elapsed.to_string(), fg(theme::MUTED)));
     Line::from(spans)
@@ -752,10 +758,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
         Mode::Attached => Line::from(""),
         Mode::Normal => {
             if !notice.is_empty() {
-                Line::from(Span::styled(
-                    notice.to_string(),
-                    fg(theme::WARN),
-                ))
+                Line::from(Span::styled(notice.to_string(), fg(theme::WARN)))
             } else if app.is_armed(now_ms) {
                 Line::from(Span::styled(
                     "[press Ctrl+X again to remove]",
@@ -823,10 +826,7 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
     let left_trunc = truncate(&left, width.saturating_sub(right_w + 1));
     let pad = width.saturating_sub(left_trunc.chars().count() + right_w);
     let line = Line::from(vec![
-        Span::styled(
-            format!(" {glyph}"),
-            fg(gcolor),
-        ),
+        Span::styled(format!(" {glyph}"), fg(gcolor)),
         Span::styled(
             left_trunc.chars().skip(2).collect::<String>(),
             fg(theme::TEXT),
@@ -878,7 +878,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ]));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         popup,
     );
 }

@@ -126,8 +126,10 @@ impl ViewerDb {
             }
         }
         for rowid in doomed {
-            self.conn
-                .execute("DELETE FROM spawned WHERE id = ?1", rusqlite::params![rowid])?;
+            self.conn.execute(
+                "DELETE FROM spawned WHERE id = ?1",
+                rusqlite::params![rowid],
+            )?;
         }
         Ok(())
     }
@@ -192,8 +194,10 @@ impl ViewerDb {
     }
 
     pub fn delete_spawn(&self, rowid: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM spawned WHERE id = ?1", rusqlite::params![rowid])?;
+        self.conn.execute(
+            "DELETE FROM spawned WHERE id = ?1",
+            rusqlite::params![rowid],
+        )?;
         Ok(())
     }
 
@@ -241,9 +245,9 @@ impl ViewerDb {
     pub fn viewer_state(&self) -> Result<ViewerState> {
         let mut state = ViewerState::default();
 
-        let mut stmt = self.conn.prepare(
-            "SELECT backend, session_id, pid FROM spawned WHERE session_id IS NOT NULL",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT backend, session_id, pid FROM spawned WHERE session_id IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -260,11 +264,12 @@ impl ViewerDb {
             state.spawn_pids.insert((backend, session_id), pid as u32);
         }
 
-        let mut stmt = self.conn.prepare("SELECT backend, session_id FROM stopped")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT backend, session_id FROM stopped")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for row in rows {
             let (backend, session_id) = row?;
             if let Some(backend) = backend_from_str(&backend) {

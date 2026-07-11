@@ -64,8 +64,20 @@ fn select(app: &mut App, id: &str) {
 #[test]
 fn filter_matches_title_and_cwd_case_insensitive() {
     let sessions = vec![
-        sess(BackendKind::Codex, "alpha", "/synthetic/apples", 300, Status::Done),
-        sess(BackendKind::Codex, "beta", "/synthetic/bananas", 200, Status::Done),
+        sess(
+            BackendKind::Codex,
+            "alpha",
+            "/synthetic/apples",
+            300,
+            Status::Done,
+        ),
+        sess(
+            BackendKind::Codex,
+            "beta",
+            "/synthetic/bananas",
+            200,
+            Status::Done,
+        ),
     ];
     let mut app = App::new(sessions);
     assert_eq!(session_rows(app.visible()).len(), 2);
@@ -110,15 +122,24 @@ fn state_sections_order_and_fold() {
     // Section headers appear in the fixed order; Failed/Stopped have no headers.
     assert_eq!(
         section_headers(rows),
-        vec![Section::NeedsInput, Section::Working, Section::Idle, Section::Done]
+        vec![
+            Section::NeedsInput,
+            Section::Working,
+            Section::Idle,
+            Section::Done
+        ]
     );
     // Failed and Stopped rows keep their own status and sit in the Done section.
-    assert!(rows.iter().any(
-        |r| matches!(r, Row::Session { id, status: Status::Failed, .. } if id == "failed")
-    ));
-    assert!(rows.iter().any(
-        |r| matches!(r, Row::Session { id, status: Status::Stopped, .. } if id == "stopped")
-    ));
+    assert!(
+        rows.iter().any(
+            |r| matches!(r, Row::Session { id, status: Status::Failed, .. } if id == "failed")
+        )
+    );
+    assert!(
+        rows.iter().any(
+            |r| matches!(r, Row::Session { id, status: Status::Stopped, .. } if id == "stopped")
+        )
+    );
 
     // Empty sections are omitted: a Working-only app has only the Working header.
     let mut only_working = App::new(vec![sess(
@@ -129,7 +150,10 @@ fn state_sections_order_and_fold() {
         Status::Working,
     )]);
     only_working.toggle_group_mode();
-    assert_eq!(section_headers(only_working.visible()), vec![Section::Working]);
+    assert_eq!(
+        section_headers(only_working.visible()),
+        vec![Section::Working]
+    );
 }
 
 #[test]
@@ -160,8 +184,20 @@ fn done_section_is_uncapped() {
 fn toggle_group_mode_project_rows() {
     // A codex and an opencode session sharing one cwd must merge into one project.
     let sessions = vec![
-        sess(BackendKind::Codex, "cx", "/synthetic/shared", 300, Status::Working),
-        sess(BackendKind::Opencode, "oc", "/synthetic/shared", 200, Status::Done),
+        sess(
+            BackendKind::Codex,
+            "cx",
+            "/synthetic/shared",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Opencode,
+            "oc",
+            "/synthetic/shared",
+            200,
+            Status::Done,
+        ),
     ];
     let mut app = App::new(sessions);
     // v2.1 startup default is ByProject: one ProjectHeader (cross-backend merge), no sections.
@@ -192,8 +228,20 @@ fn toggle_group_mode_project_rows() {
 fn spacer_rows_separate_groups_but_never_bookend() {
     // Two distinct project groups -> exactly one spacer, sitting BETWEEN their headers.
     let sessions = vec![
-        sess(BackendKind::Codex, "a", "/synthetic/one", 300, Status::Working),
-        sess(BackendKind::Codex, "b", "/synthetic/two", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a",
+            "/synthetic/one",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b",
+            "/synthetic/two",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     assert_eq!(app.group_mode(), GroupMode::ByProject);
@@ -213,7 +261,13 @@ fn spacer_rows_separate_groups_but_never_bookend() {
     assert!(headers[0] < spacer_at && spacer_at < headers[1]);
 
     // A single group has no spacer at all.
-    let solo = App::new(vec![sess(BackendKind::Codex, "s", "/synthetic/one", 1, Status::Working)]);
+    let solo = App::new(vec![sess(
+        BackendKind::Codex,
+        "s",
+        "/synthetic/one",
+        1,
+        Status::Working,
+    )]);
     assert!(!solo.visible().iter().any(|r| matches!(r, Row::Spacer)));
 
     // Selection still lands only on session rows (spacers are skipped like headers).
@@ -251,9 +305,27 @@ fn arrow_wraps_around_top_and_bottom_over_headers_and_spacers() {
 #[test]
 fn arrow_wrap_is_scoped_to_the_filtered_rows() {
     let sessions = vec![
-        sess(BackendKind::Codex, "alpha", "/synthetic/aaa", 300, Status::Working),
-        sess(BackendKind::Codex, "beta", "/synthetic/bbb", 200, Status::Working),
-        sess(BackendKind::Codex, "gamma", "/synthetic/aaa-more", 100, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "alpha",
+            "/synthetic/aaa",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "beta",
+            "/synthetic/bbb",
+            200,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "gamma",
+            "/synthetic/aaa-more",
+            100,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     app.set_filter("aaa".to_string()); // only alpha + gamma remain visible
@@ -286,7 +358,9 @@ fn rename_resolves_target_by_key_after_reorder() {
 
     // The rename target is still resolvable by key (the old selected()-filter path returned
     // None here, silently no-oping the rename).
-    let found = app.session_for(&target).expect("target still resolvable by key");
+    let found = app
+        .session_for(&target)
+        .expect("target still resolvable by key");
     assert_eq!(found.id, "a");
     assert_eq!(found.backend, BackendKind::Codex);
 
@@ -298,8 +372,20 @@ fn rename_resolves_target_by_key_after_reorder() {
 #[test]
 fn expansion_collapses_when_selection_leaves_the_expanded_row() {
     let sessions = vec![
-        sess(BackendKind::Codex, "a", "/synthetic/one", 300, Status::Working),
-        sess(BackendKind::Codex, "b", "/synthetic/two", 200, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "a",
+            "/synthetic/one",
+            300,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "b",
+            "/synthetic/two",
+            200,
+            Status::Working,
+        ),
     ];
     let mut app = App::new(sessions);
     let key_a = (BackendKind::Codex, "a".to_string());
@@ -425,7 +511,13 @@ fn selection_clamps_when_selected_session_vanishes() {
     let mut app = App::new(sessions);
     select(&mut app, "b");
     // b disappears from the refresh; selection falls back to a surviving session row.
-    app.set_sessions(vec![sess(BackendKind::Codex, "a", "/p", 300, Status::Working)]);
+    app.set_sessions(vec![sess(
+        BackendKind::Codex,
+        "a",
+        "/p",
+        300,
+        Status::Working,
+    )]);
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("a"));
 }
 
@@ -620,11 +712,29 @@ fn composer_accepts_slash_command_as_text() {
 
 #[test]
 fn filter_search_covers_hidden_and_companion_sessions() {
-    let mut hidden = sess(BackendKind::Codex, "archived-match", "/p", 300, Status::Done);
+    let mut hidden = sess(
+        BackendKind::Codex,
+        "archived-match",
+        "/p",
+        300,
+        Status::Done,
+    );
     hidden.hidden = true;
-    let mut companion = sess(BackendKind::Codex, "companion-match", "/p", 250, Status::Idle);
+    let mut companion = sess(
+        BackendKind::Codex,
+        "companion-match",
+        "/p",
+        250,
+        Status::Idle,
+    );
     companion.companion = true;
-    let visible = sess(BackendKind::Codex, "plain-match", "/p", 200, Status::Working);
+    let visible = sess(
+        BackendKind::Codex,
+        "plain-match",
+        "/p",
+        200,
+        Status::Working,
+    );
     let mut app = App::new(vec![hidden, companion, visible]);
 
     // Default view hides the archived + companion rows (only the plain one shows).
@@ -737,7 +847,10 @@ fn composer_slash_suggestions_prefix_filter() {
 #[test]
 fn composer_tab_accepts_suggestion_only_when_popup_open() {
     let mut c = Composer::new();
-    c.set_commands(vec!["implement".into(), "improve".into()], (BackendKind::Claude, None));
+    c.set_commands(
+        vec!["implement".into(), "improve".into()],
+        (BackendKind::Claude, None),
+    );
     // No slash: popup closed (Tab would cycle the backend in the key handler).
     assert!(!c.suggestions_active());
     assert!(!c.accept_suggestion());

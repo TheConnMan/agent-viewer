@@ -29,7 +29,10 @@ fn ensure_trusted_noop_when_cwd_already_trusted() {
 
     // File is not rewritten: bytes and mtime are unchanged.
     assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
-    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before_mtime);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before_mtime
+    );
 }
 
 #[test]
@@ -67,10 +70,16 @@ fn ensure_trusted_merges_and_preserves_all_keys() {
 
     let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     // cwd's project object gains the trust flag while keeping its other keys.
-    assert_eq!(after["projects"]["/work/proj"]["hasTrustDialogAccepted"], json!(true));
+    assert_eq!(
+        after["projects"]["/work/proj"]["hasTrustDialogAccepted"],
+        json!(true)
+    );
     assert_eq!(after["projects"]["/work/proj"]["someKey"], json!("keep"));
     // Unrelated project object and every top-level key are preserved verbatim.
-    assert_eq!(after["projects"]["/other"]["hasTrustDialogAccepted"], json!(true));
+    assert_eq!(
+        after["projects"]["/other"]["hasTrustDialogAccepted"],
+        json!(true)
+    );
     assert_eq!(after["topLevel"], json!("keepme"));
     assert_eq!(after["numStartups"], json!(7));
 }
@@ -115,5 +124,8 @@ fn ensure_trusted_creates_missing_config() {
     assert!(path.exists());
 
     let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(after["projects"]["/work/proj"]["hasTrustDialogAccepted"], json!(true));
+    assert_eq!(
+        after["projects"]["/work/proj"]["hasTrustDialogAccepted"],
+        json!(true)
+    );
 }

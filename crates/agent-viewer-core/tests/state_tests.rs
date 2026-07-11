@@ -48,7 +48,8 @@ fn viewer_db_spawn_roundtrip() {
         && r.pid == 4242
         && r.spawned_at_ms == 1_000_000));
 
-    db.resolve_spawn(rowid, "session-xyz").expect("resolve spawn");
+    db.resolve_spawn(rowid, "session-xyz")
+        .expect("resolve spawn");
     assert!(db.unresolved_spawns().expect("unresolved").is_empty());
 
     let state = db.viewer_state().expect("viewer state");
@@ -72,7 +73,10 @@ fn viewer_db_recreates_on_corrupt() {
 
     // A corrupt file is replaced with a fresh empty DB, not an error.
     let db = ViewerDb::open(&path).expect("recreate on corrupt");
-    assert_eq!(db.viewer_state().expect("viewer state"), ViewerState::default());
+    assert_eq!(
+        db.viewer_state().expect("viewer state"),
+        ViewerState::default()
+    );
 }
 
 #[test]
@@ -80,14 +84,16 @@ fn viewer_db_stopped_and_rename_roundtrip() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");
 
-    db.mark_stopped(BackendKind::Opencode, "ses_1").expect("mark");
+    db.mark_stopped(BackendKind::Opencode, "ses_1")
+        .expect("mark");
     assert!(
         db.viewer_state()
             .unwrap()
             .stopped
             .contains(&(BackendKind::Opencode, "ses_1".to_string()))
     );
-    db.clear_stopped(BackendKind::Opencode, "ses_1").expect("clear");
+    db.clear_stopped(BackendKind::Opencode, "ses_1")
+        .expect("clear");
     assert!(
         !db.viewer_state()
             .unwrap()
@@ -145,7 +151,10 @@ fn apply_viewer_state_pins_renames_pids() {
     let mut pinned = HashSet::new();
     pinned.insert((BackendKind::Codex, "comp".to_string()));
     let mut renames = HashMap::new();
-    renames.insert((BackendKind::Codex, "comp".to_string()), "Pinned Name".to_string());
+    renames.insert(
+        (BackendKind::Codex, "comp".to_string()),
+        "Pinned Name".to_string(),
+    );
     let mut spawn_pids = HashMap::new();
     spawn_pids.insert((BackendKind::Opencode, "nopid".to_string()), 555);
     spawn_pids.insert((BackendKind::Opencode, "withpid".to_string()), 111);
@@ -175,19 +184,32 @@ fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
 
     // Old + live (session still exists): must survive despite its age.
     let old_live = db
-        .record_spawn(BackendKind::Codex, &PathBuf::from("/p/live"), 1, now - eight_days)
+        .record_spawn(
+            BackendKind::Codex,
+            &PathBuf::from("/p/live"),
+            1,
+            now - eight_days,
+        )
         .expect("record old-live");
-    db.resolve_spawn(old_live, "old-live-sess").expect("resolve");
+    db.resolve_spawn(old_live, "old-live-sess")
+        .expect("resolve");
     // Old + dead (session gone): the only row that should be pruned.
     let old_dead = db
-        .record_spawn(BackendKind::Codex, &PathBuf::from("/p/dead"), 2, now - eight_days)
+        .record_spawn(
+            BackendKind::Codex,
+            &PathBuf::from("/p/dead"),
+            2,
+            now - eight_days,
+        )
         .expect("record old-dead");
-    db.resolve_spawn(old_dead, "old-dead-sess").expect("resolve");
+    db.resolve_spawn(old_dead, "old-dead-sess")
+        .expect("resolve");
     // Young + dead (session gone but row still fresh): survives (under the cutoff).
     let young_dead = db
         .record_spawn(BackendKind::Codex, &PathBuf::from("/p/young"), 3, now)
         .expect("record young-dead");
-    db.resolve_spawn(young_dead, "young-dead-sess").expect("resolve");
+    db.resolve_spawn(young_dead, "young-dead-sess")
+        .expect("resolve");
 
     // Only old-live-sess is present in the live set.
     let mut live = HashSet::new();
@@ -277,16 +299,46 @@ fn match_spawn_window_and_nearest() {
 
     // Two candidates -> nearest created_at wins (1_002_000 beats 1_020_000).
     let two = vec![
-        sess(BackendKind::Codex, "far", "/home/user/match-proj", 1_020_000, Status::Working),
-        sess(BackendKind::Codex, "near", "/home/user/match-proj", 1_002_000, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "far",
+            "/home/user/match-proj",
+            1_020_000,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "near",
+            "/home/user/match-proj",
+            1_002_000,
+            Status::Working,
+        ),
     ];
     assert_eq!(match_spawn(&record, &two), Some("near".to_string()));
 
     // Outside window, wrong cwd, and wrong backend all miss.
     let miss = vec![
-        sess(BackendKind::Codex, "too-late", "/home/user/match-proj", 1_040_000, Status::Working),
-        sess(BackendKind::Codex, "wrong-cwd", "/home/user/other", 1_005_000, Status::Working),
-        sess(BackendKind::Opencode, "wrong-backend", "/home/user/match-proj", 1_005_000, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "too-late",
+            "/home/user/match-proj",
+            1_040_000,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "wrong-cwd",
+            "/home/user/other",
+            1_005_000,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Opencode,
+            "wrong-backend",
+            "/home/user/match-proj",
+            1_005_000,
+            Status::Working,
+        ),
     ];
     assert_eq!(match_spawn(&record, &miss), None);
 }

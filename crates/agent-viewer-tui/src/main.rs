@@ -295,7 +295,11 @@ fn run(
         })?;
 
         // Animate the list faster while there are working/needs-input rows or a live bloom.
-        let poll = if wants_fast_ticks(ui) { FAST_POLL } else { POLL };
+        let poll = if wants_fast_ticks(ui) {
+            FAST_POLL
+        } else {
+            POLL
+        };
         if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key)
@@ -371,10 +375,7 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
         // Prune stale resolved pins now that we know which sessions are live: a >7-day
         // resolved row whose session no longer appears is dead weight, but one still in
         // the fresh list keeps its pin regardless of age.
-        let live: HashSet<Key> = sessions
-            .iter()
-            .map(|s| (s.backend, s.id.clone()))
-            .collect();
+        let live: HashSet<Key> = sessions.iter().map(|s| (s.backend, s.id.clone())).collect();
         let _ = db.prune_resolved_missing(&live);
     }
     // Hide sessions whose cwd was deleted (after the overlay, so viewer-spawn pins in live
@@ -419,7 +420,12 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
 /// or unchanged error never shows (so a recurring error neither restamps nor starves an action
 /// notice); a changed error shows only when the footer is free (empty/expired) or is itself
 /// the previous backend error.
-fn backend_error_should_show(err: &str, current: &str, current_expired: bool, last_error: &str) -> bool {
+fn backend_error_should_show(
+    err: &str,
+    current: &str,
+    current_expired: bool,
+    last_error: &str,
+) -> bool {
     if err.is_empty() || err == last_error {
         return false;
     }
@@ -508,9 +514,19 @@ mod tests {
         // The SAME recurring error does not re-show (no restamp -> no starvation).
         assert!(!backend_error_should_show("boom", "boom", false, "boom"));
         // A live (non-expired) action notice is not clobbered by an error.
-        assert!(!backend_error_should_show("boom", "spawned on codex", false, ""));
+        assert!(!backend_error_should_show(
+            "boom",
+            "spawned on codex",
+            false,
+            ""
+        ));
         // Once that action notice has expired, the error may take the footer.
-        assert!(backend_error_should_show("boom", "spawned on codex", true, ""));
+        assert!(backend_error_should_show(
+            "boom",
+            "spawned on codex",
+            true,
+            ""
+        ));
         // A CHANGED error replaces the previous backend error currently on screen.
         assert!(backend_error_should_show("boom2", "boom", false, "boom"));
     }

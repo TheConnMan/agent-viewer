@@ -27,14 +27,18 @@ impl ClaudeBackend {
     /// is missing/unreadable (the jobs dir can lag the agents list).
     fn cached_job_detail(&mut self, path: &PathBuf) -> Option<(SystemTime, JobDetail)> {
         let meta = std::fs::metadata(path).ok()?;
-        let key = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
+        let key = (
+            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            meta.len(),
+        );
         if let Some((cached_key, detail)) = self.detail_cache.get(path)
             && *cached_key == key
         {
             return Some((key.0, detail.clone()));
         }
         let detail = parse_job_state(&std::fs::read_to_string(path).ok()?);
-        self.detail_cache.insert(path.clone(), (key, detail.clone()));
+        self.detail_cache
+            .insert(path.clone(), (key, detail.clone()));
         Some((key.0, detail))
     }
 }
@@ -135,7 +139,8 @@ impl Backend for ClaudeBackend {
             .and_then(|worker| crate::json_str(worker, "rendezvousSock"))
             .ok_or_else(|| Error::Command("no live worker for session".into()))?;
         let mut stream = std::os::unix::net::UnixStream::connect(sock)?;
-        let mut line = serde_json::json!({ "subtype": "rename_session", "title": name }).to_string();
+        let mut line =
+            serde_json::json!({ "subtype": "rename_session", "title": name }).to_string();
         line.push('\n');
         stream.write_all(line.as_bytes())?;
         // The reply is advisory; a successful write is the success signal.
@@ -150,8 +155,8 @@ impl Backend for ClaudeBackend {
         // agent view with this job preselected and expanded — the view is not tied to the
         // session cwd, so it runs from $HOME. A finished session resumes by full id,
         // pinned to its cwd only when that dir still exists.
-        let live = session.pid.is_some()
-            || matches!(session.status, Status::Working | Status::NeedsInput);
+        let live =
+            session.pid.is_some() || matches!(session.status, Status::Working | Status::NeedsInput);
         if live {
             cmd.arg("agents")
                 .env(
@@ -227,14 +232,16 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
     if !project.is_object() {
         *project = serde_json::json!({});
     }
-    project
-        .as_object_mut()
-        .expect("project object")
-        .insert("hasTrustDialogAccepted".to_string(), serde_json::json!(true));
+    project.as_object_mut().expect("project object").insert(
+        "hasTrustDialogAccepted".to_string(),
+        serde_json::json!(true),
+    );
 
     // Atomic write: temp file in the same dir, then rename over the target.
     let text = serde_json::to_string_pretty(&config)?;
-    let dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
         config_path
@@ -273,9 +280,13 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
         let Some(name) = crate::json_str(&entry, "name") else {
             continue;
         };
-        let short_id = crate::json_str(&entry, "id").unwrap_or_default().to_string();
+        let short_id = crate::json_str(&entry, "id")
+            .unwrap_or_default()
+            .to_string();
         let started_at = entry.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        let source_label = crate::json_str(&entry, "kind").unwrap_or_default().to_string();
+        let source_label = crate::json_str(&entry, "kind")
+            .unwrap_or_default()
+            .to_string();
         let status = match crate::json_str(&entry, "state") {
             Some("working") => Status::Working,
             Some("blocked") => Status::NeedsInput,
@@ -438,14 +449,20 @@ mod tests {
         let cmd = claude_spawn_command("claude", Path::new("/tmp"), "do a thing", Some("fable"));
         assert_eq!(cmd.get_program(), OsStr::new("claude"));
         let a = args(&cmd);
-        let i = a.iter().position(|x| x == "--model").expect("--model present");
+        let i = a
+            .iter()
+            .position(|x| x == "--model")
+            .expect("--model present");
         assert_eq!(a[i + 1], "fable");
         assert!(a.contains(&"do a thing".to_string())); // task still the final arg
 
         // None falls back to the opus[1m] default (never a missing --model).
         let cmd = claude_spawn_command("claude", Path::new("/tmp"), "t", None);
         let a = args(&cmd);
-        let i = a.iter().position(|x| x == "--model").expect("--model present");
+        let i = a
+            .iter()
+            .position(|x| x == "--model")
+            .expect("--model present");
         assert_eq!(a[i + 1], "opus[1m]");
     }
 }

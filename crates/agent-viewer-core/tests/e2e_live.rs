@@ -173,7 +173,10 @@ fn embedded_attach_live() {
 
     // 4. Detach semantics: held, no I/O, 1s -> child still alive.
     std::thread::sleep(Duration::from_secs(1));
-    assert!(!pty.is_exited(), "child died before drop (should survive detach)");
+    assert!(
+        !pty.is_exited(),
+        "child died before drop (should survive detach)"
+    );
     let pid = pty.pid().expect("child pid");
 
     // 5. Drop -> child gone within 2s.

@@ -31,9 +31,8 @@ fn wait_for_screen(session: &PtySession, timeout: Duration, needle: &str) -> boo
 
 #[test]
 fn pty_captures_output() {
-    let mut session =
-        PtySession::spawn(spec("sh", &["-c", "printf hello-pty; sleep 30"], 24, 80))
-            .expect("spawn pty");
+    let mut session = PtySession::spawn(spec("sh", &["-c", "printf hello-pty; sleep 30"], 24, 80))
+        .expect("spawn pty");
     assert!(
         wait_for_screen(&session, Duration::from_secs(5), "hello-pty"),
         "expected 'hello-pty' to render through the vt100 parser"
@@ -114,8 +113,7 @@ fn pty_kill_after_reap_never_signals() {
     // path in kill() by construction — see pty.rs::kill, whose group-SIGKILL and
     // child.kill() both sit behind `if !self.exited`. Here we assert the observable half:
     // once is_exited() latches, kill() returns promptly without panicking.
-    let mut session =
-        PtySession::spawn(spec("sh", &["-c", "exit 0"], 24, 80)).expect("spawn pty");
+    let mut session = PtySession::spawn(spec("sh", &["-c", "exit 0"], 24, 80)).expect("spawn pty");
 
     let start = Instant::now();
     while !session.is_exited() {
@@ -141,8 +139,7 @@ fn pty_kill_after_reap_never_signals() {
 
 #[test]
 fn pty_child_survives_detach_dies_on_drop() {
-    let mut session =
-        PtySession::spawn(spec("sleep", &["30"], 24, 80)).expect("spawn pty");
+    let mut session = PtySession::spawn(spec("sleep", &["30"], 24, 80)).expect("spawn pty");
     let pid = session.pid().expect("child pid");
     let proc_path = format!("/proc/{pid}");
 
