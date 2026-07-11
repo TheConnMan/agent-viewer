@@ -9,12 +9,12 @@ pub fn now_ms() -> i64 {
 }
 
 /// Build a viewer-owned log path
-/// ($HOME/.local/state/codex-agent-viewer/logs/{prefix}-{now_ms}.log). Creates nothing;
+/// ($HOME/.local/state/agent-viewer/logs/{prefix}-{now_ms}.log). Creates nothing;
 /// the spawn helper makes the parent dir when it actually opens the file.
 pub fn viewer_log_path(prefix: &str) -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     std::path::PathBuf::from(home)
-        .join(".local/state/codex-agent-viewer/logs")
+        .join(".local/state/agent-viewer/logs")
         .join(format!("{prefix}-{}.log", now_ms()))
 }
 

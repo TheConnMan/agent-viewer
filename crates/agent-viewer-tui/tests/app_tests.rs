@@ -1,5 +1,5 @@
-use codex_viewer_core::{BackendKind, Session, Status};
-use codex_viewer_tui::app::{App, Row};
+use agent_viewer_core::{BackendKind, Session, Status};
+use agent_viewer_tui::app::{App, Row};
 use std::path::PathBuf;
 
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd

@@ -1,17 +1,17 @@
 [package]
-name = "codex-viewer-tui"
+name = "agent-viewer-tui"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "codex_viewer_tui"
+name = "agent_viewer_tui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "codex-viewer-tui"
+name = "agent-viewer"
 path = "src/main.rs"
 
 [dependencies]
-codex-viewer-core = { version = "0.1.0", path = "../codex-viewer-core" }
+agent-viewer-core = { version = "0.1.0", path = "../agent-viewer-core" }
 crossterm = "0.29.0"
 ratatui = "0.30.2"

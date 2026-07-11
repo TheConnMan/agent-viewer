@@ -1,7 +1,7 @@
 mod common;
 
-use codex_viewer_core::backend::Status;
-use codex_viewer_core::codex::status::{StatusResolver, resolve_status};
+use agent_viewer_core::backend::Status;
+use agent_viewer_core::codex::status::{StatusResolver, resolve_status};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;

@@ -1,6 +1,6 @@
 mod common;
 
-use codex_viewer_core::codex::rollout::{
+use agent_viewer_core::codex::rollout::{
     TranscriptItem, has_task_complete_tail, read_session_meta, read_transcript,
 };
 use std::io::Write;

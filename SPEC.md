@@ -1,4 +1,4 @@
-# codex-agent-viewer — build spec
+# agent-viewer — build spec
 
 Terminal viewer for OpenAI Codex sessions, in the spirit of Claude Code's `claude agents`.
 This spec is the contract. Every fact below was verified on this box (Codex 0.144.1,
@@ -104,10 +104,10 @@ the same SQLite + files we read directly. Leave a comment marking it as the v2 u
 
 ## Crate layout
 
-- `codex-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),
+- `agent-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),
   status resolver (sysinfo/procfs + `/proc/fd`), spawner (Command+setsid), and thin wrappers
   around `codex archive`/`unarchive`/`resume`. No UI. Unit-tested.
-- `codex-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`.
+- `agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`.
 
 Cargo workspace. Live-refresh the registry every ~1-2s; `notify`-watch the focused session's
 rollout for live tail.

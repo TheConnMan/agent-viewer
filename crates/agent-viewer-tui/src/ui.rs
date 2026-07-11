@@ -2,8 +2,8 @@
 // No themes/config (see plan section 5.6).
 
 use crate::app::{App, Row};
-use codex_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
-use codex_viewer_core::{BackendKind, Status};
+use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
+use agent_viewer_core::{BackendKind, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -240,7 +240,7 @@ fn draw_right(frame: &mut Frame, app: &App, area: Rect, transcript: &TranscriptC
     }
 }
 
-fn metadata_lines(session: &codex_viewer_core::Session) -> Vec<Line<'static>> {
+fn metadata_lines(session: &agent_viewer_core::Session) -> Vec<Line<'static>> {
     let status = match session.status {
         Status::Running => "running",
         Status::Done => "done",
@@ -262,7 +262,7 @@ fn draw_transcript(
     frame: &mut Frame,
     area: Rect,
     block: Block<'static>,
-    session: &codex_viewer_core::Session,
+    session: &agent_viewer_core::Session,
     items: &[TranscriptItem],
 ) {
     let inner_height = area.height.saturating_sub(2) as usize;

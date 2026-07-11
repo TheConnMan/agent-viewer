@@ -1,4 +1,4 @@
-# codex-agent-viewer
+# agent-viewer
 
 A terminal viewer for coding-agent sessions, modeled on Claude Code's `claude agents`
 view. These CLIs have no built-in "see all my sessions" console; this fills that gap.
@@ -36,7 +36,7 @@ cargo build --workspace
 ## Run
 
 ```
-cargo run -p codex-viewer-tui
+cargo run -p agent-viewer-tui
 ```
 
 Requires a `~/.codex/state_*.sqlite` on the box (the Codex backend's source of truth).
@@ -66,7 +66,7 @@ The live end-to-end tests are `#[ignore]` by default because they spawn a real
 `codex exec` and need Codex auth plus network:
 
 ```
-cargo test -p codex-viewer-core --test e2e_live -- --ignored --nocapture
+cargo test -p agent-viewer-core --test e2e_live -- --ignored --nocapture
 ```
 
 ## Status

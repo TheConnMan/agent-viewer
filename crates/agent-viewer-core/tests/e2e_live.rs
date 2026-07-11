@@ -1,18 +1,18 @@
 //! Live end-to-end tests. Both are #[ignore] — they need real codex auth + network
 //! (and, for the smoke, whatever backends exist on the box), so plain `cargo test` skips
 //! them. Run explicitly:
-//!   cargo test -p codex-viewer-core --test e2e_live -- --ignored --nocapture
+//!   cargo test -p agent-viewer-core --test e2e_live -- --ignored --nocapture
 
-use codex_viewer_core::backend::{Backend, Status, all_backends};
-use codex_viewer_core::codex::CodexBackend;
-use codex_viewer_core::default_codex_home;
+use agent_viewer_core::backend::{Backend, Status, all_backends};
+use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::default_codex_home;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Poll `list()` until `pred` matches a session or the deadline passes.
 fn poll_until<F>(backend: &mut CodexBackend, timeout: Duration, mut pred: F) -> Option<()>
 where
-    F: FnMut(&codex_viewer_core::Session) -> bool,
+    F: FnMut(&agent_viewer_core::Session) -> bool,
 {
     let start = Instant::now();
     while start.elapsed() < timeout {

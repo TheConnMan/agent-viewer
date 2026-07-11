@@ -1,8 +1,8 @@
 mod common;
 
-use codex_viewer_core::Status;
-use codex_viewer_core::backend::{Backend, BackendKind};
-use codex_viewer_core::opencode::{OpencodeBackend, opencode_status};
+use agent_viewer_core::Status;
+use agent_viewer_core::backend::{Backend, BackendKind};
+use agent_viewer_core::opencode::{OpencodeBackend, opencode_status};
 use std::path::PathBuf;
 
 #[test]

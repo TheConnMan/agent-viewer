@@ -2,10 +2,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use codex_viewer_core::backend::{Backend, all_backends};
-use codex_viewer_core::{BackendKind, Session};
-use codex_viewer_tui::app::App;
-use codex_viewer_tui::ui::{self, ModalField, Mode, NewModal, TranscriptCache};
+use agent_viewer_core::backend::{Backend, all_backends};
+use agent_viewer_core::{BackendKind, Session};
+use agent_viewer_tui::app::App;
+use agent_viewer_tui::ui::{self, ModalField, Mode, NewModal, TranscriptCache};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
     let mut last: Vec<Vec<Session>> = vec![Vec::new(); backends.len()];
     let (sessions, notice, ok_count) = refresh(&mut backends, &mut last);
     if ok_count == 0 {
-        eprintln!("codex-agent-viewer: no backend could be listed");
+        eprintln!("agent-viewer: no backend could be listed");
         if !notice.is_empty() {
             eprintln!("{notice}");
         }

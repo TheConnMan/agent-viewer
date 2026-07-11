@@ -1,7 +1,7 @@
 mod common;
 
-use codex_viewer_core::backend::{Backend, BackendKind, Status};
-use codex_viewer_core::claude::{ClaudeBackend, parse_agents_json};
+use agent_viewer_core::backend::{Backend, BackendKind, Status};
+use agent_viewer_core::claude::{ClaudeBackend, parse_agents_json};
 use std::path::PathBuf;
 
 #[test]

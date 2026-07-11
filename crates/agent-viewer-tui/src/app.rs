@@ -1,5 +1,5 @@
-use codex_viewer_core::group::project_root;
-use codex_viewer_core::{BackendKind, Session, Status};
+use agent_viewer_core::group::project_root;
+use agent_viewer_core::{BackendKind, Session, Status};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 

@@ -1,5 +1,5 @@
-use codex_viewer_core::backend::{BackendKind, Session, Status};
-use codex_viewer_core::group::{group_by_project, project_root};
+use agent_viewer_core::backend::{BackendKind, Session, Status};
+use agent_viewer_core::group::{group_by_project, project_root};
 use std::path::{Path, PathBuf};
 
 fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {

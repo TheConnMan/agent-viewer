@@ -3,6 +3,28 @@
 version = 4
 
 [[package]]
+name = "agent-viewer-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "agent-viewer-tui"
+version = "0.1.0"
+dependencies = [
+ "agent-viewer-core",
+ "crossterm",
+ "ratatui",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,28 +159,6 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
-
-[[package]]
-name = "codex-viewer-core"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "codex-viewer-tui"
-version = "0.1.0"
-dependencies = [
- "codex-viewer-core",
- "crossterm",
- "ratatui",
-]
 
 [[package]]
 name = "compact_str"

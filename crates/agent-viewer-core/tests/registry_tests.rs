@@ -1,8 +1,8 @@
 mod common;
 
-use codex_viewer_core::codex::registry::{Registry, find_state_db};
-use codex_viewer_core::codex::source::Source;
-use codex_viewer_core::error::Error;
+use agent_viewer_core::codex::registry::{Registry, find_state_db};
+use agent_viewer_core::codex::source::Source;
+use agent_viewer_core::error::Error;
 use std::path::PathBuf;
 
 const INSERT_COLS: &str = "INSERT INTO threads \

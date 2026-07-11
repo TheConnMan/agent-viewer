@@ -1,4 +1,4 @@
-use codex_viewer_core::codex::source::Source;
+use agent_viewer_core::codex::source::Source;
 
 #[test]
 fn parse_plain_variants() {
