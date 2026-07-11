@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Current time as epoch milliseconds (0 if the system clock predates the epoch).
 pub fn now_ms() -> i64 {
@@ -53,6 +53,29 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
 /// If getpgid(pid) == pid (process leads its own group) send SIGTERM to the group
 /// (-pid), else to the single pid. ESRCH (already gone) -> Ok(()). Never SIGKILL in v2.
 pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
-    let _ = (pid, expected_comm_prefix);
-    todo!("Stream A: comm-guarded SIGTERM with process-group handling")
+    // pid-reuse guard: the live comm must still be the tool we spawned.
+    let comm = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => comm,
+        // The process is already gone; nothing to signal.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !comm.trim_start().starts_with(expected_comm_prefix) {
+        return Err(Error::Command("comm mismatch".into()));
+    }
+    let pid = pid as libc::pid_t;
+    // getpgid(pid) == pid means the process leads its own group (our setsid spawns and
+    // shell foreground jobs) — signal the whole group; otherwise only the single pid.
+    let pgid = unsafe { libc::getpgid(pid) };
+    let target = if pgid == pid { -pid } else { pid };
+    let ret = unsafe { libc::kill(target, libc::SIGTERM) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(Error::Command(format!("kill failed: {err}")))
+    }
 }

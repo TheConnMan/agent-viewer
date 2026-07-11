@@ -45,7 +45,7 @@ impl Source {
     /// vscode 320 shown; exec 1671 + subagent 876 hidden). Exec | Subagent(_) -> true.
     /// thread_source/has_user_event are UNRELIABLE — do not use them.
     pub fn is_companion(&self) -> bool {
-        todo!("Stream A: Exec | Subagent(_) -> true")
+        matches!(self, Source::Exec | Source::Subagent(_))
     }
 
     /// "cli" | "exec" | "vscode" | the Subagent label. For display.

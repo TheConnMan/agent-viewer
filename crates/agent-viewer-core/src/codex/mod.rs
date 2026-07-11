@@ -76,6 +76,12 @@ impl Backend for CodexBackend {
         let mut sessions = Vec::with_capacity(threads.len());
         for thread in threads {
             let status = self.resolver.resolve(&thread.rollout_path, &open);
+            // The open map keys on the canonical rollout path (same as the resolver).
+            let canonical = std::fs::canonicalize(&thread.rollout_path)
+                .unwrap_or_else(|_| thread.rollout_path.clone());
+            let pid = open.get(&canonical).copied();
+            let companion = thread.source.is_companion();
+            let source_label = thread.source.label().to_string();
             sessions.push(Session {
                 backend: BackendKind::Codex,
                 id: thread.id,
@@ -85,12 +91,11 @@ impl Backend for CodexBackend {
                 updated_at_ms: thread.updated_at_ms,
                 status,
                 hidden: thread.archived,
-                source_label: thread.source.label().to_string(),
-                // Stage 2 placeholders; Stream A wires preview/is_companion/open pid.
-                summary: String::new(),
-                companion: false,
-                pid: None,
-                rollout_path: Some(thread.rollout_path.clone()),
+                source_label,
+                summary: thread.preview,
+                companion,
+                pid,
+                rollout_path: Some(thread.rollout_path),
             });
         }
         Ok(sessions)
@@ -119,8 +124,10 @@ impl Backend for CodexBackend {
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
-        let _ = session;
-        todo!("Stream A: SIGTERM via spawn::terminate(session.pid, \"codex\")")
+        match session.pid {
+            Some(pid) => crate::spawn::terminate(pid, "codex"),
+            None => Err(crate::error::Error::Unsupported(self.kind().name())),
+        }
     }
 
     fn remove(&self, id: &str) -> Result<()> {

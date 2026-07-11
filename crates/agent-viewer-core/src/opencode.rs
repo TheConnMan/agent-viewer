@@ -1,5 +1,5 @@
 use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub struct OpencodeBackend {
     db_path: std::path::PathBuf,
@@ -71,9 +71,9 @@ impl Backend for OpencodeBackend {
                 } else {
                     "opencode".to_string()
                 },
-                // Stage 2 placeholders; Stream A wires companion = parent_id.is_some().
                 summary: String::new(),
-                companion: false,
+                companion: parent_id.is_some(),
+                // Overlay fills the pid for viewer-spawned opencode sessions.
                 pid: None,
                 rollout_path: None,
             })
@@ -95,16 +95,39 @@ impl Backend for OpencodeBackend {
         Ok(Some(pid))
     }
     fn stop(&self, session: &Session) -> Result<()> {
-        let _ = session;
-        todo!("Stream A: spawn::terminate(session.pid?, \"opencode\")")
+        // Only viewer-spawned opencode sessions carry a pid (filled by the overlay).
+        match session.pid {
+            Some(pid) => crate::spawn::terminate(pid, "opencode"),
+            None => Err(Error::Unsupported(self.kind().name())),
+        }
     }
     fn remove(&self, id: &str) -> Result<()> {
-        let _ = id;
-        todo!("Stream A: opencode session delete <id>")
+        let output = std::process::Command::new("opencode")
+            .arg("session")
+            .arg("delete")
+            .arg(id)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::Command(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ))
+        }
     }
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
-        let _ = (session, name);
-        todo!("Stream A: opencode db \"<rename_sql(id, name)>\"")
+        // The official `opencode db` subcommand — a CLI mutation, not a raw DB write.
+        let output = std::process::Command::new("opencode")
+            .arg("db")
+            .arg(rename_sql(&session.id, name))
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::Command(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ))
+        }
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         let mut cmd = std::process::Command::new("opencode");
@@ -133,15 +156,26 @@ fn live_opencode_proc() -> bool {
 /// Done: otherwise. Never NeedsInput/Failed/Stopped (no signal exists — the session
 /// table has no error column; verified live 2026-07-11).
 pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64) -> Status {
-    // Stage 2 placeholder (deliberately wrong for the three-tier contract); Stream A
-    // implements the real Working/Idle/Done tiers. Valid so list() still builds rows.
-    let _ = (live_opencode_proc, updated_at_ms, now_ms);
-    Status::Done
+    if !live_opencode_proc {
+        return Status::Done;
+    }
+    let age = now_ms - updated_at_ms;
+    if age <= 60_000 {
+        Status::Working
+    } else if age <= 1_800_000 {
+        Status::Idle
+    } else {
+        Status::Done
+    }
 }
 
 /// PURE, unit-tested: `UPDATE session SET title='<t>' WHERE id='<id>'` with single
 /// quotes doubled in both values (SQL-92 escaping).
 pub fn rename_sql(id: &str, title: &str) -> String {
-    let _ = (id, title);
-    todo!("Stream A: UPDATE session SET title=... with SQL-92 quote doubling")
+    let escape = |value: &str| value.replace('\'', "''");
+    format!(
+        "UPDATE session SET title='{}' WHERE id='{}'",
+        escape(title),
+        escape(id)
+    )
 }

@@ -37,8 +37,13 @@ pub fn resume_command(id: &str) -> std::process::Command {
 /// `thread/name/set` {threadId, name}, serialized via serde_json (no hand-built
 /// strings — names with quotes/newlines must survive).
 pub fn name_set_request(request_id: i64, thread_id: &str, name: &str) -> String {
-    let _ = (request_id, thread_id, name);
-    todo!("Stream A: serde_json JSON-RPC 2.0 request line for thread/name/set")
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "thread/name/set",
+        "params": { "threadId": thread_id, "name": name },
+    });
+    request.to_string()
 }
 
 /// Spawn `codex app-server` (stdio mode), write the initialize handshake +
@@ -46,6 +51,81 @@ pub fn name_set_request(request_id: i64, thread_id: &str, name: &str) -> String 
 /// the child. LIVE VERIFICATION REQUIRED during implementation (framing + initialize
 /// shape against `codex app-server generate-json-schema`).
 pub fn rename(thread_id: &str, name: &str) -> Result<()> {
-    let _ = (thread_id, name);
-    todo!("Stream A: codex app-server JSON-RPC rename")
+    // Framing verified live against 0.144.1: line-delimited JSON over stdio, an
+    // `initialize` request carrying clientInfo, then `thread/name/set`. No Content-Length,
+    // no separate `initialized` notification required. The server preserves stdin order,
+    // so the two requests can be written back to back.
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Command("app-server stdin unavailable".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Command("app-server stdout unavailable".into()))?;
+
+    // A reader thread streams response lines over a channel so the wait can be bounded.
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": { "name": "agent-viewer", "version": env!("CARGO_PKG_VERSION") },
+            "capabilities": { "experimentalApi": true },
+        },
+    })
+    .to_string();
+    let name_set = name_set_request(2, thread_id, name);
+
+    let outcome = (|| -> Result<()> {
+        writeln!(stdin, "{initialize}")?;
+        writeln!(stdin, "{name_set}")?;
+        stdin.flush()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| Error::Command("app-server rename timed out".into()))?;
+            let line = rx
+                .recv_timeout(remaining)
+                .map_err(|_| Error::Command("app-server rename timed out".into()))?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(|v| v.as_i64()) == Some(2) {
+                if value.get("error").is_some() {
+                    return Err(Error::Command(format!("app-server rename error: {line}")));
+                }
+                return Ok(());
+            }
+        }
+    })();
+
+    // Closing stdin signals EOF; kill+reap the child and join the reader regardless.
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    outcome
 }

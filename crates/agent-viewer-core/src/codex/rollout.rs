@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,8 +63,57 @@ pub enum TailState {
 ///      window) -> `Complete`
 ///   3. else -> `MidTurn`
 pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
-    let _ = path;
-    todo!("Stream A: 64 KiB tail scan + approval/complete/started decision order")
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let window: u64 = 64 * 1024;
+    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut last_complete: Option<usize> = None;
+    let mut last_started: Option<usize> = None;
+    let mut last_approval: Option<usize> = None;
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        match value
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+        {
+            Some("task_complete") => last_complete = Some(idx),
+            Some("task_started") => last_started = Some(idx),
+            Some(t) if t.ends_with("_approval_request") => last_approval = Some(idx),
+            _ => {}
+        }
+    }
+    // Rule 1: an approval after the last task_started with no later task_complete.
+    if let Some(approval) = last_approval {
+        let after_started = last_started.is_none_or(|s| approval > s);
+        let no_complete_after = last_complete.is_none_or(|c| c < approval);
+        if after_started && no_complete_after {
+            return Ok(TailState::AwaitingApproval);
+        }
+    }
+    // Rule 2: v1's last-turn completion rule verbatim (prior intent, commit ae99791).
+    let complete = match (last_complete, last_started) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(c), Some(s)) => c > s,
+    };
+    if complete {
+        Ok(TailState::Complete)
+    } else {
+        Ok(TailState::MidTurn)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

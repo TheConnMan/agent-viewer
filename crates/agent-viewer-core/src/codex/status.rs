@@ -1,3 +1,4 @@
+use super::rollout::TailState;
 use crate::backend::Status;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,8 +41,18 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, u32> {
 ///   closed + anything else               -> Failed    (v1 Errored, renamed)
 /// Stopped is NOT resolved here — it is a viewer-DB overlay (section 5.7). Never panics.
 pub fn resolve_status(rollout_path: &Path, open_paths: &HashMap<PathBuf, u32>) -> Status {
-    let _ = (rollout_path, open_paths);
-    todo!("Stream A: six-state resolution over tail_state + open map")
+    let canonical =
+        std::fs::canonicalize(rollout_path).unwrap_or_else(|_| rollout_path.to_path_buf());
+    let open = open_paths.contains_key(&canonical);
+    match (open, super::rollout::tail_state(rollout_path)) {
+        (true, Ok(TailState::AwaitingApproval)) => Status::NeedsInput,
+        (true, Ok(TailState::Complete)) => Status::Idle,
+        // MidTurn or an unreadable/empty file (spawn race) -> Working while held open.
+        (true, _) => Status::Working,
+        (false, Ok(TailState::Complete)) => Status::Done,
+        // Closed and not cleanly complete (MidTurn, awaiting, or unreadable) -> Failed.
+        (false, _) => Status::Failed,
+    }
 }
 
 /// Caching wrapper for the refresh loop. Cache key: (mtime, len) of rollout_path.

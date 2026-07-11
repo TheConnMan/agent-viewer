@@ -1,5 +1,5 @@
-use crate::backend::{Backend, BackendKind, Capabilities, Session};
-use crate::error::Result;
+use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
+use crate::error::{Error, Result};
 
 pub struct ClaudeBackend {
     binary: String,
@@ -51,10 +51,25 @@ impl Backend for ClaudeBackend {
             _ => return Ok(Vec::new()),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Stream A: for each parsed (session, short_id), read the jobs state.json to fill
-        // summary/updated_at_ms/rollout_path. Stage 2 drops the short id.
         let parsed = parse_agents_json(&stdout)?;
-        Ok(parsed.into_iter().map(|(session, _short_id)| session).collect())
+        let mut sessions = Vec::with_capacity(parsed.len());
+        for (mut session, short_id) in parsed {
+            // Fill summary/updated_at_ms/rollout_path from the jobs state.json. A
+            // missing/garbled file is not an error — the jobs dir can lag the agents list.
+            let path = job_state_path(&short_id);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let detail = parse_job_state(&text);
+                session.summary = detail.summary;
+                session.rollout_path = detail.transcript_path;
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified())
+                    && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    session.updated_at_ms = since.as_millis() as i64;
+                }
+            }
+            sessions.push(session);
+        }
+        Ok(sessions)
     }
     fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<Option<u32>> {
         // Detach like the other backends so the TUI key handler returns immediately
@@ -75,8 +90,33 @@ impl Backend for ClaudeBackend {
         Ok(None)
     }
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
-        let _ = (session, name);
-        todo!("Stream A: roster.json rendezvousSock UDS rename_session")
+        // Best-effort UDS rename against the live daemon worker (unofficial Fleet View
+        // protocol). Any failure -> Err so the TUI falls back to set_name_override.
+        use std::io::{Read, Write};
+        let home = std::env::var("HOME").unwrap_or_default();
+        let roster_path = std::path::PathBuf::from(&home).join(".claude/daemon/roster.json");
+        let text = std::fs::read_to_string(&roster_path)?;
+        let roster: serde_json::Value = serde_json::from_str(&text)?;
+        let sock = roster
+            .get("workers")
+            .and_then(|w| w.as_object())
+            .and_then(|workers| {
+                workers.values().find(|worker| {
+                    worker.get("sessionId").and_then(|s| s.as_str()) == Some(session.id.as_str())
+                })
+            })
+            .and_then(|worker| worker.get("rendezvousSock"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| Error::Command("no live worker for session".into()))?;
+        let mut stream = std::os::unix::net::UnixStream::connect(sock)?;
+        let mut line = serde_json::json!({ "subtype": "rename_session", "title": name }).to_string();
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        // The reply is advisory; a successful write is the success signal.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let mut buf = [0u8; 256];
+        let _ = stream.read(&mut buf);
+        Ok(())
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         let mut cmd = std::process::Command::new(&self.binary);
@@ -96,8 +136,62 @@ impl Backend for ClaudeBackend {
 /// The SHORT id (entry "id") the caller needs for the jobs path is returned alongside.
 /// Entries missing sessionId/cwd/name are SKIPPED. Non-array top level -> Err(Json).
 pub fn parse_agents_json(stdout: &str) -> Result<Vec<(Session, String)>> {
-    let _ = stdout;
-    todo!("Stream A: six-state mapping + pid + short-id return")
+    // Non-array top level surfaces as Err(Json) via the From conversion.
+    let entries: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())?;
+    let mut sessions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // sessionId/cwd/name are required; anything missing them is skipped.
+        let Some(session_id) = entry.get("sessionId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let short_id = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let started_at = entry.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let source_label = entry
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let status = match entry.get("state").and_then(|v| v.as_str()) {
+            Some("working") => Status::Working,
+            Some("blocked") => Status::NeedsInput,
+            Some("idle") => Status::Idle,
+            Some("done") => Status::Done,
+            Some("failed") => Status::Failed,
+            Some("stopped") => Status::Stopped,
+            // Missing or unknown state -> Idle (verified live: some entries have no state).
+            _ => Status::Idle,
+        };
+        let pid = entry.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+        sessions.push((
+            Session {
+                backend: BackendKind::Claude,
+                id: session_id.to_string(),
+                title: name.to_string(),
+                cwd: std::path::PathBuf::from(cwd),
+                created_at_ms: started_at,
+                updated_at_ms: started_at,
+                status,
+                hidden: false,
+                source_label,
+                summary: String::new(),
+                companion: false,
+                pid,
+                rollout_path: None,
+            },
+            short_id,
+        ));
+    }
+    Ok(sessions)
 }
 
 /// Parsed subset of a claude jobs `state.json` (verified fields 2026-07-11).
@@ -114,8 +208,34 @@ pub struct JobDetail {
 /// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath;
 /// blocked jobs carry needs, working/done carry detail).
 pub fn parse_job_state(text: &str) -> JobDetail {
-    let _ = text;
-    todo!("Stream A: blocked-needs-else-detail summary + linkScanPath")
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return JobDetail {
+            summary: String::new(),
+            updated_at_ms: None,
+            transcript_path: None,
+        };
+    };
+    let state = value.get("state").and_then(|v| v.as_str());
+    let needs = value.get("needs").and_then(|v| v.as_str());
+    let detail = value.get("detail").and_then(|v| v.as_str());
+    let summary = if state == Some("blocked")
+        && let Some(needs) = needs
+    {
+        needs.to_string()
+    } else if let Some(detail) = detail {
+        detail.to_string()
+    } else {
+        String::new()
+    };
+    let transcript_path = value
+        .get("linkScanPath")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+    JobDetail {
+        summary,
+        updated_at_ms: None,
+        transcript_path,
+    }
 }
 
 /// $HOME/.claude/jobs/<short_id>/state.json
@@ -136,6 +256,52 @@ pub fn read_claude_transcript(
     path: &std::path::Path,
     max_items: usize,
 ) -> Result<Vec<crate::codex::rollout::TranscriptItem>> {
-    let _ = (path, max_items);
-    todo!("Stream A: claude session JSONL peek parse")
+    use crate::codex::rollout::TranscriptItem;
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut items = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = match value.get("type").and_then(|t| t.as_str()) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            // attachment/system/queue-operation/etc. are skipped.
+            _ => continue,
+        };
+        let content = value.get("message").and_then(|m| m.get("content"));
+        let text = match content {
+            // message.content is either a plain string...
+            Some(serde_json::Value::String(s)) => s.clone(),
+            // ...or a list of blocks; keep only type=="text" (thinking/tool skipped).
+            Some(serde_json::Value::Array(blocks)) => {
+                let mut text = String::new();
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = block.get("text").and_then(|t| t.as_str())
+                    {
+                        text.push_str(t);
+                    }
+                }
+                text
+            }
+            _ => continue,
+        };
+        items.push(TranscriptItem {
+            role: role.to_string(),
+            text,
+        });
+    }
+    if items.len() > max_items {
+        items = items.split_off(items.len() - max_items);
+    }
+    Ok(items)
 }
