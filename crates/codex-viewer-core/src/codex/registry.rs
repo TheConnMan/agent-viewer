@@ -1,5 +1,5 @@
-use crate::error::{Error, Result};
 use super::source::Source;
+use crate::error::{Error, Result};
 
 /// Glob <codex_home>/state_*.sqlite, parse the numeric suffix, return the highest N.
 /// Numeric compare, not lexicographic (state_10 beats state_5). Err(NoStateDb) if none.

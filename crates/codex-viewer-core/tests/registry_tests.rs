@@ -1,6 +1,6 @@
 mod common;
 
-use codex_viewer_core::codex::registry::{find_state_db, Registry};
+use codex_viewer_core::codex::registry::{Registry, find_state_db};
 use codex_viewer_core::codex::source::Source;
 use codex_viewer_core::error::Error;
 use std::path::PathBuf;
@@ -67,7 +67,10 @@ fn threads_maps_rows_and_orders_by_recency() {
     assert_eq!(threads[2].id, "t_vscode");
 
     let exec = &threads[0];
-    assert_eq!(exec.rollout_path, PathBuf::from("/home/user/proj/sessions/r1.jsonl"));
+    assert_eq!(
+        exec.rollout_path,
+        PathBuf::from("/home/user/proj/sessions/r1.jsonl")
+    );
     assert_eq!(exec.source, Source::Exec);
     assert_eq!(exec.cwd, PathBuf::from("/home/user/proj"));
     assert_eq!(exec.title, "Exec Title");

@@ -1,7 +1,7 @@
 mod common;
 
 use codex_viewer_core::backend::{Backend, BackendKind, Status};
-use codex_viewer_core::claude::{parse_agents_json, ClaudeBackend};
+use codex_viewer_core::claude::{ClaudeBackend, parse_agents_json};
 use std::path::PathBuf;
 
 #[test]
@@ -34,7 +34,11 @@ fn claude_parse_skips_malformed_and_maps_unknown_state() {
     let sessions = parse_agents_json(&json).expect("parse agents json");
 
     // Malformed entry (missing sessionId) is absent.
-    assert!(sessions.iter().all(|s| s.title != "Orphan Missing SessionId"));
+    assert!(
+        sessions
+            .iter()
+            .all(|s| s.title != "Orphan Missing SessionId")
+    );
     assert_eq!(sessions.len(), 5);
 
     // Unknown state string -> Errored (attention-safe default).

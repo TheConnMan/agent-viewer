@@ -23,12 +23,18 @@ fn parse_subagent_string() {
 fn parse_subagent_thread_spawn() {
     // Verbatim shape from the live DB: nested thread_spawn, label = agent_nickname.
     let raw = r#"{"subagent":{"thread_spawn":{"parent_thread_id":"019f4dda","depth":1,"agent_path":null,"agent_nickname":"Aristotle","agent_role":"worker"}}}"#;
-    assert_eq!(Source::parse(raw), Source::Subagent("Aristotle".to_string()));
+    assert_eq!(
+        Source::parse(raw),
+        Source::Subagent("Aristotle".to_string())
+    );
 }
 
 #[test]
 fn parse_garbage_never_panics() {
-    assert_eq!(Source::parse("banana"), Source::Subagent("unknown".to_string()));
+    assert_eq!(
+        Source::parse("banana"),
+        Source::Subagent("unknown".to_string())
+    );
     assert_eq!(Source::parse("{"), Source::Subagent("unknown".to_string()));
     assert_eq!(
         Source::parse(r#"{"other":1}"#),

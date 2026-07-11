@@ -67,11 +67,19 @@ fn group_by_project_orders_groups_by_newest_session() {
     assert_eq!(groups[1].root, Path::new(root_b));
     // Intra-group recency DESC.
     assert_eq!(
-        groups[0].sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        groups[0]
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
         vec!["a2", "a1"]
     );
     assert_eq!(
-        groups[1].sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        groups[1]
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
         vec!["b3"]
     );
 }

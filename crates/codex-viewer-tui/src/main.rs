@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use codex_viewer_core::backend::{Backend, all_backends};
 use codex_viewer_core::{BackendKind, Session};
 use codex_viewer_tui::app::App;
-use codex_viewer_tui::ui::{self, Mode, ModalField, NewModal, TranscriptCache};
+use codex_viewer_tui::ui::{self, ModalField, Mode, NewModal, TranscriptCache};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
@@ -32,7 +32,14 @@ fn main() -> io::Result<()> {
     let mut notice = notice;
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut backends, &mut last, &mut app, &mut mode, &mut notice);
+    let result = run(
+        &mut terminal,
+        &mut backends,
+        &mut last,
+        &mut app,
+        &mut mode,
+        &mut notice,
+    );
     ratatui::restore();
     result
 }
@@ -231,7 +238,10 @@ fn spawn_from_modal(backends: &[Box<dyn Backend>], modal: &NewModal, notice: &mu
 
 /// List every backend, concatenate results. On a backend error keep its last good
 /// snapshot and surface the error text. Returns (sessions, notice, ok_count).
-fn refresh(backends: &mut [Box<dyn Backend>], last: &mut [Vec<Session>]) -> (Vec<Session>, String, usize) {
+fn refresh(
+    backends: &mut [Box<dyn Backend>],
+    last: &mut [Vec<Session>],
+) -> (Vec<Session>, String, usize) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
     let mut ok_count = 0;

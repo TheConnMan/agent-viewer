@@ -186,10 +186,7 @@ fn row_to_item(row: &Row) -> ListItem<'static> {
                 Span::raw("  "),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
-                Span::styled(
-                    backend.tag(),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(backend.tag(), Style::default().fg(Color::Cyan)),
                 Span::raw(" "),
                 Span::raw(title.clone()),
             ]);
@@ -213,10 +210,7 @@ fn status_glyph(status: Status, hidden: bool) -> (char, Color) {
 fn draw_right(frame: &mut Frame, app: &App, area: Rect, transcript: &TranscriptCache) {
     let block = Block::default().borders(Borders::ALL).title("detail");
     let Some(session) = app.selected() else {
-        frame.render_widget(
-            Paragraph::new("no session selected").block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new("no session selected").block(block), area);
         return;
     };
 
@@ -232,7 +226,9 @@ fn draw_right(frame: &mut Frame, app: &App, area: Rect, transcript: &TranscriptC
                 err.clone(),
                 Style::default().fg(Color::Red),
             )));
-            let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+            let paragraph = Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
         (None, _) => {
@@ -315,9 +311,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, area: Re
 fn draw_modal(frame: &mut Frame, modal: &NewModal, area: Rect) {
     let popup = centered_rect(60, 40, area);
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("new session");
+    let block = Block::default().borders(Borders::ALL).title("new session");
     let focus = |field: ModalField| {
         if modal.field == field {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -342,7 +336,9 @@ fn draw_modal(frame: &mut Frame, modal: &NewModal, area: Rect) {
         Line::from(""),
         Line::from("Tab switch field  Enter spawn  Esc cancel"),
     ];
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
 }
 

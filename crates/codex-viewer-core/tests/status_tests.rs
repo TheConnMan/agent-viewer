@@ -1,7 +1,7 @@
 mod common;
 
 use codex_viewer_core::backend::Status;
-use codex_viewer_core::codex::status::{resolve_status, StatusResolver};
+use codex_viewer_core::codex::status::{StatusResolver, resolve_status};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,8 +29,11 @@ fn resolver_recovers_when_missing_path_appears() {
 
     // Now the rollout appears (mid-turn, no task_complete) and a live process holds the
     // kernel-canonical path open.
-    std::fs::copy(common::fixture_path("rollout_midturn.jsonl"), real.join("rollout.jsonl"))
-        .unwrap();
+    std::fs::copy(
+        common::fixture_path("rollout_midturn.jsonl"),
+        real.join("rollout.jsonl"),
+    )
+    .unwrap();
     let mut open = HashSet::new();
     open.insert(std::fs::canonicalize(&path).unwrap()); // resolves to <tmp>/real/rollout.jsonl
 
@@ -76,7 +79,10 @@ fn resolver_recomputes_on_file_change() {
     assert_eq!(resolver.resolve(&path, &empty_set()), Status::Errored);
 
     // Append token_count + task_complete: (mtime, len) changes, cache must invalidate.
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(
         f,
         r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
@@ -99,6 +105,9 @@ fn resolver_result_matches_pure_function() {
     let missing = PathBuf::from("/nonexistent/x.jsonl");
     let mut resolver = StatusResolver::new();
     for p in [&complete, &midturn, &missing] {
-        assert_eq!(resolver.resolve(p, &empty_set()), resolve_status(p, &empty_set()));
+        assert_eq!(
+            resolver.resolve(p, &empty_set()),
+            resolve_status(p, &empty_set())
+        );
     }
 }

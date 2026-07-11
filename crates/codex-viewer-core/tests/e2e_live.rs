@@ -3,7 +3,7 @@
 //! them. Run explicitly:
 //!   cargo test -p codex-viewer-core --test e2e_live -- --ignored --nocapture
 
-use codex_viewer_core::backend::{all_backends, Backend, Status};
+use codex_viewer_core::backend::{Backend, Status, all_backends};
 use codex_viewer_core::codex::CodexBackend;
 use codex_viewer_core::default_codex_home;
 use std::path::PathBuf;
@@ -53,7 +53,10 @@ fn codex_spawn_running_then_done() {
     let appeared = poll_until(&mut backend, Duration::from_secs(15), |s| {
         std::fs::canonicalize(&s.cwd).unwrap_or_else(|_| s.cwd.clone()) == canon
     });
-    assert!(appeared.is_some(), "spawned session never appeared in list()");
+    assert!(
+        appeared.is_some(),
+        "spawned session never appeared in list()"
+    );
     println!("[e2e] session appeared after {:?}", spawn_at.elapsed());
 
     let id = {
@@ -69,7 +72,10 @@ fn codex_spawn_running_then_done() {
     let running = poll_until(&mut backend, Duration::from_secs(20), |s| {
         s.id == id && s.status == Status::Running
     });
-    assert!(running.is_some(), "never observed Running (the /proc/fd proof)");
+    assert!(
+        running.is_some(),
+        "never observed Running (the /proc/fd proof)"
+    );
     println!("[e2e] observed Running after {:?}", spawn_at.elapsed());
 
     // 5. After the process exits, status flips to Done (task_complete in tail).
@@ -81,11 +87,14 @@ fn codex_spawn_running_then_done() {
 
     // 6. hide/unhide round-trip, then leave hidden.
     backend.hide(&id).expect("hide");
-    let hidden = poll_until(&mut backend, Duration::from_secs(10), |s| s.id == id && s.hidden);
+    let hidden = poll_until(&mut backend, Duration::from_secs(10), |s| {
+        s.id == id && s.hidden
+    });
     assert!(hidden.is_some(), "hide did not take");
     backend.unhide(&id).expect("unhide");
-    let unhidden =
-        poll_until(&mut backend, Duration::from_secs(10), |s| s.id == id && !s.hidden);
+    let unhidden = poll_until(&mut backend, Duration::from_secs(10), |s| {
+        s.id == id && !s.hidden
+    });
     assert!(unhidden.is_some(), "unhide did not take");
     backend.hide(&id).expect("re-hide (tidy)");
 }

@@ -1,7 +1,7 @@
 mod common;
 
 use codex_viewer_core::codex::rollout::{
-    has_task_complete_tail, read_session_meta, read_transcript, TranscriptItem,
+    TranscriptItem, has_task_complete_tail, read_session_meta, read_transcript,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,7 +44,10 @@ fn task_complete_found_when_not_last_line() {
     // Append two trailing non-terminal events after task_complete: the check must scan a
     // tail *window*, not just the final line.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     writeln!(
         f,
         r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{}},"rate_limits":null}}}}"#
