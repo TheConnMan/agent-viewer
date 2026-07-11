@@ -61,6 +61,49 @@ fn select(app: &mut App, id: &str) {
     panic!("session {id} not selectable");
 }
 
+// --- Mouse hit-test selection ---
+
+#[test]
+fn select_visible_index_lands_on_selectable_rows_only() {
+    // Two sessions in different project dirs so the row model carries headers (and, between
+    // groups, a spacer) alongside the session rows — the mix a mouse click can land on.
+    let sessions = vec![
+        sess(BackendKind::Codex, "alpha", "/synthetic/apples", 300, Status::Idle),
+        sess(BackendKind::Codex, "beta", "/synthetic/bananas", 200, Status::Idle),
+    ];
+    let mut app = App::new(sessions);
+    let rows: Vec<Row> = app.visible().to_vec();
+
+    // A Session-row index lands the cursor on that session.
+    let beta_idx = rows
+        .iter()
+        .position(|r| matches!(r, Row::Session { id, .. } if id == "beta"))
+        .expect("beta session row");
+    assert!(app.select_visible_index(beta_idx));
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("beta"));
+    assert_eq!(app.selected_index(), beta_idx);
+
+    // A header index is selectable too (headers accept Enter to collapse/expand).
+    let header_idx = rows
+        .iter()
+        .position(|r| matches!(r, Row::ProjectHeader { .. }))
+        .expect("a project header row");
+    assert!(app.select_visible_index(header_idx));
+    assert_eq!(app.selected_index(), header_idx);
+
+    // A Spacer index (if the layout has one) is rejected and leaves the selection put.
+    if let Some(spacer_idx) = rows.iter().position(|r| matches!(r, Row::Spacer)) {
+        let before = app.selected_index();
+        assert!(!app.select_visible_index(spacer_idx));
+        assert_eq!(app.selected_index(), before);
+    }
+
+    // An out-of-range index is a no-op.
+    let before = app.selected_index();
+    assert!(!app.select_visible_index(rows.len() + 5));
+    assert_eq!(app.selected_index(), before);
+}
+
 // --- Preserved v1 behavior (filter/anchor) ---
 
 #[test]

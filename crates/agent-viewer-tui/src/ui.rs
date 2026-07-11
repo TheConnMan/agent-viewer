@@ -16,6 +16,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui_image::Image;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tui_term::widget::PseudoTerminal;
@@ -386,6 +387,54 @@ pub struct AttachView<'a> {
     pub exited: bool,
 }
 
+// --- Mouse hit-testing ----------------------------------------------------------
+
+/// Frame-persistent list geometry captured during `draw_list`, so the event loop can
+/// reverse a screen cell (x, y) back to a selectable `visible()`-row index for mouse
+/// click/hover selection. Rebuilt every frame; the mouse handler reads the latest.
+#[derive(Debug, Clone, Default)]
+pub struct ListHit {
+    /// The list widget's screen rectangle (origin + size) as drawn this frame.
+    area: Rect,
+    /// The List widget's final scroll offset (item index of the first visible item).
+    offset: usize,
+    /// One entry per rendered item line, in draw order: `Some(visible-row index)` for a
+    /// selectable row, `None` for a non-selectable Spacer or an inline peek-expansion line.
+    item_to_row: Vec<Option<usize>>,
+    /// A floating overlay (the slash-command popup) that shadows the bottom of the list this
+    /// frame, if any. A cell inside it belongs to the overlay, not the row drawn underneath,
+    /// so hit-testing treats it as a hole.
+    blocked: Option<Rect>,
+}
+
+impl ListHit {
+    /// Reverse a terminal cell `(x, y)` to the selectable `visible()`-row index under it, if
+    /// the point falls on a selectable row within the list area. Pure — unit-testable with no
+    /// terminal. Returns `None` outside the area, on a blank spacer, on an expansion line, or
+    /// on a cell shadowed by a floating overlay (the slash-command popup).
+    pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let a = self.area;
+        if a.width == 0 || a.height == 0 {
+            return None;
+        }
+        if x < a.x || x >= a.x.saturating_add(a.width) || y < a.y || y >= a.y.saturating_add(a.height) {
+            return None;
+        }
+        // A cell under the floating popup belongs to the popup, not the obscured list row.
+        if let Some(b) = self.blocked
+            && x >= b.x
+            && x < b.x.saturating_add(b.width)
+            && y >= b.y
+            && y < b.y.saturating_add(b.height)
+        {
+            return None;
+        }
+        let line_in_viewport = (y - a.y) as usize;
+        let item = self.offset.checked_add(line_in_viewport)?;
+        self.item_to_row.get(item).copied().flatten()
+    }
+}
+
 // --- Draw entry point -----------------------------------------------------------
 
 /// Everything the frame needs, bundled so the entry point stays one argument wide.
@@ -405,6 +454,9 @@ pub struct Draw<'a> {
     /// The brand-logo protocols, present only when `AGENT_VIEWER_LOGO_MARKS=1` and the
     /// startup graphics probe succeeded. Overlaid on the reserved mark slot during render.
     pub logos: Option<&'a LogoMarks>,
+    /// Sink for the frame's list geometry, so the event loop can hit-test mouse clicks/hover
+    /// back to a row. Written each frame via interior mutability (draw borrows `&` throughout).
+    pub list_hit: &'a RefCell<ListHit>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -449,7 +501,13 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     draw_header(frame, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
-    draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, d.logos, vertical[1]);
+    // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
+    // below, floating over the list's bottom) shadows part of it, so record that hole too.
+    let mut hit = draw_list(frame, d.app, d.pulses, d.now_ms, d.pr_status, deco, d.logos, vertical[1]);
+    if matches!(d.mode, Mode::Normal) {
+        hit.blocked = slash_popup_area(d.composer, vertical[3]);
+    }
+    *d.list_hit.borrow_mut() = hit;
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
     // force-expanded peek above it); every other mode shows the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
@@ -481,23 +539,32 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     }
 }
 
-/// Render the slash-command suggestions as a few muted lines directly above the composer
-/// box (the highlighted row in accent). Nothing renders when there are no suggestions.
-fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
-    let suggestions = composer.suggestions();
-    if suggestions.is_empty() {
-        return;
+/// The screen rectangle the slash-command popup occupies (floating directly above the
+/// composer box), or None when nothing is shown. Pure so both the renderer and the mouse
+/// hit-test agree on exactly which cells the popup shadows over the list.
+fn slash_popup_area(composer: &Composer, composer_area: Rect) -> Option<Rect> {
+    if composer.suggestions().is_empty() {
+        return None;
     }
-    let height = (suggestions.len() as u16).min(composer_area.y);
+    let height = (composer.suggestions().len() as u16).min(composer_area.y);
     if height == 0 {
-        return;
+        return None;
     }
-    let area = Rect {
+    Some(Rect {
         x: composer_area.x,
         y: composer_area.y - height,
         width: composer_area.width,
         height,
+    })
+}
+
+/// Render the slash-command suggestions as a few muted lines directly above the composer
+/// box (the highlighted row in accent). Nothing renders when there are no suggestions.
+fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
+    let Some(area) = slash_popup_area(composer, composer_area) else {
+        return;
     };
+    let suggestions = composer.suggestions();
     frame.render_widget(Clear, area);
     let highlight = composer.suggestion_highlight();
     let items: Vec<ListItem> = suggestions
@@ -730,7 +797,7 @@ fn draw_list(
     deco: ListDeco,
     logos: Option<&LogoMarks>,
     area: Rect,
-) {
+) -> ListHit {
     let width = area.width as usize;
     let rows = app.visible();
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
@@ -738,9 +805,15 @@ fn draw_list(
     // headers/spacers/rename/expansion lines), so the logo overlay can find its rows by
     // item index after the List has laid them out.
     let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
+    // Also parallel to `items`, in lockstep draw order: each rendered line's selectable row
+    // target (Some(visible-row index) for a header/session line, None for a Spacer or an
+    // expansion line). This is the map the mouse handler reverses to pick a row from a cell.
+    let mut item_to_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
     // The selection index only shifts if expansion lines are inserted BEFORE the selected
     // row; expansion always sits under the (selected) expanded row, so it stays aligned.
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
+        // A Spacer renders a blank line but is never selectable, so it maps to no row.
+        let target = if matches!(row, Row::Spacer) { None } else { Some(row_idx) };
         match row {
             Row::Session { backend, id, .. } => {
                 // In-place rename edit field replaces the row while renaming it. The rename row
@@ -755,6 +828,7 @@ fn draw_list(
                     items.push(row_to_item(row, pulses, now_ms, pr_status, width));
                     item_backends.push(Some(*backend));
                 }
+                item_to_row.push(target);
                 // Inline peek expansion: indented muted transcript tail under the row.
                 if let Some((eb, eid)) = deco.expanded
                     && backend == eb
@@ -764,12 +838,14 @@ fn draw_list(
                         // Lines are already indented + styled by peek_expansion.
                         items.push(ListItem::new(line.clone()));
                         item_backends.push(None);
+                        item_to_row.push(None);
                     }
                 }
             }
             _ => {
                 items.push(row_to_item(row, pulses, now_ms, pr_status, width));
                 item_backends.push(None);
+                item_to_row.push(target);
             }
         }
     }
@@ -792,6 +868,15 @@ fn draw_list(
         }
     }
     frame.render_stateful_widget(list, area, &mut state);
+    // Capture the final scroll offset AFTER render (the widget computes it from the selection),
+    // together with the area and the item->row map, so the event loop can hit-test the mouse.
+    let hit = ListHit {
+        area,
+        offset: state.offset(),
+        item_to_row,
+        // The caller (`draw`) fills this in once the slash popup area is known.
+        blocked: None,
+    };
 
     // Logo overlay: for each on-screen session item, draw its brand image over the two blank
     // mark columns (x+2 = after the status glyph + its trailing space). Only the visible
@@ -833,6 +918,8 @@ fn draw_list(
             frame.set_cursor_position((x, y));
         }
     }
+
+    hit
 }
 
 /// The selected row rendered as an inline rename edit field: `✎ <mark> buffer`, the mark in
@@ -1208,6 +1295,100 @@ mod tests {
             assert_eq!(backend_mark(b), "  ");
             assert_eq!(mark_width(backend_mark(b)), 2);
         }
+    }
+
+    #[test]
+    fn list_hit_row_at_reverses_geometry() {
+        // Area at (x=0, y=2), 40 wide x 5 tall; no scroll. Five rendered lines: two rows, an
+        // expansion line, another row, a trailing expansion line.
+        let hit = ListHit {
+            area: Rect::new(0, 2, 40, 5),
+            offset: 0,
+            item_to_row: vec![Some(0), Some(1), None, Some(2), None],
+            blocked: None,
+        };
+        // Each in-area line maps to its item's target; expansion lines map to None.
+        assert_eq!(hit.row_at(0, 2), Some(0)); // first viewport line
+        assert_eq!(hit.row_at(39, 3), Some(1)); // right edge still inside
+        assert_eq!(hit.row_at(0, 4), None); // expansion line
+        assert_eq!(hit.row_at(0, 5), Some(2));
+        assert_eq!(hit.row_at(0, 6), None); // trailing expansion line
+        // Above the list area (header rows) is out of bounds.
+        assert_eq!(hit.row_at(0, 1), None);
+        assert_eq!(hit.row_at(0, 0), None);
+        // Below the area (y >= 2 + 5) is out of bounds.
+        assert_eq!(hit.row_at(0, 7), None);
+        // Past the right edge (x >= 0 + 40) is out of bounds.
+        assert_eq!(hit.row_at(40, 2), None);
+    }
+
+    #[test]
+    fn list_hit_row_at_applies_scroll_offset() {
+        // Viewport of 3 lines showing items 2,3,4 (offset 2). A screen row maps through the
+        // offset back to the underlying item.
+        let hit = ListHit {
+            area: Rect::new(0, 2, 40, 3),
+            offset: 2,
+            item_to_row: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            blocked: None,
+        };
+        assert_eq!(hit.row_at(0, 2), Some(2));
+        assert_eq!(hit.row_at(0, 3), Some(3));
+        assert_eq!(hit.row_at(0, 4), Some(4));
+        assert_eq!(hit.row_at(0, 5), None); // outside the 3-tall viewport
+    }
+
+    #[test]
+    fn list_hit_row_at_handles_empty_and_blank_tail() {
+        // A zero-size area (the default, before any frame is drawn) never hits.
+        assert_eq!(ListHit::default().row_at(0, 0), None);
+        // An in-area cell below the last rendered item (blank tail) maps to no row.
+        let hit = ListHit {
+            area: Rect::new(0, 2, 40, 5),
+            offset: 0,
+            item_to_row: vec![Some(0), Some(1)],
+            blocked: None,
+        };
+        assert_eq!(hit.row_at(0, 3), Some(1));
+        assert_eq!(hit.row_at(0, 4), None); // item index 2 is past the rendered items
+    }
+
+    #[test]
+    fn list_hit_row_at_treats_popup_overlay_as_a_hole() {
+        // The slash popup floats over the bottom rows of the list; a cell inside it belongs to
+        // the popup, so hit-testing must not select the obscured row underneath.
+        let hit = ListHit {
+            area: Rect::new(0, 2, 40, 6),
+            offset: 0,
+            item_to_row: vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)],
+            blocked: Some(Rect::new(0, 6, 40, 2)), // shadows screen rows 6 and 7
+        };
+        // Rows above the popup still select normally.
+        assert_eq!(hit.row_at(0, 2), Some(0));
+        assert_eq!(hit.row_at(0, 5), Some(3));
+        // Cells inside the popup rectangle are holes, even though a list row is drawn there.
+        assert_eq!(hit.row_at(0, 6), None);
+        assert_eq!(hit.row_at(39, 7), None);
+    }
+
+    #[test]
+    fn slash_popup_area_matches_suggestion_count() {
+        // No suggestions -> no popup, so nothing is blocked.
+        let mut composer = Composer::new();
+        let below = Rect::new(0, 20, 40, 3); // composer box well below the top
+        assert_eq!(slash_popup_area(&composer, below), None);
+        // A bare "/" matches every installed command, so the popup shows one row per command.
+        composer.set_commands(
+            vec!["review".to_string(), "security-review".to_string()],
+            (BackendKind::Claude, None),
+        );
+        composer.push_char('/');
+        let n = composer.suggestions().len() as u16;
+        assert_eq!(n, 2);
+        let area = slash_popup_area(&composer, below).expect("popup area");
+        assert_eq!(area.height, n);
+        assert_eq!(area.y, below.y - n); // sits just above the composer box
+        assert_eq!(area.width, below.width);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -13,9 +14,12 @@ use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::mutations::MutationRunner;
 use agent_viewer_tui::pr_cache::PrStatusCache;
-use agent_viewer_tui::ui::{self, AttachView, Mode, PeekCache, Pulses};
+use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+};
+use crossterm::execute;
 
 mod auto_enter;
 mod keys;
@@ -169,6 +173,9 @@ struct Ui {
     /// The brand-logo protocols, Some only when AGENT_VIEWER_LOGO_MARKS=1 and the startup
     /// graphics probe succeeded. Borrowed immutably each frame by the render path.
     logos: Option<LogoMarks>,
+    /// Latest list geometry, written by `draw` each frame and read by the mouse handler to
+    /// hit-test click/hover to a row. Interior mutability keeps the draw path `&`-only.
+    list_hit: RefCell<ListHit>,
 }
 
 impl Ui {
@@ -264,6 +271,7 @@ fn main() -> io::Result<()> {
         focused_session: None,
         focused_exited: false,
         logos,
+        list_hit: RefCell::new(ListHit::default()),
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate cheap set
@@ -273,7 +281,12 @@ fn main() -> io::Result<()> {
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
+    // Mouse capture powers click/hover row selection on the list. The terminal's native
+    // text selection still works with Shift held in most terminals. Best-effort: a terminal
+    // that rejects the sequence just leaves the keyboard nav as-is.
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, &action_backends, &refresher, &mut ui);
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -357,6 +370,7 @@ fn run(
                     attach,
                     pr_status: &ui.pr_status,
                     logos: ui.logos.as_ref(),
+                    list_hit: &ui.list_hit,
                 },
             );
         })?;
@@ -383,6 +397,7 @@ fn run(
                         let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
                     }
                 }
+                Event::Mouse(me) => keys::handle_mouse(me, ui),
                 _ => {}
             }
         }
