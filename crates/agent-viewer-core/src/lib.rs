@@ -11,6 +11,24 @@ pub mod state;
 pub use backend::{Backend, BackendKind, Capabilities, Session, Status};
 pub use error::{Error, Result};
 
+/// Flag any session whose cwd is a non-empty path that no longer exists on disk as a
+/// companion, so the default view hides deleted-dir noise (e.g. agentos /tmp sessions).
+/// Only ever SETS companion — an already-flagged session and a session with a live or
+/// empty cwd are left untouched.
+pub fn mark_dead_dirs(sessions: &mut [Session]) {
+    for session in sessions.iter_mut() {
+        if session.companion {
+            continue;
+        }
+        if session.cwd.as_os_str().is_empty() {
+            continue;
+        }
+        if !session.cwd.exists() {
+            session.companion = true;
+        }
+    }
+}
+
 /// Open a SQLite DB read-only with a 500ms busy timeout (Codex and opencode write
 /// concurrently). Read-only flags mean the file is never created if missing.
 pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {

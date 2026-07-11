@@ -61,10 +61,11 @@ impl Backend for ClaudeBackend {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parsed = parse_agents_json(&stdout)?;
         let mut sessions = Vec::with_capacity(parsed.len());
-        for (mut session, short_id) in parsed {
+        for mut session in parsed {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json. A
             // missing/garbled file is not an error — the jobs dir can lag the agents list.
             // The parse is cached by (mtime, len) so an unchanged file is not re-read.
+            let short_id = session.short_id.clone().unwrap_or_default();
             let path = job_state_path(&short_id);
             if let Ok(meta) = std::fs::metadata(&path) {
                 let key = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
@@ -137,9 +138,94 @@ impl Backend for ClaudeBackend {
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         let mut cmd = std::process::Command::new(&self.binary);
-        cmd.current_dir(&session.cwd).arg("-r").arg(&session.id);
+        // A live session (pid present, or a Working/NeedsInput state) opens Claude Code's
+        // agent view with this job preselected and expanded — the view is not tied to the
+        // session cwd, so it runs from $HOME. A finished session resumes by full id,
+        // pinned to its cwd only when that dir still exists.
+        let live = session.pid.is_some()
+            || matches!(session.status, Status::Working | Status::NeedsInput);
+        if live {
+            let short_id = session.short_id.clone().unwrap_or_default();
+            let home = std::env::var("HOME").unwrap_or_default();
+            cmd.arg("agents")
+                .env("CLAUDE_AGENTS_SELECT", short_id)
+                .current_dir(home);
+        } else {
+            cmd.arg("-r").arg(&session.id);
+            if session.cwd.is_dir() {
+                cmd.current_dir(&session.cwd);
+            }
+        }
         Some(cmd)
     }
+}
+
+/// Pre-accept the claude trust dialog for `cwd` in the config JSON at `config_path`, so a
+/// non-interactive attach into a fresh project does not stall on the trust prompt. Returns
+/// Ok(false) (no write) when `cwd` or any ancestor is already accepted, Ok(true) when the
+/// flag was merged in (or the file was created). Every other key at every level is
+/// preserved; the write is atomic (temp file in the same dir + rename). This is claude's
+/// own sanctioned field — its error text instructs setting exactly `hasTrustDialogAccepted`
+/// for non-interactive use.
+pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> Result<bool> {
+    let mut config: serde_json::Value = match std::fs::read_to_string(config_path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
+        // Missing file -> start from a minimal structure and create it.
+        Err(_) => serde_json::json!({}),
+    };
+
+    // Already trusted if cwd or any ancestor has hasTrustDialogAccepted == true.
+    if let Some(projects) = config.get("projects").and_then(|p| p.as_object()) {
+        let mut dir = Some(cwd);
+        while let Some(d) = dir {
+            let accepted = projects
+                .get(&d.to_string_lossy().into_owned())
+                .and_then(|p| p.get("hasTrustDialogAccepted"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if accepted {
+                return Ok(false);
+            }
+            dir = d.parent();
+        }
+    }
+
+    // Merge hasTrustDialogAccepted: true into projects[<cwd>], preserving every other key.
+    let projects = config
+        .as_object_mut()
+        .expect("json object")
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    if !projects.is_object() {
+        *projects = serde_json::json!({});
+    }
+    let cwd_key = cwd.to_string_lossy().into_owned();
+    let project = projects
+        .as_object_mut()
+        .expect("projects object")
+        .entry(cwd_key)
+        .or_insert_with(|| serde_json::json!({}));
+    if !project.is_object() {
+        *project = serde_json::json!({});
+    }
+    project
+        .as_object_mut()
+        .expect("project object")
+        .insert("hasTrustDialogAccepted".to_string(), serde_json::json!(true));
+
+    // Atomic write: temp file in the same dir, then rename over the target.
+    let text = serde_json::to_string_pretty(&config)?;
+    let dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        config_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "claude.json".to_string())
+    ));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, config_path)?;
+    Ok(true)
 }
 
 /// PURE parser, unit-tested against the fixture. Input: stdout of
@@ -150,9 +236,10 @@ impl Backend for ClaudeBackend {
 /// state: "working" -> Working, "blocked" -> NeedsInput, "idle" -> Idle,
 /// "done" -> Done, "failed" -> Failed, "stopped" -> Stopped,
 /// missing or unknown -> Idle. pid: entry "pid" as u32 when present.
-/// The SHORT id (entry "id") the caller needs for the jobs path is returned alongside.
-/// Entries missing sessionId/cwd/name are SKIPPED. Non-array top level -> Err(Json).
-pub fn parse_agents_json(stdout: &str) -> Result<Vec<(Session, String)>> {
+/// The SHORT id (entry "id") the caller needs for the jobs path is folded into
+/// `Session.short_id`. Entries missing sessionId/cwd/name are SKIPPED. Non-array top
+/// level -> Err(Json).
+pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
     // Non-array top level surfaces as Err(Json) via the From conversion.
     let entries: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())?;
     let mut sessions = Vec::with_capacity(entries.len());
@@ -189,24 +276,22 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<(Session, String)>> {
             _ => Status::Idle,
         };
         let pid = entry.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
-        sessions.push((
-            Session {
-                backend: BackendKind::Claude,
-                id: session_id.to_string(),
-                title: name.to_string(),
-                cwd: std::path::PathBuf::from(cwd),
-                created_at_ms: started_at,
-                updated_at_ms: started_at,
-                status,
-                hidden: false,
-                source_label,
-                summary: String::new(),
-                companion: false,
-                pid,
-                rollout_path: None,
-            },
-            short_id,
-        ));
+        sessions.push(Session {
+            backend: BackendKind::Claude,
+            id: session_id.to_string(),
+            short_id: Some(short_id),
+            title: name.to_string(),
+            cwd: std::path::PathBuf::from(cwd),
+            created_at_ms: started_at,
+            updated_at_ms: started_at,
+            status,
+            hidden: false,
+            source_label,
+            summary: String::new(),
+            companion: false,
+            pid,
+            rollout_path: None,
+        });
     }
     Ok(sessions)
 }

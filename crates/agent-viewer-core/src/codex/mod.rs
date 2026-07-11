@@ -83,6 +83,7 @@ impl Backend for CodexBackend {
             sessions.push(Session {
                 backend: BackendKind::Codex,
                 id: thread.id,
+                short_id: None,
                 title: thread.title,
                 cwd: thread.cwd,
                 created_at_ms: thread.created_at_ms,

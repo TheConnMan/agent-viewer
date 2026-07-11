@@ -34,41 +34,60 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✗` failed — exited with an error.
 - `○` stopped — stopped from the viewer.
 
-The default list groups by state (needs-input, working, idle, done, with failed and
-stopped folding into done); `Ctrl+S` regroups by project directory.
+The default list groups by project directory; `Ctrl+S` regroups by state (needs-input,
+working, idle, done, with failed and stopped folding into done). Every row renders — the
+list is uncapped and scrolls with the selection to fill the terminal height.
+
+Working rows shimmer their glyph, needs-input rows breathe between muted and bright, and a
+session you just spawned blooms once when its row first appears.
 
 ## Companion filtering
 
 A single session can surface from more than one source (e.g. a registry row and a
 rollout file). The secondary copies are marked **companions** and hidden by default so
-the list shows one row per session. Archived sessions are hidden too. Press `a` to reveal
-both; the footer shows how many rows are currently hidden. Sessions you spawn from the
-viewer are pinned, so they always show even if another source would have marked them a
-companion.
+the list shows one row per session. Archived sessions are hidden too, and so are sessions
+whose working directory no longer exists on disk (e.g. deleted `/tmp` scratch dirs). Press
+`a` to reveal all of them; the footer shows how many rows are currently hidden. Sessions
+you spawn from the viewer are pinned, so they always show even if another source would
+have marked them a companion.
+
+## Inline spawn composer
+
+The list view carries a persistent one-line composer above the footer:
+`[cc] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the target agent
+(claude code `[cc]` → codex `[cx]` → opencode `[oc]`), and `Enter` spawns it detached. The
+target directory is the selected row's project root (by-project view) or its exact cwd
+(by-state view). While the composer is empty, the single-letter command keys below still
+fire; once you have typed anything, every printable key (and space) is task text, and `Esc`
+clears it.
 
 ## Keys
 
-- `↑`/`↓` or `j`/`k` — move selection.
-- `→` / `Enter` — attach the selected session in an embedded terminal.
-- `Ctrl+q` — detach (the session keeps running).
+- `↑`/`↓` — move selection.
+- `→` — attach the selected session in an embedded terminal.
+- `Enter` — spawn the composed task, or (empty composer) attach the selected session.
+- `Tab` — cycle the composer's target agent.
 - `Space` — peek the transcript tail (Codex/Claude) or session metadata (opencode).
-- `n` — new session. A modal prompts for backend (`Left`/`Right`), directory, and task;
-  `Tab` moves between fields, `Enter` spawns detached, `Esc` cancels.
 - `Ctrl+R` — rename the selected session.
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
-- `Ctrl+S` — toggle grouping by state / by project.
-- `a` — show all (companions + archived).
+- `Ctrl+S` — toggle grouping by project / by state.
+- `a` — show all (companions + archived + deleted-dir rows).
 - `h` / `u` — archive / unarchive (Codex only).
 - `/` — filter by title or directory.
 - `?` — key help.
 - `q` — quit.
 
+Renames, stops, removes, and archives run on a background worker so a slow backend call
+never freezes the list; a `…` notice shows while the action is in flight.
+
 ## Embedded attach
 
-`Enter` (or `→`) opens the selected session inside the viewer as a full-screen embedded
-terminal — Codex runs `codex resume`, Claude runs `claude -r`, opencode runs its resume
-command. `Ctrl+q` detaches and returns to the list; the attached PTY stays alive in the
-background so re-attaching is instant.
+`→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
+full-screen embedded terminal. Codex runs `codex resume`; opencode runs `opencode -s`;
+Claude opens its live agents view for a running background job (preselecting it) or
+`claude -r` to resume a finished one. `←` returns to the list when the input line is empty
+(otherwise it moves the child's cursor), and `Ctrl+]` always detaches. The attached PTY
+stays alive in the background so re-attaching is instant.
 
 Quitting the viewer (`q`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

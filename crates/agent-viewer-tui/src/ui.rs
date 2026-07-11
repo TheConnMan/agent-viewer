@@ -2,7 +2,7 @@
 //! one-line footer, bottom peek overlay, centered new/rename/help modals, and the
 //! full-screen embedded-PTY attach view. The approved amber palette lives in `theme`.
 
-use crate::app::{App, Row, Section};
+use crate::app::{App, Composer, Row, Section};
 use agent_viewer_core::codex::rollout::{TranscriptItem, read_transcript};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
@@ -11,8 +11,12 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tui_term::widget::PseudoTerminal;
+
+/// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
+pub type Pulses = HashMap<(BackendKind, String), i64>;
 
 /// Cap on transcript items retained for peek (only the tail is ever shown).
 const MAX_TRANSCRIPT_ITEMS: usize = 200;
@@ -33,18 +37,54 @@ pub mod theme {
     pub const STOPPED: Color = Color::Rgb(0x85, 0x7e, 0x6a);
 }
 
-/// Six-state glyph + color. `✽` (Working) blinks on a ~500ms parity from now_ms.
-fn status_glyph(status: Status, now_ms: i64) -> (char, ratatui::style::Color) {
+/// Working shimmer: the glyph cycles this frame table at ~120ms/frame.
+const SHIMMER: [&str; 8] = ["✻", "✽", "✶", "✢", "·", "✢", "✶", "✽"];
+/// Spawn one-shot bloom: a ~400ms grow when a composer-spawned row first appears.
+const BLOOM: [&str; 4] = ["·", "✢", "✶", "✽"];
+/// Needs-input breathing brightness steps (muted -> accent-bright), a discrete pulse.
+const BREATH_STEPS: [ratatui::style::Color; 4] = [
+    theme::MUTED,
+    ratatui::style::Color::Rgb(0xb5, 0x95, 0x50),
+    theme::ACCENT,
+    ratatui::style::Color::Rgb(0xf4, 0xc0, 0x72),
+];
+
+/// PURE working-shimmer frame: cycles `SHIMMER` at ~120ms/frame off a monotonic ms clock.
+pub fn shimmer_glyph(elapsed_ms: i64) -> &'static str {
+    let i = (elapsed_ms.max(0) / 120) as usize % SHIMMER.len();
+    SHIMMER[i]
+}
+
+/// PURE needs-input breath phase: a 0..3 triangle wave over a ~1.2s period.
+pub fn breath_phase(elapsed_ms: i64) -> usize {
+    let period = 1200_i64;
+    let t = elapsed_ms.rem_euclid(period);
+    let half = period / 2;
+    let up = t < half;
+    let pos = if up { t } else { period - t };
+    (pos * BREATH_STEPS.len() as i64 / (half + 1)) as usize % BREATH_STEPS.len()
+}
+
+/// PURE spawn bloom: the one-shot glyph for `elapsed_ms` since the row appeared, or None
+/// once the ~400ms bloom has finished.
+pub fn bloom_glyph(elapsed_ms: i64) -> Option<&'static str> {
+    if !(0..400).contains(&elapsed_ms) {
+        return None;
+    }
+    let i = (elapsed_ms / 100) as usize;
+    Some(BLOOM[i.min(BLOOM.len() - 1)])
+}
+
+/// Six-state glyph + color. Working shimmers its glyph (~120ms/frame); needs-input
+/// breathes its color (muted <-> accent-bright, ~1.2s). Both derive from `now_ms`.
+fn status_glyph(status: Status, now_ms: i64) -> (&'static str, ratatui::style::Color) {
     match status {
-        Status::Working => {
-            let on = (now_ms / 500) % 2 == 0;
-            ('✽', if on { theme::ACCENT } else { theme::FAINT })
-        }
-        Status::NeedsInput => ('◐', theme::WARN),
-        Status::Idle => ('∙', theme::MUTED),
-        Status::Done => ('●', theme::OK),
-        Status::Failed => ('✗', theme::ERR),
-        Status::Stopped => ('○', theme::STOPPED),
+        Status::Working => (shimmer_glyph(now_ms), theme::ACCENT),
+        Status::NeedsInput => ("◐", BREATH_STEPS[breath_phase(now_ms)]),
+        Status::Idle => ("∙", theme::MUTED),
+        Status::Done => ("●", theme::OK),
+        Status::Failed => ("✗", theme::ERR),
+        Status::Stopped => ("○", theme::STOPPED),
     }
 }
 
@@ -156,44 +196,6 @@ fn file_key(path: &Path) -> Option<(u64, u64)> {
 
 // --- Modals / modes -------------------------------------------------------------
 
-/// Which field of the `n` modal has focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModalField {
-    Backend,
-    Dir,
-    Task,
-}
-
-/// The `n` (new session) modal state.
-#[derive(Debug, Clone)]
-pub struct NewModal {
-    pub backend: BackendKind,
-    pub dir: String,
-    pub task: String,
-    pub field: ModalField,
-}
-
-impl NewModal {
-    pub fn cycle_backend(&mut self, forward: bool) {
-        self.backend = match (self.backend, forward) {
-            (BackendKind::Codex, true) => BackendKind::Claude,
-            (BackendKind::Claude, true) => BackendKind::Opencode,
-            (BackendKind::Opencode, true) => BackendKind::Codex,
-            (BackendKind::Codex, false) => BackendKind::Opencode,
-            (BackendKind::Claude, false) => BackendKind::Codex,
-            (BackendKind::Opencode, false) => BackendKind::Claude,
-        };
-    }
-
-    pub fn next_field(&mut self) {
-        self.field = match self.field {
-            ModalField::Backend => ModalField::Dir,
-            ModalField::Dir => ModalField::Task,
-            ModalField::Task => ModalField::Backend,
-        };
-    }
-}
-
 /// The `Ctrl+R` rename modal (prefilled with the current title).
 #[derive(Debug, Clone)]
 pub struct RenameModal {
@@ -202,11 +204,11 @@ pub struct RenameModal {
     pub buffer: String,
 }
 
-/// Top-level input mode driving key routing and what the footer/overlay shows.
+/// Top-level input mode driving key routing and what the footer/overlay shows. The
+/// inline spawn composer is not a mode — it lives on the Normal list view at all times.
 pub enum Mode {
     Normal,
     Filter,
-    New(NewModal),
     Rename(RenameModal),
     Peek,
     Help,
@@ -222,49 +224,101 @@ pub struct AttachView<'a> {
 
 // --- Draw entry point -----------------------------------------------------------
 
-pub fn draw(
-    frame: &mut Frame,
-    app: &App,
-    mode: &Mode,
-    notice: &str,
-    peek: &PeekCache,
-    now_ms: i64,
-    attach: Option<AttachView>,
-) {
+/// Everything the frame needs, bundled so the entry point stays one argument wide.
+pub struct Draw<'a> {
+    pub app: &'a App,
+    pub mode: &'a Mode,
+    pub notice: &'a str,
+    pub peek: &'a PeekCache,
+    pub composer: &'a Composer,
+    pub pulses: &'a Pulses,
+    pub now_ms: i64,
+    pub attach: Option<AttachView<'a>>,
+}
+
+pub fn draw(frame: &mut Frame, d: Draw) {
     // Paint the whole surface with the base background first.
     frame.render_widget(
         Block::default().style(Style::default().bg(theme::BG).fg(theme::TEXT)),
         frame.area(),
     );
 
-    if let Some(av) = attach {
-        draw_attach(frame, av, now_ms);
+    if let Some(av) = d.attach {
+        draw_attach(frame, av, d.now_ms);
         return;
     }
 
+    // list · persistent composer input line · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
-    draw_list(frame, app, now_ms, vertical[0]);
-    draw_footer(frame, app, mode, notice, now_ms, vertical[1]);
+    draw_list(frame, d.app, d.pulses, d.now_ms, vertical[0]);
+    draw_composer(frame, d.app, d.composer, vertical[1]);
+    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[2]);
 
-    match mode {
-        Mode::New(modal) => draw_new_modal(frame, modal, frame.area()),
+    match d.mode {
         Mode::Rename(modal) => draw_rename_modal(frame, modal, frame.area()),
         Mode::Help => draw_help(frame, frame.area()),
-        Mode::Peek => draw_peek(frame, app, peek, frame.area()),
+        Mode::Peek => draw_peek(frame, d.app, d.peek, frame.area()),
         _ => {}
     }
 }
 
+/// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
+fn abbreviate_dir(dir: &Path) -> String {
+    let s = dir.display().to_string();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = s.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    s
+}
+
+/// Persistent inline spawn composer: `[cc] ~/git/foo ❯ <text>`, or a muted placeholder
+/// when empty. The tag is accent, the target dir muted.
+fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) {
+    // Same tag as the row prefix ([cc]/[cx]/[oc]) now that Claude's row tag is [cc].
+    let tag = composer.backend().tag();
+    let dir = app
+        .spawn_target()
+        .map(|d| abbreviate_dir(&d))
+        .unwrap_or_default();
+    let mut spans = vec![
+        Span::styled(format!(" {tag} "), Style::default().fg(theme::ACCENT)),
+        Span::styled(format!("{dir} "), Style::default().fg(theme::MUTED)),
+        Span::styled("❯ ", Style::default().fg(theme::ACCENT)),
+    ];
+    if composer.is_empty() {
+        spans.push(Span::styled(
+            "describe a task · tab to switch agent",
+            Style::default().fg(theme::FAINT),
+        ));
+    } else {
+        spans.push(Span::styled(
+            composer.text().to_string(),
+            Style::default().fg(theme::TEXT),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 // --- Main list ------------------------------------------------------------------
 
-fn draw_list(frame: &mut Frame, app: &App, now_ms: i64, area: Rect) {
+fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, area: Rect) {
     let width = area.width as usize;
     let rows = app.visible();
-    let items: Vec<ListItem> = rows.iter().map(|r| row_to_item(r, now_ms, width)).collect();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|r| row_to_item(r, pulses, now_ms, width))
+        .collect();
     let list = List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
     let mut state = ListState::default();
     if !rows.is_empty() {
@@ -273,7 +327,7 @@ fn draw_list(frame: &mut Frame, app: &App, now_ms: i64, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn row_to_item(row: &Row, now_ms: i64, width: usize) -> ListItem<'static> {
+fn row_to_item(row: &Row, pulses: &Pulses, now_ms: i64, width: usize) -> ListItem<'static> {
     match row {
         Row::SectionHeader { section, count } => ListItem::new(Line::from(Span::styled(
             format!("{}  ({count})", section_label(*section)),
@@ -287,21 +341,25 @@ fn row_to_item(row: &Row, now_ms: i64, width: usize) -> ListItem<'static> {
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ))),
-        Row::MoreMarker { hidden } => ListItem::new(Line::from(Span::styled(
-            format!("  … {hidden} more"),
-            Style::default().fg(theme::FAINT),
-        ))),
         Row::Session {
             backend,
+            id,
             summary,
             status,
             title,
             updated_at_ms,
             ..
         } => {
-            let (glyph, gcolor) = status_glyph(*status, now_ms);
+            // A live spawn bloom overrides the glyph and flashes the row background.
+            let bloom = pulses
+                .get(&(*backend, id.clone()))
+                .and_then(|start| bloom_glyph(now_ms - *start));
+            let (glyph, gcolor) = match bloom {
+                Some(g) => (g, theme::ACCENT),
+                None => status_glyph(*status, now_ms),
+            };
             let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
-            ListItem::new(session_line(
+            let line = session_line(
                 glyph,
                 gcolor,
                 backend.tag(),
@@ -309,7 +367,12 @@ fn row_to_item(row: &Row, now_ms: i64, width: usize) -> ListItem<'static> {
                 summary,
                 &elapsed,
                 width,
-            ))
+            );
+            if bloom.is_some() {
+                ListItem::new(line).style(Style::default().bg(theme::SEL_BG))
+            } else {
+                ListItem::new(line)
+            }
         }
     }
 }
@@ -317,7 +380,7 @@ fn row_to_item(row: &Row, now_ms: i64, width: usize) -> ListItem<'static> {
 /// `state glyph · [tag] · name · dim summary · right-aligned elapsed`, padded so the
 /// elapsed sits flush right. Widths approximated by char count (glyphs are single-cell).
 fn session_line(
-    glyph: char,
+    glyph: &str,
     gcolor: ratatui::style::Color,
     tag: &str,
     name: &str,
@@ -353,7 +416,6 @@ fn session_line(
 fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: i64, area: Rect) {
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
-        Mode::New(_) => Line::from("new session — Tab field · Enter spawn · Esc cancel"),
         Mode::Rename(_) => Line::from("rename — Enter apply · Esc cancel"),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Peek => Line::from("peek — Esc/Space to close"),
@@ -379,7 +441,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}Enter attach · space peek · n new · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · / filter · ? help · q quit"
+                        "{hidden_txt}{showing}type task · Tab agent · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · / filter · ? help · q quit"
                     ),
                     Style::default().fg(theme::MUTED),
                 ))
@@ -483,7 +545,7 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
     let right = if exited {
         "process exited · press any key"
     } else {
-        "Ctrl+q detach"
+        "← back · ctrl+] detach"
     };
     let left = format!(
         " {glyph} {} {}  {}",
@@ -517,46 +579,6 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
 }
 
 // --- Modals ---------------------------------------------------------------------
-
-fn draw_new_modal(frame: &mut Frame, modal: &NewModal, area: Rect) {
-    let popup = centered_rect(60, 40, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
-        .title("new session");
-    let focus = |field: ModalField| {
-        if modal.field == field {
-            Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG)
-        } else {
-            Style::default().fg(theme::TEXT)
-        }
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("backend: ", Style::default().fg(theme::MUTED)),
-            Span::styled(modal.backend.name(), focus(ModalField::Backend)),
-            Span::styled("  (Left/Right)", Style::default().fg(theme::FAINT)),
-        ]),
-        Line::from(vec![
-            Span::styled("dir    : ", Style::default().fg(theme::MUTED)),
-            Span::styled(modal.dir.clone(), focus(ModalField::Dir)),
-        ]),
-        Line::from(vec![
-            Span::styled("task   : ", Style::default().fg(theme::MUTED)),
-            Span::styled(modal.task.clone(), focus(ModalField::Task)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Tab switch field · Enter spawn · Esc cancel",
-            Style::default().fg(theme::FAINT),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
-        popup,
-    );
-}
 
 fn draw_rename_modal(frame: &mut Frame, modal: &RenameModal, area: Rect) {
     let popup = centered_rect(60, 20, area);
@@ -594,10 +616,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .title("keys");
     let entries = [
         ("↑/↓  j/k", "move selection"),
-        ("→ / Enter", "attach (embedded terminal)"),
-        ("Ctrl+q", "detach (session keeps running)"),
+        ("→ / Enter", "attach selected (empty composer)"),
+        ("type · Tab", "compose task · switch agent"),
+        ("Enter", "spawn composed task"),
+        ("← back", "detach (composer empty)"),
+        ("Ctrl+]", "detach (always)"),
         ("Space", "peek transcript tail"),
-        ("n", "new session"),
         ("Ctrl+R", "rename session"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
@@ -650,4 +674,39 @@ fn bottom_rect(percent: u16, area: Rect) -> Rect {
             Constraint::Percentage(percent),
         ])
         .split(area)[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shimmer_cycles_frames_on_120ms() {
+        // Frame index steps every 120ms and wraps at 8 frames.
+        assert_eq!(shimmer_glyph(0), SHIMMER[0]);
+        assert_eq!(shimmer_glyph(120), SHIMMER[1]);
+        assert_eq!(shimmer_glyph(119), SHIMMER[0]);
+        assert_eq!(shimmer_glyph(120 * 8), SHIMMER[0]); // wraps
+        assert_eq!(shimmer_glyph(-500), SHIMMER[0]); // negative clamps to frame 0
+    }
+
+    #[test]
+    fn breath_phase_is_a_bounded_triangle() {
+        // Always in range, rises then falls across the 1.2s period.
+        for ms in [0, 150, 300, 450, 600, 750, 900, 1050, 1200, 5321] {
+            assert!(breath_phase(ms) < BREATH_STEPS.len());
+        }
+        // Trough at the start, near the peak mid-period.
+        assert_eq!(breath_phase(0), 0);
+        assert!(breath_phase(600) >= breath_phase(0));
+    }
+
+    #[test]
+    fn bloom_runs_for_400ms_then_stops() {
+        assert_eq!(bloom_glyph(0), Some(BLOOM[0]));
+        assert_eq!(bloom_glyph(100), Some(BLOOM[1]));
+        assert_eq!(bloom_glyph(399), Some(BLOOM[3]));
+        assert_eq!(bloom_glyph(400), None); // finished
+        assert_eq!(bloom_glyph(-1), None); // not started
+    }
 }

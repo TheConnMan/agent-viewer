@@ -60,6 +60,7 @@ impl Backend for OpencodeBackend {
             Ok(Session {
                 backend: BackendKind::Opencode,
                 id: row.get(0)?,
+                short_id: None,
                 title: row.get(3)?,
                 cwd: std::path::PathBuf::from(row.get::<_, String>(2)?),
                 created_at_ms: row.get(4)?,
@@ -130,13 +131,14 @@ impl Backend for OpencodeBackend {
         }
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
+        // The TUI command accepts `-s <id>` to open a session; the old `run -s <id> -i
+        // --dir` form was invalid (`run` has no -i flag). Pin the cwd only when it exists,
+        // so a deleted dir does not fail the spawn.
         let mut cmd = std::process::Command::new("opencode");
-        cmd.arg("run")
-            .arg("-s")
-            .arg(&session.id)
-            .arg("-i")
-            .arg("--dir")
-            .arg(&session.cwd);
+        cmd.arg("-s").arg(&session.id);
+        if session.cwd.is_dir() {
+            cmd.current_dir(&session.cwd);
+        }
         Some(cmd)
     }
 }

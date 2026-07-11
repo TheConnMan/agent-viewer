@@ -14,11 +14,11 @@ impl BackendKind {
             BackendKind::Opencode => "opencode",
         }
     }
-    /// "[cx]" | "[cl]" | "[oc]"  (row prefix)
+    /// "[cx]" | "[cc]" | "[oc]"  (row + composer prefix)
     pub fn tag(self) -> &'static str {
         match self {
             BackendKind::Codex => "[cx]",
-            BackendKind::Claude => "[cl]",
+            BackendKind::Claude => "[cc]",
             BackendKind::Opencode => "[oc]",
         }
     }
@@ -53,6 +53,10 @@ pub enum Status {
 pub struct Session {
     pub backend: BackendKind,
     pub id: String,
+    /// Claude's short agents-JSON "id" (the jobs-dir key). Only claude sessions carry
+    /// one; every other backend leaves it None. Used for the live agents-view attach
+    /// and the jobs `state.json` path.
+    pub short_id: Option<String>,
     pub title: String,
     pub cwd: std::path::PathBuf,
     pub created_at_ms: i64,
@@ -76,7 +80,9 @@ pub struct Session {
     pub rollout_path: Option<std::path::PathBuf>,
 }
 
-pub trait Backend {
+/// `Send` so the TUI can move the listing backends onto a dedicated refresh thread
+/// (each impl's state — rusqlite Connection, caches, PathBuf — is already Send).
+pub trait Backend: Send {
     fn kind(&self) -> BackendKind;
     fn capabilities(&self) -> Capabilities;
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).

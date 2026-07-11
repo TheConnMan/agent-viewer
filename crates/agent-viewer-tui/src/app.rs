@@ -3,7 +3,7 @@ use agent_viewer_core::{BackendKind, Session, Status};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Grouping mode for the flat list. `ByState` is the startup default (Ctrl+S toggles).
+/// Grouping mode for the flat list. `ByProject` is the startup default (Ctrl+S toggles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
     ByState,
@@ -18,9 +18,6 @@ pub enum Section {
     Idle,
     Done,
 }
-
-/// DONE-section overflow cap (I-5): the first 15 Done rows, then a `… N more` marker.
-const DONE_CAP: usize = 15;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
@@ -42,10 +39,6 @@ pub enum Row {
         status: Status,
         hidden: bool,
         updated_at_ms: i64,
-    },
-    /// DONE overflow "… N more" (I-5, cap 15).
-    MoreMarker {
-        hidden: usize,
     },
 }
 
@@ -80,7 +73,7 @@ impl App {
             selected: 0,
             filter: String::new(),
             show_all: false,
-            group_mode: GroupMode::ByState,
+            group_mode: GroupMode::ByProject,
             rows: Vec::new(),
             root_cache: HashMap::new(),
             armed_kill: None,
@@ -258,6 +251,24 @@ impl App {
         }
     }
 
+    /// Where an inline-composer spawn lands, given the current grouping:
+    ///   - ByProject: the selected session's project group root (the header's root).
+    ///   - ByState: the selected session's own cwd.
+    ///
+    /// None when the list is empty (nothing selected).
+    pub fn spawn_target(&self) -> Option<PathBuf> {
+        let session = self.selected()?;
+        match self.group_mode {
+            GroupMode::ByProject => Some(
+                self.root_cache
+                    .get(&session.cwd)
+                    .cloned()
+                    .unwrap_or_else(|| project_root(&session.cwd)),
+            ),
+            GroupMode::ByState => Some(session.cwd.clone()),
+        }
+    }
+
     pub fn filter(&self) -> &str {
         &self.filter
     }
@@ -297,7 +308,7 @@ impl App {
 
     /// Recompute the cached row model: default-view exclusion of companion/archived
     /// rows, the substring filter, then either ByState sections (fixed order, empty
-    /// sections omitted, Done capped at 15 + MoreMarker) or ByProject headers.
+    /// sections omitted, all rows uncapped) or ByProject headers.
     fn rebuild_rows(&mut self) {
         // Visible session indices (exclusion + filter), recency DESC.
         let mut indices: Vec<usize> = self
@@ -316,7 +327,8 @@ impl App {
         };
     }
 
-    /// ByState: fixed section order, empty sections omitted, Done capped + MoreMarker.
+    /// ByState: fixed section order, empty sections omitted. Every member row renders —
+    /// the list widget's ListState selection auto-scrolls the full (uncapped) list.
     fn build_state_rows(&self, indices: &[usize]) -> Vec<Row> {
         let order = [
             Section::NeedsInput,
@@ -338,17 +350,8 @@ impl App {
                 section,
                 count: members.len(),
             });
-            if section == Section::Done && members.len() > DONE_CAP {
-                for &i in &members[..DONE_CAP] {
-                    rows.push(Self::session_row(&self.sessions[i]));
-                }
-                rows.push(Row::MoreMarker {
-                    hidden: members.len() - DONE_CAP,
-                });
-            } else {
-                for &i in &members {
-                    rows.push(Self::session_row(&self.sessions[i]));
-                }
+            for &i in &members {
+                rows.push(Self::session_row(&self.sessions[i]));
             }
         }
         rows
@@ -461,6 +464,96 @@ pub fn row_layout(
     let used = left_fixed + name_len + if summary_len > 0 { 2 + summary_len } else { 0 };
     let pad = width.saturating_sub(used + elapsed_len).max(1);
     (name_out, summary_out, pad)
+}
+
+/// Inline spawn composer (item 8): a persistent one-line input above the footer. Holds
+/// the task text plus the target backend, which Tab cycles Claude -> Codex -> Opencode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composer {
+    text: String,
+    backend: BackendKind,
+}
+
+impl Default for Composer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Composer {
+    /// Fresh composer: empty text, Claude backend.
+    pub fn new() -> Composer {
+        Composer {
+            text: String::new(),
+            backend: BackendKind::Claude,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        self.text.push(c);
+    }
+
+    /// Backspace on empty is a no-op (not a panic).
+    pub fn backspace(&mut self) {
+        self.text.pop();
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+    }
+
+    /// Tab: Claude -> Codex -> Opencode -> Claude.
+    pub fn cycle_backend(&mut self) {
+        self.backend = match self.backend {
+            BackendKind::Claude => BackendKind::Codex,
+            BackendKind::Codex => BackendKind::Opencode,
+            BackendKind::Opencode => BackendKind::Claude,
+        };
+    }
+}
+
+/// Tracks typed-but-unsubmitted input while attached, so a Left arrow detaches only when
+/// the input line is empty (otherwise Left is forwarded to the child as cursor movement).
+#[derive(Debug, Clone, Default)]
+pub struct DetachTracker {
+    pending: u32,
+}
+
+impl DetachTracker {
+    pub fn new() -> DetachTracker {
+        DetachTracker { pending: 0 }
+    }
+
+    pub fn on_char(&mut self) {
+        self.pending += 1;
+    }
+
+    /// Backspace saturates at zero (no underflow).
+    pub fn on_backspace(&mut self) {
+        self.pending = self.pending.saturating_sub(1);
+    }
+
+    /// Enter (submit) resets the pending count.
+    pub fn on_enter(&mut self) {
+        self.pending = 0;
+    }
+
+    /// Left detaches only when there is no pending input.
+    pub fn detach_on_left(&self) -> bool {
+        self.pending == 0
+    }
 }
 
 /// "42s" / "17m" / "3h" / "6d" (largest whole unit, no decimals; negative -> "0s").
