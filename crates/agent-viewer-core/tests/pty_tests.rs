@@ -61,6 +61,36 @@ fn pty_resize_applies() {
 }
 
 #[test]
+fn pty_kill_returns_when_grandchild_holds_slave() {
+    // A grandchild that escapes the session (setsid) keeps the pty slave open after the
+    // direct child is reaped and survives the controlling-process SIGHUP, so the master
+    // reader never EOFs and a naive join() hangs forever. kill() must SIGKILL the whole
+    // process group so the slave closes and the reader unblocks. Run kill() on a helper
+    // thread so a regression surfaces as a timeout, not a hang.
+    let mut session = PtySession::spawn(spec(
+        "sh",
+        &["-c", "setsid sleep 30 & exec sleep 30"],
+        24,
+        80,
+    ))
+    .expect("spawn pty");
+    // Let the shell fork the escaping grandchild and exec into the foreground sleep.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        session.kill();
+        let _ = tx.send(());
+    });
+    // The invariant is "returns promptly, not never"; a loose bound avoids flaking under
+    // parallel workspace runs while still catching a genuine hang (which never returns).
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "kill() did not return within 5s — reader join hung on a grandchild holding the pty slave"
+    );
+}
+
+#[test]
 fn pty_child_survives_detach_dies_on_drop() {
     let mut session =
         PtySession::spawn(spec("sleep", &["30"], 24, 80)).expect("spawn pty");

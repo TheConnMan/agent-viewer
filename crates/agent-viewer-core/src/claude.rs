@@ -1,19 +1,27 @@
 use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
 use crate::error::{Error, Result};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 pub struct ClaudeBackend {
     binary: String,
+    /// Per-job state.json cache keyed by (mtime, len): the file is re-read and re-parsed
+    /// only when it changes, not every tick (mirrors the codex StatusResolver pattern).
+    detail_cache: HashMap<PathBuf, ((SystemTime, u64), JobDetail)>,
 }
 
 impl ClaudeBackend {
     pub fn new() -> ClaudeBackend {
         ClaudeBackend {
             binary: "claude".to_string(),
+            detail_cache: HashMap::new(),
         }
     }
     pub fn with_binary(binary: &str) -> ClaudeBackend {
         ClaudeBackend {
             binary: binary.to_string(),
+            detail_cache: HashMap::new(),
         }
     }
 }
@@ -56,15 +64,24 @@ impl Backend for ClaudeBackend {
         for (mut session, short_id) in parsed {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json. A
             // missing/garbled file is not an error — the jobs dir can lag the agents list.
+            // The parse is cached by (mtime, len) so an unchanged file is not re-read.
             let path = job_state_path(&short_id);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let detail = parse_job_state(&text);
-                session.summary = detail.summary;
-                session.rollout_path = detail.transcript_path;
-                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified())
-                    && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
-                {
-                    session.updated_at_ms = since.as_millis() as i64;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let key = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
+                let detail = match self.detail_cache.get(&path) {
+                    Some((cached_key, detail)) if *cached_key == key => Some(detail.clone()),
+                    _ => std::fs::read_to_string(&path).ok().map(|text| {
+                        let detail = parse_job_state(&text);
+                        self.detail_cache.insert(path.clone(), (key, detail.clone()));
+                        detail
+                    }),
+                };
+                if let Some(detail) = detail {
+                    session.summary = detail.summary;
+                    session.rollout_path = detail.transcript_path;
+                    if let Ok(since) = key.0.duration_since(std::time::UNIX_EPOCH) {
+                        session.updated_at_ms = since.as_millis() as i64;
+                    }
                 }
             }
             sessions.push(session);

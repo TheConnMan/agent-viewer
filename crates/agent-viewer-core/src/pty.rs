@@ -67,7 +67,7 @@ impl PtySession {
             cmd.cwd(cwd);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| Error::Command(format!("spawn {}: {e}", spec.program)))?;
@@ -77,14 +77,24 @@ impl PtySession {
         // thread — and thus Drop — finish without hanging.
         drop(pair.slave);
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| Error::Command(format!("clone reader: {e}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| Error::Command(format!("take writer: {e}")))?;
+        // If wiring up the master fails after the child is already running, kill+reap it
+        // on the way out so a bailed spawn does not leak a live child.
+        let reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Command(format!("clone reader: {e}")));
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Command(format!("take writer: {e}")));
+            }
+        };
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let reader_parser = Arc::clone(&parser);
@@ -132,15 +142,17 @@ impl PtySession {
                 pixel_height: 0,
             })
             .map_err(|e| Error::Command(format!("resize: {e}")))?;
-        if let Ok(mut p) = self.parser.lock() {
-            p.screen_mut().set_size(rows, cols);
-        }
+        // Recover from a poisoned lock (a panicked reader thread) instead of propagating
+        // the panic — the vt100 screen is advisory render state, not an invariant.
+        let mut p = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        p.screen_mut().set_size(rows, cols);
         Ok(())
     }
 
     /// Run f against the current screen under the parser lock (render path).
     pub fn with_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
-        let parser = self.parser.lock().expect("pty parser lock poisoned");
+        // Recover from a poisoned lock rather than crash the render loop mid-alt-screen.
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         f(parser.screen())
     }
 
@@ -154,11 +166,34 @@ impl PtySession {
 
     /// Kill + reap the child, join the reader. Idempotent.
     pub fn kill(&mut self) {
+        // SIGKILL the child's whole process group first: a backgrounded grandchild in the
+        // same group can keep the pty slave open after the direct child is reaped, leaving
+        // the master reader blocked on read() forever. portable-pty spawns the child as a
+        // session/group leader (setsid), so its pid is the pgid.
+        if let Some(pid) = self.child.process_id() {
+            let pid = pid as libc::pid_t;
+            // Safety: getpgid/kill are simple libc calls; a negative pgid targets the group.
+            unsafe {
+                let pgid = libc::getpgid(pid);
+                if pgid > 0 {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait(); // reap the zombie
         if let Some(handle) = self.reader_thread.take() {
-            // The child is dead, so the slave is closed and the reader has unblocked.
-            let _ = handle.join();
+            // The group kill closes the slave for the common case, so join returns at once.
+            // A grandchild that escaped the group (its own setsid session) can still hold
+            // the slave open, so bound the wait: hand the join to a watcher and detach it
+            // rather than hang the render loop. The detached reader unblocks on its own
+            // once that grandchild finally exits.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
         }
     }
 }

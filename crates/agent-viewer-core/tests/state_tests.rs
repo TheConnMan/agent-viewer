@@ -165,6 +165,59 @@ fn apply_viewer_state_pins_renames_pids() {
 }
 
 #[test]
+fn viewer_db_prunes_resolved_spawns_older_than_7_days() {
+    let (_dir, path) = temp_db_path();
+    let now = agent_viewer_core::spawn::now_ms();
+    let eight_days = 8 * 24 * 60 * 60 * 1000;
+
+    {
+        let db = ViewerDb::open(&path).expect("open viewer db");
+        // An old resolved pin (stale) and a recent resolved pin (should survive).
+        let old = db
+            .record_spawn(BackendKind::Codex, &PathBuf::from("/p/old"), 1, now - eight_days)
+            .expect("record old");
+        db.resolve_spawn(old, "old-sess").expect("resolve old");
+        let recent = db
+            .record_spawn(BackendKind::Codex, &PathBuf::from("/p/new"), 2, now)
+            .expect("record recent");
+        db.resolve_spawn(recent, "recent-sess").expect("resolve recent");
+    }
+
+    // Reopening runs the on-open prune.
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    let pinned = db.viewer_state().expect("viewer state").pinned;
+    assert!(!pinned.contains(&(BackendKind::Codex, "old-sess".to_string())));
+    assert!(pinned.contains(&(BackendKind::Codex, "recent-sess".to_string())));
+}
+
+#[test]
+fn apply_viewer_state_skips_pid_on_terminal_sessions() {
+    let mut sessions = vec![
+        sess(BackendKind::Opencode, "done", "/p", 10, Status::Done),
+        sess(BackendKind::Opencode, "failed", "/p", 20, Status::Failed),
+        sess(BackendKind::Opencode, "stopped", "/p", 30, Status::Stopped),
+        sess(BackendKind::Opencode, "live", "/p", 40, Status::Working),
+    ];
+    let mut spawn_pids = HashMap::new();
+    for id in ["done", "failed", "stopped", "live"] {
+        spawn_pids.insert((BackendKind::Opencode, id.to_string()), 777);
+    }
+    let state = ViewerState {
+        spawn_pids,
+        ..Default::default()
+    };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    // Terminal sessions never take the recorded pid (it may be reused by another process).
+    assert_eq!(sessions[0].pid, None);
+    assert_eq!(sessions[1].pid, None);
+    assert_eq!(sessions[2].pid, None);
+    // A live session still gets the overlay (opencode stop path).
+    assert_eq!(sessions[3].pid, Some(777));
+}
+
+#[test]
 fn match_spawn_window_and_nearest() {
     let record = SpawnRecord {
         rowid: 1,

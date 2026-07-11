@@ -75,11 +75,9 @@ impl Backend for CodexBackend {
         let open = status::open_rollout_paths();
         let mut sessions = Vec::with_capacity(threads.len());
         for thread in threads {
-            let status = self.resolver.resolve(&thread.rollout_path, &open);
-            // The open map keys on the canonical rollout path (same as the resolver).
-            let canonical = std::fs::canonicalize(&thread.rollout_path)
-                .unwrap_or_else(|_| thread.rollout_path.clone());
-            let pid = open.get(&canonical).copied();
+            // The resolver canonicalizes once (cached) and returns the owning pid from the
+            // same open map, so no per-tick canonicalize is needed here.
+            let (status, pid) = self.resolver.resolve(&thread.rollout_path, &open);
             let companion = thread.source.is_companion();
             let source_label = thread.source.label().to_string();
             sessions.push(Session {
@@ -139,6 +137,13 @@ impl Backend for CodexBackend {
     }
 
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
-        Some(cli::resume_command(&session.id))
+        let mut cmd = cli::resume_command(&session.id);
+        // `codex resume` inherits the viewer's cwd and otherwise prompts "Choose working
+        // directory" on attach. Pin it to the session's own cwd when that directory still
+        // exists; leave it unset when the dir was deleted so the spawn cannot fail on it.
+        if session.cwd.is_dir() {
+            cmd.current_dir(&session.cwd);
+        }
+        Some(cmd)
     }
 }

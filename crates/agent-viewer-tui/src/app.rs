@@ -422,6 +422,47 @@ fn section_of(status: Status) -> Section {
     }
 }
 
+/// Truncate `s` to at most `width` chars (char-, not byte-bounded).
+fn truncate_to(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    s.chars().take(width).collect()
+}
+
+/// Width math for one session row, kept pure so it is unit-testable.
+///
+/// The row is `<space><glyph><space><tag><space><name>[<2sp><summary>]<pad><elapsed>`.
+/// The elapsed field is reserved on the right FIRST (plus a one-space minimum gap), so a
+/// long title truncates instead of clipping the right-aligned elapsed off the line. Any
+/// content room left after the name (and a two-space gap) goes to a truncated summary.
+/// Returns the visible name, the visible summary (empty if none fits), and the pad width.
+pub fn row_layout(
+    width: usize,
+    tag_len: usize,
+    name: &str,
+    summary: &str,
+    elapsed_len: usize,
+) -> (String, String, usize) {
+    // Fixed left decorations before the name: space + glyph + space + tag + space.
+    let left_fixed = 4 + tag_len;
+    // Reserve the elapsed slot plus at least one space of separation.
+    let content = width.saturating_sub(left_fixed + elapsed_len + 1);
+
+    let name_out = truncate_to(name, content);
+    let name_len = name_out.chars().count();
+
+    let mut summary_out = String::new();
+    if !summary.is_empty() && content > name_len + 2 {
+        summary_out = truncate_to(summary, content - name_len - 2);
+    }
+    let summary_len = summary_out.chars().count();
+
+    let used = left_fixed + name_len + if summary_len > 0 { 2 + summary_len } else { 0 };
+    let pad = width.saturating_sub(used + elapsed_len).max(1);
+    (name_out, summary_out, pad)
+}
+
 /// "42s" / "17m" / "3h" / "6d" (largest whole unit, no decimals; negative -> "0s").
 pub fn format_elapsed(delta_ms: i64) -> String {
     if delta_ms <= 0 {

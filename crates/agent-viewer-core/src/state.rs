@@ -95,6 +95,15 @@ impl ViewerDb {
         // WAL so two concurrent viewers coexist (last-writer-wins on advisory state).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Prune resolved spawn rows older than 7 days on open: they are always-visible
+        // pins whose sessions are long gone, so left unpruned they grow the table and the
+        // per-tick overlay scan without bound. Unresolved rows are handled by the caller's
+        // 10-minute abandonment rule.
+        let cutoff = crate::spawn::now_ms() - 7 * 24 * 60 * 60 * 1000;
+        conn.execute(
+            "DELETE FROM spawned WHERE session_id IS NOT NULL AND spawned_at_ms < ?1",
+            rusqlite::params![cutoff],
+        )?;
         Ok(ViewerDb { conn })
     }
 
@@ -271,18 +280,26 @@ pub fn apply_viewer_state(
         if state.pinned.contains(&key) {
             session.companion = false;
         }
-        if session.pid.is_none()
-            && let Some(pid) = state.spawn_pids.get(&key)
-        {
-            session.pid = Some(*pid);
-        }
         if state.stopped.contains(&key) {
             match session.status {
                 Status::Done | Status::Failed => session.status = Status::Stopped,
                 // Already live again: the stopped record is stale, leave the status.
-                Status::Working | Status::NeedsInput | Status::Idle => stale.push(key),
+                Status::Working | Status::NeedsInput | Status::Idle => stale.push(key.clone()),
                 Status::Stopped => {}
             }
+        }
+        // Overlay the spawn pid only onto a still-live session (opencode stop path). A
+        // terminal row's recorded pid may have been reused by an unrelated process, so a
+        // later stop must never signal it — run this after the stopped fold above so a
+        // just-stopped row is excluded too.
+        if session.pid.is_none()
+            && matches!(
+                session.status,
+                Status::Working | Status::NeedsInput | Status::Idle
+            )
+            && let Some(pid) = state.spawn_pids.get(&key)
+        {
+            session.pid = Some(*pid);
         }
     }
     stale

@@ -57,6 +57,18 @@ fn failed_when_file_missing() {
 }
 
 #[test]
+fn resolver_reresolves_when_session_closes_without_file_change() {
+    // Regression: status depends on the open/closed state, not just (mtime, len). An
+    // open+complete rollout resolves Idle; when the owning process exits with the file
+    // UNCHANGED it must resolve Done, never the cached Idle.
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
+    let mut resolver = StatusResolver::new();
+    let open = open_with(&path);
+    assert_eq!(resolver.resolve(&path, &open).0, Status::Idle);
+    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Done);
+}
+
+#[test]
 fn resolver_matches_pure_and_recomputes_on_change() {
     // The cache wrapper agrees with the pure function across states...
     let complete = common::fixture_path("rollout_complete.jsonl");
@@ -65,7 +77,7 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     let mut resolver = StatusResolver::new();
     for p in [&complete, &midturn, &missing] {
         assert_eq!(
-            resolver.resolve(p, &empty_map()),
+            resolver.resolve(p, &empty_map()).0,
             resolve_status(p, &empty_map())
         );
     }
@@ -73,7 +85,7 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     // ...and invalidates its (mtime, len) cache when the file changes.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
-    assert_eq!(resolver.resolve(&path, &empty_map()), Status::Failed);
+    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Failed);
     let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
     writeln!(
         f,
@@ -81,5 +93,5 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     )
     .unwrap();
     drop(f);
-    assert_eq!(resolver.resolve(&path, &empty_map()), Status::Done);
+    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Done);
 }

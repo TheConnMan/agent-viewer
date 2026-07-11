@@ -126,7 +126,7 @@ fn run(
         }
 
         if last_tick.elapsed() >= TICK {
-            tick_refresh(backends, last, ui);
+            tick_refresh(backends, last, ui, false);
             last_tick = Instant::now();
         }
     }
@@ -148,7 +148,16 @@ fn build_attach_view(ui: &Ui) -> Option<AttachView<'_>> {
 }
 
 /// Refresh sessions, apply the viewer overlay, resolve spawn records, prune dead PTYs.
-fn tick_refresh(backends: &mut [Box<dyn Backend>], last: &mut [Vec<Session>], ui: &mut Ui) {
+///
+/// `preserve_notice` keeps the current `ui.notice` intact instead of replacing it with
+/// the refresh's own notice — used right after an action (e.g. a spawn) so its
+/// success/failure feedback is not clobbered by the immediately-following refresh.
+fn tick_refresh(
+    backends: &mut [Box<dyn Backend>],
+    last: &mut [Vec<Session>],
+    ui: &mut Ui,
+    preserve_notice: bool,
+) {
     let (mut sessions, notice, _ok) = refresh(backends, last);
     if let Some(db) = &ui.db {
         overlay(db, &mut sessions);
@@ -162,7 +171,7 @@ fn tick_refresh(backends: &mut [Box<dyn Backend>], last: &mut [Vec<Session>], ui
         ui.focused_session = Some(s.clone());
     }
     ui.app.set_sessions(sessions);
-    if matches!(ui.mode, Mode::Normal) {
+    if !preserve_notice && matches!(ui.mode, Mode::Normal) {
         ui.notice = notice;
     }
     prune_exited(ui);
@@ -371,7 +380,8 @@ fn handle_new_key(
         KeyCode::Enter => {
             spawn_from_modal(backends, ui);
             ui.mode = Mode::Normal;
-            tick_refresh(backends, last, ui);
+            // Preserve the spawn notice — the refresh must not clobber its feedback.
+            tick_refresh(backends, last, ui, true);
         }
         _ => {}
     }
@@ -429,7 +439,18 @@ fn apply_rename(backends: &mut [Box<dyn Backend>], ui: &mut Ui) {
         return;
     };
     match backend.rename(&session, &name) {
-        Ok(()) => ui.notice = format!("renamed {}", backend_kind.name()),
+        Ok(()) => {
+            // A prior daemon-down rename may have left a claude name override with the
+            // OLD name; the overlay applies it unconditionally and would shadow this
+            // native rename. Re-point the override at the new name (core-free: the
+            // override now equals the native title, so it is a no-op on display).
+            if backend_kind == BackendKind::Claude
+                && let Some(db) = &ui.db
+            {
+                let _ = db.set_name_override(backend_kind, &id, &name);
+            }
+            ui.notice = format!("renamed {}", backend_kind.name());
+        }
         Err(e) => {
             // claude: fall back to the viewer-DB name override (live sessions only).
             if backend_kind == BackendKind::Claude

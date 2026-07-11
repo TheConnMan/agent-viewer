@@ -1,5 +1,5 @@
 use agent_viewer_core::{BackendKind, Session, Status};
-use agent_viewer_tui::app::{App, GroupMode, KillStage, Row, Section, format_elapsed};
+use agent_viewer_tui::app::{App, GroupMode, KillStage, Row, Section, format_elapsed, row_layout};
 use std::path::PathBuf;
 
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd
@@ -237,6 +237,89 @@ fn kill_stage_two_stage() {
     assert_eq!(app.kill_stage(20_000), KillStage::Stop);
     select(&mut app, "other");
     assert_eq!(app.kill_stage(20_500), KillStage::Stop);
+}
+
+// --- Sticky selection across per-tick reordering (finding 4) ---
+
+#[test]
+fn selection_and_arm_stick_across_reorder() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a", "/p", 300, Status::Working),
+        sess(BackendKind::Codex, "b", "/p", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    select(&mut app, "b");
+    // Arm b for removal, then confirm the hint is on b.
+    assert_eq!(app.kill_stage(1_000), KillStage::Stop);
+    assert!(app.is_armed(1_500));
+
+    // A refresh reorders: b becomes the most-recent session and moves to a new row.
+    app.set_sessions(vec![
+        sess(BackendKind::Codex, "a", "/p", 300, Status::Working),
+        sess(BackendKind::Codex, "b", "/p", 400, Status::Working),
+    ]);
+    // Selection follows session b to its new row (not the stale row index, which now
+    // holds a different session).
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("b"));
+    // The armed Ctrl+X hint is still on b (not desynced onto a), and the second press
+    // removes b — proving the armed identity survived the reorder.
+    assert!(app.is_armed(1_600));
+    assert_eq!(app.kill_stage(2_000), KillStage::Remove);
+}
+
+#[test]
+fn selection_clamps_when_selected_session_vanishes() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a", "/p", 300, Status::Working),
+        sess(BackendKind::Codex, "b", "/p", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    select(&mut app, "b");
+    // b disappears from the refresh; selection falls back to a surviving session row.
+    app.set_sessions(vec![sess(BackendKind::Codex, "a", "/p", 300, Status::Working)]);
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("a"));
+}
+
+// --- Row layout reserves the elapsed slot (finding 3) ---
+
+#[test]
+fn row_layout_reserves_elapsed_for_long_titles() {
+    let width = 40;
+    let tag_len = 2;
+    let elapsed_len = 2; // e.g. "3h"
+    let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
+    let (name, summary, pad) = row_layout(width, tag_len, long, "", elapsed_len);
+    // The title is truncated rather than clipping the right-aligned elapsed.
+    assert!(name.chars().count() < long.chars().count());
+    assert!(summary.is_empty());
+    // The whole row (fixed left + name + pad + elapsed) fits exactly in width, so the
+    // elapsed field is never pushed off the line.
+    let left_fixed = 4 + tag_len;
+    assert_eq!(left_fixed + name.chars().count() + pad + elapsed_len, width);
+}
+
+#[test]
+fn row_layout_fits_name_and_summary_with_flush_elapsed() {
+    let width = 60;
+    let tag_len = 2;
+    let elapsed_len = 3; // "10s"
+    let (name, summary, pad) = row_layout(width, tag_len, "sess", "a short summary", elapsed_len);
+    assert_eq!(name, "sess");
+    assert_eq!(summary, "a short summary");
+    let used = (4 + tag_len) + name.chars().count() + 2 + summary.chars().count();
+    assert_eq!(used + pad + elapsed_len, width);
+}
+
+#[test]
+fn row_layout_drops_summary_when_no_room() {
+    // Width fits the name and the reserved elapsed but leaves nothing for a summary.
+    let tag_len = 2;
+    let elapsed_len = 3;
+    let width = (4 + tag_len) + 4 + 1 + elapsed_len; // left_fixed + name(4) + gap + elapsed
+    let (name, summary, pad) = row_layout(width, tag_len, "sess", "wont fit", elapsed_len);
+    assert_eq!(name, "sess");
+    assert!(summary.is_empty());
+    assert!(pad >= 1);
 }
 
 #[test]

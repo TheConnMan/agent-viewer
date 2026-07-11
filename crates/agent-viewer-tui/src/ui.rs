@@ -325,27 +325,21 @@ fn session_line(
     elapsed: &str,
     width: usize,
 ) -> Line<'static> {
+    // Reserve the elapsed slot first so a long title truncates instead of clipping it.
+    let (name_out, summary_out, pad) =
+        crate::app::row_layout(width, tag.chars().count(), name, summary, elapsed.chars().count());
     let mut spans = vec![
         Span::raw(" "),
         Span::styled(glyph.to_string(), Style::default().fg(gcolor)),
         Span::raw(" "),
         Span::styled(tag.to_string(), Style::default().fg(theme::MUTED)),
         Span::raw(" "),
-        Span::styled(name.to_string(), Style::default().fg(theme::TEXT)),
+        Span::styled(name_out, Style::default().fg(theme::TEXT)),
     ];
-    let mut used = 1 + 1 + 1 + tag.chars().count() + 1 + name.chars().count();
-    let elapsed_w = elapsed.chars().count();
-
-    // Dim summary fills the middle if room remains before the reserved elapsed slot.
-    if !summary.is_empty() && width > used + elapsed_w + 3 {
-        let avail = width - used - elapsed_w - 3;
-        let sum = truncate(summary, avail);
-        used += 2 + sum.chars().count();
+    if !summary_out.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(sum, Style::default().fg(theme::FAINT)));
+        spans.push(Span::styled(summary_out, Style::default().fg(theme::FAINT)));
     }
-
-    let pad = width.saturating_sub(used + elapsed_w).max(1);
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(
         elapsed.to_string(),
@@ -487,7 +481,7 @@ fn draw_attach(frame: &mut Frame, av: AttachView, now_ms: i64) {
 fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms: i64, area: Rect) {
     let (glyph, gcolor) = status_glyph(session.status, now_ms);
     let right = if exited {
-        "process exited · Ctrl+q"
+        "process exited · press any key"
     } else {
         "Ctrl+q detach"
     };
