@@ -60,6 +60,27 @@ fn task_complete_found_when_not_last_line() {
 }
 
 #[test]
+fn task_complete_stale_before_abandoned_resume() {
+    // Regression: a session completes a turn (task_complete), is resumed, then abandoned
+    // mid-turn. The STALE task_complete is still inside the tail window, but the resumed
+    // turn emitted a later `task_started` (plus a user message) and never a new
+    // task_complete. Done requires the last task_complete to occur AFTER the last
+    // task_started, so this must resolve to NOT done (else it is misclassified Done).
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("rollout_stale_resume.jsonl");
+    let lines = [
+        r#"{"timestamp":"2026-07-10T21:00:00.000Z","type":"session_meta","payload":{"id":"019f-stale","cwd":"/home/user/project","originator":"codex_exec","cli_version":"0.144.1","source":"exec"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":null}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"first turn done","completed_at":1783716000,"duration_ms":1000}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","id":"user_resume","role":"user","content":[{"type":"input_text","text":"Now do more work."}]}}"#,
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    assert!(!has_task_complete_tail(&path).expect("read tail"));
+}
+
+#[test]
 fn transcript_extracts_text_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
     let items = read_transcript(&path).expect("read transcript");

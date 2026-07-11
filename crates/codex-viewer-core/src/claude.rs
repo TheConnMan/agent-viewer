@@ -1,5 +1,5 @@
 use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use std::path::PathBuf;
 
 pub struct ClaudeBackend {
@@ -50,22 +50,26 @@ impl Backend for ClaudeBackend {
         parse_agents_json(&stdout)
     }
     fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<()> {
-        // `claude --bg` self-detaches after dispatching the background job; wait for it.
+        // Detach like the other backends so the TUI key handler returns immediately
+        // (`claude --bg` still self-detaches; setsid + no wait keeps it off this thread).
         let name: String = task.chars().take(40).collect();
-        let output = std::process::Command::new(&self.binary)
-            .current_dir(dir)
+        let mut cmd = std::process::Command::new(&self.binary);
+        cmd.current_dir(dir)
             .arg("--bg")
             .arg("--model")
             .arg("opus[1m]")
             .arg("--name")
             .arg(&name)
-            .arg(task)
-            .output()?;
-        if !output.status.success() {
-            return Err(Error::Command(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
+            .arg(task);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let log_path = std::path::PathBuf::from(home)
+            .join(".local/state/codex-agent-viewer/logs")
+            .join(format!("claude-{unix_ms}.log"));
+        crate::spawn::spawn_detached(cmd, &log_path)?;
         Ok(())
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {

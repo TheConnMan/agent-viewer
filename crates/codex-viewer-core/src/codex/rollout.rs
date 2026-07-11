@@ -42,8 +42,12 @@ pub fn read_session_meta(path: &std::path::Path) -> Result<SessionMeta> {
     })
 }
 
-/// Terminal marker check. Read at most the final 64 KiB, split to lines, return true
-/// iff any line is an event_msg whose payload.type == "task_complete".
+/// Terminal marker check. Read at most the final 64 KiB, split to lines, and decide the
+/// last turn's outcome by event order: return true iff the LAST `task_complete` event
+/// occurs after the LAST `task_started` event (both are event_msg lines with payload.type).
+/// If no `task_started` is in the window (its turn start may predate the window), any
+/// `task_complete` still counts. A stale `task_complete` followed by a later `task_started`
+/// with no new completion (resumed-then-abandoned) resolves to false.
 pub fn has_task_complete_tail(path: &std::path::Path) -> Result<bool> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -52,7 +56,9 @@ pub fn has_task_complete_tail(path: &std::path::Path) -> Result<bool> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    for line in text.lines() {
+    let mut last_complete: Option<usize> = None;
+    let mut last_started: Option<usize> = None;
+    for (idx, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -60,17 +66,24 @@ pub fn has_task_complete_tail(path: &std::path::Path) -> Result<bool> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) == Some("event_msg")
-            && value
-                .get("payload")
-                .and_then(|p| p.get("type"))
-                .and_then(|t| t.as_str())
-                == Some("task_complete")
+        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        match value
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
         {
-            return Ok(true);
+            Some("task_complete") => last_complete = Some(idx),
+            Some("task_started") => last_started = Some(idx),
+            _ => {}
         }
     }
-    Ok(false)
+    Ok(match (last_complete, last_started) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(complete), Some(started)) => complete > started,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
