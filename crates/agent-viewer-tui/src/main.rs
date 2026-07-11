@@ -242,7 +242,11 @@ fn main() -> io::Result<()> {
     if let Some(db) = &db
         && let Ok(keys) = db.collapsed_groups()
     {
-        app.set_collapsed(keys.iter().filter_map(|k| GroupKey::from_storage(k)).collect());
+        app.set_collapsed(
+            keys.iter()
+                .filter_map(|k| GroupKey::from_storage(k))
+                .collect(),
+        );
     }
     let mut ui = Ui {
         app,

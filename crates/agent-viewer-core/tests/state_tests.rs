@@ -351,15 +351,18 @@ fn viewer_db_collapsed_groups_roundtrip() {
         let db = ViewerDb::open(&path).expect("open viewer db");
 
         // Insert two collapsed keys (opaque strings; the TUI owns their meaning).
-        db.set_group_collapsed("project:/a", true).expect("set project");
-        db.set_group_collapsed("state:done", true).expect("set state");
+        db.set_group_collapsed("project:/a", true)
+            .expect("set project");
+        db.set_group_collapsed("state:done", true)
+            .expect("set state");
 
         let collapsed = db.collapsed_groups().expect("collapsed groups");
         assert!(collapsed.contains("project:/a"));
         assert!(collapsed.contains("state:done"));
 
         // Clearing one removes only that key.
-        db.set_group_collapsed("project:/a", false).expect("clear project");
+        db.set_group_collapsed("project:/a", false)
+            .expect("clear project");
         let collapsed = db.collapsed_groups().expect("collapsed groups");
         assert!(!collapsed.contains("project:/a"));
         assert!(collapsed.contains("state:done"));

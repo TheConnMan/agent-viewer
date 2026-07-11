@@ -25,8 +25,8 @@ pub enum CheckState {
 /// The GitHub facts `pr_color` maps from (parsed from `gh pr view --json ...`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrStatusFacts {
-    pub state: String,                   // "OPEN" | "MERGED" | "CLOSED" (any case)
-    pub merged_at: Option<String>,       // gh `mergedAt` (RFC3339) or None
+    pub state: String,             // "OPEN" | "MERGED" | "CLOSED" (any case)
+    pub merged_at: Option<String>, // gh `mergedAt` (RFC3339) or None
     pub is_draft: bool,
     pub review_decision: Option<String>, // "REVIEW_REQUIRED" | "APPROVED" | "CHANGES_REQUESTED" | None
     pub review_requested: bool,          // reviewRequests array nonempty (a reviewer is awaiting)
@@ -73,7 +73,9 @@ pub fn rollup_check_state(rollup: &[serde_json::Value]) -> CheckState {
             if status != "COMPLETED" {
                 Bucket::Pending
             } else {
-                let conclusion = crate::json_str(el, "conclusion").unwrap_or("").to_uppercase();
+                let conclusion = crate::json_str(el, "conclusion")
+                    .unwrap_or("")
+                    .to_uppercase();
                 match conclusion.as_str() {
                     "SUCCESS" | "NEUTRAL" | "SKIPPED" => Bucket::Pass,
                     _ => Bucket::Fail, // FAILURE, CANCELLED, etc. and unknown -> conservative fail

@@ -125,7 +125,10 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
         };
         let exited = pty.is_exited();
         let marker_present = need_marker
-            && pty.with_screen(|s| s.contents().contains(crate::auto_enter::CLAUDE_AGENTS_MARKER));
+            && pty.with_screen(|s| {
+                s.contents()
+                    .contains(crate::auto_enter::CLAUDE_AGENTS_MARKER)
+            });
         (exited, marker_present)
     } else {
         (false, false)
