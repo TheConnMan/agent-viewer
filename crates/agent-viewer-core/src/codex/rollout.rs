@@ -21,19 +21,13 @@ pub fn read_session_meta(path: &std::path::Path) -> Result<SessionMeta> {
         return Err(Error::Command("empty rollout file".into()));
     }
     let value: serde_json::Value = serde_json::from_str(line.trim())?;
-    if value.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+    if crate::json_str(&value, "type") != Some("session_meta") {
         return Err(Error::Command("first line is not session_meta".into()));
     }
     let payload = value
         .get("payload")
         .ok_or_else(|| Error::Command("session_meta missing payload".into()))?;
-    let field = |key: &str| {
-        payload
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
+    let field = |key: &str| crate::json_str(payload, key).unwrap_or_default().to_string();
     Ok(SessionMeta {
         id: field("id"),
         cwd: PathBuf::from(field("cwd")),
@@ -74,21 +68,13 @@ pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
     let mut last_started: Option<usize> = None;
     let mut last_approval: Option<usize> = None;
     for (idx, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(value) = crate::parse_json_line(line) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+        if crate::json_str(&value, "type") != Some("event_msg") {
             continue;
         }
-        match value
-            .get("payload")
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str())
-        {
+        match value.get("payload").and_then(|p| crate::json_str(p, "type")) {
             Some("task_complete") => last_complete = Some(idx),
             Some("task_started") => last_started = Some(idx),
             Some(t) if t.ends_with("_approval_request") => last_approval = Some(idx),
@@ -131,20 +117,16 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
     let mut items = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        if crate::json_str(&value, "type") != Some("response_item") {
             continue;
         }
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        let Some(role) = payload.get("role").and_then(|r| r.as_str()) else {
+        let Some(role) = crate::json_str(payload, "role") else {
             continue;
         };
         let Some(content) = payload.get("content").and_then(|c| c.as_array()) else {
@@ -152,9 +134,10 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
         };
         let mut text = String::new();
         for chunk in content {
-            let chunk_type = chunk.get("type").and_then(|t| t.as_str());
-            if matches!(chunk_type, Some("input_text") | Some("output_text"))
-                && let Some(t) = chunk.get("text").and_then(|t| t.as_str())
+            if matches!(
+                crate::json_str(chunk, "type"),
+                Some("input_text") | Some("output_text")
+            ) && let Some(t) = crate::json_str(chunk, "text")
             {
                 text.push_str(t);
             }

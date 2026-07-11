@@ -16,14 +16,7 @@ pub fn unarchive(id: &str) -> Result<()> {
 }
 
 fn run_codex(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("codex").args(args).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Command(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ))
-    }
+    crate::spawn::run_checked(std::process::Command::new("codex").args(args))
 }
 
 /// Build (do not run) `codex resume <id>` with inherited stdio.

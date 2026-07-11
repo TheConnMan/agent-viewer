@@ -68,9 +68,7 @@ impl ViewerDb {
     /// On any open/schema failure: delete the file, recreate fresh (all contents are
     /// advisory; losing them costs pins/labels, nothing more).
     pub fn open_default() -> Result<ViewerDb> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = std::path::PathBuf::from(home).join(".local/state/agent-viewer/viewer.db");
-        ViewerDb::open(&path)
+        ViewerDb::open(&crate::home_dir().join(".local/state/agent-viewer/viewer.db"))
     }
 
     /// tests: temp path.

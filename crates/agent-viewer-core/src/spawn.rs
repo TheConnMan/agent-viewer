@@ -12,10 +12,23 @@ pub fn now_ms() -> i64 {
 /// ($HOME/.local/state/agent-viewer/logs/{prefix}-{now_ms}.log). Creates nothing;
 /// the spawn helper makes the parent dir when it actually opens the file.
 pub fn viewer_log_path(prefix: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home)
+    crate::home_dir()
         .join(".local/state/agent-viewer/logs")
         .join(format!("{prefix}-{}.log", now_ms()))
+}
+
+/// Run a command to completion; non-zero exit -> Err(Error::Command(stderr)).
+/// The shared shape for every shell-out mutation (codex archive/unarchive,
+/// opencode delete/rename).
+pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Command(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
 }
 
 /// Shared detached-spawn helper (codex + opencode; claude self-detaches):

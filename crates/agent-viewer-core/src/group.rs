@@ -55,10 +55,10 @@ pub fn group_by_project(sessions: Vec<crate::backend::Session>) -> Vec<ProjectGr
             ProjectGroup { root, sessions }
         })
         .collect();
+    // Each group is already sorted DESC, so its first session is its newest.
     groups.sort_by(|a, b| {
-        let a_newest = a.sessions.iter().map(|s| s.updated_at_ms).max();
-        let b_newest = b.sessions.iter().map(|s| s.updated_at_ms).max();
-        b_newest.cmp(&a_newest)
+        let newest = |g: &ProjectGroup| g.sessions.first().map(|s| s.updated_at_ms);
+        newest(b).cmp(&newest(a))
     });
     groups
 }

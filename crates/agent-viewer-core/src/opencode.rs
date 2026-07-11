@@ -8,9 +8,8 @@ pub struct OpencodeBackend {
 impl OpencodeBackend {
     /// Default path: $HOME/.local/share/opencode/opencode.db
     pub fn new() -> OpencodeBackend {
-        let home = std::env::var("HOME").unwrap_or_default();
         OpencodeBackend {
-            db_path: std::path::PathBuf::from(home).join(".local/share/opencode/opencode.db"),
+            db_path: crate::home_dir().join(".local/share/opencode/opencode.db"),
         }
     }
     pub fn with_db(db_path: std::path::PathBuf) -> OpencodeBackend {
@@ -104,32 +103,20 @@ impl Backend for OpencodeBackend {
         }
     }
     fn remove(&self, id: &str) -> Result<()> {
-        let output = std::process::Command::new("opencode")
-            .arg("session")
-            .arg("delete")
-            .arg(id)
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Command(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ))
-        }
+        crate::spawn::run_checked(
+            std::process::Command::new("opencode")
+                .arg("session")
+                .arg("delete")
+                .arg(id),
+        )
     }
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
         // The official `opencode db` subcommand — a CLI mutation, not a raw DB write.
-        let output = std::process::Command::new("opencode")
-            .arg("db")
-            .arg(rename_sql(&session.id, name))
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Command(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ))
-        }
+        crate::spawn::run_checked(
+            std::process::Command::new("opencode")
+                .arg("db")
+                .arg(rename_sql(&session.id, name)),
+        )
     }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         // The TUI command accepts `-s <id>` to open a session; the old `run -s <id> -i
@@ -154,18 +141,22 @@ fn live_opencode_proc() -> bool {
         .any(|p| p.name().to_string_lossy().starts_with("opencode"))
 }
 
+/// Recency thresholds for the status heuristic below.
+const WORKING_MAX_AGE_MS: i64 = 60_000; // 1 min
+const IDLE_MAX_AGE_MS: i64 = 1_800_000; // 30 min
+
 /// PURE three-tier status heuristic, unit-tested (the process check is injected, I-3):
-/// Working: live && age <= 60_000; Idle: live && age <= 1_800_000 (30 min);
-/// Done: otherwise. Never NeedsInput/Failed/Stopped (no signal exists — the session
-/// table has no error column; verified live 2026-07-11).
+/// Working: live && age <= 1 min; Idle: live && age <= 30 min; Done: otherwise.
+/// Never NeedsInput/Failed/Stopped (no signal exists — the session table has no error
+/// column; verified live 2026-07-11).
 pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64) -> Status {
     if !live_opencode_proc {
         return Status::Done;
     }
     let age = now_ms - updated_at_ms;
-    if age <= 60_000 {
+    if age <= WORKING_MAX_AGE_MS {
         Status::Working
-    } else if age <= 1_800_000 {
+    } else if age <= IDLE_MAX_AGE_MS {
         Status::Idle
     } else {
         Status::Done

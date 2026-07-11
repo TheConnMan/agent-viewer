@@ -14,10 +14,10 @@ use std::path::Path;
 // `thread/list`, `command/exec/terminate`) is the eventual "clean" backend and the v2
 // upgrade path. v1 reads the same SQLite + rollout files directly.
 
-/// Sandbox flag passed to `codex exec` for viewer-spawned sessions. Least-privileged
+/// Sandbox args passed to `codex exec` for viewer-spawned sessions. Least-privileged
 /// choice (verified working unattended on this box). If a workspace-write run ever fails
-/// to complete unattended, switch to "--dangerously-bypass-approvals-and-sandbox".
-const SANDBOX_FLAG: &str = "--sandbox workspace-write";
+/// to complete unattended, switch to ["--dangerously-bypass-approvals-and-sandbox"].
+const SANDBOX_ARGS: &[&str] = &["--sandbox", "workspace-write"];
 
 pub struct CodexBackend {
     codex_home: std::path::PathBuf,
@@ -104,9 +104,7 @@ impl Backend for CodexBackend {
     fn spawn(&self, dir: &Path, task: &str) -> Result<Option<u32>> {
         let mut cmd = std::process::Command::new("codex");
         cmd.arg("exec").arg("--json").arg("-C").arg(dir);
-        for flag in SANDBOX_FLAG.split_whitespace() {
-            cmd.arg(flag);
-        }
+        cmd.args(SANDBOX_ARGS);
         cmd.arg(task);
         let log_path = crate::default_codex_home()
             .join("bg-logs")

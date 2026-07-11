@@ -52,6 +52,13 @@ fn claude_parse_maps_six_states_and_pid() {
 }
 
 #[test]
+fn claude_parse_rejects_non_array_top_level() {
+    // Documented contract: a non-array top level is Err(Json), not silently empty.
+    assert!(parse_agents_json("{\"sessions\": []}").is_err());
+    assert!(parse_agents_json("not json").is_err());
+}
+
+#[test]
 fn parse_job_state_blocked_prefers_needs() {
     let text = common::read_fixture("claude_state_blocked.json");
     let detail = parse_job_state(&text);

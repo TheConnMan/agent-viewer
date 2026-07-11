@@ -38,11 +38,30 @@ pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// $HOME as a PathBuf (empty if unset — never panics; downstream opens just fail).
+pub(crate) fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+}
+
 /// $CODEX_HOME if set, else $HOME/.codex.
 pub fn default_codex_home() -> std::path::PathBuf {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         return std::path::PathBuf::from(codex_home);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join(".codex")
+    home_dir().join(".codex")
+}
+
+/// value[key] as &str — the ubiquitous JSON string-field accessor.
+pub(crate) fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(|v| v.as_str())
+}
+
+/// One JSONL line -> Value: trim, then None for blank or malformed lines (all the
+/// line-oriented parsers skip those silently).
+pub(crate) fn parse_json_line(line: &str) -> Option<serde_json::Value> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    serde_json::from_str(line).ok()
 }

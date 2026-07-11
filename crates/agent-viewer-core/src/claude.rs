@@ -13,16 +13,29 @@ pub struct ClaudeBackend {
 
 impl ClaudeBackend {
     pub fn new() -> ClaudeBackend {
-        ClaudeBackend {
-            binary: "claude".to_string(),
-            detail_cache: HashMap::new(),
-        }
+        ClaudeBackend::with_binary("claude")
     }
     pub fn with_binary(binary: &str) -> ClaudeBackend {
         ClaudeBackend {
             binary: binary.to_string(),
             detail_cache: HashMap::new(),
         }
+    }
+
+    /// The parsed jobs state.json for `path`, plus its mtime (the caller's updated_at
+    /// signal). Re-read and re-parsed only when (mtime, len) changes; None when the file
+    /// is missing/unreadable (the jobs dir can lag the agents list).
+    fn cached_job_detail(&mut self, path: &PathBuf) -> Option<(SystemTime, JobDetail)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let key = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
+        if let Some((cached_key, detail)) = self.detail_cache.get(path)
+            && *cached_key == key
+        {
+            return Some((key.0, detail.clone()));
+        }
+        let detail = parse_job_state(&std::fs::read_to_string(path).ok()?);
+        self.detail_cache.insert(path.clone(), (key, detail.clone()));
+        Some((key.0, detail))
     }
 }
 
@@ -59,34 +72,18 @@ impl Backend for ClaudeBackend {
             _ => return Ok(Vec::new()),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed = parse_agents_json(&stdout)?;
-        let mut sessions = Vec::with_capacity(parsed.len());
-        for mut session in parsed {
-            // Fill summary/updated_at_ms/rollout_path from the jobs state.json. A
-            // missing/garbled file is not an error — the jobs dir can lag the agents list.
-            // The parse is cached by (mtime, len) so an unchanged file is not re-read.
-            let short_id = session.short_id.clone().unwrap_or_default();
-            let path = job_state_path(&short_id);
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let key = (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len());
-                let detail = match self.detail_cache.get(&path) {
-                    Some((cached_key, detail)) if *cached_key == key => Some(detail.clone()),
-                    _ => std::fs::read_to_string(&path).ok().map(|text| {
-                        let detail = parse_job_state(&text);
-                        self.detail_cache.insert(path.clone(), (key, detail.clone()));
-                        detail
-                    }),
-                };
-                if let Some(detail) = detail {
-                    session.summary = detail.summary;
-                    session.rollout_path = detail.transcript_path;
-                    session.pr_refs = detail.prs;
-                    if let Ok(since) = key.0.duration_since(std::time::UNIX_EPOCH) {
-                        session.updated_at_ms = since.as_millis() as i64;
-                    }
+        let mut sessions = parse_agents_json(&stdout)?;
+        for session in &mut sessions {
+            // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
+            let path = job_state_path(session.short_id.as_deref().unwrap_or_default());
+            if let Some((mtime, detail)) = self.cached_job_detail(&path) {
+                session.summary = detail.summary;
+                session.rollout_path = detail.transcript_path;
+                session.pr_refs = detail.prs;
+                if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    session.updated_at_ms = since.as_millis() as i64;
                 }
             }
-            sessions.push(session);
         }
         Ok(sessions)
     }
@@ -112,8 +109,7 @@ impl Backend for ClaudeBackend {
         // Best-effort UDS rename against the live daemon worker (unofficial Fleet View
         // protocol). Any failure -> Err so the TUI falls back to set_name_override.
         use std::io::{Read, Write};
-        let home = std::env::var("HOME").unwrap_or_default();
-        let roster_path = std::path::PathBuf::from(&home).join(".claude/daemon/roster.json");
+        let roster_path = crate::home_dir().join(".claude/daemon/roster.json");
         let text = std::fs::read_to_string(&roster_path)?;
         let roster: serde_json::Value = serde_json::from_str(&text)?;
         let sock = roster
@@ -121,11 +117,10 @@ impl Backend for ClaudeBackend {
             .and_then(|w| w.as_object())
             .and_then(|workers| {
                 workers.values().find(|worker| {
-                    worker.get("sessionId").and_then(|s| s.as_str()) == Some(session.id.as_str())
+                    crate::json_str(worker, "sessionId") == Some(session.id.as_str())
                 })
             })
-            .and_then(|worker| worker.get("rendezvousSock"))
-            .and_then(|s| s.as_str())
+            .and_then(|worker| crate::json_str(worker, "rendezvousSock"))
             .ok_or_else(|| Error::Command("no live worker for session".into()))?;
         let mut stream = std::os::unix::net::UnixStream::connect(sock)?;
         let mut line = serde_json::json!({ "subtype": "rename_session", "title": name }).to_string();
@@ -146,11 +141,12 @@ impl Backend for ClaudeBackend {
         let live = session.pid.is_some()
             || matches!(session.status, Status::Working | Status::NeedsInput);
         if live {
-            let short_id = session.short_id.clone().unwrap_or_default();
-            let home = std::env::var("HOME").unwrap_or_default();
             cmd.arg("agents")
-                .env("CLAUDE_AGENTS_SELECT", short_id)
-                .current_dir(home);
+                .env(
+                    "CLAUDE_AGENTS_SELECT",
+                    session.short_id.as_deref().unwrap_or_default(),
+                )
+                .current_dir(crate::home_dir());
         } else {
             cmd.arg("-r").arg(&session.id);
             if session.cwd.is_dir() {
@@ -256,27 +252,19 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
     let mut sessions = Vec::with_capacity(entries.len());
     for entry in entries {
         // sessionId/cwd/name are required; anything missing them is skipped.
-        let Some(session_id) = entry.get("sessionId").and_then(|v| v.as_str()) else {
+        let Some(session_id) = crate::json_str(&entry, "sessionId") else {
             continue;
         };
-        let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) else {
+        let Some(cwd) = crate::json_str(&entry, "cwd") else {
             continue;
         };
-        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+        let Some(name) = crate::json_str(&entry, "name") else {
             continue;
         };
-        let short_id = entry
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let short_id = crate::json_str(&entry, "id").unwrap_or_default().to_string();
         let started_at = entry.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        let source_label = entry
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let status = match entry.get("state").and_then(|v| v.as_str()) {
+        let source_label = crate::json_str(&entry, "kind").unwrap_or_default().to_string();
+        let status = match crate::json_str(&entry, "state") {
             Some("working") => Status::Working,
             Some("blocked") => Status::NeedsInput,
             Some("idle") => Status::Idle,
@@ -309,12 +297,12 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
 }
 
 /// Parsed subset of a claude jobs `state.json` (verified fields 2026-07-11).
-#[derive(Debug, Clone, PartialEq)]
+/// The file's own ISO updatedAt is deliberately NOT parsed — the caller uses the
+/// state.json file mtime as the updated_at signal.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobDetail {
     /// needs if state=="blocked" && needs present, else detail, else "".
     pub summary: String,
-    /// NOT parsed from ISO updatedAt — the caller uses the state.json file mtime.
-    pub updated_at_ms: Option<i64>,
     /// linkScanPath (verified field).
     pub transcript_path: Option<std::path::PathBuf>,
     /// `children[].id` where `kind == "pr"` — the associated pull requests.
@@ -325,29 +313,19 @@ pub struct JobDetail {
 /// blocked jobs carry needs, working/done carry detail).
 pub fn parse_job_state(text: &str) -> JobDetail {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return JobDetail {
-            summary: String::new(),
-            updated_at_ms: None,
-            transcript_path: None,
-            prs: Vec::new(),
-        };
+        return JobDetail::default();
     };
-    let state = value.get("state").and_then(|v| v.as_str());
-    let needs = value.get("needs").and_then(|v| v.as_str());
-    let detail = value.get("detail").and_then(|v| v.as_str());
-    let summary = if state == Some("blocked")
+    let needs = crate::json_str(&value, "needs");
+    let summary = if crate::json_str(&value, "state") == Some("blocked")
         && let Some(needs) = needs
     {
         needs.to_string()
-    } else if let Some(detail) = detail {
+    } else if let Some(detail) = crate::json_str(&value, "detail") {
         detail.to_string()
     } else {
         String::new()
     };
-    let transcript_path = value
-        .get("linkScanPath")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let transcript_path = crate::json_str(&value, "linkScanPath").map(std::path::PathBuf::from);
     // children: [{id, href, kind}] — keep the ids of the kind=="pr" entries.
     let prs = value
         .get("children")
@@ -355,14 +333,13 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         .map(|children| {
             children
                 .iter()
-                .filter(|c| c.get("kind").and_then(|k| k.as_str()) == Some("pr"))
-                .filter_map(|c| c.get("id").and_then(|id| id.as_str()).map(String::from))
+                .filter(|c| crate::json_str(c, "kind") == Some("pr"))
+                .filter_map(|c| crate::json_str(c, "id").map(String::from))
                 .collect()
         })
         .unwrap_or_default();
     JobDetail {
         summary,
-        updated_at_ms: None,
         transcript_path,
         prs,
     }
@@ -370,8 +347,7 @@ pub fn parse_job_state(text: &str) -> JobDetail {
 
 /// $HOME/.claude/jobs/<short_id>/state.json
 pub fn job_state_path(short_id: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home)
+    crate::home_dir()
         .join(".claude/jobs")
         .join(short_id)
         .join("state.json")
@@ -394,14 +370,10 @@ pub fn read_claude_transcript(
     let mut items = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
-        let role = match value.get("type").and_then(|t| t.as_str()) {
+        let role = match crate::json_str(&value, "type") {
             Some("user") => "user",
             Some("assistant") => "assistant",
             // attachment/system/queue-operation/etc. are skipped.
@@ -415,8 +387,8 @@ pub fn read_claude_transcript(
             Some(serde_json::Value::Array(blocks)) => {
                 let mut text = String::new();
                 for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && let Some(t) = block.get("text").and_then(|t| t.as_str())
+                    if crate::json_str(block, "type") == Some("text")
+                        && let Some(t) = crate::json_str(block, "text")
                     {
                         text.push_str(t);
                     }
