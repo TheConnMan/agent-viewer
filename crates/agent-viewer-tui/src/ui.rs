@@ -62,9 +62,9 @@ fn glyph_marks() -> bool {
 }
 
 /// Startup-read (once): when true, the mark slot is left blank (two reserved columns) and a
-/// brand-logo image is overlaid there by the render path. Set from `AGENT_VIEWER_LOGO_MARKS=1`
-/// only after the terminal-graphics probe (`LogoMarks::build`) succeeds — so the flag being on
-/// implies a live `LogoMarks`. Takes precedence over the glyph marks.
+/// brand-logo image is overlaid there by the render path. Set after the terminal-graphics
+/// probe (`LogoMarks::build`) succeeds — so it being on implies a live `LogoMarks`. Takes
+/// precedence over the glyph marks.
 static LOGO_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Enable the brand-logo marks once at startup (idempotent; later calls are ignored).
@@ -402,8 +402,8 @@ pub struct Draw<'a> {
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
     pub pr_status: &'a crate::pr_cache::PrStatusCache,
-    /// The brand-logo protocols, present only when `AGENT_VIEWER_LOGO_MARKS=1` and the
-    /// startup graphics probe succeeded. Overlaid on the reserved mark slot during render.
+    /// The brand-logo protocols, present when the startup graphics probe succeeded. Overlaid
+    /// on the reserved mark slot during render.
     pub logos: Option<&'a LogoMarks>,
 }
 
