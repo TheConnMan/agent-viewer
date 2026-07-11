@@ -172,8 +172,11 @@ pub fn read_opencode_last_message(
     for row in rows {
         let (mid, mdata, pdata) = row?;
         if cur_id.as_deref() != Some(mid.as_str()) {
-            // Boundary: the previous message is complete — return it if it had text.
-            if cur_id.is_some() && !cur_text.is_empty() {
+            // Boundary: the previous message is complete — return it if it had non-blank text
+            // (a whitespace-only message, e.g. newline-only parts around tool transitions,
+            // would otherwise hide the real prior message behind blank lines). Return the
+            // original untrimmed text so the real message's internal formatting is preserved.
+            if cur_id.is_some() && !cur_text.trim().is_empty() {
                 return Ok(Some(TranscriptItem {
                     role: cur_role,
                     text: cur_text,
@@ -188,7 +191,7 @@ pub fn read_opencode_last_message(
         }
     }
     // The final message (no boundary follows it).
-    if cur_id.is_some() && !cur_text.is_empty() {
+    if cur_id.is_some() && !cur_text.trim().is_empty() {
         return Ok(Some(TranscriptItem {
             role: cur_role,
             text: cur_text,

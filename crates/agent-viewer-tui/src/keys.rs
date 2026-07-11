@@ -382,12 +382,21 @@ fn send_reply(
         return Ok(());
     }
 
-    // Decide the payload (bytes, require_run_view) per backend; None attaches with focus only.
-    let payload: Option<(Vec<u8>, bool)> = match backend_kind {
-        BackendKind::Claude => Some((format!("{buffer}\r").into_bytes(), true)),
+    // Decide the payload bytes per backend; None attaches with focus only (the run-view gate
+    // is derived from the backend/attach kind after attach, below).
+    let payload: Option<Vec<u8>> = match backend_kind {
+        BackendKind::Claude => Some(format!("{buffer}\r").into_bytes()),
         BackendKind::Codex => match codex_reply_keystroke(&buffer) {
-            CodexReply::Approve => Some((b"y".to_vec(), false)),
-            CodexReply::Deny => Some((b"n".to_vec(), false)),
+            // Approve auto-sends the stable `y` approve key. Deny is deliberately NOT
+            // auto-injected: the reject key is Codex-version/config specific (0.144.1 binds
+            // deny to `d`, and `n` is a different decline-with-guidance action), so a guessed
+            // byte could invoke the wrong action. Attach with focus and let the user confirm
+            // the denial by hand rather than risk it.
+            CodexReply::Approve => Some(b"y".to_vec()),
+            CodexReply::Deny => {
+                ui.set_notice("confirm the denial in the attached session".to_string());
+                None
+            }
             CodexReply::Freeform => {
                 ui.set_notice("type your reply in the attached session".to_string());
                 None
@@ -399,11 +408,19 @@ fn send_reply(
     if !attach_session(backends, ui, terminal, &session)? {
         return Ok(());
     }
-    if let Some((payload, require_run_view)) = payload {
+    if let Some(payload) = payload {
+        let key: Key = (backend_kind, id);
+        // require_run_view: only claude opens onto the agents list; codex resume lands in the
+        // pending prompt. fresh_attach: attach_session arms auto_enter exactly for a fresh
+        // live-claude list attach (so the injector waits for its explicit landing); a reused
+        // PTY leaves auto_enter unarmed, so run-view is confirmed by the marker being absent.
+        let require_run_view = matches!(backend_kind, BackendKind::Claude);
+        let fresh_attach = ui.auto_enter.as_ref().map(|ae| &ae.key) == Some(&key);
         ui.pending_reply = Some(PendingReply {
-            key: (backend_kind, id),
+            key,
             payload,
             require_run_view,
+            fresh_attach,
             armed_at: Instant::now(),
             ready_since: None,
         });

@@ -31,7 +31,8 @@ const TAIL_ITEMS: usize = 3;
 /// Word-wrap `text` to `width` columns. Explicit '\n' always breaks (a blank source line
 /// yields one empty output line, preserving paragraph breaks); each source line is then
 /// greedy-wrapped on ASCII whitespace, and any single word longer than `width` is hard-split
-/// into width-sized chunks. Width is measured by `char` count. `width == 0` is a no-op guard.
+/// into width-sized chunks. Width is measured by unicode display width (so wide CJK/emoji
+/// glyphs do not overflow the panel). `width == 0` is a no-op guard.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -46,27 +47,33 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 /// Greedy-wrap a single (newline-free) source line into `out`. Always emits at least one line
 /// (an empty string for an empty source line, preserving blank paragraph breaks).
 fn wrap_one(line: &str, width: usize, out: &mut Vec<String>) {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let start_len = out.len();
     let mut current = String::new();
     let mut current_w = 0usize;
     for word in line.split_ascii_whitespace() {
-        let word_w = word.chars().count();
+        let word_w = UnicodeWidthStr::width(word);
         if word_w > width {
-            // Flush the pending line, then hard-split the overlong word into chunks.
+            // Flush the pending line, then hard-split the overlong word into chunks bounded by
+            // display width (never split a wide char across lines: flush before it overflows).
             if current_w > 0 {
                 out.push(std::mem::take(&mut current));
                 current_w = 0;
             }
             let mut chunk = String::new();
+            let mut chunk_w = 0usize;
             for ch in word.chars() {
-                chunk.push(ch);
-                if chunk.chars().count() == width {
+                let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if chunk_w + ch_w > width && !chunk.is_empty() {
                     out.push(std::mem::take(&mut chunk));
+                    chunk_w = 0;
                 }
+                chunk.push(ch);
+                chunk_w += ch_w;
             }
             if !chunk.is_empty() {
                 current = chunk;
-                current_w = current.chars().count();
+                current_w = chunk_w;
             }
             continue;
         }
@@ -91,12 +98,24 @@ fn wrap_one(line: &str, width: usize, out: &mut Vec<String>) {
     }
 }
 
-/// Char-truncate `s` to `width` (no ellipsis — the tail one-liners just clip).
+/// Width-truncate `s` to `width` display columns (no ellipsis — the tail one-liners just
+/// clip). Measured by unicode display width so wide glyphs do not overflow the panel.
 fn truncate(s: &str, width: usize) -> String {
-    if width == 0 || s.chars().count() <= width {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 || UnicodeWidthStr::width(s) <= width {
         return s.to_string();
     }
-    s.chars().take(width).collect()
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + ch_w > width {
+            break;
+        }
+        out.push(ch);
+        w += ch_w;
+    }
+    out
 }
 
 /// Collapse every newline in `text` to a space, folding it into a single-line summary for a
@@ -232,6 +251,22 @@ mod tests {
         let lines = wrap("supercalifragilistic", 5);
         assert!(lines.iter().all(|l| l.chars().count() <= 5));
         assert_eq!(lines.concat(), "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_bounds_wide_chars_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        // CJK glyphs are two columns each; wrapping must bound every output line by display
+        // width (not char count) so wide text never overflows the panel. Greedy path:
+        let spaced = "\u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57} \u{6f22}\u{5b57}";
+        let lines = wrap(spaced, 5);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 5));
+        // Hard-split path: a single overlong wide word, no char lost.
+        let solid = "\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}";
+        let split = wrap(solid, 5);
+        assert!(split.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 5));
+        assert_eq!(split.concat(), solid);
     }
 
     #[test]

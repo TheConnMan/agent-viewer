@@ -580,9 +580,10 @@ pub fn reply_allowed(caps_reply: bool, status: Status) -> bool {
     caps_reply && matches!(status, Status::NeedsInput)
 }
 
-/// How a typed codex approval reply maps to a decision. Approve/Deny inject the single
-/// approval keystroke; Freeform (anything else, including empty) attaches with focus so the
-/// user finishes manually rather than guessing. Pure.
+/// How a typed codex approval reply maps to a decision. Approve auto-sends the stable `y`
+/// approve key; Deny and Freeform (anything else, including empty) attach with focus so the
+/// user finishes manually rather than guessing (the reject key is version/config specific,
+/// and a free-text reply is not a yes/no decision). Pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexReply {
     Approve,

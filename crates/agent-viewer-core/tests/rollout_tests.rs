@@ -188,12 +188,27 @@ fn exec_summary_quotes_whitespace_args() {
         cwd: None,
     };
     assert_eq!(approval.summary(), "echo 'a b'");
-    // Plain args stay bare.
-    let plain = PendingApproval::Exec {
-        command: vec!["rm".to_string(), "-rf".to_string(), "target".to_string()],
+    // Shell metacharacters are quoted too, so the summary never misstates the argv.
+    let meta = PendingApproval::Exec {
+        command: vec![
+            "$HOME".to_string(),
+            "a;b".to_string(),
+            "*.rs".to_string(),
+        ],
         cwd: None,
     };
-    assert_eq!(plain.summary(), "rm -rf target");
+    assert_eq!(meta.summary(), "'$HOME' 'a;b' '*.rs'");
+    // Plain args (including paths with `/`, `.`, `-`) stay bare.
+    let plain = PendingApproval::Exec {
+        command: vec![
+            "rm".to_string(),
+            "-rf".to_string(),
+            "target".to_string(),
+            "src/main.rs".to_string(),
+        ],
+        cwd: None,
+    };
+    assert_eq!(plain.summary(), "rm -rf target src/main.rs");
 }
 
 #[test]
