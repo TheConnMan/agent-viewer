@@ -15,6 +15,7 @@ fn sess(backend: BackendKind, id: &str, title: &str, cwd: &str, updated_at_ms: i
         status: Status::Done,
         hidden,
         source_label: "test".to_string(),
+        rollout_path: None,
     }
 }
 

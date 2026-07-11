@@ -83,6 +83,7 @@ impl Backend for CodexBackend {
                 status,
                 hidden: thread.archived,
                 source_label: thread.source.label().to_string(),
+                rollout_path: Some(thread.rollout_path.clone()),
             });
         }
         Ok(sessions)

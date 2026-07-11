@@ -13,6 +13,7 @@ fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         status: Status::Done,
         hidden: false,
         source_label: "exec".to_string(),
+        rollout_path: None,
     }
 }
 

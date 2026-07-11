@@ -49,6 +49,9 @@ pub struct Session {
     pub status: Status,
     pub hidden: bool,
     pub source_label: String,
+    /// Some for codex — path to the rollout JSONL for transcript-tail reads.
+    /// None for backends without a local transcript file (claude, opencode).
+    pub rollout_path: Option<std::path::PathBuf>,
 }
 
 pub trait Backend {
