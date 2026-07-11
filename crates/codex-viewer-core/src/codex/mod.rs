@@ -96,13 +96,9 @@ impl Backend for CodexBackend {
             cmd.arg(flag);
         }
         cmd.arg(task);
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
         let log_path = crate::default_codex_home()
             .join("bg-logs")
-            .join(format!("{unix_ms}.log"));
+            .join(format!("{}.log", crate::spawn::now_ms()));
         crate::spawn::spawn_detached(cmd, &log_path)?;
         Ok(())
     }

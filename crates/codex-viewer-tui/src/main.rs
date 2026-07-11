@@ -191,6 +191,10 @@ fn attach_selected(
     let Some(backend) = backends.iter().find(|b| b.kind() == session.backend) else {
         return Ok(());
     };
+    if !backend.capabilities().attach {
+        *notice = format!("{} does not support attach", backend.kind().name());
+        return Ok(());
+    }
     let Some(mut command) = backend.attach_command(session) else {
         *notice = format!("{} does not support attach", backend.kind().name());
         return Ok(());

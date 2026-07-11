@@ -49,12 +49,9 @@ impl Registry {
     /// OpenFlags::SQLITE_OPEN_READ_ONLY; busy_timeout 500ms (Codex writes concurrently).
     /// Must NOT create the file if missing (read-only open errors instead).
     pub fn open(db_path: &std::path::Path) -> Result<Registry> {
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
-        Ok(Registry { conn })
+        Ok(Registry {
+            conn: crate::open_readonly(db_path)?,
+        })
     }
 
     /// All rows including archived, recency DESC. COALESCE bridges the nullable *_ms
@@ -69,26 +66,24 @@ impl Registry {
              FROM threads \
              ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Thread {
-                id: row.get(0)?,
-                rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
-                created_at_ms: row.get(2)?,
-                updated_at_ms: row.get(3)?,
-                source: Source::parse(&row.get::<_, String>(4)?),
-                cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
-                title: row.get(6)?,
-                archived: row.get::<_, i64>(7)? != 0,
-                model: row.get(8)?,
-                git_branch: row.get(9)?,
-                first_user_message: row.get(10)?,
-                preview: row.get(11)?,
-            })
-        })?;
-        let mut threads = Vec::new();
-        for thread in rows {
-            threads.push(thread?);
-        }
+        let threads = stmt
+            .query_map([], |row| {
+                Ok(Thread {
+                    id: row.get(0)?,
+                    rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
+                    created_at_ms: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
+                    source: Source::parse(&row.get::<_, String>(4)?),
+                    cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
+                    title: row.get(6)?,
+                    archived: row.get::<_, i64>(7)? != 0,
+                    model: row.get(8)?,
+                    git_branch: row.get(9)?,
+                    first_user_message: row.get(10)?,
+                    preview: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(threads)
     }
 }

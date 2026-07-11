@@ -31,6 +31,15 @@ pub fn open_rollout_paths() -> HashSet<PathBuf> {
     open
 }
 
+/// Not-running resolution from the file signal alone: Done iff the tail marks the last
+/// turn complete, else Errored (Ok(false) OR any read error, incl. missing file).
+fn tail_status(rollout_path: &Path) -> Status {
+    match super::rollout::has_task_complete_tail(rollout_path) {
+        Ok(true) => Status::Done,
+        _ => Status::Errored,
+    }
+}
+
 /// PURE resolution given the open set (all unit tests target this):
 /// 1. canonicalize rollout_path (fall back to the raw path on error);
 ///    if it is in open_paths -> Running  (running wins over task_complete).
@@ -42,28 +51,38 @@ pub fn resolve_status(rollout_path: &Path, open_paths: &HashSet<PathBuf>) -> Sta
     if open_paths.contains(&canonical) {
         return Status::Running;
     }
-    match super::rollout::has_task_complete_tail(rollout_path) {
-        Ok(true) => Status::Done,
-        _ => Status::Errored,
-    }
+    tail_status(rollout_path)
 }
 
 /// Caching wrapper for the refresh loop. Cache key: (mtime, len) of rollout_path.
 /// Recompute when the key changes, when the path is in open_paths, or on first sight.
 pub struct StatusResolver {
     cache: HashMap<PathBuf, ((SystemTime, u64), Status)>,
+    canonical: HashMap<PathBuf, PathBuf>,
 }
 
 impl StatusResolver {
     pub fn new() -> StatusResolver {
         StatusResolver {
             cache: HashMap::new(),
+            canonical: HashMap::new(),
         }
     }
 
     pub fn resolve(&mut self, rollout_path: &Path, open_paths: &HashSet<PathBuf>) -> Status {
-        let canonical =
-            std::fs::canonicalize(rollout_path).unwrap_or_else(|_| rollout_path.to_path_buf());
+        // canonicalize once per distinct rollout_path, then reuse across ticks. Cache ONLY
+        // successful canonicalizations: an Err (path not present yet) uses the raw path for
+        // this tick without caching, so a later tick retries once the file appears.
+        let canonical = match self.canonical.get(rollout_path) {
+            Some(c) => c.clone(),
+            None => match std::fs::canonicalize(rollout_path) {
+                Ok(c) => {
+                    self.canonical.insert(rollout_path.to_path_buf(), c.clone());
+                    c
+                }
+                Err(_) => rollout_path.to_path_buf(),
+            },
+        };
         if open_paths.contains(&canonical) {
             return Status::Running;
         }
@@ -74,15 +93,15 @@ impl StatusResolver {
             )
         });
         let Some(key) = key else {
-            // No metadata (missing file): resolve_status yields Errored, nothing to cache.
-            return resolve_status(rollout_path, open_paths);
+            // No metadata (missing file): tail_status yields Errored, nothing to cache.
+            return tail_status(rollout_path);
         };
         if let Some((cached_key, cached_status)) = self.cache.get(rollout_path)
             && *cached_key == key
         {
             return *cached_status;
         }
-        let status = resolve_status(rollout_path, open_paths);
+        let status = tail_status(rollout_path);
         self.cache.insert(rollout_path.to_path_buf(), (key, status));
         status
     }

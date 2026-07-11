@@ -61,14 +61,7 @@ impl Backend for ClaudeBackend {
             .arg("--name")
             .arg(&name)
             .arg(task);
-        let home = std::env::var("HOME").unwrap_or_default();
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let log_path = std::path::PathBuf::from(home)
-            .join(".local/state/codex-agent-viewer/logs")
-            .join(format!("claude-{unix_ms}.log"));
+        let log_path = crate::spawn::viewer_log_path("claude");
         crate::spawn::spawn_detached(cmd, &log_path)?;
         Ok(())
     }

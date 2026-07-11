@@ -1,5 +1,23 @@
 use crate::error::Result;
 
+/// Current time as epoch milliseconds (0 if the system clock predates the epoch).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Build a viewer-owned log path
+/// ($HOME/.local/state/codex-agent-viewer/logs/{prefix}-{now_ms}.log). Creates nothing;
+/// the spawn helper makes the parent dir when it actually opens the file.
+pub fn viewer_log_path(prefix: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join(".local/state/codex-agent-viewer/logs")
+        .join(format!("{prefix}-{}.log", now_ms()))
+}
+
 /// Shared detached-spawn helper (codex + opencode; claude self-detaches):
 /// unsafe pre_exec calling libc::setsid() (new session, no ctty); stdin Stdio::null();
 /// stdout+stderr appended to log_path (parent dir created if missing); do NOT wait.

@@ -42,14 +42,10 @@ impl Backend for OpencodeBackend {
         }
         // Read-only open (same discipline as the codex registry): never create or write
         // the tool's own DB; WAL is fine to read while opencode holds it open.
-        let conn = rusqlite::Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        let conn = crate::open_readonly(&self.db_path)?;
         // ONE process check per list() call: no per-session /proc signal exists.
         let live = live_opencode_proc();
-        let now = now_ms();
+        let now = crate::spawn::now_ms();
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, directory, title, time_created, time_updated, time_archived \
              FROM session ORDER BY time_updated DESC",
@@ -75,11 +71,7 @@ impl Backend for OpencodeBackend {
                 rollout_path: None,
             })
         })?;
-        let mut sessions = Vec::new();
-        for session in rows {
-            sessions.push(session?);
-        }
-        Ok(sessions)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn spawn(&self, dir: &std::path::Path, task: &str) -> Result<()> {
         let title: String = task.chars().take(40).collect();
@@ -91,10 +83,7 @@ impl Backend for OpencodeBackend {
             .arg(&title)
             .arg(task);
         // Viewer-owned log dir; we do NOT write under ~/.local/share/opencode/.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let log_path = std::path::PathBuf::from(home)
-            .join(".local/state/codex-agent-viewer/logs")
-            .join(format!("opencode-{}.log", now_ms()));
+        let log_path = crate::spawn::viewer_log_path("opencode");
         crate::spawn::spawn_detached(cmd, &log_path)?;
         Ok(())
     }
@@ -118,13 +107,6 @@ fn live_opencode_proc() -> bool {
     sys.processes()
         .values()
         .any(|p| p.name().to_string_lossy().starts_with("opencode"))
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// PURE status heuristic, unit-tested (the process check is injected):
