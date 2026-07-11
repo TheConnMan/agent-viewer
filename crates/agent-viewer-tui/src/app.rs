@@ -1,6 +1,6 @@
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::{BackendKind, PrRef, Session, Status};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Grouping mode for the flat list. `ByProject` is the startup default (Ctrl+S toggles).
@@ -11,7 +11,7 @@ pub enum GroupMode {
 }
 
 /// State sections in the ByState view. Failed + Stopped fold into Done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     NeedsInput,
     Working,
@@ -19,12 +19,73 @@ pub enum Section {
     Done,
 }
 
+/// Stable identity of a collapsible group, keyed by the active grouping. Persisted to the
+/// viewer DB via its text form so a collapse survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GroupKey {
+    Project(PathBuf),
+    State(Section),
+}
+
+impl GroupKey {
+    /// Stable text form for DB persistence. Project -> "project:<path>" (to_string_lossy),
+    /// State -> "state:needs_input" | "state:working" | "state:idle" | "state:done".
+    pub fn to_storage(&self) -> String {
+        match self {
+            GroupKey::Project(p) => format!("project:{}", p.to_string_lossy()),
+            GroupKey::State(section) => format!("state:{}", section_storage(*section)),
+        }
+    }
+
+    /// Inverse of `to_storage`. Unknown/malformed text yields None (never a panic).
+    pub fn from_storage(s: &str) -> Option<GroupKey> {
+        if let Some(path) = s.strip_prefix("project:") {
+            return Some(GroupKey::Project(PathBuf::from(path)));
+        }
+        if let Some(name) = s.strip_prefix("state:") {
+            return section_from_storage(name).map(GroupKey::State);
+        }
+        None
+    }
+}
+
+/// The persisted token for a Section (paired with `section_from_storage`).
+fn section_storage(section: Section) -> &'static str {
+    match section {
+        Section::NeedsInput => "needs_input",
+        Section::Working => "working",
+        Section::Idle => "idle",
+        Section::Done => "done",
+    }
+}
+
+/// The Section for a persisted token (None for unknown text).
+fn section_from_storage(name: &str) -> Option<Section> {
+    match name {
+        "needs_input" => Some(Section::NeedsInput),
+        "working" => Some(Section::Working),
+        "idle" => Some(Section::Idle),
+        "done" => Some(Section::Done),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
-    /// ByState mode.
-    SectionHeader { section: Section, count: usize },
-    /// ByProject mode.
-    ProjectHeader { root: PathBuf, count: usize },
+    /// ByState mode. `collapsed` hides this section's session rows; `count` stays the group's
+    /// total member count (when collapsed, that IS the hidden-row count).
+    SectionHeader {
+        section: Section,
+        count: usize,
+        collapsed: bool,
+    },
+    /// ByProject mode. `collapsed` hides this project's session rows; `count` stays the
+    /// group's total member count (when collapsed, that IS the hidden-row count).
+    ProjectHeader {
+        root: PathBuf,
+        count: usize,
+        collapsed: bool,
+    },
     Session {
         backend: BackendKind,
         id: String,
@@ -71,6 +132,10 @@ pub struct App {
     /// Cached `hidden_count()` value, recomputed with the rows (it depends on exactly the
     /// same inputs), so the per-frame footer never re-filters the session list.
     hidden_rows: usize,
+    /// Groups the user has collapsed (keyed by the active grouping). A collapsed group still
+    /// renders its header but omits its session rows. Seeded once from the DB at startup and
+    /// persisted by the caller on every toggle.
+    collapsed: HashSet<GroupKey>,
 }
 
 impl App {
@@ -86,20 +151,29 @@ impl App {
             armed_kill: None,
             expanded: None,
             hidden_rows: 0,
+            collapsed: HashSet::new(),
         };
         app.rebuild_rows();
         app.clamp_selection();
         app
     }
 
-    /// Replace the session set, keeping the current selection anchored to the same
-    /// (backend,id) session row when it survives the refresh; otherwise clamp.
+    /// Replace the session set, keeping the current selection anchored across the refresh to
+    /// EITHER the same (backend,id) session row (existing behavior) OR, when a header is
+    /// selected, the same group header key (so a header selection is not lost on the 1s
+    /// background refresh); only when neither anchor survives does it clamp.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
-        let anchor = self.selected().map(|s| (s.backend, s.id.clone()));
+        let session_anchor = self.selected().map(|s| (s.backend, s.id.clone()));
+        let header_anchor = self.selected_header_key();
         self.sessions = sessions;
         self.rebuild_rows();
-        if let Some(anchor) = anchor
+        if let Some(anchor) = session_anchor
             && self.select_by_key(&anchor)
+        {
+            return;
+        }
+        if let Some(key) = header_anchor
+            && self.select_header(&key)
         {
             return;
         }
@@ -140,6 +214,65 @@ impl App {
 
     pub fn group_mode(&self) -> GroupMode {
         self.group_mode
+    }
+
+    /// Seed the collapsed set (called once at startup from the DB). Rebuilds rows + clamps.
+    pub fn set_collapsed(&mut self, collapsed: HashSet<GroupKey>) {
+        self.collapsed = collapsed;
+        self.rebuild_rows();
+        self.clamp_selection();
+    }
+
+    /// Read the collapsed set (persistence + tests).
+    pub fn collapsed(&self) -> &HashSet<GroupKey> {
+        &self.collapsed
+    }
+
+    /// Whether a group is currently collapsed.
+    pub fn is_group_collapsed(&self, key: &GroupKey) -> bool {
+        self.collapsed.contains(key)
+    }
+
+    /// If the selected row is a header, flip its collapsed state, rebuild rows, keep the
+    /// cursor on that same header, and return (key, now_collapsed) for the caller to persist.
+    /// None when the selected row is not a header (a session row or empty list).
+    pub fn toggle_selected_group(&mut self) -> Option<(GroupKey, bool)> {
+        let key = self.selected_header_key()?;
+        let now_collapsed = if self.collapsed.remove(&key) {
+            false
+        } else {
+            self.collapsed.insert(key.clone());
+            true
+        };
+        self.rebuild_rows();
+        self.select_header(&key);
+        Some((key, now_collapsed))
+    }
+
+    /// The GroupKey of the currently selected header row, if the selection is on one.
+    fn selected_header_key(&self) -> Option<GroupKey> {
+        match self.rows.get(self.selected)? {
+            Row::ProjectHeader { root, .. } => Some(GroupKey::Project(root.clone())),
+            Row::SectionHeader { section, .. } => Some(GroupKey::State(*section)),
+            _ => None,
+        }
+    }
+
+    /// Pin the selection onto the header row for `key` if it is currently visible (keeps the
+    /// cursor on a group header across a toggle/refresh). Returns true when found.
+    fn select_header(&mut self, key: &GroupKey) -> bool {
+        let found = self.rows.iter().position(|r| match (r, key) {
+            (Row::ProjectHeader { root, .. }, GroupKey::Project(k)) => root == k,
+            (Row::SectionHeader { section, .. }, GroupKey::State(k)) => section == k,
+            _ => false,
+        });
+        if let Some(idx) = found {
+            self.selected = idx;
+            self.sync_expanded();
+            true
+        } else {
+            false
+        }
     }
 
     /// Two-stage Ctrl+X (list page only). Selected session S, injected now_ms:
@@ -187,9 +320,11 @@ impl App {
         self.clamp_selection();
     }
 
-    /// j/k/arrows — cursor only, never rebuilds the row cache. Lands on Session rows,
-    /// skipping headers/spacers in the direction of travel. A single-step move (±1) off the
-    /// last/first session row WRAPS to the first/last one; larger deltas clamp as before.
+    /// j/k/arrows — cursor only, never rebuilds the row cache. Lands on selectable rows
+    /// (headers AND session rows), skipping only Spacer rows in the direction of travel (a
+    /// collapsed group's session rows are simply not emitted, so they need no extra skip). A
+    /// single-step move (±1) off the last/first selectable row WRAPS to the first/last one;
+    /// larger deltas clamp as before.
     pub fn move_selection(&mut self, delta: i32) {
         let len = self.rows.len();
         if len == 0 {
@@ -199,19 +334,19 @@ impl App {
         }
         let step: i32 = if delta >= 0 { 1 } else { -1 };
         let target = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
-        // Nearest Session row from `target` in the travel direction, else the other way.
+        // Nearest selectable row from `target` in the travel direction, else the other way.
         let chosen = self
-            .session_from(target, step)
-            .or_else(|| self.session_from(target, -step));
+            .selectable_from(target, step)
+            .or_else(|| self.selectable_from(target, -step));
 
         if let Some(c) = chosen {
-            // A single arrow press that can't advance means we are on the first/last session
-            // row — wrap to the opposite end.
+            // A single arrow press that can't advance means we are on the first/last
+            // selectable row — wrap to the opposite end.
             if delta == step && c == self.selected {
                 let wrapped = if step > 0 {
-                    self.session_from(0, 1)
+                    self.selectable_from(0, 1)
                 } else {
-                    self.session_from(len as i32 - 1, -1)
+                    self.selectable_from(len as i32 - 1, -1)
                 };
                 self.selected = wrapped.unwrap_or(c);
             } else {
@@ -221,17 +356,28 @@ impl App {
         self.sync_expanded();
     }
 
-    /// The first Session-row index at or beyond `start` walking in `step` direction, if any.
-    fn session_from(&self, start: i32, step: i32) -> Option<usize> {
+    /// The first row index at or beyond `start` (walking `step`) whose row matches `pred`.
+    fn scan_from(&self, start: i32, step: i32, pred: impl Fn(&Row) -> bool) -> Option<usize> {
         let len = self.rows.len() as i32;
         let mut idx = start;
         while (0..len).contains(&idx) {
-            if matches!(self.rows[idx as usize], Row::Session { .. }) {
+            if pred(&self.rows[idx as usize]) {
                 return Some(idx as usize);
             }
             idx += step;
         }
         None
+    }
+
+    /// The first selectable-row index at or beyond `start` walking in `step` direction, if
+    /// any. Selectable rows are everything but Spacer (headers + session rows).
+    fn selectable_from(&self, start: i32, step: i32) -> Option<usize> {
+        self.scan_from(start, step, |r| !matches!(r, Row::Spacer))
+    }
+
+    /// The first Session-row index at or beyond `start` walking in `step` direction, if any.
+    fn session_from(&self, start: i32, step: i32) -> Option<usize> {
+        self.scan_from(start, step, |r| matches!(r, Row::Session { .. }))
     }
 
     pub fn selected(&self) -> Option<&Session> {
@@ -332,7 +478,15 @@ impl App {
     ///   - ByState: the selected session's own cwd.
     ///
     /// None when the list is empty (nothing selected).
+    ///
+    /// On a selected header: a ProjectHeader spawns into its own root (a sensible dir); a
+    /// SectionHeader has no spawn dir (None -> the caller shows the "no target" footer notice).
     pub fn spawn_target(&self) -> Option<PathBuf> {
+        match self.rows.get(self.selected) {
+            Some(Row::ProjectHeader { root, .. }) => return Some(root.clone()),
+            Some(Row::SectionHeader { .. }) => return None,
+            _ => {}
+        }
         let session = self.selected()?;
         match self.group_mode {
             GroupMode::ByProject => Some(self.cached_root(&session.cwd)),
@@ -448,12 +602,18 @@ impl App {
             if !rows.is_empty() {
                 rows.push(Row::Spacer);
             }
+            // A collapsed section still shows its header (count = hidden rows) but omits its
+            // session rows.
+            let collapsed = self.collapsed.contains(&GroupKey::State(section));
             rows.push(Row::SectionHeader {
                 section,
                 count: members.len(),
+                collapsed,
             });
-            for &i in &members {
-                rows.push(Self::session_row(&self.sessions[i]));
+            if !collapsed {
+                for &i in &members {
+                    rows.push(Self::session_row(&self.sessions[i]));
+                }
             }
         }
         rows
@@ -475,6 +635,8 @@ impl App {
         }
         // `indices` is recency DESC, so the first time we see a root is its newest
         // session — `order` is therefore already group-order (newest group first).
+        // Roots are computed above (the only &mut self borrow, via root_of); the emit loop
+        // below reads self.collapsed / self.sessions immutably.
         let mut rows = Vec::new();
         for root in order {
             let members = &by_root[&root];
@@ -482,12 +644,18 @@ impl App {
             if !rows.is_empty() {
                 rows.push(Row::Spacer);
             }
+            // A collapsed project still shows its header (count = hidden rows) but omits its
+            // session rows.
+            let collapsed = self.collapsed.contains(&GroupKey::Project(root.clone()));
             rows.push(Row::ProjectHeader {
                 root: root.clone(),
                 count: members.len(),
+                collapsed,
             });
-            for &i in members {
-                rows.push(Self::session_row(&self.sessions[i]));
+            if !collapsed {
+                for &i in members {
+                    rows.push(Self::session_row(&self.sessions[i]));
+                }
             }
         }
         rows
@@ -506,11 +674,15 @@ impl App {
             self.selected = len - 1;
         }
         if !matches!(self.rows.get(self.selected), Some(Row::Session { .. })) {
-            // Snap onto the nearest Session row: search forward from here, then backward.
+            // Prefer a Session row (so startup + a vanished selection land on a session):
+            // search forward from here, then backward. Only when no session row exists (e.g.
+            // every group collapsed) fall back to the nearest selectable header.
             let here = self.selected as i32;
             if let Some(found) = self
                 .session_from(here, 1)
                 .or_else(|| self.session_from(here - 1, -1))
+                .or_else(|| self.selectable_from(here, 1))
+                .or_else(|| self.selectable_from(here - 1, -1))
             {
                 self.selected = found;
             }

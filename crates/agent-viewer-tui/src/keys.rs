@@ -110,7 +110,11 @@ fn handle_normal_key(
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
             if ui.composer.is_empty() {
-                attach_selected(backends, ui, terminal)?;
+                // On a group header, Enter collapses/expands the group (and persists) instead
+                // of attaching; on a session it attaches as before.
+                if !toggle_group_if_header(ui) {
+                    attach_selected(backends, ui, terminal)?;
+                }
             } else {
                 spawn_from_composer(backends, refresher, ui);
             }
@@ -129,8 +133,18 @@ fn handle_normal_key(
                     'u' => hide_selected(backends, ui, false),
                     'r' => open_reply(backends, ui),
                     '?' => ui.mode = Mode::Help,
-                    // Space toggles the inline peek expansion of the selected row.
-                    ' ' if ui.app.selected().is_some() => ui.app.toggle_expanded(),
+                    // On a header, Space collapses/expands the group (and persists), never
+                    // typing a space; on a session it toggles the inline peek; otherwise it
+                    // is composer text.
+                    ' ' => {
+                        if !toggle_group_if_header(ui) {
+                            if ui.app.selected().is_some() {
+                                ui.app.toggle_expanded();
+                            } else {
+                                ui.composer.push_char(' ');
+                            }
+                        }
+                    }
                     // '/' is no longer a filter hotkey — it types into the composer so a
                     // slash command like `/implement RS-123` spawns as the task prompt.
                     _ => ui.composer.push_char(c),
@@ -294,6 +308,18 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 }
 
 // --- Actions --------------------------------------------------------------------
+
+/// Enter/Space on a header toggles + persists the collapse. Returns true when a header was
+/// handled (so the caller skips attach/peek).
+fn toggle_group_if_header(ui: &mut Ui) -> bool {
+    let Some((key, collapsed)) = ui.app.toggle_selected_group() else {
+        return false;
+    };
+    if let Some(db) = &ui.db {
+        let _ = db.set_group_collapsed(&key.to_storage(), collapsed);
+    }
+    true
+}
 
 /// Ctrl+F — enter filter mode with a fresh, empty query.
 fn open_filter(ui: &mut Ui) {
