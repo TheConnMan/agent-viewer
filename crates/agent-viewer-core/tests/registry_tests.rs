@@ -97,6 +97,44 @@ fn threads_maps_rows_and_orders_by_recency() {
 }
 
 #[test]
+fn distinct_models_orders_by_frequency_and_drops_empty_null() {
+    let schema = common::read_fixture("threads_schema.sql");
+    // gpt-5 x3, gpt-5-codex x2, o3 x1, plus one empty-string and one NULL model that
+    // must be dropped entirely.
+    let mut inserts = Vec::new();
+    let rows = [
+        ("m1", "gpt-5"),
+        ("m2", "gpt-5"),
+        ("m3", "gpt-5"),
+        ("m4", "gpt-5-codex"),
+        ("m5", "gpt-5-codex"),
+        ("m6", "o3"),
+        ("m7", "''"), // empty-string model literal
+        ("m8", "NULL"),
+    ];
+    for (id, model) in rows {
+        let model_literal = if model == "NULL" || model == "''" {
+            model.to_string()
+        } else {
+            format!("'{model}'")
+        };
+        inserts.push(format!(
+            "{INSERT_COLS}\
+             ('{id}','/r/{id}.jsonl',1,1,'cli','openai','/p','T',\
+              'workspace-write','on-request',0,{model_literal},NULL,'msg','preview',1000,1000)"
+        ));
+    }
+    let insert_refs: Vec<&str> = inserts.iter().map(String::as_str).collect();
+    let (_dir, path) = common::temp_db(&schema, &insert_refs);
+
+    let reg = Registry::open(&path).expect("open read-only");
+    let models = reg.distinct_models().expect("distinct models");
+    // Most-used first; empty and NULL never appear.
+    assert_eq!(models, vec!["gpt-5", "gpt-5-codex", "o3"]);
+    assert!(!models.iter().any(|m| m.is_empty()));
+}
+
+#[test]
 fn open_missing_db_errors_and_creates_nothing() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("nope.sqlite");

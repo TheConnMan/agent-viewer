@@ -480,9 +480,14 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     }
     draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[4]);
 
-    // Slash-command completion popup, floating just above the composer box.
+    // Completion popup floating just above the composer box: the /model picker when a /model
+    // command is being typed, else the slash-command popup.
     if matches!(d.mode, Mode::Normal) {
-        draw_slash_popup(frame, d.composer, vertical[3]);
+        if d.composer.is_model_command() {
+            draw_model_popup(frame, d.composer, vertical[3]);
+        } else {
+            draw_slash_popup(frame, d.composer, vertical[3]);
+        }
     }
 
     if matches!(d.mode, Mode::Help) {
@@ -519,6 +524,41 @@ fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect)
                 fg(theme::MUTED)
             };
             ListItem::new(Line::from(Span::styled(format!(" /{name}"), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(items), area);
+}
+
+/// Render the `/model` picker suggestions as muted lines above the composer box (the
+/// highlighted row in accent), mirroring `draw_slash_popup` but with no leading slash.
+/// Nothing renders when there are no suggestions.
+fn draw_model_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
+    let suggestions = composer.model_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let height = (suggestions.len() as u16).min(composer_area.y);
+    if height == 0 {
+        return;
+    }
+    let area = Rect {
+        x: composer_area.x,
+        y: composer_area.y - height,
+        width: composer_area.width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let highlight = composer.suggestion_highlight();
+    let items: Vec<ListItem> = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let style = if i == highlight {
+                fg(theme::ACCENT)
+            } else {
+                fg(theme::MUTED)
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {model}"), style)))
         })
         .collect();
     frame.render_widget(List::new(items), area);
@@ -1073,7 +1113,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q/Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q/Ctrl+C quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -1156,6 +1196,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("→ / Enter", "attach selected (empty composer)"),
         ("type · Tab", "compose task · switch agent"),
         ("Shift+Tab", "cycle agent model"),
+        ("/model", "pick from all available models"),
         ("Enter", "spawn composed task"),
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),

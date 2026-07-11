@@ -801,52 +801,173 @@ fn filter_search_covers_hidden_and_companion_sessions() {
 }
 
 #[test]
-fn composer_cycles_model_and_resets_on_backend_change() {
+fn composer_set_models_selects_default_first() {
+    // The caller installs the discovered list; the leading entry (index 0) becomes the
+    // current selection, and the install key records the backend it was scanned for.
     let mut c = Composer::new();
-    // Claude starts on its first model.
-    assert_eq!(c.backend(), BackendKind::Claude);
-    assert_eq!(c.model(), "opus[1m]");
-    // Shift+Tab cycles the claude models opus[1m] -> sonnet -> fable -> opus[1m].
-    c.cycle_model();
-    assert_eq!(c.model(), "sonnet");
-    c.cycle_model();
-    assert_eq!(c.model(), "fable");
-    c.cycle_model();
-    assert_eq!(c.model(), "opus[1m]");
-
-    // Move off the default model, then Tab to codex resets the model slot to its first.
-    c.cycle_model(); // sonnet
-    assert_eq!(c.model(), "sonnet");
-    c.cycle_backend(); // -> codex, model reset
-    assert_eq!(c.backend(), BackendKind::Codex);
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into(), "gpt-5.5".into()],
+        BackendKind::Codex,
+    );
     assert_eq!(c.model(), "default");
-    // Opencode has a single-entry cycle: Shift+Tab stays put.
-    c.cycle_backend(); // -> opencode
-    assert_eq!(c.backend(), BackendKind::Opencode);
-    assert_eq!(c.model(), "default");
-    c.cycle_model();
-    assert_eq!(c.model(), "default");
-    // Back to claude resets to its first model, not any previously-cycled one.
-    c.cycle_backend(); // claude
-    assert_eq!(c.backend(), BackendKind::Claude);
-    assert_eq!(c.model(), "opus[1m]");
+    assert_eq!(c.models_key(), Some(BackendKind::Codex));
 }
 
-// --- v2.5: codex models, slash-command completion ---
-
 #[test]
-fn composer_codex_model_cycle_order() {
+fn composer_cycle_model_over_discovered_list() {
+    // Shift+Tab advances through the caller-installed list, wrapping at the end.
     let mut c = Composer::new();
-    c.cycle_backend(); // claude -> codex
-    assert_eq!(c.backend(), BackendKind::Codex);
+    c.cycle_backend(); // -> codex
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into(), "gpt-5.5".into()],
+        BackendKind::Codex,
+    );
     assert_eq!(c.model(), "default");
     c.cycle_model();
-    assert_eq!(c.model(), "gpt-5.3-codex");
+    assert_eq!(c.model(), "gpt-5.6-sol");
     c.cycle_model();
-    assert_eq!(c.model(), "gpt-5.2-codex");
+    assert_eq!(c.model(), "gpt-5.5");
     c.cycle_model();
     assert_eq!(c.model(), "default"); // wraps
 }
+
+#[test]
+fn composer_cycle_model_noop_on_opencode_and_single_item() {
+    // Opencode's list is huge, so Shift+Tab is a NO-OP there (the picker is the way).
+    let mut c = Composer::new();
+    c.cycle_backend(); // codex
+    c.cycle_backend(); // opencode
+    assert_eq!(c.backend(), BackendKind::Opencode);
+    c.set_models(
+        vec![
+            "default".into(),
+            "anthropic/claude".into(),
+            "openai/gpt".into(),
+        ],
+        BackendKind::Opencode,
+    );
+    assert_eq!(c.model(), "default");
+    c.cycle_model();
+    assert_eq!(c.model(), "default"); // unchanged despite a multi-item list
+
+    // A single-item list is a no-op on any backend.
+    let mut c2 = Composer::new();
+    c2.set_models(vec!["opus[1m]".into()], BackendKind::Claude);
+    assert_eq!(c2.model(), "opus[1m]");
+    c2.cycle_model();
+    assert_eq!(c2.model(), "opus[1m]");
+}
+
+// --- v2.6: /model picker ---
+
+#[test]
+fn composer_is_model_command_detection() {
+    let mut c = Composer::new();
+    let set = |c: &mut Composer, s: &str| {
+        c.clear();
+        for ch in s.chars() {
+            c.push_char(ch);
+        }
+    };
+    set(&mut c, "/model");
+    assert!(c.is_model_command());
+    set(&mut c, "/model gpt");
+    assert!(c.is_model_command());
+    set(&mut c, "/implement");
+    assert!(!c.is_model_command());
+    // "/models" is neither "/model" nor a "/model " prefix.
+    set(&mut c, "/models");
+    assert!(!c.is_model_command());
+    c.clear();
+    assert!(!c.is_model_command()); // empty text
+}
+
+#[test]
+fn composer_model_suggestions_filter_and_cap() {
+    let mut c = Composer::new();
+    // 20 models, 10 containing "gpt" plus one uppercase match to prove case-insensitivity.
+    let mut list: Vec<String> = (0..10).map(|i| format!("gpt-{i}")).collect();
+    list.extend((0..10).map(|i| format!("claude-{i}")));
+    list.push("GPT-SOL".to_string());
+    c.set_models(list, BackendKind::Codex);
+
+    // Bare "/model": first 8 of the whole list.
+    for ch in "/model".chars() {
+        c.push_char(ch);
+    }
+    let all = c.model_suggestions();
+    assert_eq!(all.len(), 8);
+    assert_eq!(all[0], "gpt-0");
+
+    // "/model gpt": only substring matches (case-insensitive), capped at 8 (11 match).
+    c.clear();
+    for ch in "/model gpt".chars() {
+        c.push_char(ch);
+    }
+    let gpt = c.model_suggestions();
+    assert_eq!(gpt.len(), 8);
+    assert!(gpt.iter().all(|m| m.to_lowercase().contains("gpt")));
+}
+
+#[test]
+fn composer_accept_model_sets_model_and_clears_text() {
+    let mut c = Composer::new();
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into(), "gpt-5.5".into()],
+        BackendKind::Codex,
+    );
+    for ch in "/model 5.5".chars() {
+        c.push_char(ch);
+    }
+    // The single "5.5" substring match is highlighted at index 0.
+    assert_eq!(c.model_suggestions(), vec!["gpt-5.5".to_string()]);
+    assert!(c.accept_model());
+    assert_eq!(c.model(), "gpt-5.5");
+    assert!(c.is_empty()); // accept clears the composer text
+}
+
+#[test]
+fn composer_move_suggestion_drives_model_picker() {
+    // Up/Down share the highlight between the two popups; here it walks the model picker.
+    let mut c = Composer::new();
+    c.set_models(
+        vec!["default".into(), "gpt-a".into(), "gpt-b".into()],
+        BackendKind::Codex,
+    );
+    for ch in "/model gpt".chars() {
+        c.push_char(ch);
+    }
+    assert_eq!(
+        c.model_suggestions(),
+        vec!["gpt-a".to_string(), "gpt-b".to_string()]
+    );
+    assert_eq!(c.suggestion_highlight(), 0);
+    c.move_suggestion(1);
+    assert_eq!(c.suggestion_highlight(), 1);
+    // accept_model picks the highlighted (second) entry.
+    assert!(c.accept_model());
+    assert_eq!(c.model(), "gpt-b");
+}
+
+#[test]
+fn composer_slash_suggestions_empty_while_model_command() {
+    // "/model" is the model meta-command: the SLASH popup stays empty (only the model
+    // picker shows), even when "model" is itself a registered slash command.
+    let mut c = Composer::new();
+    c.set_commands(
+        vec!["model".into(), "modernize".into()],
+        (BackendKind::Claude, None),
+    );
+    for ch in "/model".chars() {
+        c.push_char(ch);
+    }
+    assert!(c.is_model_command());
+    assert!(c.suggestions().is_empty());
+    assert!(!c.suggestions_active());
+    assert!(c.model_picking()); // the model picker is the active popup instead
+}
+
+// --- v2.5: codex models, slash-command completion ---
 
 #[test]
 fn composer_slash_suggestions_prefix_filter() {

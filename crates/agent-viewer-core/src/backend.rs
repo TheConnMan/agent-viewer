@@ -114,6 +114,11 @@ pub trait Backend: Send {
         task: &str,
         model: Option<&str>,
     ) -> crate::error::Result<Option<u32>>;
+    /// Candidate models for the composer's model picker, DEFAULT-FIRST and deduped.
+    /// Discovery is best-effort and cached; a failing probe degrades to just the default.
+    fn available_models(&self) -> Vec<String> {
+        vec!["default".to_string()]
+    }
     fn hide(&self, id: &str) -> crate::error::Result<()> {
         let _ = id;
         Err(crate::error::Error::Unsupported(self.kind().name()))
@@ -141,6 +146,20 @@ pub trait Backend: Send {
     fn attach_command(&self, session: &Session) -> Option<std::process::Command>;
 }
 
+/// Remove duplicates while preserving first-seen order (case-sensitive exact match).
+/// Used by every backend's `available_models` to fold the leading default in with the
+/// discovered slugs without reordering them.
+pub(crate) fn dedup_preserve(v: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(v.len());
+    for item in v {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// The fixed v1 roster: Codex (default_codex_home), Claude ("claude" on PATH),
 /// Opencode (~/.local/share/opencode/opencode.db). No config surface.
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
@@ -149,4 +168,65 @@ pub fn all_backends() -> Vec<Box<dyn Backend>> {
         Box::new(crate::claude::ClaudeBackend::new()),
         Box::new(crate::opencode::OpencodeBackend::new()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_preserve_keeps_first_seen_order() {
+        let got = dedup_preserve(vec![
+            "default".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+        ]);
+        assert_eq!(got, vec!["default", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn dedup_preserve_is_case_sensitive() {
+        let got = dedup_preserve(vec!["A".to_string(), "a".to_string(), "A".to_string()]);
+        assert_eq!(got, vec!["A", "a"]);
+    }
+
+    #[test]
+    fn trait_default_available_models_is_just_default() {
+        // A minimal backend that overrides nothing gets the trait fallback: `["default"]`.
+        struct Dummy;
+        impl Backend for Dummy {
+            fn kind(&self) -> BackendKind {
+                BackendKind::Codex
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    spawn: false,
+                    hide: false,
+                    attach: false,
+                    stop: false,
+                    remove: false,
+                    rename: false,
+                    reply: false,
+                }
+            }
+            fn list(&mut self) -> crate::error::Result<Vec<Session>> {
+                Ok(Vec::new())
+            }
+            fn spawn(
+                &self,
+                _dir: &std::path::Path,
+                _task: &str,
+                _model: Option<&str>,
+            ) -> crate::error::Result<Option<u32>> {
+                Ok(None)
+            }
+            fn attach_command(&self, _session: &Session) -> Option<std::process::Command> {
+                None
+            }
+        }
+        assert_eq!(Dummy.available_models(), vec!["default".to_string()]);
+    }
 }

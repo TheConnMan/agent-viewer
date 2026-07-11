@@ -1,8 +1,12 @@
 use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
 use crate::error::{Error, Result};
+use std::sync::OnceLock;
 
 pub struct OpencodeBackend {
     db_path: std::path::PathBuf,
+    /// Discovered model list, computed once and reused (best-effort; degrades to just the
+    /// default when the `opencode models` probe fails).
+    models_cache: OnceLock<Vec<String>>,
 }
 
 impl OpencodeBackend {
@@ -10,10 +14,14 @@ impl OpencodeBackend {
     pub fn new() -> OpencodeBackend {
         OpencodeBackend {
             db_path: crate::home_dir().join(".local/share/opencode/opencode.db"),
+            models_cache: OnceLock::new(),
         }
     }
     pub fn with_db(db_path: std::path::PathBuf) -> OpencodeBackend {
-        OpencodeBackend { db_path }
+        OpencodeBackend {
+            db_path,
+            models_cache: OnceLock::new(),
+        }
     }
 }
 
@@ -82,6 +90,16 @@ impl Backend for OpencodeBackend {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+    fn available_models(&self) -> Vec<String> {
+        // default first, then whatever `opencode models` lists (provider/model ids).
+        self.models_cache
+            .get_or_init(|| {
+                let mut models = vec!["default".to_string()];
+                models.extend(opencode_models_via_cli());
+                crate::backend::dedup_preserve(models)
+            })
+            .clone()
+    }
     fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         let title: String = task.chars().take(40).collect();
         let mut cmd = std::process::Command::new("opencode");
@@ -138,6 +156,28 @@ impl Backend for OpencodeBackend {
 /// Default opencode DB path (mirrors OpencodeBackend::new()).
 pub fn default_opencode_db() -> std::path::PathBuf {
     crate::home_dir().join(".local/share/opencode/opencode.db")
+}
+
+/// Run `opencode models` and parse stdout. Any failure (spawn error, non-zero exit) is a
+/// quiet empty Vec — discovery is best-effort.
+fn opencode_models_via_cli() -> Vec<String> {
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.arg("models");
+    match crate::spawn::run_with_timeout(cmd, std::time::Duration::from_secs(3)) {
+        Some(stdout) => parse_opencode_models(&stdout),
+        None => Vec::new(),
+    }
+}
+
+/// PURE: each non-empty trimmed line of `opencode models` stdout is a model id
+/// (format `provider/model`). Blank/whitespace-only lines are dropped.
+pub fn parse_opencode_models(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
 }
 
 /// The most recent opencode message that has text, as a TranscriptItem (role + concatenated

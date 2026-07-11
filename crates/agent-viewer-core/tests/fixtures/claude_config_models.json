@@ -1,0 +1,20 @@
+{
+  "additionalModelOptionsCache": [
+    {"value": "opusplan", "label": "Opus Plan"},
+    {"value": "sonnet[1m]", "label": "Sonnet 1M"}
+  ],
+  "projects": {
+    "/home/user/proj-a": {
+      "lastModelUsage": {
+        "claude-opus-4-8": {"inputTokens": 100},
+        "claude-sonnet-4-5": {"inputTokens": 50}
+      }
+    },
+    "/home/user/proj-b": {
+      "lastModelUsage": {
+        "claude-sonnet-4-5": {"inputTokens": 20},
+        "claude-haiku-4-5": {"inputTokens": 10}
+      }
+    }
+  }
+}

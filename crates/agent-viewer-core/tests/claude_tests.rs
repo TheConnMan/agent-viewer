@@ -2,7 +2,8 @@ mod common;
 
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, Status};
 use agent_viewer_core::claude::{
-    ClaudeBackend, parse_agents_json, parse_job_state, read_claude_transcript,
+    ClaudeBackend, parse_agents_json, parse_claude_json_models, parse_job_state,
+    read_claude_transcript,
 };
 use agent_viewer_core::codex::rollout::TranscriptItem;
 use std::io::Write;
@@ -53,6 +54,30 @@ fn claude_parse_maps_six_states_and_pid() {
     assert_eq!(nostate.status, Status::Idle);
     assert_eq!(nostate.pid, None);
     assert_eq!(nostate.short_id, Some("nost0001".to_string()));
+}
+
+#[test]
+fn parse_claude_json_models_cache_first_then_sorted_usage_union() {
+    let json = common::read_fixture("claude_config_models.json");
+    let got = parse_claude_json_models(&json);
+    // additionalModelOptionsCache values first, in array order; then the union of all
+    // projects' lastModelUsage keys sorted ascending (overlapping sonnet appears once).
+    assert_eq!(
+        got,
+        vec![
+            "opusplan",
+            "sonnet[1m]",
+            "claude-haiku-4-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-5",
+        ]
+    );
+}
+
+#[test]
+fn parse_claude_json_models_malformed_is_empty() {
+    assert!(parse_claude_json_models("not json").is_empty());
+    assert!(parse_claude_json_models("{}").is_empty());
 }
 
 #[test]

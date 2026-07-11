@@ -3,7 +3,7 @@ mod common;
 use agent_viewer_core::Status;
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::opencode::{
-    OpencodeBackend, opencode_status, read_opencode_last_message, rename_sql,
+    OpencodeBackend, opencode_status, parse_opencode_models, read_opencode_last_message, rename_sql,
 };
 use std::path::PathBuf;
 
@@ -184,6 +184,28 @@ fn opencode_last_message_missing_db_is_none() {
         read_opencode_last_message(&missing, "ses_1")
             .expect("read ok")
             .is_none()
+    );
+}
+
+// --- v2: `opencode models` stdout parse ---
+
+#[test]
+fn parse_opencode_models_trims_and_drops_blanks() {
+    let stdout = "\
+anthropic/claude-opus-4-8
+  openai/gpt-5.6
+
+github-copilot/gpt-5
+
+";
+    let got = parse_opencode_models(stdout);
+    assert_eq!(
+        got,
+        vec![
+            "anthropic/claude-opus-4-8",
+            "openai/gpt-5.6",
+            "github-copilot/gpt-5",
+        ]
     );
 }
 

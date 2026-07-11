@@ -1,0 +1,8 @@
+{
+  "models": [
+    {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6 Sol", "visibility": "list", "priority": 2, "supported_in_api": true},
+    {"slug": "gpt-5.6-pro", "display_name": "GPT-5.6 Pro", "visibility": "list", "priority": 1, "supported_in_api": true},
+    {"slug": "gpt-5.6-internal", "display_name": "Internal", "visibility": "hide", "priority": 0, "supported_in_api": false},
+    {"slug": "gpt-5.6-mini", "display_name": "GPT-5.6 Mini", "visibility": "list", "supported_in_api": true}
+  ]
+}

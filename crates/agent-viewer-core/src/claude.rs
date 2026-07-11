@@ -2,6 +2,7 @@ use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, Status}
 use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 pub struct ClaudeBackend {
@@ -9,6 +10,9 @@ pub struct ClaudeBackend {
     /// Per-job state.json cache keyed by (mtime, len): the file is re-read and re-parsed
     /// only when it changes, not every tick (mirrors the codex StatusResolver pattern).
     detail_cache: HashMap<PathBuf, ((SystemTime, u64), JobDetail)>,
+    /// Discovered model list, computed once and reused (best-effort; degrades to just the
+    /// opus[1m] default when ~/.claude.json is missing or unreadable).
+    models_cache: OnceLock<Vec<String>>,
 }
 
 impl ClaudeBackend {
@@ -19,6 +23,7 @@ impl ClaudeBackend {
         ClaudeBackend {
             binary: binary.to_string(),
             detail_cache: HashMap::new(),
+            models_cache: OnceLock::new(),
         }
     }
 
@@ -111,6 +116,19 @@ impl Backend for ClaudeBackend {
             }
         }
         Ok(sessions)
+    }
+    fn available_models(&self) -> Vec<String> {
+        // opus[1m] (the non-pinned alias) first, then whatever ~/.claude.json advertises.
+        self.models_cache
+            .get_or_init(|| {
+                let mut models = vec!["opus[1m]".to_string()];
+                let path = crate::home_dir().join(".claude.json");
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    models.extend(parse_claude_json_models(&text));
+                }
+                crate::backend::dedup_preserve(models)
+            })
+            .clone()
     }
     fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         // Detach like the other backends so the TUI key handler returns immediately
@@ -318,6 +336,47 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
         });
     }
     Ok(sessions)
+}
+
+/// PURE: candidate model ids collected from a claude config JSON (`~/.claude.json`).
+/// Order: every `additionalModelOptionsCache[].value` (a top-level array of objects) in
+/// array order, then the UNION of every `projects.<path>.lastModelUsage` key (each is a
+/// map of model-id -> usage stats) sorted ascending. Empty strings are skipped; the
+/// caller dedups. Malformed/missing keys yield whatever can be collected; never panics.
+pub fn parse_claude_json_models(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    // additionalModelOptionsCache: [{ "value": "<model>" }, ...] in array order.
+    if let Some(cache) = value
+        .get("additionalModelOptionsCache")
+        .and_then(|c| c.as_array())
+    {
+        for entry in cache {
+            if let Some(v) = crate::json_str(entry, "value")
+                && !v.is_empty()
+            {
+                out.push(v.to_string());
+            }
+        }
+    }
+    // projects.<path>.lastModelUsage keys, unioned across projects and sorted ascending
+    // (BTreeSet gives both dedup and sort for free).
+    let mut usage_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(projects) = value.get("projects").and_then(|p| p.as_object()) {
+        for project in projects.values() {
+            if let Some(usage) = project.get("lastModelUsage").and_then(|u| u.as_object()) {
+                for key in usage.keys() {
+                    if !key.is_empty() {
+                        usage_keys.insert(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    out.extend(usage_keys);
+    out
 }
 
 /// Parsed subset of a claude jobs `state.json` (verified fields 2026-07-11).
