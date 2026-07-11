@@ -67,6 +67,10 @@ pub struct App {
     root_cache: HashMap<PathBuf, PathBuf>,
     /// The armed (backend, id, armed_at_ms) for the two-stage Ctrl+X.
     armed_kill: Option<(BackendKind, String, i64)>,
+    /// The row expanded in place for an inline peek (keyed by session). Held in App so the
+    /// rebuild path can centrally collapse it the moment the selection diverges from it
+    /// (regroup / show-all / filter / cursor move), never rendering the wrong transcript.
+    expanded: Option<(BackendKind, String)>,
 }
 
 impl App {
@@ -80,6 +84,7 @@ impl App {
             rows: Vec::new(),
             root_cache: HashMap::new(),
             armed_kill: None,
+            expanded: None,
         };
         app.rebuild_rows();
         app.clamp_selection();
@@ -98,6 +103,7 @@ impl App {
             })
         {
             self.selected = idx;
+            self.sync_expanded();
             return;
         }
         self.clamp_selection();
@@ -195,28 +201,36 @@ impl App {
         let len = self.rows.len();
         if len == 0 {
             self.selected = 0;
+            self.sync_expanded();
             return;
         }
         let target = (self.selected as i32 + delta).clamp(0, len as i32 - 1);
         let step: i32 = if delta >= 0 { 1 } else { -1 };
-        // Walk from the clamped target toward the travel direction for a Session row.
+        // Walk from the clamped target toward the travel direction for a Session row;
+        // if none that way (target sat past the last session), fall back the other way.
+        let mut chosen = None;
         let mut idx = target;
         while (0..len as i32).contains(&idx) {
             if matches!(self.rows[idx as usize], Row::Session { .. }) {
-                self.selected = idx as usize;
-                return;
+                chosen = Some(idx as usize);
+                break;
             }
             idx += step;
         }
-        // None that way (target sat past the last session) — fall back the other way.
-        let mut idx = target;
-        while (0..len as i32).contains(&idx) {
-            if matches!(self.rows[idx as usize], Row::Session { .. }) {
-                self.selected = idx as usize;
-                return;
+        if chosen.is_none() {
+            let mut idx = target;
+            while (0..len as i32).contains(&idx) {
+                if matches!(self.rows[idx as usize], Row::Session { .. }) {
+                    chosen = Some(idx as usize);
+                    break;
+                }
+                idx -= step;
             }
-            idx -= step;
         }
+        if let Some(c) = chosen {
+            self.selected = c;
+        }
+        self.sync_expanded();
     }
 
     pub fn selected(&self) -> Option<&Session> {
@@ -232,6 +246,48 @@ impl App {
     /// Index of the currently selected row (aligns 1:1 with `visible()`).
     pub fn selected_index(&self) -> usize {
         self.selected
+    }
+
+    /// (backend, id) of the currently selected session row, if any.
+    fn selected_key(&self) -> Option<(BackendKind, String)> {
+        match self.rows.get(self.selected)? {
+            Row::Session { backend, id, .. } => Some((*backend, id.clone())),
+            _ => None,
+        }
+    }
+
+    /// Space: toggle the inline peek expansion of the selected row (one at a time).
+    pub fn toggle_expanded(&mut self) {
+        let key = self.selected_key();
+        self.expanded = match (key, self.expanded.take()) {
+            (Some(k), Some(e)) if k == e => None, // already expanded -> collapse
+            (Some(k), _) => Some(k),
+            (None, _) => None,
+        };
+    }
+
+    /// The currently inline-expanded row, if any.
+    pub fn expanded(&self) -> Option<&(BackendKind, String)> {
+        self.expanded.as_ref()
+    }
+
+    /// The session behind a (backend, id) key (for resolving expansion content by the
+    /// EXPANDED key rather than the selection, which may have since diverged).
+    pub fn session_for(&self, key: &(BackendKind, String)) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .find(|s| s.backend == key.0 && s.id == key.1)
+    }
+
+    /// Collapse the expansion whenever the selected row is no longer the expanded row (a
+    /// regroup / show-all / filter / cursor move landed elsewhere). Called after every
+    /// selection settle so a stale expansion can never render another session's transcript.
+    fn sync_expanded(&mut self) {
+        if let Some(e) = &self.expanded
+            && self.selected_key().as_ref() != Some(e)
+        {
+            self.expanded = None;
+        }
     }
 
     /// Project root of the group the selection sits in (header or session row).
@@ -399,31 +455,40 @@ impl App {
         rows
     }
 
-    /// Clamp selection into bounds and snap it onto a Session row when possible.
+    /// Clamp selection into bounds and snap it onto a Session row when possible, then sync
+    /// the inline expansion (collapse it if the selection has moved off the expanded row).
     fn clamp_selection(&mut self) {
         let len = self.rows.len();
         if len == 0 {
             self.selected = 0;
+            self.sync_expanded();
             return;
         }
         if self.selected >= len {
             self.selected = len - 1;
         }
-        if matches!(self.rows.get(self.selected), Some(Row::Session { .. })) {
-            return;
-        }
-        for i in self.selected..len {
-            if matches!(self.rows[i], Row::Session { .. }) {
-                self.selected = i;
-                return;
+        if !matches!(self.rows.get(self.selected), Some(Row::Session { .. })) {
+            // Snap onto the nearest Session row: search forward from here, then backward.
+            let mut found = None;
+            for i in self.selected..len {
+                if matches!(self.rows[i], Row::Session { .. }) {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for i in (0..self.selected).rev() {
+                    if matches!(self.rows[i], Row::Session { .. }) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(f) = found {
+                self.selected = f;
             }
         }
-        for i in (0..self.selected).rev() {
-            if matches!(self.rows[i], Row::Session { .. }) {
-                self.selected = i;
-                return;
-            }
-        }
+        self.sync_expanded();
     }
 }
 

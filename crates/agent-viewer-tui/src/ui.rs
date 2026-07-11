@@ -319,10 +319,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         Mode::Rename(m) => Some((m.backend, m.id.as_str(), m.buffer.as_str())),
         _ => None,
     };
-    let expand_lines = if d.expanded.is_some() {
-        expansion_lines(d.app, d.peek)
-    } else {
-        Vec::new()
+    let expand_lines = match d.expanded {
+        Some(key) => expansion_lines(d.app, d.peek, key),
+        None => Vec::new(),
     };
     let deco = ListDeco {
         rename,
@@ -347,10 +346,11 @@ struct ListDeco<'a> {
     expand_lines: &'a [String],
 }
 
-/// Up to 8 muted lines for the inline expansion of the selected row: the transcript tail
-/// (codex/claude) collapsed one item per line, or metadata (opencode / no transcript).
-fn expansion_lines(app: &App, peek: &PeekCache) -> Vec<String> {
-    let Some(session) = app.selected() else {
+/// Up to 8 muted lines for the inline expansion of the EXPANDED row (resolved by its key,
+/// not the selection — which App keeps in sync but which could momentarily diverge): the
+/// transcript tail (codex/claude) collapsed one item per line, or metadata (opencode).
+fn expansion_lines(app: &App, peek: &PeekCache, key: &(BackendKind, String)) -> Vec<String> {
+    let Some(session) = app.session_for(key) else {
         return Vec::new();
     };
     if session.rollout_path.is_none() {
@@ -467,7 +467,19 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
     let list = List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
     let mut state = ListState::default();
     if !rows.is_empty() {
-        state.select(Some(app.selected_index().min(rows.len() - 1)));
+        let sel = app.selected_index().min(rows.len() - 1);
+        state.select(Some(sel));
+        // The List widget only scrolls the SELECTED item into view — the expansion lines
+        // that follow it can fall below the viewport (under the composer). When expanded,
+        // push the offset up so the selected row plus all its expansion lines are visible.
+        let viewport = area.height as usize;
+        if !deco.expand_lines.is_empty() && viewport > 0 {
+            let last = sel + deco.expand_lines.len(); // item index of the last expansion line
+            if last >= viewport {
+                // Keep the selected row itself visible (never scroll past it).
+                *state.offset_mut() = (last + 1 - viewport).min(sel);
+            }
+        }
     }
     frame.render_stateful_widget(list, area, &mut state);
 }

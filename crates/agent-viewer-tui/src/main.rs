@@ -141,13 +141,17 @@ enum AutoEnterStage {
 }
 
 /// One-shot auto-Enter state for a live claude attach: which PTY, when it was armed, which
-/// stage we are on, and when the current stage's marker was first seen (settle debounce).
+/// stage we are on, when the current stage's marker was first seen (settle debounce), and
+/// (stage 2 only) whether the expanded-row hint was ever seen ABSENT since stage 1's Enter —
+/// proof of a genuine collapsed->expanded transition, so a pre-existing hint can't queue a
+/// stray Enter into the just-opened run.
 #[derive(Debug, Clone)]
 struct AutoEnter {
     key: Key,
     armed_at: Instant,
     stage: AutoEnterStage,
     marker_since: Option<Instant>,
+    expanded_absent_seen: bool,
 }
 
 /// Everything the run loop mutates, threaded through the key/tick handlers.
@@ -170,8 +174,6 @@ struct Ui {
     mutations: MutationRunner,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
     pulses: Pulses,
-    /// The row expanded in place for an inline peek (one at a time), or None.
-    expanded: Option<Key>,
     /// A one-shot auto-Enter armed on a live claude attach. While set, the run loop watches
     /// the PTY for the agents view and presses Enter once (after a settle) to land in the
     /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
@@ -232,7 +234,6 @@ fn main() -> io::Result<()> {
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
-        expanded: None,
         auto_enter: None,
         attached: HashMap::new(),
         focused: None,
@@ -311,7 +312,7 @@ fn run(
                     peek: &ui.peek,
                     composer: &ui.composer,
                     pulses: &ui.pulses,
-                    expanded: ui.expanded.as_ref(),
+                    expanded: ui.app.expanded(),
                     now_ms: now,
                     attach,
                 },
@@ -381,51 +382,76 @@ fn drive_auto_enter(ui: &mut Ui) {
     let Some(pty) = ui.attached.get_mut(&state.key) else {
         return;
     };
-    // Each stage watches its own marker(s); the settle timer is per-stage. The expanded
-    // row's hint renders as one of two variants depending on how the view drew it.
-    let visible = pty.with_screen(|screen| {
-        let contents = screen.contents();
-        match state.stage {
-            AutoEnterStage::AwaitingList => contents.contains(CLAUDE_AGENTS_MARKER),
-            AutoEnterStage::AwaitingExpanded => {
-                contents.contains(CLAUDE_EXPANDED_MARKER)
-                    || contents.contains(CLAUDE_EXPANDED_MARKER_ALT)
-            }
-        }
+    // Snapshot the two markers we care about this frame under one screen lock.
+    let (list_present, expanded_present) = pty.with_screen(|screen| {
+        let c = screen.contents();
+        (
+            c.contains(CLAUDE_AGENTS_MARKER),
+            c.contains(CLAUDE_EXPANDED_MARKER) || c.contains(CLAUDE_EXPANDED_MARKER_ALT),
+        )
     });
-    if !visible {
-        // Marker not up yet (or flickered away) — restart this stage's settle timer.
-        if let Some(ae) = &mut ui.auto_enter {
-            ae.marker_since = None;
-        }
-        return;
-    }
-    match state.marker_since {
-        // First frame this stage's marker appears: start the settle debounce, do not press.
-        None => {
-            if let Some(ae) = &mut ui.auto_enter {
-                ae.marker_since = Some(Instant::now());
-            }
-        }
-        Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => match state.stage {
-            // Stage 1: with real preselection (CLAUDE_AGENTS_SELECT now reaches the child)
-            // the row comes up pre-expanded, so this Enter opens the run directly — stage 2's
-            // marker never appears. Advance anyway as a harmless fallback for a collapsed
-            // variant where the first Enter only expands.
-            AutoEnterStage::AwaitingList => {
-                let _ = pty.write_input(b"\r");
+
+    match state.stage {
+        AutoEnterStage::AwaitingList => {
+            if !list_present {
                 if let Some(ae) = &mut ui.auto_enter {
-                    ae.stage = AutoEnterStage::AwaitingExpanded;
                     ae.marker_since = None;
                 }
+                return;
             }
-            // Stage 2 (fallback only): a second Enter opens the expanded row, then disarm.
-            AutoEnterStage::AwaitingExpanded => {
-                let _ = pty.write_input(b"\r");
+            match state.marker_since {
+                None => {
+                    if let Some(ae) = &mut ui.auto_enter {
+                        ae.marker_since = Some(Instant::now());
+                    }
+                }
+                Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => {
+                    // With real preselection (CLAUDE_AGENTS_SELECT now reaches the child) the
+                    // row comes up pre-expanded, so this Enter opens the run directly. Advance
+                    // to stage 2 only as a fallback for a collapsed variant.
+                    let _ = pty.write_input(b"\r");
+                    if let Some(ae) = &mut ui.auto_enter {
+                        ae.stage = AutoEnterStage::AwaitingExpanded;
+                        ae.marker_since = None;
+                        ae.expanded_absent_seen = false;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        AutoEnterStage::AwaitingExpanded => {
+            // Stage-1's Enter opened the run: the list marker is gone -> we've left the list,
+            // so disarm without pressing (never queue a stray Enter into the opened run).
+            if !list_present {
                 ui.auto_enter = None;
+                return;
             }
-        },
-        Some(_) => {}
+            // Still on the list. The fallback second Enter may fire only after a GENUINE
+            // collapsed->expanded transition — i.e. the hint was observed ABSENT at least once
+            // since stage 1 — so a hint that was already on screen can't trigger a stray press.
+            if !expanded_present {
+                if let Some(ae) = &mut ui.auto_enter {
+                    ae.expanded_absent_seen = true;
+                    ae.marker_since = None;
+                }
+                return;
+            }
+            if !state.expanded_absent_seen {
+                return;
+            }
+            match state.marker_since {
+                None => {
+                    if let Some(ae) = &mut ui.auto_enter {
+                        ae.marker_since = Some(Instant::now());
+                    }
+                }
+                Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => {
+                    let _ = pty.write_input(b"\r");
+                    ui.auto_enter = None;
+                }
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -685,15 +711,9 @@ fn handle_normal_key(
     }
 
     match key.code {
-        // Arrows navigate/act at all times. Moving the cursor collapses any inline peek.
-        KeyCode::Down => {
-            ui.expanded = None;
-            ui.app.move_selection(1);
-        }
-        KeyCode::Up => {
-            ui.expanded = None;
-            ui.app.move_selection(-1);
-        }
+        // Arrows navigate/act at all times (App collapses any inline peek on the move).
+        KeyCode::Down => ui.app.move_selection(1),
+        KeyCode::Up => ui.app.move_selection(-1),
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
         // Tab cycles the composer's target backend at any time.
         KeyCode::Tab => ui.composer.cycle_backend(),
@@ -720,7 +740,7 @@ fn handle_normal_key(
                     'u' => hide_selected(backends, ui, false),
                     '?' => ui.mode = Mode::Help,
                     // Space toggles the inline peek expansion of the selected row.
-                    ' ' if ui.app.selected().is_some() => toggle_expand(ui),
+                    ' ' if ui.app.selected().is_some() => ui.app.toggle_expanded(),
                     '/' => {
                         ui.app.set_filter(String::new());
                         ui.notice.clear();
@@ -806,19 +826,6 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
 fn detach_to_list(ui: &mut Ui) {
     ui.mode = Mode::Normal;
     ui.focused = None;
-}
-
-/// Toggle the inline peek expansion of the selected row (only one expands at a time).
-fn toggle_expand(ui: &mut Ui) {
-    let Some(session) = ui.app.selected() else {
-        return;
-    };
-    let key = (session.backend, session.id.clone());
-    if ui.expanded.as_ref() == Some(&key) {
-        ui.expanded = None;
-    } else {
-        ui.expanded = Some(key);
-    }
 }
 
 fn handle_filter_key(code: KeyCode, ui: &mut Ui) {
@@ -1028,6 +1035,7 @@ fn attach_selected(
                         armed_at: Instant::now(),
                         stage: AutoEnterStage::AwaitingList,
                         marker_since: None,
+                        expanded_absent_seen: false,
                     });
                 }
             }

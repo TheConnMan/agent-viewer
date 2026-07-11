@@ -222,6 +222,37 @@ fn spacer_rows_separate_groups_but_never_bookend() {
 }
 
 #[test]
+fn expansion_collapses_when_selection_leaves_the_expanded_row() {
+    let sessions = vec![
+        sess(BackendKind::Codex, "a", "/synthetic/one", 300, Status::Working),
+        sess(BackendKind::Codex, "b", "/synthetic/two", 200, Status::Working),
+    ];
+    let mut app = App::new(sessions);
+    let key_a = (BackendKind::Codex, "a".to_string());
+
+    // Toggle expands the selected row; toggle again collapses it.
+    select(&mut app, "a");
+    app.toggle_expanded();
+    assert_eq!(app.expanded(), Some(&key_a));
+    app.toggle_expanded();
+    assert_eq!(app.expanded(), None);
+
+    // Moving the selection off the expanded row collapses it (never renders b's peek under a).
+    select(&mut app, "a");
+    app.toggle_expanded();
+    assert_eq!(app.expanded(), Some(&key_a));
+    select(&mut app, "b");
+    assert_eq!(app.expanded(), None);
+
+    // A filter that drops the expanded row also collapses it (selection can't stay on a).
+    select(&mut app, "a");
+    app.toggle_expanded();
+    assert_eq!(app.expanded(), Some(&key_a));
+    app.set_filter("two".to_string()); // only b's cwd matches
+    assert_eq!(app.expanded(), None);
+}
+
+#[test]
 fn show_all_covers_companions_and_archived() {
     let mut companion = sess(BackendKind::Codex, "comp", "/p", 300, Status::Idle);
     companion.companion = true;
