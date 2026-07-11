@@ -1,7 +1,7 @@
 //! Optional brand-logo marks: the three backend SVGs rasterized once at startup into
 //! fixed 2x1-cell graphics protocols (Kitty/iTerm2/Sixel, else Unicode half-blocks), drawn
-//! over the reserved 2-column mark slot on list rows and in the composer. Strictly opt-in
-//! via `AGENT_VIEWER_LOGO_MARKS=1`; any failure here leaves the textual marks in place.
+//! over the reserved 2-column mark slot on list rows and in the composer. Always attempted at
+//! startup; any failure here (non-tty, no graphics protocol) leaves the textual marks in place.
 
 use agent_viewer_core::BackendKind;
 use ratatui::layout::Size;
