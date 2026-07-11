@@ -57,19 +57,20 @@ fn ascii_marks() -> bool {
     *ASCII_MARKS.get().unwrap_or(&false)
 }
 
-/// The mark for a backend on list rows + the composer: the brand glyph, or the textual
-/// `[cc]`/`[cx]`/`[oc]` tag under the ASCII fallback. `BackendKind::tag()` is also used
-/// directly for help/notices regardless of this setting. The codex glyph is "⬡" (U+2B21,
-/// unicode-width 1, renders cleanly under ratatui — verified); the approved fallback order
-/// if a font lacks it is "⬢" then "◆".
+/// The mark for a backend on list rows + the composer (single source of truth for every
+/// mark call site): the brand glyph, or the textual `[cc]`/`[cx]`/`[oc]` tag under the ASCII
+/// fallback. `BackendKind::tag()` is also used directly for help/notices regardless of this
+/// setting. Glyphs are all core Geometric Shapes (same coverage class as the status dots):
+/// claude "✳", codex "◆" (U+25C6), opencode "■" (U+25A0). `AGENT_VIEWER_ASCII_MARKS=1` is
+/// the escape hatch for fonts lacking them.
 fn backend_mark(backend: BackendKind) -> &'static str {
     if ascii_marks() {
         return backend.tag();
     }
     match backend {
         BackendKind::Claude => "✳",
-        BackendKind::Codex => "⬡",
-        BackendKind::Opencode => "▣",
+        BackendKind::Codex => "◆",
+        BackendKind::Opencode => "■",
     }
 }
 
@@ -82,11 +83,16 @@ fn backend_mark_color(backend: BackendKind) -> ratatui::style::Color {
     }
 }
 
-/// Terminal display width of a mark glyph (measured, not assumed 1 — some marks are
-/// ambiguous-width). Falls back to 1 for a zero/absent width.
-fn mark_width(mark: &str) -> usize {
+/// Terminal display width of a string (measured, not assumed — some glyphs are
+/// ambiguous/wide).
+fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
-    mark.width().max(1)
+    s.width()
+}
+
+/// Display width of a mark glyph, floored at 1 so a zero-width glyph still reserves a column.
+fn mark_width(mark: &str) -> usize {
+    display_width(mark).max(1)
 }
 
 /// Working shimmer: the glyph cycles this frame table at ~120ms/frame.
@@ -329,8 +335,16 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         expand_lines: &expand_lines,
     };
 
+    // The composer cursor blinks only in Normal mode (the composer is the active input);
+    // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     draw_list(frame, d.app, d.pulses, d.now_ms, deco, vertical[0]);
-    draw_composer(frame, d.app, d.composer, vertical[2]);
+    draw_composer(
+        frame,
+        d.app,
+        d.composer,
+        vertical[2],
+        matches!(d.mode, Mode::Normal),
+    );
     draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[3]);
 
     if matches!(d.mode, Mode::Help) {
@@ -391,9 +405,11 @@ fn abbreviate_dir(dir: &Path) -> String {
 }
 
 /// Persistent inline spawn composer inside a rounded, faint-bordered box (Claude Code's
-/// input-box feel): `⬡ codex ~/git/foo ❯ <text>`, or a muted placeholder when empty. The
-/// brand mark + backend name are in the backend's color, the target dir muted.
-fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) {
+/// input-box feel): `◆ codex ~/git/foo ❯ <text>`, or a muted placeholder when empty. The
+/// brand mark + backend name are in the backend's color, the target dir muted. When
+/// `show_cursor` (list view, Normal mode), the terminal's native cursor is placed at the
+/// end of the typed text so it blinks there.
+fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect, show_cursor: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -406,6 +422,8 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) 
         .spawn_target()
         .map(|d| abbreviate_dir(&d))
         .unwrap_or_default();
+    // The fixed prefix before the input: `<mark> <backend> <dir> ❯ `.
+    let prefix = format!("{} {} {dir} ❯ ", backend_mark(backend), backend.name());
     let mut spans = vec![
         Span::styled(
             format!("{} {} ", backend_mark(backend), backend.name()),
@@ -426,6 +444,13 @@ fn draw_composer(frame: &mut Frame, app: &App, composer: &Composer, area: Rect) 
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+
+    if show_cursor && inner.width > 0 {
+        // Cursor at the end of the typed text, clamped inside the box.
+        let col = display_width(&prefix) + display_width(composer.text());
+        let x = inner.x + (col as u16).min(inner.width - 1);
+        frame.set_cursor_position((x, inner.y));
+    }
 }
 
 // --- Main list ------------------------------------------------------------------
@@ -482,10 +507,28 @@ fn draw_list(frame: &mut Frame, app: &App, pulses: &Pulses, now_ms: i64, deco: L
         }
     }
     frame.render_stateful_widget(list, area, &mut state);
+
+    // Place the terminal's native cursor at the end of the inline rename buffer (its row is
+    // the selection, so it is always on screen). Prefix is `✎ `(2) + `<mark> `(mark_width+1).
+    if let Some((rb, rid, buf)) = deco.rename
+        && let Some(idx) = rows.iter().position(
+            |r| matches!(r, Row::Session { backend, id, .. } if *backend == rb && *id == rid),
+        )
+    {
+        let offset = state.offset();
+        let y = area.y + idx.saturating_sub(offset) as u16;
+        if idx >= offset && y < area.y + area.height {
+            let shown = truncate(buf, width.saturating_sub(6));
+            let col = 2 + mark_width(backend_mark(rb)) + 1 + display_width(&shown);
+            let x = area.x + (col as u16).min(area.width.saturating_sub(1));
+            frame.set_cursor_position((x, y));
+        }
+    }
 }
 
-/// The selected row rendered as an inline rename edit field: `✎ <mark> buffer_`, the mark
-/// in the backend's brand color and the edited title in accent.
+/// The selected row rendered as an inline rename edit field: `✎ <mark> buffer`, the mark in
+/// the backend's brand color and the edited title in accent. The blinking cursor at the end
+/// of the buffer is the terminal's native cursor, placed by `draw_list`.
 fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
         Span::styled("✎ ", Style::default().fg(theme::ACCENT)),
@@ -494,7 +537,7 @@ fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem
             Style::default().fg(backend_mark_color(backend)),
         ),
         Span::styled(
-            format!("{}_", truncate(buffer, width.saturating_sub(6))),
+            truncate(buffer, width.saturating_sub(6)),
             Style::default().fg(theme::ACCENT),
         ),
     ]))
@@ -602,24 +645,25 @@ struct SessionRow<'a> {
     width: usize,
 }
 
-/// `glyph mark name  Word · summary <pad> [#pr] elapsed`, flush-left (glyph in column 0),
-/// with the brand mark in the backend's color, the status word in the state's color,
-/// "· summary" muted, and a right-aligned PR badge just left of the elapsed.
+/// `glyph mark name  summary <pad> <pr> <status word> <time>`, flush-left (glyph in column
+/// 0). The animated glyph + brand mark + title sit left with a muted summary; the right
+/// cluster (Claude Code style) is a right-aligned `<pr> <status word> <time>` — PR badge
+/// accent, status word in its state color, elapsed muted. The title truncates first when
+/// width is tight; the right cluster is never clipped.
 fn session_line(r: SessionRow) -> Line<'static> {
     let word = status_display_word(r.status);
-    // The status word plus an optional "· summary" is the one truncatable detail field.
-    let detail = if r.summary.is_empty() {
-        word.to_string()
+    // The right cluster as one reserved unit: [pr ]word elapsed.
+    let right = if r.pr.is_empty() {
+        format!("{word} {}", r.elapsed)
     } else {
-        format!("{word} · {}", r.summary)
+        format!("{} {word} {}", r.pr, r.elapsed)
     };
-    let (name_out, detail_out, pad) = crate::app::row_layout(
+    let (name_out, summary_out, pad) = crate::app::row_layout(
         r.width,
         mark_width(r.mark),
         r.name,
-        &detail,
-        r.pr.chars().count(),
-        r.elapsed.chars().count(),
+        r.summary,
+        right.chars().count(),
     );
     let mut spans = vec![
         Span::styled(r.glyph.to_string(), Style::default().fg(r.gcolor)),
@@ -628,27 +672,21 @@ fn session_line(r: SessionRow) -> Line<'static> {
         Span::raw(" "),
         Span::styled(name_out, Style::default().fg(theme::TEXT)),
     ];
-    if !detail_out.is_empty() {
+    if !summary_out.is_empty() {
         spans.push(Span::raw("  "));
-        // Color the leading status word; the "· summary" remainder is muted.
-        if let Some(rest) = detail_out.strip_prefix(word) {
-            spans.push(Span::styled(
-                word.to_string(),
-                Style::default().fg(status_color(r.status)),
-            ));
-            if !rest.is_empty() {
-                spans.push(Span::styled(rest.to_string(), Style::default().fg(theme::MUTED)));
-            }
-        } else {
-            // Truncation cut into the word itself — render what's left in the word color.
-            spans.push(Span::styled(detail_out, Style::default().fg(status_color(r.status))));
-        }
+        spans.push(Span::styled(summary_out, Style::default().fg(theme::MUTED)));
     }
     spans.push(Span::raw(" ".repeat(pad)));
+    // Right cluster: <pr> <status word> <time>.
     if !r.pr.is_empty() {
         spans.push(Span::styled(r.pr.to_string(), Style::default().fg(theme::ACCENT)));
         spans.push(Span::raw(" "));
     }
+    spans.push(Span::styled(
+        word.to_string(),
+        Style::default().fg(status_color(r.status)),
+    ));
+    spans.push(Span::raw(" "));
     spans.push(Span::styled(r.elapsed.to_string(), Style::default().fg(theme::MUTED)));
     Line::from(spans)
 }

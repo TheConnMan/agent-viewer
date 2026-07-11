@@ -222,6 +222,35 @@ fn spacer_rows_separate_groups_but_never_bookend() {
 }
 
 #[test]
+fn rename_resolves_target_by_key_after_reorder() {
+    // Regression: rename must resolve its target by (backend, id), never by selection — the
+    // background refresh reorders rows while the user types, drifting selection off the row.
+    let a = sess(BackendKind::Codex, "a", "/p", 300, Status::Working);
+    let b = sess(BackendKind::Claude, "b", "/p", 200, Status::Working);
+    let mut app = App::new(vec![a, b]);
+    select(&mut app, "a");
+    let target = (BackendKind::Codex, "a".to_string());
+
+    // A refresh reorders (b becomes most-recent); then selection drifts to b.
+    app.set_sessions(vec![
+        sess(BackendKind::Claude, "b", "/p", 400, Status::Working),
+        sess(BackendKind::Codex, "a", "/p", 300, Status::Working),
+    ]);
+    select(&mut app, "b");
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("b")); // selection left a
+
+    // The rename target is still resolvable by key (the old selected()-filter path returned
+    // None here, silently no-oping the rename).
+    let found = app.session_for(&target).expect("target still resolvable by key");
+    assert_eq!(found.id, "a");
+    assert_eq!(found.backend, BackendKind::Codex);
+
+    // And re-pinning selection back onto the rename row works (keeps the edit under cursor).
+    assert!(app.select_by_key(&target));
+    assert_eq!(app.selected().map(|s| s.id.as_str()), Some("a"));
+}
+
+#[test]
 fn expansion_collapses_when_selection_leaves_the_expanded_row() {
     let sessions = vec![
         sess(BackendKind::Codex, "a", "/synthetic/one", 300, Status::Working),
@@ -358,59 +387,40 @@ fn selection_clamps_when_selected_session_vanishes() {
 // --- Row layout reserves the elapsed slot (finding 3) ---
 
 #[test]
-fn row_layout_reserves_elapsed_for_long_titles() {
+fn row_layout_reserves_right_cluster_for_long_titles() {
     let width = 40;
-    let tag_len = 2;
-    let elapsed_len = 2; // e.g. "3h"
+    let mark_width = 1;
+    let right_len = 10; // e.g. "Working 3h"
     let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
-    let (name, detail, pad) = row_layout(width, tag_len, long, "", 0, elapsed_len);
-    // The title is truncated rather than clipping the right-aligned elapsed.
+    let (name, detail, pad) = row_layout(width, mark_width, long, "", right_len);
+    // The title is truncated rather than clipping the right-aligned cluster.
     assert!(name.chars().count() < long.chars().count());
     assert!(detail.is_empty());
-    // The whole row (flush left + name + pad + elapsed) fits exactly in width, so the
-    // elapsed field is never pushed off the line.
-    let left_fixed = 3 + tag_len;
-    assert_eq!(left_fixed + name.chars().count() + pad + elapsed_len, width);
+    // The whole row (flush left + name + pad + right cluster) fits exactly in width, so the
+    // status word + time cluster is never pushed off the line.
+    let left_fixed = 3 + mark_width;
+    assert_eq!(left_fixed + name.chars().count() + pad + right_len, width);
 }
 
 #[test]
-fn row_layout_reserves_pr_badge_left_of_elapsed() {
-    let width = 40;
-    let tag_len = 2;
-    let elapsed_len = 2; // "3h"
-    let pr_len = 4; // "#315"
-    let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
-    let (name, detail, pad) = row_layout(width, tag_len, long, "Working", pr_len, elapsed_len);
-    assert!(name.chars().count() < long.chars().count()); // truncated
-    assert!(detail.is_empty()); // no room for the status word beside a long title
-    // Flush left + name + pad + PR badge (+gap) + elapsed fills the row exactly, so the
-    // badge sits immediately left of elapsed and is never clipped.
-    let left_fixed = 3 + tag_len;
-    assert_eq!(
-        left_fixed + name.chars().count() + pad + (pr_len + 1) + elapsed_len,
-        width
-    );
-}
-
-#[test]
-fn row_layout_fits_name_and_detail_with_flush_elapsed() {
+fn row_layout_fits_name_and_summary_with_flush_right_cluster() {
     let width = 60;
-    let tag_len = 2;
-    let elapsed_len = 3; // "10s"
-    let (name, detail, pad) = row_layout(width, tag_len, "sess", "Working · summary", 0, elapsed_len);
+    let mark_width = 1;
+    let right_len = 12; // "#315 Done 2h"
+    let (name, detail, pad) = row_layout(width, mark_width, "sess", "a short summary", right_len);
     assert_eq!(name, "sess");
-    assert_eq!(detail, "Working · summary");
-    let used = (3 + tag_len) + name.chars().count() + 2 + detail.chars().count();
-    assert_eq!(used + pad + elapsed_len, width);
+    assert_eq!(detail, "a short summary");
+    let used = (3 + mark_width) + name.chars().count() + 2 + detail.chars().count();
+    assert_eq!(used + pad + right_len, width);
 }
 
 #[test]
-fn row_layout_drops_detail_when_no_room() {
-    // Width fits the name and the reserved elapsed but leaves nothing for a detail.
-    let tag_len = 2;
-    let elapsed_len = 3;
-    let width = (3 + tag_len) + 4 + 1 + elapsed_len; // left_fixed + name(4) + gap + elapsed
-    let (name, detail, pad) = row_layout(width, tag_len, "sess", "wont fit", 0, elapsed_len);
+fn row_layout_drops_summary_when_no_room() {
+    // Width fits the name and the reserved right cluster but leaves nothing for a summary.
+    let mark_width = 1;
+    let right_len = 8;
+    let width = (3 + mark_width) + 4 + 1 + right_len; // left_fixed + name(4) + gap + cluster
+    let (name, detail, pad) = row_layout(width, mark_width, "sess", "wont fit", right_len);
     assert_eq!(name, "sess");
     assert!(detail.is_empty());
     assert!(pad >= 1);

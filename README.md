@@ -35,7 +35,7 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `○` stopped — stopped from the viewer.
 
 Each row is prefixed by its backend's brand mark in the backend's color — `✳` Claude
-(terracotta), `⬡` Codex (teal), `▣` opencode (green) — and spells the state as a word in the
+(terracotta), `◆` Codex (teal), `■` opencode (green) — and spells the state as a word in the
 state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`, `Stopped`) followed by a
 muted one-line summary. Claude jobs with associated pull requests show a right-aligned badge
 just left of the elapsed time — `#315` for one PR, `2 PRs` for several.
@@ -64,8 +64,8 @@ have marked them a companion.
 ## Inline spawn composer
 
 The list view carries a persistent composer in a rounded box between the list and the
-footer: `⬡ codex ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the
-target agent (Claude `✳` → Codex `⬡` → opencode `▣`, each in its brand color), and `Enter`
+footer: `◆ codex ~/git/foo ❯ …`. Just start typing to describe a task; `Tab` cycles the
+target agent (Claude `✳` → Codex `◆` → opencode `■`, each in its brand color), and `Enter`
 spawns it detached. The target directory is the selected row's project root (by-project
 view) or its exact cwd (by-state view). While the composer is empty, the single-letter
 command keys below still fire; once you have typed anything, every printable key (and space)

@@ -272,11 +272,27 @@ impl App {
     }
 
     /// The session behind a (backend, id) key (for resolving expansion content by the
-    /// EXPANDED key rather than the selection, which may have since diverged).
+    /// EXPANDED key rather than the selection, which may have since diverged, and for the
+    /// rename flow which must target the row by id even after a reorder).
     pub fn session_for(&self, key: &(BackendKind, String)) -> Option<&Session> {
         self.sessions
             .iter()
             .find(|s| s.backend == key.0 && s.id == key.1)
+    }
+
+    /// Pin the selection onto the row for `key` if it is currently visible (used to keep the
+    /// inline rename row from visually jumping away when the background refresh reorders).
+    /// Returns true when the row was found and selected.
+    pub fn select_by_key(&mut self, key: &(BackendKind, String)) -> bool {
+        if let Some(idx) = self.rows.iter().position(
+            |r| matches!(r, Row::Session { backend, id, .. } if *backend == key.0 && *id == key.1),
+        ) {
+            self.selected = idx;
+            self.sync_expanded();
+            true
+        } else {
+            false
+        }
     }
 
     /// Collapse the expansion whenever the selected row is no longer the expanded row (a
@@ -512,27 +528,25 @@ fn truncate_to(s: &str, width: usize) -> String {
 
 /// Width math for one session row, kept pure so it is unit-testable.
 ///
-/// The row is `<glyph><space><mark><space><name>[<2sp><detail>]<pad>[<pr><space>]<elapsed>`,
+/// The row is `<glyph><space><mark><space><name>[<2sp><detail>]<pad><right cluster>`,
 /// flush-left (glyph in column 0). `mark_width` is the measured display width of the brand
-/// mark (some marks are ambiguous-width — the caller measures, never assumes 1). The elapsed
-/// slot and, when present, a PR badge are reserved on the right FIRST (plus a one-space
-/// minimum gap), so a long title truncates instead of clipping them off the line. `detail`
-/// is the status-word-plus-summary field; any room left after the name (and a two-space gap)
-/// goes to a truncated `detail`. Returns the visible name, the visible detail, and the pad.
+/// mark (some marks are ambiguous-width — the caller measures, never assumes 1). `right_len`
+/// is the measured width of the whole right-aligned cluster (`<pr> <status word> <time>`),
+/// reserved FIRST plus a one-space minimum gap, so a long title truncates instead of
+/// clipping the cluster off the line. `detail` is the left muted summary; any room left
+/// after the name (and a two-space gap) goes to a truncated `detail`. Returns the visible
+/// name, the visible detail, and the pad width.
 pub fn row_layout(
     width: usize,
     mark_width: usize,
     name: &str,
     detail: &str,
-    pr_len: usize,
-    elapsed_len: usize,
+    right_len: usize,
 ) -> (String, String, usize) {
     // Fixed left decorations before the name: glyph + space + mark + space (flush, no indent).
     let left_fixed = 3 + mark_width;
-    // Right reservation folded into content: PR badge (+1 gap) when present, then elapsed.
-    let pr_reserve = if pr_len > 0 { pr_len + 1 } else { 0 };
-    // Reserve the elapsed slot plus at least one space of separation, and the PR badge.
-    let content = width.saturating_sub(left_fixed + pr_reserve + elapsed_len + 1);
+    // Reserve the right cluster plus at least one space of separation.
+    let content = width.saturating_sub(left_fixed + right_len + 1);
 
     let name_out = truncate_to(name, content);
     let name_len = name_out.chars().count();
@@ -544,7 +558,7 @@ pub fn row_layout(
     let detail_len = detail_out.chars().count();
 
     let used = left_fixed + name_len + if detail_len > 0 { 2 + detail_len } else { 0 };
-    let pad = width.saturating_sub(used + pr_reserve + elapsed_len).max(1);
+    let pad = width.saturating_sub(used + right_len).max(1);
     (name_out, detail_out, pad)
 }
 

@@ -408,12 +408,15 @@ fn drive_auto_enter(ui: &mut Ui) {
                 Some(since) if since.elapsed() >= AUTO_ENTER_SETTLE => {
                     // With real preselection (CLAUDE_AGENTS_SELECT now reaches the child) the
                     // row comes up pre-expanded, so this Enter opens the run directly. Advance
-                    // to stage 2 only as a fallback for a collapsed variant.
+                    // to stage 2 only as a fallback for a collapsed variant. Seed the
+                    // "hint seen absent" flag from THIS pre-Enter frame — the row is not yet
+                    // expanded here, so its hint is absent — otherwise a hint that paints within
+                    // one poll pass would leave the flag unset and stage 2 would never fire.
                     let _ = pty.write_input(b"\r");
                     if let Some(ae) = &mut ui.auto_enter {
                         ae.stage = AutoEnterStage::AwaitingExpanded;
                         ae.marker_since = None;
-                        ae.expanded_absent_seen = false;
+                        ae.expanded_absent_seen = stage2_seed_absent(expanded_present);
                     }
                 }
                 Some(_) => {}
@@ -436,7 +439,7 @@ fn drive_auto_enter(ui: &mut Ui) {
                 }
                 return;
             }
-            if !state.expanded_absent_seen {
+            if !stage2_ready(expanded_present, state.expanded_absent_seen) {
                 return;
             }
             match state.marker_since {
@@ -453,6 +456,20 @@ fn drive_auto_enter(ui: &mut Ui) {
             }
         }
     }
+}
+
+/// Initial `expanded_absent_seen` at the stage-1 -> stage-2 transition: seeded from the
+/// pre-Enter frame, where the row is not yet expanded so its hint is absent. Only a hint
+/// already on screen at the transition (should not happen) leaves it unseeded.
+fn stage2_seed_absent(expanded_present_at_transition: bool) -> bool {
+    !expanded_present_at_transition
+}
+
+/// Whether stage 2's fallback Enter may fire this frame: the expanded hint is on screen AND
+/// it was observed absent at least once (a genuine collapsed->expanded transition, not a
+/// hint that was already up). The settle timing is enforced separately.
+fn stage2_ready(expanded_present: bool, expanded_absent_seen: bool) -> bool {
+    expanded_present && expanded_absent_seen
 }
 
 /// Assemble the `AttachView` for the focused session, if any.
@@ -506,6 +523,11 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
         ui.focused_session = Some(s.clone());
     }
     ui.app.set_sessions(sessions);
+    // Keep the inline rename edit row pinned under the cursor across a reorder so it does not
+    // visually jump away mid-edit (the rename still targets by id regardless).
+    if let Mode::Rename(modal) = &ui.mode {
+        ui.app.select_by_key(&(modal.backend, modal.id.clone()));
+    }
     // Surface a backend-error notice, but do not let a per-second recurring error restamp
     // (which would starve spawn/mutation feedback and make the error effectively permanent):
     // show it only when it CHANGED and the footer is free (empty/expired, or already the old
@@ -890,12 +912,10 @@ fn apply_rename(ui: &mut Ui) {
     let backend_kind = modal.backend;
     let id = modal.id.clone();
     let name = modal.buffer.clone();
-    let Some(session) = ui
-        .app
-        .selected()
-        .filter(|s| s.backend == backend_kind && s.id == id)
-        .cloned()
-    else {
+    // Resolve the target by (backend, id), NOT by selected() — the background refresh
+    // reorders rows while the user types, so selection may have drifted off the rename row
+    // (which would silently no-op the rename).
+    let Some(session) = ui.app.session_for(&(backend_kind, id.clone())).cloned() else {
         return;
     };
     let key = format!("{}:{}:rename", backend_kind.name(), id);
@@ -1120,7 +1140,28 @@ fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTICE_MS, NoticeState, backend_error_should_show};
+    use super::{
+        NOTICE_MS, NoticeState, backend_error_should_show, stage2_ready, stage2_seed_absent,
+    };
+
+    #[test]
+    fn stage2_seeds_absent_from_pre_enter_frame_so_fast_paint_still_fires() {
+        // At the stage-1 -> stage-2 transition the row is not yet expanded, so its hint is
+        // absent — that observation is seeded, not discarded.
+        let seen = stage2_seed_absent(/* expanded_present_at_transition = */ false);
+        assert!(seen);
+        // Fast paint: the hint appears on the very next poll pass. Stage 2 is ready without
+        // needing to sample a separate absent frame first (the bug: it used to never fire).
+        assert!(stage2_ready(/* expanded_present = */ true, seen));
+
+        // A hint somehow already up AT the transition leaves the flag unseeded, so stage 2
+        // waits for a genuine absent->present transition rather than firing a stray Enter.
+        let unseen = stage2_seed_absent(true);
+        assert!(!unseen);
+        assert!(!stage2_ready(true, unseen));
+        // And with the hint not on screen this frame, stage 2 is never ready regardless.
+        assert!(!stage2_ready(false, true));
+    }
 
     #[test]
     fn backend_error_show_dedups_and_respects_action_notice() {
