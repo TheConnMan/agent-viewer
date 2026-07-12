@@ -40,6 +40,21 @@ pub struct Capabilities {
     pub reply: bool,
 }
 
+impl Capabilities {
+    /// All-false capabilities: the fallback for an absent backend and a minimal test stub.
+    pub const fn none() -> Capabilities {
+        Capabilities {
+            spawn: false,
+            hide: false,
+            attach: false,
+            stop: false,
+            remove: false,
+            rename: false,
+            reply: false,
+        }
+    }
+}
+
 /// Six-state model (v2). `Working`/`Failed` are v1's `Running`/`Errored` renamed;
 /// `NeedsInput`, `Idle`, `Stopped` are new. `Hash` is used to key sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -170,6 +185,15 @@ pub fn all_backends() -> Vec<Box<dyn Backend>> {
     ]
 }
 
+/// Test-only: a command's args as owned Strings (shared by the per-backend
+/// spawn-command tests in `claude` and `codex`).
+#[cfg(test)]
+pub(crate) fn args(cmd: &std::process::Command) -> Vec<String> {
+    cmd.get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,15 +226,7 @@ mod tests {
                 BackendKind::Codex
             }
             fn capabilities(&self) -> Capabilities {
-                Capabilities {
-                    spawn: false,
-                    hide: false,
-                    attach: false,
-                    stop: false,
-                    remove: false,
-                    rename: false,
-                    reply: false,
-                }
+                Capabilities::none()
             }
             fn list(&mut self) -> crate::error::Result<Vec<Session>> {
                 Ok(Vec::new())
