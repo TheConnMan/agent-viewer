@@ -35,9 +35,6 @@ pub struct Thread {
     pub cwd: std::path::PathBuf,
     pub title: String,
     pub archived: bool,
-    pub model: Option<String>,
-    pub git_branch: Option<String>,
-    pub first_user_message: String,
     pub preview: String,
 }
 
@@ -61,8 +58,7 @@ impl Registry {
             "SELECT id, rollout_path, \
                     COALESCE(created_at_ms, created_at * 1000), \
                     COALESCE(updated_at_ms, updated_at * 1000), \
-                    source, cwd, title, archived, model, git_branch, \
-                    first_user_message, preview \
+                    source, cwd, title, archived, preview \
              FROM threads \
              ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC",
         )?;
@@ -77,10 +73,7 @@ impl Registry {
                     cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
                     title: row.get(6)?,
                     archived: row.get::<_, i64>(7)? != 0,
-                    model: row.get(8)?,
-                    git_branch: row.get(9)?,
-                    first_user_message: row.get(10)?,
-                    preview: row.get(11)?,
+                    preview: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
