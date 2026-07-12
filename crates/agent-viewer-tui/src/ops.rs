@@ -65,7 +65,9 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<String, String> {
                 Ok(format!("renamed {}", s.backend.name()))
             }
             Err(e) => {
-                // claude: fall back to the viewer-DB name override (live sessions only).
+                // claude has no working external rename channel (the Fleet View rendezvous
+                // socket rejects rename frames), so every claude rename falls back to the
+                // viewer-local name override, which the state overlay applies to the row.
                 if s.backend == BackendKind::Claude
                     && let Ok(db) = ViewerDb::open_default()
                     && db.set_name_override(s.backend, &s.id, &name).is_ok()
