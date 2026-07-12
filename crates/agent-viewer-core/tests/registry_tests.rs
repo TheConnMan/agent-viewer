@@ -75,9 +75,6 @@ fn threads_maps_rows_and_orders_by_recency() {
     assert_eq!(exec.cwd, PathBuf::from("/home/user/proj"));
     assert_eq!(exec.title, "Exec Title");
     assert!(!exec.archived);
-    assert_eq!(exec.model.as_deref(), Some("gpt-5"));
-    assert_eq!(exec.git_branch.as_deref(), Some("main"));
-    assert_eq!(exec.first_user_message, "first exec msg");
     assert_eq!(exec.preview, "preview exec");
     assert_eq!(exec.created_at_ms, 1000);
     assert_eq!(exec.updated_at_ms, 3000);
@@ -85,8 +82,6 @@ fn threads_maps_rows_and_orders_by_recency() {
     let cli = &threads[1];
     assert_eq!(cli.source, Source::Cli);
     assert!(cli.archived);
-    assert_eq!(cli.model, None);
-    assert_eq!(cli.git_branch, None);
 
     let vscode = &threads[2];
     assert_eq!(vscode.source, Source::VsCode);

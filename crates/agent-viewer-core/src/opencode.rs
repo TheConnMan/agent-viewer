@@ -101,7 +101,7 @@ impl Backend for OpencodeBackend {
             .clone()
     }
     fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
-        let title: String = task.chars().take(40).collect();
+        let title = crate::spawn::truncated_title(task);
         let mut cmd = std::process::Command::new("opencode");
         cmd.arg("run")
             .arg("--dir")
