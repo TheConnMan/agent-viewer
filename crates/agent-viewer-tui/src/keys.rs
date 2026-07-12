@@ -16,7 +16,7 @@ use agent_viewer_tui::app::{
 };
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::ui::{Mode, RenameModal, ReplyModal};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::auto_enter::{AutoEnter, AutoEnterStage};
 use crate::ops::{Mutation, run_mutation};
@@ -53,6 +53,29 @@ pub(crate) fn handle_key(
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
     }
     Ok(false)
+}
+
+/// Mouse routing for the list view: click or hover selects the row under the cursor and the
+/// wheel walks the selection. Only the Normal list view responds — modals and the full-screen
+/// attach own their surface, so mouse there is a no-op (the terminal's own text selection still
+/// works with Shift held). Hit-testing reads the geometry `draw` recorded on the last frame.
+pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
+    if !matches!(ui.mode, Mode::Normal) {
+        return;
+    }
+    match me.kind {
+        // Left click and bare hover both land the selection on the row under the cursor.
+        MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+            let target = ui.list_hit.borrow().row_at(me.column, me.row);
+            if let Some(idx) = target {
+                ui.app.select_visible_index(idx);
+            }
+        }
+        // The wheel nudges the selection one selectable row at a time (same path as arrows).
+        MouseEventKind::ScrollDown => ui.app.move_selection(1),
+        MouseEventKind::ScrollUp => ui.app.move_selection(-1),
+        _ => {}
+    }
 }
 
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
@@ -804,6 +827,7 @@ mod tests {
             focused_session: None,
             focused_exited: false,
             logos: None,
+            list_hit: std::cell::RefCell::new(agent_viewer_tui::ui::ListHit::default()),
         }
     }
 
