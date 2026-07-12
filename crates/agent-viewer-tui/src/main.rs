@@ -281,9 +281,11 @@ fn main() -> io::Result<()> {
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
-    // Mouse capture powers click/hover row selection on the list. The terminal's native
-    // text selection still works with Shift held in most terminals. Best-effort: a terminal
-    // that rejects the sequence just leaves the keyboard nav as-is.
+    // Mouse capture powers click/hover row selection on the list, and while attached it lets
+    // us forward real mouse reports to the child so the wheel scrolls the transcript instead
+    // of the terminal's alternate-scroll turning it into arrow keys codex reads as history
+    // navigation. The terminal's native text selection still works with Shift held in most
+    // terminals. Best-effort: a terminal that rejects the sequence leaves the keyboard nav.
     let _ = execute!(io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, &action_backends, &refresher, &mut ui);
     let _ = execute!(io::stdout(), DisableMouseCapture);
