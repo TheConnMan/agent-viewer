@@ -82,6 +82,7 @@ fn handle_normal_key(
         match key.code {
             KeyCode::Char('s') => ui.app.toggle_group_mode(),
             KeyCode::Char('r') => open_rename(ui),
+            KeyCode::Char('e') => open_reply(backends, ui),
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             _ => {}
@@ -148,7 +149,6 @@ fn handle_normal_key(
                     'a' => ui.app.toggle_show_all(),
                     'h' => hide_selected(backends, ui, true),
                     'u' => hide_selected(backends, ui, false),
-                    'r' => open_reply(backends, ui),
                     '?' => ui.mode = Mode::Help,
                     // On a header, Space collapses/expands the group (and persists), never
                     // typing a space; on a session it toggles the inline peek; otherwise it
@@ -408,7 +408,7 @@ fn open_rename(ui: &mut Ui) {
     });
 }
 
-/// `r` on an empty composer — focus a reply input for the selected session, gated on the
+/// `Ctrl+E` — focus a reply input for the selected session, gated on the
 /// backend supporting reply AND the session actually being blocked (the sole safety gate).
 /// Force the peek open so the pending ask stays visible above the input.
 fn open_reply(backends: &[Box<dyn Backend>], ui: &mut Ui) {

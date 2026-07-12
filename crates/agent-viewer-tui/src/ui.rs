@@ -1234,7 +1234,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
         ("Space", "expand peek in row"),
-        ("r", "reply to a blocked session"),
+        ("Ctrl+E", "reply to a blocked session"),
         ("Enter/Space", "collapse group (on a header)"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
