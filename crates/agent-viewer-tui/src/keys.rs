@@ -55,25 +55,42 @@ pub(crate) fn handle_key(
     Ok(false)
 }
 
-/// Mouse routing for the list view: click or hover selects the row under the cursor and the
-/// wheel walks the selection. Only the Normal list view responds — modals and the full-screen
-/// attach own their surface, so mouse there is a no-op (the terminal's own text selection still
-/// works with Shift held). Hit-testing reads the geometry `draw` recorded on the last frame.
+/// Route a mouse event. While attached, forward it to the focused child PTY as a native
+/// mouse report (the child, e.g. codex, has its own mouse tracking on and scrolls itself),
+/// so the wheel scrolls the transcript instead of the terminal's alternate-scroll turning it
+/// into arrow keys codex reads as prompt-history navigation. In the list, click or hover
+/// selects the row under the cursor and the wheel walks the selection (hit-testing reads the
+/// geometry `draw` recorded on the last frame). Modals own their surface, so mouse is a no-op
+/// there (the terminal's own text selection still works with Shift held).
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
-    if !matches!(ui.mode, Mode::Normal) {
-        return;
-    }
-    match me.kind {
-        // Left click and bare hover both land the selection on the row under the cursor.
-        MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
-            let target = ui.list_hit.borrow().row_at(me.column, me.row);
-            if let Some(idx) = target {
-                ui.app.select_visible_index(idx);
+    match &ui.mode {
+        Mode::Attached => {
+            let Some(fkey) = ui.focused.clone() else {
+                return;
+            };
+            let Some(pty) = ui.attached.get_mut(&fkey) else {
+                return;
+            };
+            let (mode, encoding) =
+                pty.with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()));
+            // draw_attach draws a one-row header above the child screen, so offset by 1.
+            if let Some(bytes) = agent_viewer_tui::mouse::encode_mouse_report(me, mode, encoding, 1)
+            {
+                let _ = pty.write_input(&bytes);
             }
         }
-        // The wheel nudges the selection one selectable row at a time (same path as arrows).
-        MouseEventKind::ScrollDown => ui.app.move_selection(1),
-        MouseEventKind::ScrollUp => ui.app.move_selection(-1),
+        Mode::Normal => match me.kind {
+            // Left click and bare hover both land the selection on the row under the cursor.
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = ui.list_hit.borrow().row_at(me.column, me.row) {
+                    ui.app.select_visible_index(idx);
+                }
+            }
+            // The wheel nudges the selection one selectable row at a time (same as arrows).
+            MouseEventKind::ScrollDown => ui.app.move_selection(1),
+            MouseEventKind::ScrollUp => ui.app.move_selection(-1),
+            _ => {}
+        },
         _ => {}
     }
 }
