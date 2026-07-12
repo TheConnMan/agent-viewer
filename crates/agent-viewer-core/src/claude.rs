@@ -62,7 +62,7 @@ fn claude_spawn_command(
     task: &str,
     model: Option<&str>,
 ) -> std::process::Command {
-    let name: String = task.chars().take(40).collect();
+    let name = crate::spawn::truncated_title(task);
     let mut cmd = std::process::Command::new(binary);
     cmd.current_dir(dir)
         .arg("--bg")
@@ -538,14 +538,9 @@ pub fn read_claude_transcript(
 #[cfg(test)]
 mod tests {
     use super::claude_spawn_command;
+    use crate::backend::args;
     use std::ffi::OsStr;
     use std::path::Path;
-
-    fn args(cmd: &std::process::Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
 
     #[test]
     fn claude_spawn_command_carries_model_flag() {

@@ -233,13 +233,8 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod tests {
     use super::codex_spawn_command;
+    use crate::backend::args;
     use std::path::Path;
-
-    fn args(cmd: &std::process::Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
 
     #[test]
     fn codex_spawn_command_carries_model_flag() {

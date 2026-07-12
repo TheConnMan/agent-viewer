@@ -661,15 +661,7 @@ fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn B
 fn caps_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Capabilities {
     backend_of(backends, kind)
         .map(|b| b.capabilities())
-        .unwrap_or(Capabilities {
-            spawn: false,
-            hide: false,
-            attach: false,
-            stop: false,
-            remove: false,
-            rename: false,
-            reply: false,
-        })
+        .unwrap_or_else(Capabilities::none)
 }
 
 fn attach_selected(

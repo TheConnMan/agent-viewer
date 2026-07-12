@@ -8,6 +8,12 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The spawn "name"/"title" derived from a task prompt: the first 40 chars (char-, not
+/// byte-bounded). Shared by the claude `--name` and opencode `--title` spawn flags.
+pub fn truncated_title(task: &str) -> String {
+    task.chars().take(40).collect()
+}
+
 /// Build a viewer-owned log path
 /// ($HOME/.local/state/agent-viewer/logs/{prefix}-{now_ms}.log). Creates nothing;
 /// the spawn helper makes the parent dir when it actually opens the file.
