@@ -68,8 +68,20 @@ fn select_visible_index_lands_on_selectable_rows_only() {
     // Two sessions in different project dirs so the row model carries headers (and, between
     // groups, a spacer) alongside the session rows — the mix a mouse click can land on.
     let sessions = vec![
-        sess(BackendKind::Codex, "alpha", "/synthetic/apples", 300, Status::Idle),
-        sess(BackendKind::Codex, "beta", "/synthetic/bananas", 200, Status::Idle),
+        sess(
+            BackendKind::Codex,
+            "alpha",
+            "/synthetic/apples",
+            300,
+            Status::Idle,
+        ),
+        sess(
+            BackendKind::Codex,
+            "beta",
+            "/synthetic/bananas",
+            200,
+            Status::Idle,
+        ),
     ];
     let mut app = App::new(sessions);
     let rows: Vec<Row> = app.visible().to_vec();

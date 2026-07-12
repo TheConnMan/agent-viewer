@@ -276,7 +276,11 @@ impl ListHit {
         if a.width == 0 || a.height == 0 {
             return None;
         }
-        if x < a.x || x >= a.x.saturating_add(a.width) || y < a.y || y >= a.y.saturating_add(a.height) {
+        if x < a.x
+            || x >= a.x.saturating_add(a.width)
+            || y < a.y
+            || y >= a.y.saturating_add(a.height)
+        {
             return None;
         }
         // A cell under the floating popup belongs to the popup, not the obscured list row.
@@ -912,7 +916,11 @@ fn draw_list(
     // row; expansion always sits under the (selected) expanded row, so it stays aligned.
     for (row_idx, row) in rows.iter().enumerate() {
         // A Spacer renders a blank line but is never selectable, so it maps to no row.
-        let target = if matches!(row, Row::Spacer) { None } else { Some(row_idx) };
+        let target = if matches!(row, Row::Spacer) {
+            None
+        } else {
+            Some(row_idx)
+        };
         match row {
             Row::Session { backend, id, .. } => {
                 // In-place rename edit field replaces the row while renaming it. The rename row
