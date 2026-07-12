@@ -493,18 +493,6 @@ impl App {
         }
     }
 
-    /// Project root of the group the selection sits in (header or session row).
-    pub fn selected_group_root(&self) -> Option<PathBuf> {
-        match self.rows.get(self.selected)? {
-            Row::ProjectHeader { root, .. } => Some(root.clone()),
-            Row::Session { backend, id, .. } => {
-                let session = self.find_session(*backend, id)?;
-                Some(self.cached_root(&session.cwd))
-            }
-            _ => None,
-        }
-    }
-
     /// Where an inline-composer spawn lands, given the current grouping:
     ///   - ByProject: the selected session's project group root (the header's root).
     ///   - ByState: the selected session's own cwd.
@@ -745,7 +733,10 @@ fn section_of(status: Status) -> Section {
     }
 }
 
-/// Truncate `s` to at most `width` chars (char-, not byte-bounded).
+/// Truncate `s` to at most `width` chars (char-, not byte-bounded). NOTE: at `width == 0`
+/// this yields the EMPTY string — deliberately unlike `ui::truncate`, which returns the full
+/// string at width 0. The row-layout math here needs "no room -> show nothing"; do not merge
+/// the two helpers without preserving each caller's zero-width behavior.
 fn truncate_to(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
