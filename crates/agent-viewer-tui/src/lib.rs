@@ -5,5 +5,6 @@ pub mod logos;
 pub mod mouse;
 pub mod mutations;
 pub mod peek;
+pub mod peek_cache;
 pub mod pr_cache;
 pub mod ui;
