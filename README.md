@@ -110,7 +110,7 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
 - `Space` — expand the selected row in place to peek its last message / metadata.
-- `r` — reply to the selected needs-input session (an input opens in the composer area;
+- `Ctrl+E` — reply to the selected needs-input session (an input opens in the composer area;
   `Enter` sends, `Esc` cancels). Capability-gated: unsupported backends (opencode) and
   non-blocked rows are a no-op with a footer notice.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
@@ -135,7 +135,7 @@ agents list — or `claude -r` to resume a finished one. `←` returns to the li
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
 
-Replies (`r`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
+Replies (`Ctrl+E`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
 into the run once the viewer has navigated into it (not while still on the agents list). A
 A Codex approval reply of yes auto-sends the approve key; a denial or any free-text reply
 instead attaches you with focus so you can confirm it by hand (the Codex reject key is
