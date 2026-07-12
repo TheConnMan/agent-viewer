@@ -567,10 +567,23 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup.
     if matches!(d.mode, Mode::Normal) {
+        let highlight = d.composer.suggestion_highlight();
         if d.composer.is_model_command() {
-            draw_model_popup(frame, d.composer, vertical[3]);
+            draw_suggestion_popup(
+                frame,
+                &d.composer.model_suggestions(),
+                highlight,
+                "",
+                vertical[3],
+            );
         } else {
-            draw_slash_popup(frame, d.composer, vertical[3]);
+            draw_suggestion_popup(
+                frame,
+                &d.composer.suggestions(),
+                highlight,
+                "/",
+                vertical[3],
+            );
         }
     }
 
@@ -598,35 +611,16 @@ fn slash_popup_area(composer: &Composer, composer_area: Rect) -> Option<Rect> {
     })
 }
 
-/// Render the slash-command suggestions as a few muted lines directly above the composer
-/// box (the highlighted row in accent). Nothing renders when there are no suggestions.
-fn draw_slash_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
-    let Some(area) = slash_popup_area(composer, composer_area) else {
-        return;
-    };
-    let suggestions = composer.suggestions();
-    frame.render_widget(Clear, area);
-    let highlight = composer.suggestion_highlight();
-    let items: Vec<ListItem> = suggestions
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let style = if i == highlight {
-                fg(theme::ACCENT)
-            } else {
-                fg(theme::MUTED)
-            };
-            ListItem::new(Line::from(Span::styled(format!(" /{name}"), style)))
-        })
-        .collect();
-    frame.render_widget(List::new(items), area);
-}
-
-/// Render the `/model` picker suggestions as muted lines above the composer box (the
-/// highlighted row in accent), mirroring `draw_slash_popup` but with no leading slash.
-/// Nothing renders when there are no suggestions.
-fn draw_model_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect) {
-    let suggestions = composer.model_suggestions();
+/// Render completion suggestions as a few muted lines directly above the composer box (the
+/// highlighted row in accent), each rendered as `" {prefix}{item}"` — `prefix` is "/" for the
+/// slash-command popup and "" for the `/model` picker. Nothing renders when the list is empty.
+fn draw_suggestion_popup<S: AsRef<str>>(
+    frame: &mut Frame,
+    suggestions: &[S],
+    highlight: usize,
+    prefix: &str,
+    composer_area: Rect,
+) {
     if suggestions.is_empty() {
         return;
     }
@@ -641,17 +635,19 @@ fn draw_model_popup(frame: &mut Frame, composer: &Composer, composer_area: Rect)
         height,
     };
     frame.render_widget(Clear, area);
-    let highlight = composer.suggestion_highlight();
     let items: Vec<ListItem> = suggestions
         .iter()
         .enumerate()
-        .map(|(i, model)| {
+        .map(|(i, item)| {
             let style = if i == highlight {
                 fg(theme::ACCENT)
             } else {
                 fg(theme::MUTED)
             };
-            ListItem::new(Line::from(Span::styled(format!(" {model}"), style)))
+            ListItem::new(Line::from(Span::styled(
+                format!(" {prefix}{}", item.as_ref()),
+                style,
+            )))
         })
         .collect();
     frame.render_widget(List::new(items), area);
@@ -1394,6 +1390,10 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Truncate `s` to at most `width` chars. NOTE: at `width == 0` this returns the FULL string
+/// (width 0 is treated as "unconstrained" by the callers here) — deliberately unlike
+/// `app::truncate_to`, which returns the empty string at width 0. Do not merge the two helpers
+/// without preserving each caller's zero-width behavior.
 fn truncate(s: &str, width: usize) -> String {
     if width == 0 || s.chars().count() <= width {
         return s.to_string();
