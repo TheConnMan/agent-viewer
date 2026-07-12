@@ -273,7 +273,13 @@ fn main() -> io::Result<()> {
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
+    // Capture mouse events so the terminal stops its alternate-scroll trick of turning the
+    // wheel into arrow keys. While attached, codex reads those arrows as prompt-history nav
+    // instead of scrolling; with capture on we forward real mouse reports to the child and
+    // it scrolls natively. Best-effort: a terminal that rejects it degrades to keyboard nav.
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture);
     let result = run(&mut terminal, &action_backends, &refresher, &mut ui);
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -383,6 +389,7 @@ fn run(
                         let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
                     }
                 }
+                Event::Mouse(me) => keys::handle_mouse(me, ui),
                 _ => {}
             }
         }
