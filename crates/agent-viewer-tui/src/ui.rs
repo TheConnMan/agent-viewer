@@ -419,15 +419,40 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         return;
     }
 
+    // The composer box grows with its wrapped text (empty -> 3 rows; long input wraps and the
+    // box gets taller, up to a cap) so a long task description stays visible instead of
+    // scrolling off to the right. Reply mode sizes the same box to the reply buffer.
+    let inner_w = frame.area().width.saturating_sub(2);
+    let composer_h = match &d.mode {
+        Mode::Reply(m) => {
+            let title = d
+                .app
+                .session_for(&(m.backend, m.id.clone()))
+                .map(|s| s.title.clone())
+                .unwrap_or_default();
+            let title_seg = if title.is_empty() {
+                String::new()
+            } else {
+                format!("{title} ")
+            };
+            let prefix = format!("↳ reply {title_seg}❯ ");
+            input_box_height(display_width(&prefix), &m.buffer, inner_w)
+        }
+        _ => {
+            let prefix = composer_prefix(d.app, d.composer);
+            input_box_height(display_width(&prefix), d.composer.text(), inner_w)
+        }
+    };
+
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
-    // (3 rows) · footer.
+    // (grows with wrapped input) · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(composer_h),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -643,11 +668,158 @@ fn abbreviate_dir(dir: &Path) -> String {
     s
 }
 
+/// Upper bound on how many wrapped text rows the input box grows to before it stops growing
+/// and keeps only the tail (the cursor end) visible. Keeps a runaway paste from eating the
+/// whole screen while still showing a generous multi-line task description.
+const COMPOSER_MAX_LINES: u16 = 10;
+
+/// Split `text` into visual lines by terminal display width: the first line gets `first`
+/// columns, every line after it gets `rest`. Breaks between characters (never mid-char),
+/// honoring wide/zero-width glyphs. Always returns at least one (possibly empty) segment so
+/// the caller can rely on `.last()`.
+fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut budget = first.max(1);
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + cw > budget && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            budget = rest.max(1);
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    lines.push(cur);
+    lines
+}
+
+/// The full box height (including both borders) an input box needs to show `text` wrapped to
+/// `inner_width` columns after a `prefix_w`-wide prompt. Empty text (or a zero-width area)
+/// keeps the resting 3-row box; longer text grows a row per wrapped line up to the cap.
+fn input_box_height(prefix_w: usize, text: &str, inner_width: u16) -> u16 {
+    if inner_width == 0 || text.is_empty() {
+        return 3;
+    }
+    let w = inner_width as usize;
+    let first = w.saturating_sub(prefix_w);
+    let lines = wrap_by_width(text, first, w).len();
+    (lines as u16).clamp(1, COMPOSER_MAX_LINES) + 2
+}
+
+/// The composer prompt prefix (`<mark> <backend> [<model> ]<dir> ❯ `) as a plain string, for
+/// measuring its width. Mirrors the colored spans built in `draw_composer`.
+fn composer_prefix(app: &App, composer: &Composer) -> String {
+    let backend = composer.backend();
+    let dir = app
+        .spawn_target()
+        .map(|d| abbreviate_dir(&d))
+        .unwrap_or_default();
+    let model = composer.model();
+    let model_seg = if model == "default" {
+        String::new()
+    } else {
+        format!("{model} ")
+    };
+    format!(
+        "{} {} {model_seg}{dir} ❯ ",
+        backend_mark(backend),
+        backend.name()
+    )
+}
+
+/// The look of an input box: its border color, the colored prompt spans that lead the first
+/// line (with their measured width), and the faint placeholder shown when empty.
+struct InputBox {
+    border: ratatui::style::Color,
+    prefix_spans: Vec<Span<'static>>,
+    prefix_w: usize,
+    placeholder: &'static str,
+}
+
+/// Render a growing bordered input box: the colored prompt spans lead the first line, the
+/// text wraps across the inner rows (which the caller sized via `input_box_height`), the
+/// placeholder shows when empty, and the native cursor sits at the end of `text` when
+/// `show_cursor`. If the text wraps past the box, the tail is kept so the cursor stays
+/// visible. Returns the inner rect and whether the first logical line (the prompt) is on
+/// screen, for the caller's logo overlay.
+fn draw_input_box(
+    frame: &mut Frame,
+    area: Rect,
+    style: InputBox,
+    text: &str,
+    show_cursor: bool,
+) -> (Rect, bool) {
+    let InputBox {
+        border,
+        prefix_spans,
+        prefix_w,
+        placeholder,
+    } = style;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return (inner, false);
+    }
+
+    if text.is_empty() {
+        let mut spans = prefix_spans;
+        spans.push(Span::styled(placeholder.to_string(), fg(theme::FAINT)));
+        frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+        if show_cursor {
+            let x = inner.x + (prefix_w as u16).min(inner.width - 1);
+            frame.set_cursor_position((x, inner.y));
+        }
+        return (inner, true);
+    }
+
+    let w = inner.width as usize;
+    let first = w.saturating_sub(prefix_w);
+    let segs = wrap_by_width(text, first, w);
+    let total = segs.len();
+    // Show the last `inner.height` wrapped lines so a very long input keeps its tail (and the
+    // cursor) in view; the prompt prefix only renders when the true first line is visible.
+    let start = total.saturating_sub(inner.height as usize);
+    let mut lines: Vec<Line> = Vec::with_capacity(total - start);
+    for (i, seg) in segs[start..].iter().enumerate() {
+        if start + i == 0 {
+            let mut spans = prefix_spans.clone();
+            spans.push(Span::styled(seg.clone(), fg(theme::TEXT)));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(Span::styled(seg.clone(), fg(theme::TEXT))));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if show_cursor {
+        // Cursor at the end of the text: last visible row, offset by the prompt only when the
+        // end sits on the first logical line.
+        let last_w = display_width(segs.last().unwrap());
+        let col = if total == 1 {
+            prefix_w + last_w
+        } else {
+            last_w
+        };
+        let row = (total - start - 1) as u16;
+        let x = inner.x + (col as u16).min(inner.width - 1);
+        frame.set_cursor_position((x, inner.y + row));
+    }
+    (inner, start == 0)
+}
+
 /// Persistent inline spawn composer inside a rounded, faint-bordered box (Claude Code's
 /// input-box feel): `◆ codex ~/git/foo ❯ <text>`, or a muted placeholder when empty. The
-/// brand mark + backend name are in the backend's color, the target dir muted. When
-/// `show_cursor` (list view, Normal mode), the terminal's native cursor is placed at the
-/// end of the typed text so it blinks there.
+/// brand mark + backend name are in the backend's color, the target dir muted. Long input
+/// wraps down the (grown) box; when `show_cursor` (list view, Normal mode), the terminal's
+/// native cursor is placed at the end of the typed text so it blinks there.
 fn draw_composer(
     frame: &mut Frame,
     app: &App,
@@ -656,13 +828,6 @@ fn draw_composer(
     area: Rect,
     show_cursor: bool,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(fg(theme::FAINT));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let backend = composer.backend();
     let dir = app
         .spawn_target()
@@ -675,29 +840,35 @@ fn draw_composer(
     } else {
         format!("{model} ")
     };
-    let mut spans = vec![Span::styled(
+    let mut prefix_spans = vec![Span::styled(
         format!("{} {} ", backend_mark(backend), backend.name()),
         fg(backend_mark_color(backend)),
     )];
     if !model_seg.is_empty() {
-        spans.push(Span::styled(model_seg.clone(), fg(theme::MUTED)));
+        prefix_spans.push(Span::styled(model_seg, fg(theme::MUTED)));
     }
-    spans.push(Span::styled(format!("{dir} "), fg(theme::MUTED)));
-    spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
-    if composer.is_empty() {
-        spans.push(Span::styled(
-            "describe a task · tab to switch agent",
-            fg(theme::FAINT),
-        ));
-    } else {
-        spans.push(Span::styled(composer.text().to_string(), fg(theme::TEXT)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    prefix_spans.push(Span::styled(format!("{dir} "), fg(theme::MUTED)));
+    prefix_spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
+    let prefix_w = display_width(&composer_prefix(app, composer));
+
+    let (inner, first_visible) = draw_input_box(
+        frame,
+        area,
+        InputBox {
+            border: theme::FAINT,
+            prefix_spans,
+            prefix_w,
+            placeholder: "describe a task · tab to switch agent",
+        },
+        composer.text(),
+        show_cursor,
+    );
 
     // Logo mode: the mark prefix rendered as two blank columns above; overlay the brand image
-    // onto them. inner.x is the mark slot (no leading status glyph in the composer).
+    // onto them. Only when the first line (which carries the mark slot) is on screen.
     if let Some(logos) = logos
         && logo_marks()
+        && first_visible
         && inner.width >= 2
     {
         frame.render_widget(
@@ -710,59 +881,37 @@ fn draw_composer(
             },
         );
     }
-
-    if show_cursor && inner.width > 0 {
-        // Cursor at the end of the typed text, clamped inside the box. The prefix mirrors
-        // the fixed spans above: `<mark> <backend> [<model> ]<dir> ❯ `.
-        let prefix = format!(
-            "{} {} {model_seg}{dir} ❯ ",
-            backend_mark(backend),
-            backend.name()
-        );
-        let col = display_width(&prefix) + display_width(composer.text());
-        let x = inner.x + (col as u16).min(inner.width - 1);
-        frame.set_cursor_position((x, inner.y));
-    }
 }
 
 /// The reply-compose input, occupying the composer box: an accent-bordered rounded box with
 /// `↳ reply <title> ❯ <buffer>` (title muted, prompt accent, text bright), a muted
 /// placeholder when empty, and the native cursor at the end of the buffer (as draw_composer).
+/// Long replies wrap down the (grown) box.
 fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: &str) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(fg(theme::ACCENT));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let title_seg = if session_title.is_empty() {
         String::new()
     } else {
         format!("{session_title} ")
     };
-    let mut spans = vec![Span::styled("↳ reply ", fg(theme::ACCENT))];
+    let mut prefix_spans = vec![Span::styled("↳ reply ", fg(theme::ACCENT))];
     if !title_seg.is_empty() {
-        spans.push(Span::styled(title_seg.clone(), fg(theme::MUTED)));
+        prefix_spans.push(Span::styled(title_seg.clone(), fg(theme::MUTED)));
     }
-    spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
-    if modal.buffer.is_empty() {
-        spans.push(Span::styled(
-            "type a reply · Enter send · Esc cancel",
-            fg(theme::FAINT),
-        ));
-    } else {
-        spans.push(Span::styled(modal.buffer.clone(), fg(theme::TEXT)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    prefix_spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
+    let prefix_w = display_width(&format!("↳ reply {title_seg}❯ "));
 
-    if inner.width > 0 {
-        // Cursor at the end of the typed reply. Prefix mirrors the fixed spans above.
-        let prefix = format!("↳ reply {title_seg}❯ ");
-        let col = display_width(&prefix) + display_width(&modal.buffer);
-        let x = inner.x + (col as u16).min(inner.width - 1);
-        frame.set_cursor_position((x, inner.y));
-    }
+    draw_input_box(
+        frame,
+        area,
+        InputBox {
+            border: theme::ACCENT,
+            prefix_spans,
+            prefix_w,
+            placeholder: "type a reply · Enter send · Esc cancel",
+        },
+        &modal.buffer,
+        true,
+    );
 }
 
 // --- Header ---------------------------------------------------------------------
@@ -786,7 +935,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = Span::styled(
         " Agent Viewer",
-        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
     );
     let running = app.running_count();
     let needs = app.needs_input_count();
@@ -1234,9 +1385,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
         ("Space", "expand peek in row"),
-        ("r", "reply to a blocked session"),
         ("Enter/Space", "collapse group (on a header)"),
         ("Ctrl+R", "rename in row"),
+        ("Ctrl+E", "reply to a blocked session"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
         ("a", "show all (companions + archived)"),
@@ -1341,5 +1492,95 @@ mod tests {
         assert_eq!(bloom_glyph(399), Some(BLOOM[3]));
         assert_eq!(bloom_glyph(400), None); // finished
         assert_eq!(bloom_glyph(-1), None); // not started
+    }
+
+    #[test]
+    fn wrap_by_width_splits_first_line_shorter_than_the_rest() {
+        // First line budget 4, rest budget 6: "abcdefghij" -> "abcd" | "efghij".
+        assert_eq!(wrap_by_width("abcdefghij", 4, 6), vec!["abcd", "efghij"]);
+        // Fits on one line -> one segment.
+        assert_eq!(wrap_by_width("abc", 10, 10), vec!["abc"]);
+        // Empty text -> one empty segment (callers rely on .last()).
+        assert_eq!(wrap_by_width("", 5, 5), vec![""]);
+    }
+
+    #[test]
+    fn wrap_by_width_counts_wide_glyphs_by_display_width() {
+        // Each CJK glyph is two columns wide, so only two fit in a 5-wide budget.
+        assert_eq!(wrap_by_width("一二三", 5, 5), vec!["一二", "三"]);
+    }
+
+    #[test]
+    fn input_box_height_grows_with_wrapped_lines_and_caps() {
+        // Empty text keeps the resting 3-row box regardless of width.
+        assert_eq!(input_box_height(5, "", 40), 3);
+        // A zero-width area never grows.
+        assert_eq!(input_box_height(5, "anything", 0), 3);
+        // One wrapped line -> 1 text row + 2 borders. Prefix 2, width 12 -> first budget 10.
+        assert_eq!(input_box_height(2, "0123456789", 12), 3);
+        // Prefix 2, width 12 (first budget 10, rest 12), 22 chars -> 2 rows -> height 4.
+        assert_eq!(input_box_height(2, &"x".repeat(22), 12), 4);
+        // Runaway input is capped at COMPOSER_MAX_LINES text rows + 2 borders.
+        let huge = "y".repeat(10_000);
+        assert_eq!(input_box_height(0, &huge, 10), COMPOSER_MAX_LINES + 2);
+    }
+
+    /// Render `draw_input_box` into an in-memory `TestBackend` buffer and return the per-row
+    /// text plus the final cursor position — the actual render path, no terminal or pty.
+    fn render_input_box(
+        w: u16,
+        h: u16,
+        prefix: &'static str,
+        prefix_w: usize,
+        text: &str,
+    ) -> (Vec<String>, (u16, u16)) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let spans = vec![Span::styled(prefix.to_string(), fg(theme::ACCENT))];
+            draw_input_box(
+                f,
+                Rect::new(0, 0, w, h),
+                InputBox {
+                    border: theme::FAINT,
+                    prefix_spans: spans,
+                    prefix_w,
+                    placeholder: "placeholder",
+                },
+                text,
+                true,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let pos = term.get_cursor_position().unwrap();
+        (rows, (pos.x, pos.y))
+    }
+
+    #[test]
+    fn input_box_wraps_long_text_down_the_rows_with_cursor_on_the_last() {
+        // Inner width 6 (8 - 2 borders), prompt "> " (width 2): first budget 4, rest 6.
+        // "abcdefgh" -> "abcd" | "efgh" across the two inner rows.
+        let (rows, cursor) = render_input_box(8, 4, "> ", 2, "abcdefgh");
+        assert!(rows[0].starts_with('╭'), "top border: {:?}", rows[0]);
+        assert!(rows[3].starts_with('╰'), "bottom border: {:?}", rows[3]);
+        // Row 1: border + prompt + first 4 chars. Row 2: border + next 4 chars (no prompt).
+        assert_eq!(&rows[1], "│> abcd│");
+        assert_eq!(&rows[2], "│efgh  │");
+        // Cursor sits at the end of the text on the second inner row (y == 2), not off-screen
+        // to the right, which was the bug: inner.x (1) + 4 typed chars = col 5.
+        assert_eq!(cursor, (5, 2));
+    }
+
+    #[test]
+    fn input_box_short_text_stays_on_one_row() {
+        // Short text does not wrap: single inner row, cursor right after it on row 1.
+        let (rows, cursor) = render_input_box(12, 3, "> ", 2, "hi");
+        assert_eq!(&rows[1], "│> hi      │");
+        assert_eq!(cursor, (5, 1));
     }
 }
