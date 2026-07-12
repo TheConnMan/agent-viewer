@@ -34,9 +34,10 @@ Codex maintains a global session registry. **Read it; do not scrape JSONL for th
 - Table `threads`, load-bearing columns (verified via `.schema threads`):
   `id TEXT PK`, `rollout_path TEXT`, `created_at`, `updated_at` / `updated_at_ms`,
   `source TEXT`, `cwd TEXT`, `title TEXT`, `archived INTEGER DEFAULT 0`, `archived_at`,
-  `model TEXT`, `git_branch TEXT`, `git_origin_url TEXT`, `first_user_message TEXT`,
-  `preview TEXT`, `thread_source TEXT`, `agent_nickname TEXT`, `agent_role TEXT`.
-  Order by `updated_at_ms DESC`.
+  `model TEXT` (read only for the model-picker fallback via `distinct_models`, not per row),
+  `preview TEXT`. Order by `updated_at_ms DESC`. Other columns exist in the schema
+  (`git_branch`, `git_origin_url`, `first_user_message`, `thread_source`, `agent_nickname`,
+  `agent_role`) but the reader does not load them.
 - `source` is a **serialized enum, not a flat string**. Observed values: `cli`, `exec`,
   `vscode`, and JSON blobs like `{"subagent":"review"}` or nested `thread_spawn` objects.
   Parse defensively: match `cli`/`exec`/`vscode` prefixes; anything else → treat as subagent.
@@ -44,7 +45,6 @@ Codex maintains a global session registry. **Read it; do not scrape JSONL for th
   `~/.codex/archived_sessions/` (active rows point into `~/.codex/sessions/`).
 - Grouping key = `cwd`. Optionally fold `cwd` up to the nearest `.git` root so worktrees
   collapse under one project (mirrors the local `claude-usage` "aggregate worktrees" idea).
-  Use `git_branch` as a sub-label. Keep this optional/simple.
 
 A lighter index exists at `~/.codex/session_index.jsonl` but `threads` is strictly richer —
 use the SQLite.

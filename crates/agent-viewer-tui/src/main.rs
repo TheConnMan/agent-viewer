@@ -21,6 +21,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
+mod actions;
 mod auto_enter;
 mod keys;
 mod ops;
