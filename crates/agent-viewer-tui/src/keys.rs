@@ -16,7 +16,7 @@ use agent_viewer_tui::app::{
 };
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::ui::{Mode, RenameModal, ReplyModal};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::auto_enter::{AutoEnter, AutoEnterStage};
 use crate::ops::{Mutation, run_mutation};
@@ -53,6 +53,37 @@ pub(crate) fn handle_key(
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
     }
     Ok(false)
+}
+
+/// Route a mouse event. While attached, forward it to the focused child PTY as a native
+/// mouse report (the child, e.g. codex, has its own mouse tracking on and scrolls itself).
+/// In the list, the wheel scrolls the selection; other modes ignore the mouse.
+pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
+    match &ui.mode {
+        Mode::Attached => {
+            let Some(fkey) = ui.focused.clone() else {
+                return;
+            };
+            let Some(pty) = ui.attached.get_mut(&fkey) else {
+                return;
+            };
+            let (mode, encoding) =
+                pty.with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()));
+            // draw_attach draws a one-row header above the child screen, so offset by 1.
+            if let Some(bytes) = agent_viewer_tui::mouse::encode_mouse_report(me, mode, encoding, 1)
+            {
+                let _ = pty.write_input(&bytes);
+            }
+        }
+        // Enabling mouse capture stops the terminal's alternate-scroll from sending arrow
+        // keys, so the list must handle wheel scroll explicitly to keep scrolling working.
+        Mode::Normal => match me.kind {
+            MouseEventKind::ScrollUp => ui.app.move_selection(-1),
+            MouseEventKind::ScrollDown => ui.app.move_selection(1),
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
