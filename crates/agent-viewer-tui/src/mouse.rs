@@ -154,12 +154,7 @@ mod tests {
     fn mode_none_returns_none() {
         let e = ev(MouseEventKind::ScrollUp, 5, 3, KeyModifiers::NONE);
         assert_eq!(
-            encode_mouse_report(
-                e,
-                MouseProtocolMode::None,
-                MouseProtocolEncoding::Sgr,
-                1
-            ),
+            encode_mouse_report(e, MouseProtocolMode::None, MouseProtocolEncoding::Sgr, 1),
             None
         );
     }
@@ -169,12 +164,7 @@ mod tests {
         // row 0 is above the 1-row header offset, so it is not on the child screen.
         let e = ev(MouseEventKind::ScrollUp, 5, 0, KeyModifiers::NONE);
         assert_eq!(
-            encode_mouse_report(
-                e,
-                MouseProtocolMode::Press,
-                MouseProtocolEncoding::Sgr,
-                1
-            ),
+            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1),
             None
         );
     }
@@ -183,48 +173,50 @@ mod tests {
     fn scroll_up_sgr_at_offset_one() {
         // column 5 -> cx 6; row 3 with offset 1 -> child_row 2 -> cy 3.
         let e = ev(MouseEventKind::ScrollUp, 5, 3, KeyModifiers::NONE);
-        let out =
-            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
-                .unwrap();
+        let out = encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
+            .unwrap();
         assert_eq!(out, b"\x1b[<64;6;3M".to_vec());
     }
 
     #[test]
     fn scroll_down_sgr_is_sixty_five() {
         let e = ev(MouseEventKind::ScrollDown, 5, 3, KeyModifiers::NONE);
-        let out =
-            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
-                .unwrap();
+        let out = encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
+            .unwrap();
         assert_eq!(out, b"\x1b[<65;6;3M".to_vec());
     }
 
     #[test]
     fn ctrl_scroll_up_sgr_adds_sixteen() {
         let e = ev(MouseEventKind::ScrollUp, 5, 3, KeyModifiers::CONTROL);
-        let out =
-            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
-                .unwrap();
+        let out = encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
+            .unwrap();
         // 64 + 16 = 80.
         assert_eq!(out, b"\x1b[<80;6;3M".to_vec());
     }
 
     #[test]
     fn release_in_press_mode_is_dropped() {
-        let e = ev(MouseEventKind::Up(MouseButton::Left), 5, 3, KeyModifiers::NONE);
+        let e = ev(
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            3,
+            KeyModifiers::NONE,
+        );
         assert_eq!(
-            encode_mouse_report(
-                e,
-                MouseProtocolMode::Press,
-                MouseProtocolEncoding::Sgr,
-                1
-            ),
+            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1),
             None
         );
     }
 
     #[test]
     fn release_in_press_release_mode_ends_in_lowercase_m() {
-        let e = ev(MouseEventKind::Up(MouseButton::Left), 5, 3, KeyModifiers::NONE);
+        let e = ev(
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            3,
+            KeyModifiers::NONE,
+        );
         let out = encode_mouse_report(
             e,
             MouseProtocolMode::PressRelease,
@@ -244,9 +236,8 @@ mod tests {
             3,
             KeyModifiers::NONE,
         );
-        let out =
-            encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
-                .unwrap();
+        let out = encode_mouse_report(e, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1)
+            .unwrap();
         assert_eq!(out, b"\x1b[<0;6;3M".to_vec());
     }
 
