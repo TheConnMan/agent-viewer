@@ -74,6 +74,15 @@ fn claude_spawn_command(
     cmd
 }
 
+/// Build the `claude rm <short_id>` remove command (extracted so the exact argv is unit-
+/// testable, mirroring `claude_spawn_command`). `binary` is a &Path so the caller can pass
+/// its configured binary directly. Deleting a bg session is headless; a bogus id is a no-op.
+fn claude_rm_command(binary: &std::path::Path, short_id: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("rm").arg(short_id);
+    cmd
+}
+
 impl Backend for ClaudeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Claude
@@ -84,7 +93,7 @@ impl Backend for ClaudeBackend {
             hide: false,
             attach: true,
             stop: false,
-            remove: false,
+            remove: true,
             rename: true,
             reply: true,
         }
@@ -178,25 +187,35 @@ impl Backend for ClaudeBackend {
             ))
         }
     }
+    fn remove(&self, session: &Session) -> Result<()> {
+        // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
+        // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
+        // bg job to remove, so it is Unsupported rather than a stray no-op.
+        let short_id = session.short_id.as_deref().unwrap_or_default();
+        if short_id.is_empty() {
+            return Err(Error::Unsupported(self.kind().name()));
+        }
+        crate::spawn::run_checked(&mut claude_rm_command(
+            std::path::Path::new(&self.binary),
+            short_id,
+        ))
+    }
     fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
         let mut cmd = std::process::Command::new(&self.binary);
-        // A live session (pid present, or a Working/NeedsInput state) opens Claude Code's
-        // agent view with this job preselected and expanded — the view is not tied to the
-        // session cwd, so it runs from $HOME. A finished session resumes by full id,
-        // pinned to its cwd only when that dir still exists.
-        let live =
-            session.pid.is_some() || matches!(session.status, Status::Working | Status::NeedsInput);
-        if live {
-            cmd.arg("agents")
-                .env(
-                    "CLAUDE_AGENTS_SELECT",
-                    session.short_id.as_deref().unwrap_or_default(),
-                )
-                .current_dir(crate::home_dir());
-        } else {
-            cmd.arg("-r").arg(&session.id);
-            if session.cwd.is_dir() {
-                cmd.current_dir(&session.cwd);
+        // `claude attach <short_id>` resumes the SAME thread whether the session is live or
+        // done — it wakes a finished session in place and resolves the session's own cwd from
+        // its jobs dir, so there is no cwd pin and no CLAUDE_AGENTS_SELECT. Only a row with no
+        // short id (a rare jobs entry missing its "id" key) falls back to `claude -r <full id>`,
+        // pinned to its cwd when that dir still exists.
+        match session.short_id.as_deref() {
+            Some(short_id) if !short_id.is_empty() => {
+                cmd.arg("attach").arg(short_id);
+            }
+            _ => {
+                cmd.arg("-r").arg(&session.id);
+                if session.cwd.is_dir() {
+                    cmd.current_dir(&session.cwd);
+                }
             }
         }
         Some(cmd)
@@ -537,10 +556,19 @@ pub fn read_claude_transcript(
 
 #[cfg(test)]
 mod tests {
-    use super::claude_spawn_command;
+    use super::{claude_rm_command, claude_spawn_command};
     use crate::backend::args;
     use std::ffi::OsStr;
     use std::path::Path;
+
+    #[test]
+    fn claude_rm_command_builds_rm_subcommand() {
+        // The pure builder for `claude rm <short_id>` (mirrors claude_spawn_command) so the
+        // exact argv is asserted without running claude. binary is a &Path here.
+        let cmd = claude_rm_command(Path::new("claude"), "abc12345");
+        assert_eq!(cmd.get_program(), OsStr::new("claude"));
+        assert_eq!(args(&cmd), vec!["rm".to_string(), "abc12345".to_string()]);
+    }
 
     #[test]
     fn claude_spawn_command_carries_model_flag() {

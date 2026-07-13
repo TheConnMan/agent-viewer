@@ -1,38 +1,49 @@
-//! One-shot reply injector for a blocked session: after `send_reply` attaches (reusing the
-//! same PTY + auto-Enter landing path as a normal attach), this armed state watches the
-//! focused PTY and writes the reply payload once — but only after proving it is safe to do
-//! so. The safety invariants (never inject into a wrong/unfocused session, never before we
-//! are actually in the run, never blindly after a timeout) mirror `auto_enter`'s discipline.
+//! One-shot reply injector for a blocked session: after `send_reply` attaches (spawning a
+//! fresh `claude attach` PTY, or reusing one already in the run), this armed state watches
+//! the focused PTY and writes the
+//! reply payload once — but only after proving it is safe to do so. The safety invariants
+//! (never inject into a wrong/unfocused session, never before the attached run is actually
+//! accepting input, never blindly after a timeout) gate every write.
 
 use std::time::{Duration, Instant};
 
 use crate::{Key, Ui};
 
-/// The marker/landing state must hold this long before we write the payload, so we type when
-/// the run is actually accepting input rather than on a still-initializing frame.
+/// The ready state must hold this long before we write the payload, so we type when the run
+/// is actually accepting input rather than on a still-initializing frame.
 const REPLY_SETTLE: Duration = Duration::from_millis(600);
 /// Give up on a clean auto-inject after this long and tell the user to type it themselves
 /// (they are already attached). Never inject blindly late.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(50);
+/// Substrings claude prints while `claude attach` is still waking/attaching the session,
+/// before its real prompt renders. While either is on screen we are not yet in the run, so
+/// the injector must not type. Verified live on claude 2.1.207: the attach shows
+/// "Waking session <id>…" then "Attaching…" before the session UI repaints over them.
+const CLAUDE_ATTACHING_MARKERS: [&str; 2] = ["Waking session", "Attaching"];
 
-/// One-shot reply-injection state: which PTY to write into, the bytes to write, whether we
-/// must confirm we have left the claude agents list into the run first, whether this attach
-/// was a fresh list-attach (vs a reused in-run PTY), when it was armed, and when the
-/// ready-to-write state was first observed (settle debounce).
+/// One-shot reply-injection state: which PTY to write into, the bytes to write, whether the
+/// run-view gate applies (claude's attach transient must clear first), whether this attach
+/// spawned a fresh PTY (vs reused one already in the run), whether the attach transient has
+/// been observed yet, when it was armed, and when the ready-to-write state was first observed
+/// (settle debounce).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingReply {
     pub(crate) key: Key,
     pub(crate) payload: Vec<u8>,
-    /// Claude: the run-view gate applies (we must confirm we are in the run, not the agents
-    /// list, before injecting). Codex: false (codex resume opens straight into the pending
-    /// prompt). How the gate is satisfied depends on `fresh_attach` (see below).
+    /// Claude: the run-view gate applies — `claude attach` prints a "Waking…/Attaching…"
+    /// transient before its prompt renders, so we must confirm that transient has cleared
+    /// before injecting. Codex: false (codex resume opens straight into the pending prompt).
     pub(crate) require_run_view: bool,
-    /// True when THIS attach armed auto_enter and must wait for the explicit landing signal
-    /// (a fresh live-claude list attach). False when the PTY was reused (already attached
-    /// earlier, already in the run): auto_enter is never armed, so run-view is instead
-    /// confirmed by the agents-list marker being ABSENT on the pty screen. Ignored when
-    /// `require_run_view` is false (codex).
+    /// True when `send_reply` spawned a FRESH attach PTY for this reply (the reply feature's
+    /// primary path); false when it reused a PTY already attached (already past the transient,
+    /// already in the run). A fresh attach must SEE the transient appear and then clear before
+    /// it is safe to type — mere marker-absence is also true on the blank pre-paint frame, so
+    /// absence alone would race a slow cold-start. A reused PTY is already in the run, so
+    /// absence alone is sufficient. Ignored when `require_run_view` is false (codex).
     pub(crate) fresh_attach: bool,
+    /// Set once the "Waking…/Attaching…" transient has been observed on the PTY (fresh-attach
+    /// gate only). Latches true and never resets, so the gate is "seen then cleared".
+    pub(crate) transient_seen: bool,
     pub(crate) armed_at: Instant,
     pub(crate) ready_since: Option<Instant>,
 }
@@ -59,10 +70,11 @@ pub(crate) enum ReplyStep {
 /// Pure gate for the injector. `focused` = the reply target is the focused PTY; `elapsed` =
 /// since armed; `exited` = the PTY's child has exited; `still_blocked` = the session is still
 /// NeedsInput at write time (re-checked from the live list, not just when armed);
-/// `run_view_ready` = we are confirmed in the run (not the agents list) so it is safe to type
-/// — the driver precomputes this per backend/attach kind (codex: always; fresh claude: the
-/// explicit landing signal; reused claude: the agents-list marker being absent); `ready_since`
-/// = elapsed since the ready state was first observed, if any.
+/// `run_view_ready` = the attached run is accepting input so it is safe to type — the driver
+/// precomputes this per backend/attach kind (codex: always; claude fresh attach: the
+/// "Waking…/Attaching…" transient was seen and has since cleared; claude reused PTY: the
+/// transient is absent); `ready_since` = elapsed since the ready state was first observed,
+/// if any.
 pub(crate) fn reply_step(
     focused: bool,
     elapsed: Duration,
@@ -94,8 +106,8 @@ pub(crate) fn reply_step(
 }
 
 /// While a reply is armed, watch its focused PTY and write the payload once it is safe:
-/// only into the focused target, only after any live auto-Enter has finished and (for
-/// claude) the run view is confirmed, and only after a settle. Give up after a timeout.
+/// only into the focused target, only after (for claude) the attach transient has cleared so
+/// the run view is confirmed, and only after a settle. Give up after a timeout.
 /// The decision is delegated to the pure [`reply_step`]; this function only gathers the
 /// observable inputs and applies the resulting side effect.
 pub(crate) fn drive_pending_reply(ui: &mut Ui) {
@@ -114,11 +126,11 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
         .session_for(&state.key)
         .is_some_and(|s| matches!(s.status, agent_viewer_core::Status::NeedsInput));
 
-    // The PTY-observable inputs: the child's exit (always) and, only for a reused-run-PTY
-    // run-view gate, whether the agents-list marker is on screen. Read both under the borrow,
-    // then drop it before mutating `ui.pending_reply`. When focused but the PTY entry is
-    // missing, keep the current early-return (return without disarm).
-    let need_marker = state.require_run_view && !state.fresh_attach;
+    // The PTY-observable inputs: the child's exit (always) and, only for the claude run-view
+    // gate, whether the "Waking…/Attaching…" attach transient is on screen. Read both under
+    // the borrow, then drop it before mutating `ui.pending_reply`. When focused but the PTY
+    // entry is missing, keep the current early-return (return without disarm).
+    let need_marker = state.require_run_view;
     let (exited, marker_present) = if focused {
         let Some(pty) = ui.attached.get_mut(&state.key) else {
             return;
@@ -126,22 +138,42 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
         let exited = pty.is_exited();
         let marker_present = need_marker
             && pty.with_screen(|s| {
-                s.contents()
-                    .contains(crate::auto_enter::CLAUDE_AGENTS_MARKER)
+                let contents = s.contents();
+                CLAUDE_ATTACHING_MARKERS
+                    .iter()
+                    .any(|m| contents.contains(m))
             });
         (exited, marker_present)
     } else {
         (false, false)
     };
 
-    // Precompute the run-view gate: codex never waits (resume opens straight into the prompt);
-    // a fresh claude attach waits for auto_enter's explicit successful landing (never a
-    // timed-out clear); a reused claude PTY is ready once the agents-list marker is absent
-    // (we are in the run, not sitting on the list).
+    // Latch "the attach transient has been seen" so a fresh attach requires an affirmative
+    // seen-then-cleared transition, not mere absence. Persist the latch back into the armed
+    // state; it never resets.
+    if state.require_run_view
+        && marker_present
+        && !state.transient_seen
+        && let Some(p) = ui.pending_reply.as_mut()
+    {
+        p.transient_seen = true;
+    }
+    let transient_seen = state.transient_seen || marker_present;
+
+    // Precompute the run-view gate:
+    //  - codex: always ready (resume opens straight into the pending prompt).
+    //  - claude fresh attach: ready only once the "Waking…/Attaching…" transient was SEEN and
+    //    then cleared. Absence alone is not enough — a freshly spawned attach PTY is blank
+    //    before claude paints the transient, so injecting on absence would type into a still-
+    //    initializing terminal. A very fast attach whose transient no poll pass catches leaves
+    //    transient_seen=false, so the reply falls through to the 50s "type it in the session"
+    //    timeout — safe (never a misdirected write) and acceptable.
+    //  - claude reused PTY: already in the run from an earlier attach, so ready once the
+    //    transient marker is absent (it is never expected to reappear).
     let run_view_ready = if !state.require_run_view {
         true
     } else if state.fresh_attach {
-        ui.auto_enter_landed.as_ref() == Some(&state.key)
+        transient_seen && !marker_present
     } else {
         !marker_present
     };
@@ -196,9 +228,10 @@ mod tests {
     use super::*;
 
     // Small, PTY-free durations proving the safety invariants of the pure gate. The gate
-    // takes a single precomputed `run_view_ready`; the fresh-vs-reused distinction (fresh
-    // claude waits for the landing signal, reused claude waits for the agents-list marker to
-    // clear, codex is always ready) is resolved into that bool by `drive_pending_reply`.
+    // takes a single precomputed `run_view_ready`; the per-backend/attach-kind distinction
+    // (claude fresh attach waits for the "Waking…/Attaching…" transient to be seen and clear,
+    // claude reused PTY waits for it to be absent, codex is always ready) is resolved into that
+    // bool by `drive_pending_reply`.
     const SHORT: Duration = Duration::from_millis(10);
 
     #[test]
@@ -236,8 +269,8 @@ mod tests {
 
     #[test]
     fn not_run_view_ready_waits() {
-        // The run-view gate has not resolved yet (fresh landing not seen, or the agents-list
-        // marker still present for a reused PTY): keep waiting.
+        // The run-view gate has not resolved yet (claude's attach transient is still on
+        // screen): keep waiting.
         assert_eq!(
             reply_step(true, SHORT, false, true, false, None),
             ReplyStep::Wait

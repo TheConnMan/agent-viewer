@@ -9,14 +9,13 @@ use agent_viewer_core::backend::{Backend, BackendKind, Capabilities};
 use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_core::{Session, Status};
+use agent_viewer_core::Session;
 use agent_viewer_tui::app::{
     CodexReply, DetachTracker, KillStage, codex_reply_keystroke, file_stems, reply_allowed,
     subdir_names,
 };
 use agent_viewer_tui::ui::{Mode, RenameModal, ReplyModal};
 
-use crate::auto_enter::{AutoEnter, AutoEnterStage};
 use crate::ops::{Mutation, run_mutation};
 use crate::pending_reply::PendingReply;
 use crate::{Key, Refresher, Ui};
@@ -127,8 +126,8 @@ pub(crate) fn open_reply(backends: &[Box<dyn Backend>], ui: &mut Ui) {
 }
 
 /// Deliver the composed reply: re-resolve the target, re-check the safety gate (state may
-/// have changed while typing), attach (reusing the auto-Enter landing path), then arm the
-/// one-shot injector to write the payload once we are safely in the run. Claude sends the
+/// have changed while typing), attach (native `claude attach`, or a reused live PTY), then arm
+/// the one-shot injector to write the payload once we are safely in the run. Claude sends the
 /// text + Enter; codex maps y/n approvals to a single keystroke and otherwise attaches with
 /// focus for the user to finish; opencode is gated out upstream.
 pub(crate) fn send_reply(
@@ -177,22 +176,25 @@ pub(crate) fn send_reply(
         BackendKind::Opencode => None,
     };
 
+    // Whether a live PTY already exists BEFORE we attach decides fresh-vs-reused for the
+    // reply gate: attach_session reuses an existing PTY (already in the run) and otherwise
+    // spawns a fresh `claude attach` (which must show its transient before we may type).
+    let key: Key = (backend_kind, id);
+    let reused = ui.attached.contains_key(&key);
     if !attach_session(backends, ui, terminal, &session)? {
         return Ok(());
     }
     if let Some(payload) = payload {
-        let key: Key = (backend_kind, id);
-        // require_run_view: only claude opens onto the agents list; codex resume lands in the
-        // pending prompt. fresh_attach: attach_session arms auto_enter exactly for a fresh
-        // live-claude list attach (so the injector waits for its explicit landing); a reused
-        // PTY leaves auto_enter unarmed, so run-view is confirmed by the marker being absent.
+        // require_run_view: only claude prints a "Waking…/Attaching…" transient before its
+        // prompt renders, so the injector must wait for that to clear before typing. Codex
+        // resume lands straight in the pending prompt (always ready).
         let require_run_view = matches!(backend_kind, BackendKind::Claude);
-        let fresh_attach = ui.auto_enter.as_ref().map(|ae| &ae.key) == Some(&key);
         ui.pending_reply = Some(PendingReply {
             key,
             payload,
             require_run_view,
-            fresh_attach,
+            fresh_attach: !reused,
+            transient_seen: false,
             armed_at: Instant::now(),
             ready_since: None,
         });
@@ -331,8 +333,8 @@ pub(crate) fn attach_selected(
 }
 
 /// Attach a GIVEN session (shared by `attach_selected` and the reply delivery path): reuse a
-/// live PTY (resize) or spawn one, arm the live-claude auto-Enter, and focus it. Returns true
-/// when it ended attached (Mode::Attached), false when it bailed with a notice.
+/// live PTY (resize) or spawn one, and focus it. Returns true when it ended attached
+/// (Mode::Attached), false when it bailed with a notice.
 fn attach_session(
     backends: &[Box<dyn Backend>],
     ui: &mut Ui,
@@ -358,11 +360,13 @@ fn attach_session(
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();
     } else {
-        // Pre-accept the trust dialog before a claude RESUME attach into a fresh project
-        // (best-effort; the live agents-view path and other backends never need it).
-        let claude_live =
-            session.pid.is_some() || matches!(session.status, Status::Working | Status::NeedsInput);
-        if session.backend == BackendKind::Claude && !claude_live {
+        // Pre-accept the trust dialog before a claude `-r` RESUME attach into a fresh project
+        // (best-effort; only the no-short-id fallback resumes by full id and can hit the trust
+        // prompt — `claude attach <short_id>` resolves the trusted jobs cwd itself, and other
+        // backends never need it).
+        let claude_fallback = session.backend == BackendKind::Claude
+            && session.short_id.as_deref().unwrap_or_default().is_empty();
+        if claude_fallback {
             let home = std::env::var("HOME").unwrap_or_default();
             let config = std::path::PathBuf::from(&home).join(".claude.json");
             let _ = ensure_trusted(&config, &session.cwd);
@@ -377,20 +381,6 @@ fn attach_session(
                 ui.attached.insert(key.clone(), pty);
                 // Fresh Left-gate: a brand-new PTY starts with an empty input line.
                 ui.detach_trackers.insert(key.clone(), DetachTracker::new());
-                // A live claude attach opens the agents view; arm the one-shot auto-Enter
-                // to land in the preselected run (only on a fresh spawn, never a re-attach).
-                if session.backend == BackendKind::Claude && claude_live {
-                    ui.auto_enter = Some(AutoEnter {
-                        key: key.clone(),
-                        armed_at: Instant::now(),
-                        stage: AutoEnterStage::AwaitingList,
-                        marker_since: None,
-                        expanded_absent_seen: false,
-                    });
-                    // A fresh attach has not landed yet: clear any stale landing signal so the
-                    // reply injector waits for THIS attach's explicit success.
-                    ui.auto_enter_landed = None;
-                }
             }
             Err(e) => {
                 ui.set_notice(format!("attach failed: {e}"));

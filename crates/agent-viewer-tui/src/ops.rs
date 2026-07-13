@@ -50,10 +50,17 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<String, String> {
             if let Some(pid) = s.pid {
                 let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
             }
-            fresh_backend(s.backend)
-                .remove(&s.id)
-                .map(|()| format!("removed — {}", s.title))
-                .map_err(|e| format!("remove failed: {e}"))
+            match fresh_backend(s.backend).remove(&s) {
+                Ok(()) => Ok(format!("removed — {}", s.title)),
+                // A row with no bg job to remove (id-less) is a capability miss, not a
+                // failure: surface it as the invariant's benign "not supported" notice, the
+                // same shape as the stop/rename unsupported messaging. Genuine CLI failures
+                // (Error::Command) stay a "remove failed" error.
+                Err(agent_viewer_core::error::Error::Unsupported(name)) => {
+                    Err(format!("{name} does not support remove"))
+                }
+                Err(e) => Err(format!("remove failed: {e}")),
+            }
         }
         Mutation::Rename(s, name) => match fresh_backend(s.backend).rename(&s, &name) {
             Ok(()) => {

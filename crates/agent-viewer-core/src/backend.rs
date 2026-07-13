@@ -148,8 +148,8 @@ pub trait Backend: Send {
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
     /// Second-stage Ctrl+X hard-remove. Default Unsupported.
-    fn remove(&self, id: &str) -> crate::error::Result<()> {
-        let _ = id;
+    fn remove(&self, session: &Session) -> crate::error::Result<()> {
+        let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
     /// Rename in the backend's own store (never a raw DB write). Default Unsupported.

@@ -210,8 +210,8 @@ impl Backend for CodexBackend {
         }
     }
 
-    fn remove(&self, id: &str) -> Result<()> {
-        cli::archive(id)
+    fn remove(&self, session: &Session) -> Result<()> {
+        cli::archive(&session.id)
     }
 
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
