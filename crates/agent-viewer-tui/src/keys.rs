@@ -221,9 +221,8 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         return;
     };
 
-    // Any key here is the user taking over, so cancel a pending auto-Enter or reply injection
-    // on this attach (do not type our queued reply in behind the user's own input).
-    ui.auto_enter = None;
+    // Any key here is the user taking over, so cancel a pending reply injection on this
+    // attach (do not type our queued reply in behind the user's own input).
     ui.pending_reply = None;
 
     // Ctrl+] always detaches (PTY lives on in the map). Terminals send Ctrl+] as raw byte
@@ -385,8 +384,6 @@ mod tests {
             mutations: MutationRunner::new(),
             pulses: Pulses::new(),
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
-            auto_enter: None,
-            auto_enter_landed: None,
             pending_reply: None,
             attached: HashMap::new(),
             focused: None,

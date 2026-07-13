@@ -20,12 +20,10 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, Key
 use crossterm::execute;
 
 mod actions;
-mod auto_enter;
 mod keys;
 mod ops;
 mod pending_reply;
 
-use auto_enter::AutoEnter;
 use pending_reply::PendingReply;
 
 /// How often the refresh worker re-lists the backends (off the UI thread).
@@ -148,14 +146,6 @@ struct Ui {
     pulses: Pulses,
     /// Background PR-status cache: colors the right-aligned PR badge by live GitHub state.
     pr_status: PrStatusCache,
-    /// A one-shot auto-Enter armed on a live claude attach. While set, the run loop watches
-    /// the PTY for the agents view and presses Enter once (after a settle) to land in the
-    /// preselected run. Cleared on trigger, timeout, user key, or PTY prune.
-    auto_enter: Option<AutoEnter>,
-    /// The key for which `drive_auto_enter` reported an explicit SUCCESSFUL landing in the run
-    /// (its Enter opened the run, not a timeout/abort). The reply injector uses this as proof
-    /// we are in the run before writing — a timed-out `auto_enter` clear never sets it.
-    auto_enter_landed: Option<Key>,
     /// A one-shot reply injection armed by `send_reply`. While set, the run loop watches the
     /// focused PTY and writes the reply payload once it is safe (in the run, settled).
     /// Cleared on write, timeout, user takeover, or PTY prune.
@@ -184,16 +174,10 @@ impl Ui {
     }
 
     /// Drop a PTY together with its per-PTY state: the detach tracker dies with it and a
-    /// pending auto-Enter aimed at it is disarmed.
+    /// pending reply injection aimed at it is disarmed.
     fn remove_pty(&mut self, key: &Key) {
         self.attached.remove(key);
         self.detach_trackers.remove(key);
-        if self.auto_enter.as_ref().map(|ae| &ae.key) == Some(key) {
-            self.auto_enter = None;
-        }
-        if self.auto_enter_landed.as_ref() == Some(key) {
-            self.auto_enter_landed = None;
-        }
         if self.pending_reply.as_ref().map(|pr| &pr.key) == Some(key) {
             self.pending_reply = None;
         }
@@ -262,8 +246,6 @@ fn main() -> io::Result<()> {
         mutations: MutationRunner::new(),
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
-        auto_enter: None,
-        auto_enter_landed: None,
         pending_reply: None,
         attached: HashMap::new(),
         focused: None,
@@ -349,9 +331,7 @@ fn run(
             None => false,
         };
 
-        // Drive the one-shot auto-Enter for a live claude attach (lands us in the run).
-        auto_enter::drive_auto_enter(ui);
-        // Then drive any armed one-shot reply injection into the just-landed run.
+        // Drive any armed one-shot reply injection once we are safely in the attached run.
         pending_reply::drive_pending_reply(ui);
 
         // Build the attach view (if focused) before borrowing the frame.

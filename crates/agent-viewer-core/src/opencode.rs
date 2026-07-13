@@ -124,12 +124,12 @@ impl Backend for OpencodeBackend {
             None => Err(Error::Unsupported(self.kind().name())),
         }
     }
-    fn remove(&self, id: &str) -> Result<()> {
+    fn remove(&self, session: &Session) -> Result<()> {
         crate::spawn::run_checked(
             std::process::Command::new("opencode")
                 .arg("session")
                 .arg("delete")
-                .arg(id),
+                .arg(&session.id),
         )
     }
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
