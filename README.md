@@ -16,9 +16,9 @@ no data or whose CLI is not installed simply list empty — they never error the
   `threads`) plus the rollout transcripts under `~/.codex/sessions/`, resolves live
   running/done/errored status, spawns detached `codex exec` jobs, attaches via
   `codex resume`, and archives/unarchives.
-- **Claude / Claude Code** — enumerate, spawn, attach (`claude -r`), and rename. No
-  archive (Claude has no hide concept); rename falls back to a local override when the
-  daemon rename is unavailable.
+- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), rename, and
+  remove (`claude rm`). No archive/hide (Claude has no hide concept); rename falls back to
+  a local override when the daemon rename is unavailable.
 - **opencode** — enumerate, spawn, and attach from `~/.local/share/opencode/opencode.db`.
   No archive, no rename.
 
@@ -129,14 +129,15 @@ never freezes the list; a `…` notice shows while the action is in flight.
 
 `→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
 full-screen embedded terminal. Codex runs `codex resume`; opencode runs `opencode -s`;
-Claude opens its live agents view for a running background job — the viewer then presses
-Enter for you once the view is ready so you land directly in that job's run, not on the
-agents list — or `claude -r` to resume a finished one. `←` returns to the list when the
+Claude runs `claude attach`, which resumes the same thread for both a running background
+job and a finished one (waking it in place); a row with no background-job id falls back to
+`claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
 
 Replies (`Ctrl+E`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
-into the run once the viewer has navigated into it (not while still on the agents list). A
+into the run once the attach transient (`Waking…/Attaching…`) has cleared and the session
+is accepting input.
 A Codex approval reply of yes auto-sends the approve key; a denial or any free-text reply
 instead attaches you with focus so you can confirm it by hand (the Codex reject key is
 version and config specific, so denials are left to you). Codex needs-input is inferred from
