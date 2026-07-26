@@ -49,6 +49,61 @@ Codex maintains a global session registry. **Read it; do not scrape JSONL for th
 A lighter index exists at `~/.codex/session_index.jsonl` but `threads` is strictly richer —
 use the SQLite.
 
+## Enumeration — opencode, and the run-mode companion rule
+
+opencode keeps its own registry at `~/.local/share/opencode/opencode.db`. Same discipline as
+the Codex registry: open read-only, never write it, and treat a missing file as a quiet empty
+backend rather than an error.
+
+- Table `session`, load-bearing columns: `id`, `parent_id`, `directory`, `title`,
+  `time_created`, `time_updated`, `time_archived`, `permission`. Order by `time_updated DESC`.
+  The live table carries ~27 drizzle-managed columns; the reader depends only on these eight,
+  and the test fixture enforces that by construction.
+- `time_archived IS NOT NULL` is the hidden set. Grouping key = `directory`.
+- opencode exposes no per-session process signal, so status is a three-tier recency heuristic
+  over one `live_opencode_proc()` check per `list()` call, never `NeedsInput` or `Error`.
+
+**Companions.** A session is a companion when `parent_id` is non-NULL (a sub-session of
+another session) **or** when it was started as a one-shot `opencode run` rather than by a
+human at the TUI. The second half is the opencode analogue of the Codex `exec`/subagent rule
+above: a run fired off by a script (an `/implement` review pass, a CI job) is a step inside
+somebody else's job, not a fleet member anyone would attach to. `parent_id` alone does not
+catch it, because `opencode run` creates a top-level session with no parent.
+
+The discriminator is the `session.permission` column. `opencode run` denies the interactive
+`question` tool when it creates the session; the TUI writes no session override at all.
+Verified live on this box 2026-07-26, both on opencode 1.17.20, which rules out a version
+confound in the stored history (every 1.17.20 row observed had the column set, every 1.17.17
+row had it empty):
+
+```
+$ opencode run --title "AV probe run mode" "..."     -> permission =
+    [{"permission":"question","pattern":"*","action":"deny"},
+     {"permission":"plan_enter","pattern":"*","action":"deny"},
+     {"permission":"plan_exit","pattern":"*","action":"deny"}]
+
+$ opencode  (TUI, driven through a pty, one message sent)  -> permission = NULL
+```
+
+Corroborated in the shipped binary: that array literal is constructed inside the `run`
+command handler, immediately after its "You must provide a message or a command" and
+"--fork requires --continue or --session" validations.
+
+Match **semantically** — a `question` entry with `action: "deny"` anywhere in the array — not
+by string equality. The stored key order is not the source order, and the github-action path
+writes the `question` deny without the `plan_enter`/`plan_exit` pair. Anything that is not a
+JSON array of objects parses to "interactive", the safe direction: a shown row one keypress
+from hidden beats a hidden row the user cannot find.
+
+Two existing behaviors keep this from swallowing anything: sessions the viewer itself spawned
+are pinned by the viewer-state overlay, which clears `companion`, and `Ctrl+F` searches hidden
+rows, so a run-mode session is always reachable by name.
+
+Selecting `permission` makes the reader depend on a column older opencode schemas lack. That
+is deliberate and matches how the Codex reader depends on its columns directly; a
+`backend.list()` error is already contained to a footer notice over the previous snapshot, so
+the failure mode on an old schema is a visible notice, not a crash.
+
 ## Rollout transcripts (for detail view + status tail)
 
 Path: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. Parse with `serde_json`
