@@ -217,7 +217,7 @@ impl Backend for ClaudeBackend {
         // Read-modify-write, never a blind overwrite: state.json carries the job's respawn
         // contract, and a missing file means the job is gone (Err, so the TUI reports it).
         let existing = std::fs::read_to_string(&path)?;
-        write_atomic(
+        replace_atomic(
             &path,
             &job_state_with_name(&existing, name, SystemTime::now())?,
         )
@@ -599,16 +599,20 @@ pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 /// while the jobs dir itself is traversable, so leaving the temp at the umask default (0644 or
 /// 0664) would quietly publish that job's intent, output, respawn flags, and transcript path
 /// to every local user.
-fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
+///
+/// REPLACE, never create: a missing target is an error. `claude rm` can unlink state.json
+/// between the caller's read and this write (the mutation runner keys rename and remove
+/// separately, so they can overlap), and resurrecting the file there would leave a ghost job
+/// behind the removal.
+pub fn replace_atomic(path: &std::path::Path, body: &str) -> Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let tmp = dir.join(format!(
         ".{}.agent-viewer.{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    let mode = std::fs::metadata(path)
-        .ok()
-        .map(|meta| std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+    // Also the freshness check: metadata on the target is what proves it still exists.
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path)?.permissions());
     // Create OWNER-ONLY, before a single byte is written: chmod-after-write leaves a window in
     // which another local user can open the temp and read the whole job state. umask can only
     // clear bits, so the file is never wider than 0600 at creation.
@@ -617,11 +621,9 @@ fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
         let mut file = create_owner_only(tmp)?;
         file.write_all(body.as_bytes())?;
         // Widen to the target's own mode only once the content is in place.
-        if let Some(mode) = mode {
-            file.set_permissions(
-                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
-            )?;
-        }
+        file.set_permissions(
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+        )?;
         Ok(())
     };
     if let Err(e) = write(&tmp) {
