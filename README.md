@@ -16,9 +16,9 @@ no data or whose CLI is not installed simply list empty — they never error the
   `threads`) plus the rollout transcripts under `~/.codex/sessions/`, resolves live
   running/done/errored status, spawns detached `codex exec` jobs, attaches via
   `codex resume`, and archives/unarchives.
-- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), rename, and
-  remove (`claude rm`). No archive/hide (Claude has no hide concept); rename falls back to
-  a local override when the daemon rename is unavailable.
+- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), and remove
+  (`claude rm`). No archive/hide (Claude has no hide concept) and no rename (Claude exposes
+  no external rename channel, so `Ctrl+R` on a Claude row is a footer notice).
 - **opencode** — enumerate, spawn, and attach from `~/.local/share/opencode/opencode.db`.
   No archive, no rename.
 
@@ -114,6 +114,7 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
   `Enter` sends, `Esc` cancels). Capability-gated: unsupported backends (opencode) and
   non-blocked rows are a no-op with a footer notice.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
+  Capability-gated: unsupported backends (Claude) are a no-op with a footer notice.
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `a` — show all (companions + archived + deleted-dir rows).
@@ -153,7 +154,7 @@ the conversations live in each backend's own store and re-attach by session ID n
 If a child exits while you are attached, its final screen stays visible and any key
 returns you to the list.
 
-Viewer-local state (renames, archive flags, stop markers, spawn records) is kept in a
+Viewer-local state (archive flags, stop markers, spawn records) is kept in a
 SQLite database at `~/.local/state/agent-viewer/viewer.db`, separate from every backend's
 own store.
 

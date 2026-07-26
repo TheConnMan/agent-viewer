@@ -33,7 +33,8 @@ pub struct Capabilities {
     pub stop: bool,
     /// Second-stage Ctrl+X hard-remove (codex T archive, claude F, opencode T delete).
     pub remove: bool,
-    /// Rename in the backend's own store (codex T, claude T UDS best-effort, opencode T).
+    /// Rename in the backend's own store (codex T, claude F since no external rename
+    /// channel exists, opencode T).
     pub rename: bool,
     /// Reply into a blocked/live session (codex approval keystroke T, claude text T,
     /// opencode F).
