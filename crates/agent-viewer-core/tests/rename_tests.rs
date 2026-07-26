@@ -1,6 +1,28 @@
-use agent_viewer_core::claude::rename_reply_accepted;
+use agent_viewer_core::backend::{Backend, BackendKind, Status};
+use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::cli::name_set_request;
+use agent_viewer_core::error::Error;
 use serde_json::Value;
+
+fn claude_session(short_id: Option<&str>) -> agent_viewer_core::Session {
+    agent_viewer_core::Session {
+        backend: BackendKind::Claude,
+        id: "3f9c1a2e-0000-4000-8000-000000000001".to_string(),
+        short_id: short_id.map(str::to_string),
+        title: "probe".to_string(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        status: Status::Working,
+        hidden: false,
+        source_label: String::new(),
+        summary: String::new(),
+        companion: false,
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+    }
+}
 
 #[test]
 fn codex_name_set_request_shape() {
@@ -18,32 +40,24 @@ fn codex_name_set_request_shape() {
     assert_eq!(v["id"], 7);
 }
 
-// The Fleet View rendezvous socket authenticates its first frame as `attacher-caps` and
-// rejects our `rename_session` frame. The classifier must treat every rejection variant (and
-// an empty/garbage read) as NOT accepted, so the caller falls back to the viewer-local name
-// override instead of falsely reporting a native rename success.
+// Claude has no external rename channel. The daemon rendezvous socket authenticates its first
+// frame as `attacher-caps` and rejects a `rename_session` frame, so the old best-effort attempt
+// could never succeed - while every attempt evicted the daemon's supervisor connection for that
+// live session. Rename must therefore be advertised unsupported and must never open the socket.
 #[test]
-fn claude_rename_reply_rejection_is_not_accepted() {
-    // The exact frame the live daemon (claude 2.1.207) sends back to our rename attempt.
-    assert!(!rename_reply_accepted(br#"{"type":"reply-rejected"}"#));
-    assert!(!rename_reply_accepted(br#"{"type":"auth-rejected"}"#));
-    assert!(!rename_reply_accepted(br#"{"type":"rv-reply-rejected"}"#));
-    // A trailing newline (the daemon line-delimits frames) must not change the verdict.
-    assert!(!rename_reply_accepted(b"{\"type\":\"reply-rejected\"}\n"));
+fn claude_advertises_rename_unsupported() {
+    assert!(!ClaudeBackend::new().capabilities().rename);
 }
 
 #[test]
-fn claude_rename_reply_missing_or_garbage_is_not_accepted() {
-    // No reply within the read timeout -> cannot confirm -> fall back to the override.
-    assert!(!rename_reply_accepted(b""));
-    // Non-JSON bytes, and JSON without a `type` field, are both unconfirmable.
-    assert!(!rename_reply_accepted(b"not json at all"));
-    assert!(!rename_reply_accepted(br#"{"foo":1}"#));
-}
-
-#[test]
-fn claude_rename_reply_affirmative_is_accepted() {
-    // A future/older daemon that acknowledges the rename with a non-rejection typed frame is
-    // honored as a native success (so the override is cleared and the native name shows).
-    assert!(rename_reply_accepted(br#"{"type":"reply","text":"ok"}"#));
+fn claude_rename_is_refused_without_contacting_the_daemon() {
+    let backend = ClaudeBackend::new();
+    // A row carrying a live short id is exactly the case that previously reached the socket.
+    let err = backend
+        .rename(&claude_session(Some("ab12")), "new name")
+        .expect_err("claude rename must be refused, never attempted");
+    match err {
+        Error::Unsupported(name) => assert_eq!(name, "claude"),
+        other => panic!("expected Unsupported(\"claude\"), got {other:?}"),
+    }
 }

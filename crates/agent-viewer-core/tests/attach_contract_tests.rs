@@ -77,10 +77,11 @@ fn claude_capabilities_advertise_native_remove() {
     assert!(caps.remove, "claude now advertises native rm as remove");
     assert!(caps.spawn);
     assert!(caps.attach);
-    assert!(caps.rename);
     assert!(caps.reply);
     assert!(!caps.hide);
     assert!(!caps.stop);
+    // Rename stays unsupported: claude has no external rename channel (see rename_tests).
+    assert!(!caps.rename);
 }
 
 // --- Claude: `claude attach <short_id>` resumes the SAME thread, live OR done ---

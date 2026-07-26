@@ -88,12 +88,16 @@ pub(crate) fn ensure_models(ui: &mut Ui, backends: &[Box<dyn Backend>]) {
     }
 }
 
-/// Open the rename modal for the selected session (claude falls back to the local
-/// name override on apply, so it opens regardless of the backend's rename capability).
-pub(crate) fn open_rename(ui: &mut Ui) {
-    let Some(session) = ui.app.selected() else {
+/// `Ctrl+R` — open the rename modal for the selected session, gated on the backend
+/// advertising rename (claude has no external rename channel, so it is a footer notice).
+pub(crate) fn open_rename(backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    let Some(session) = ui.app.selected().cloned() else {
         return;
     };
+    if !caps_of(backends, session.backend).rename {
+        ui.set_notice(format!("{} does not support rename", session.backend.name()));
+        return;
+    }
     ui.mode = Mode::Rename(RenameModal {
         backend: session.backend,
         id: session.id.clone(),
