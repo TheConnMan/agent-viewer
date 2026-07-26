@@ -84,8 +84,8 @@ fn claude_capabilities_advertise_native_remove() {
     assert!(caps.needs_input);
     assert!(caps.pr_refs);
     assert!(caps.live_status);
-    // Rename stays unsupported: claude has no external rename channel (see rename_tests).
-    assert!(!caps.rename);
+    // Rename is a bg-job state.json write, gated per row on the short id (see rename_tests).
+    assert!(caps.rename);
 }
 
 // --- Claude: `claude attach <short_id>` resumes the SAME thread, live OR done ---

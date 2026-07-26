@@ -134,6 +134,41 @@ shallow versioning, so deserialize permissively and fall back to read-only `stat
 enumeration when `status` is not `running` or the handshake fails. agent-viewer never starts,
 stops, or restarts a daemon.
 
+## Claude mutations — CLI subcommands, plus one deliberate state-file write
+
+Spawn is `claude --bg`, attach is `claude attach <short>`, remove is `claude rm <short>`. Rename
+is the single exception to "delegate to a CLI subcommand": Claude ships no `rename` subcommand,
+so agent-viewer does what Claude's own fleet view does and writes the job's state file.
+
+**Mechanism.** Read `~/.claude/jobs/<short>/state.json`, set `name` and `nameSource: "user"`,
+write it back atomically (temp file in the same dir, then rename over the target). Read-modify-
+write, never a blind overwrite: that file also carries `respawnFlags`, `intent`, and the
+transcript path, and dropping them would break the job's respawn contract.
+
+**Evidence (2026-07-26, claude 2.1.220).** Fleet View's `Ctrl+R` has exactly two branches. For
+daemon-backed rows it calls the state writer above; its failure notice in the bundle is "the job
+may have been removed or *its state file is unwritable*", and the writer sets exactly
+`name`/`nameSource`/`updatedAt`. For interactive rows it writes one line of
+`{"type":"control","action":"rename","name":...}` to the session's `messagingSocketPath` from
+`~/.claude/sessions/<pid>.json` — dead in this build, because the field that would hold that
+path is declared and never assigned, so no session has one and Fleet View's own gate
+(`backend !== "daemon" && !sock` returns early) makes rename background-only. Confirmed live:
+writing `name` into a finished job's state.json made `claude agents --json --all` report the new
+name on the next listing.
+
+**What the rendezvous socket is not.** The per-session rendezvous socket authenticates its FIRST
+frame as `attacher-caps` and answers anything else with `{"type":"reply-rejected"}`; merely
+opening it evicts the daemon's supervisor connection for that live session. The
+`{"subtype":"rename_session"}` frame agent-viewer once sent there belongs to a third, unrelated
+protocol — the SDK/bridge control-request schema carried on the subprocess-stdin transport and
+the remote claude.ai bridge. It was never going to be understood by that socket.
+
+**Consequences.** `rename` is advertised backend-wide but gated per row on the short id
+(`capabilities_for`), since an interactive row has no job dir. Racing a live worker's own state
+write is accepted: the worker re-reads the file immediately before each write, so it merges the
+new name rather than reverting it, which is the same race Claude's own fleet view runs. No
+viewer-local name override is involved, so the list can never disagree with `claude agents`.
+
 ## Crate layout
 
 - `agent-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),
