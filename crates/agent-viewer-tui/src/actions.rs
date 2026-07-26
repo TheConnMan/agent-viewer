@@ -245,7 +245,11 @@ pub(crate) fn kill_selected(backends: &[Box<dyn Backend>], ui: &mut Ui) {
             );
         }
         KillStage::Remove => {
-            if !caps.remove {
+            // Per-row, not just per-backend: claude advertises remove but can only act on a
+            // row carrying a short id. Asking the row keeps the notice honest at keypress.
+            let removable = backend_of(backends, session.backend)
+                .is_some_and(|backend| backend.can_remove(&session));
+            if !removable {
                 ui.set_notice(format!(
                     "{} does not support remove",
                     session.backend.name()

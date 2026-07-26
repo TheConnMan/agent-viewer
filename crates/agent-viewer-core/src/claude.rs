@@ -187,6 +187,14 @@ impl Backend for ClaudeBackend {
             ))
         }
     }
+    fn can_remove(&self, session: &Session) -> bool {
+        // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
+        // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
+        session
+            .short_id
+            .as_deref()
+            .is_some_and(|short_id| !short_id.is_empty())
+    }
     fn remove(&self, session: &Session) -> Result<()> {
         // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
         // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
