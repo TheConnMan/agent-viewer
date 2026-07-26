@@ -3,7 +3,8 @@ mod common;
 use agent_viewer_core::Status;
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin};
 use agent_viewer_core::opencode::{
-    OpencodeBackend, opencode_status, parse_opencode_models, read_opencode_last_message, rename_sql,
+    OpencodeBackend, is_run_mode_permission, opencode_status, parse_opencode_models,
+    read_opencode_last_message, rename_sql,
 };
 use std::path::PathBuf;
 
@@ -280,4 +281,88 @@ fn opencode_rename_sql_escapes_quotes() {
     );
     // No un-doubled apostrophe survives inside the title literal.
     assert!(sql.contains("''s"));
+}
+
+// --- run-mode companions: `opencode run` sessions are one-shots, not fleet members ---
+
+#[test]
+fn opencode_run_mode_permission_marks_companion() {
+    let schema = common::read_fixture("opencode_session_schema.sql");
+    // The exact blob `opencode run` writes (verified live on this box, opencode 1.17.20:
+    // a `run` session stores this triple, a TUI session stores NULL).
+    let run_perm = "[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"},\
+                    {\"permission\":\"plan_enter\",\"pattern\":\"*\",\"action\":\"deny\"},\
+                    {\"permission\":\"plan_exit\",\"pattern\":\"*\",\"action\":\"deny\"}]";
+    let inserts = [
+        // TUI session: no parent, no permission override -> a real fleet row.
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived, permission) \
+         VALUES ('ses_tui',NULL,'/home/user/oc-proj','Interactive',1000,5000,NULL,NULL)"
+            .to_string(),
+        // `opencode run` one-shot (an /implement review pass): no parent, so parent_id
+        // alone would have shown it.
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived, permission) \
+             VALUES ('ses_run',NULL,'/home/user/oc-proj','CUR-1667 billing bug fix review',1000,4000,NULL,'{run_perm}')"
+        ),
+        // A permission override that is NOT the run marker must stay visible.
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived, permission) \
+         VALUES ('ses_other',NULL,'/home/user/oc-proj','Custom perms',1000,3000,NULL,'[{\"permission\":\"read\",\"pattern\":\"*\",\"action\":\"allow\"}]')"
+            .to_string(),
+        // Empty string (not NULL) is the same as no override.
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived, permission) \
+         VALUES ('ses_empty',NULL,'/home/user/oc-proj','Empty perms',1000,2000,NULL,'')"
+            .to_string(),
+    ];
+    let refs: Vec<&str> = inserts.iter().map(String::as_str).collect();
+    let (_dir, path) = common::temp_db(&schema, &refs);
+
+    let mut backend = OpencodeBackend::with_db(path);
+    let sessions = backend.list().expect("list opencode sessions");
+    let by = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} missing"))
+            .companion
+    };
+
+    assert!(!by("ses_tui"), "interactive TUI session must stay visible");
+    assert!(by("ses_run"), "`opencode run` one-shot must be a companion");
+    assert!(
+        !by("ses_other"),
+        "unrelated permission override is not a run marker"
+    );
+    assert!(!by("ses_empty"), "empty permission is not a run marker");
+}
+
+#[test]
+fn opencode_run_mode_permission_marker_shapes() {
+    // Absent / empty -> interactive.
+    assert!(!is_run_mode_permission(None));
+    assert!(!is_run_mode_permission(Some("")));
+    assert!(!is_run_mode_permission(Some("   ")));
+    // Not JSON, or JSON of the wrong shape -> interactive (never panics).
+    assert!(!is_run_mode_permission(Some("not json at all")));
+    assert!(!is_run_mode_permission(Some("{}")));
+    assert!(!is_run_mode_permission(Some("[]")));
+    assert!(!is_run_mode_permission(Some(
+        "[{\"permission\":\"question\"}]"
+    )));
+    // A `question` entry that is allowed, not denied -> interactive.
+    assert!(!is_run_mode_permission(Some(
+        "[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"allow\"}]"
+    )));
+    // The stored key order is not the source order, so order must not matter.
+    assert!(is_run_mode_permission(Some(
+        "[{\"action\":\"deny\",\"permission\":\"question\",\"pattern\":\"*\"}]"
+    )));
+    // The github-action variant writes the `question` deny alone, without the plan pair.
+    assert!(is_run_mode_permission(Some(
+        "[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"}]"
+    )));
+    // Extra unrelated entries around the marker must not hide it.
+    assert!(is_run_mode_permission(Some(
+        "[{\"permission\":\"read\",\"pattern\":\"*\",\"action\":\"allow\"},\
+          {\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"}]"
+    )));
 }
