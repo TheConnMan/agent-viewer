@@ -222,3 +222,103 @@ fn claude_jobs_root_follows_the_claude_config_dir() {
         "a blank env value is not a config dir"
     );
 }
+
+#[test]
+fn claude_iso8601_matches_the_javascript_toisostring_shape() {
+    // The value goes into a field claude's own writer stamps with `new Date().toISOString()`,
+    // so the shape has to match exactly: UTC, millisecond precision, trailing Z.
+    use agent_viewer_core::claude::iso8601_utc_millis;
+    use std::time::{Duration, UNIX_EPOCH};
+    assert_eq!(iso8601_utc_millis(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+    assert_eq!(
+        iso8601_utc_millis(UNIX_EPOCH + Duration::from_millis(1_785_095_531_007)),
+        "2026-07-26T19:52:11.007Z"
+    );
+    // Leap day, and the last second of a leap year.
+    assert_eq!(
+        iso8601_utc_millis(UNIX_EPOCH + Duration::from_secs(1_709_209_845)),
+        "2024-02-29T12:30:45.000Z"
+    );
+    assert_eq!(
+        iso8601_utc_millis(UNIX_EPOCH + Duration::from_secs(1_735_689_599)),
+        "2024-12-31T23:59:59.000Z"
+    );
+}
+
+#[test]
+fn claude_rename_stamps_updated_at_like_claude_does() {
+    // Claude's own rename writer sets `updatedAt` alongside the name. Leaving it stale makes
+    // this rename invisible to anything that sorts or invalidates on that field.
+    let root = jobs_root_with(
+        "ab12",
+        r#"{"name":"old","updatedAt":"2020-01-01T00:00:00.000Z"}"#,
+    );
+    let backend = ClaudeBackend::with_binary_and_jobs_root("claude", root.path().to_path_buf());
+
+    backend
+        .rename(&claude_session(Some("ab12")), "new")
+        .expect("rename succeeds");
+
+    let after = state_json(&root, "ab12");
+    let stamped = after["updatedAt"].as_str().expect("updatedAt is a string");
+    assert_ne!(
+        stamped, "2020-01-01T00:00:00.000Z",
+        "updatedAt must advance"
+    );
+    assert!(
+        stamped.ends_with('Z') && stamped.len() == 24,
+        "updatedAt must keep the toISOString shape, got {stamped:?}"
+    );
+}
+
+#[test]
+fn claude_rename_never_exposes_the_temp_file_to_other_users() {
+    // The temp must be CREATED restricted, not widened after the fact: another local user can
+    // read a 0644 temp in the window between write and chmod.
+    use std::os::unix::fs::PermissionsExt;
+    let root = jobs_root_with("ab12", r#"{"name":"old","intent":"secret"}"#);
+    let dir = root.path().join("ab12");
+    std::fs::set_permissions(
+        dir.join("state.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod 600");
+
+    // A writer that observes every file the rename creates, at the moment it is created.
+    let watch_dir = dir.clone();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let sink = std::sync::Arc::clone(&observed);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let watcher = std::thread::spawn(move || {
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(entries) = std::fs::read_dir(&watch_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().contains(".tmp")
+                        && let Ok(meta) = entry.metadata()
+                    {
+                        sink.lock()
+                            .expect("lock")
+                            .push(meta.permissions().mode() & 0o777);
+                    }
+                }
+            }
+        }
+    });
+
+    let backend = ClaudeBackend::with_binary_and_jobs_root("claude", root.path().to_path_buf());
+    for i in 0..40 {
+        backend
+            .rename(&claude_session(Some("ab12")), &format!("new {i}"))
+            .expect("rename succeeds");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().expect("watcher joins");
+
+    let seen = observed.lock().expect("lock").clone();
+    assert!(
+        seen.iter().all(|mode| mode & 0o077 == 0),
+        "temp file was group/other readable at some point: {seen:?}"
+    );
+}
