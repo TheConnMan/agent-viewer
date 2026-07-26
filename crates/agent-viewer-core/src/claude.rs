@@ -499,9 +499,23 @@ pub fn parse_job_state(text: &str) -> JobDetail {
     }
 }
 
-/// $HOME/.claude/jobs
+/// $CLAUDE_CONFIG_DIR/jobs if set, else $HOME/.claude/jobs.
 pub fn default_jobs_root() -> PathBuf {
-    crate::home_dir().join(".claude/jobs")
+    jobs_root_from(
+        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        &crate::home_dir(),
+    )
+}
+
+/// The jobs root for a given config dir, split out from the env read so the precedence is
+/// testable. `claude agents` lists jobs out of `$CLAUDE_CONFIG_DIR` when it is set, so a
+/// viewer that inherited that env must read AND write the same tree - otherwise rename either
+/// fails on a missing file or writes a same-short-id job in the default tree.
+pub fn jobs_root_from(config_dir: Option<&str>, home: &std::path::Path) -> PathBuf {
+    match config_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("jobs"),
+        None => home.join(".claude/jobs"),
+    }
 }
 
 /// <jobs_root>/<short_id>/state.json
@@ -531,6 +545,11 @@ fn job_state_with_name(existing: &str, name: &str) -> Result<String> {
 /// rename over the target, so a concurrent reader (the claude daemon, our own list tick)
 /// sees either the old file or the new one, never a partial write. Mirrors claude's own
 /// state writer.
+///
+/// The temp file inherits the target's mode BEFORE the rename. Claude writes state.json 0600
+/// while the jobs dir itself is traversable, so leaving the temp at the umask default (0644 or
+/// 0664) would quietly publish that job's intent, output, respawn flags, and transcript path
+/// to every local user.
 fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let tmp = dir.join(format!(
@@ -538,7 +557,19 @@ fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
+    let mode = std::fs::metadata(path)
+        .ok()
+        .map(|meta| std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
     std::fs::write(&tmp, body)?;
+    if let Some(mode) = mode
+        && let Err(e) = std::fs::set_permissions(
+            &tmp,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+        )
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());

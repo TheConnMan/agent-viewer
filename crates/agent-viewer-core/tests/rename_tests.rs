@@ -176,3 +176,49 @@ fn claude_rename_refuses_a_state_file_that_is_not_an_object() {
     );
     assert_eq!(state_json(&root, "ab12"), serde_json::json!([1, 2, 3]));
 }
+
+#[test]
+fn claude_rename_preserves_the_state_file_permissions() {
+    // Claude writes state.json 0600 and the jobs dir is group/other traversable, so replacing
+    // the file with a umask-default 0644/0664 temp would expose intent, output, respawn
+    // configuration, and transcript paths to every local user. The atomic write must carry the
+    // original mode across the rename.
+    use std::os::unix::fs::PermissionsExt;
+    let root = jobs_root_with("ab12", r#"{"name":"old","intent":"secret"}"#);
+    let path = root.path().join("ab12").join("state.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+
+    let backend = ClaudeBackend::with_binary_and_jobs_root("claude", root.path().to_path_buf());
+    backend
+        .rename(&claude_session(Some("ab12")), "new")
+        .expect("rename succeeds");
+
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "rename must not widen the state file");
+}
+
+#[test]
+fn claude_jobs_root_follows_the_claude_config_dir() {
+    // `claude agents` lists jobs out of $CLAUDE_CONFIG_DIR when it is set, so a viewer that
+    // inherited that env must write the same tree - otherwise rename either fails on a missing
+    // file or, worse, writes a same-short-id job in the default tree.
+    use agent_viewer_core::claude::jobs_root_from;
+    let home = std::path::Path::new("/home/somebody");
+    assert_eq!(
+        jobs_root_from(Some("/srv/claude-config"), home),
+        std::path::Path::new("/srv/claude-config/jobs")
+    );
+    assert_eq!(
+        jobs_root_from(None, home),
+        std::path::Path::new("/home/somebody/.claude/jobs")
+    );
+    assert_eq!(
+        jobs_root_from(Some("   "), home),
+        std::path::Path::new("/home/somebody/.claude/jobs"),
+        "a blank env value is not a config dir"
+    );
+}
