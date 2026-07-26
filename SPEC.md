@@ -90,8 +90,34 @@ All verified present in `codex --help` (0.144.1):
   ```
   In Rust: `std::process::Command`, detached (new session via `nix::unistd::setsid` or
   `libc`, `stdin(Stdio::null())`), do not wait. The new `threads` row appears within ~1s and
-  enumeration picks it up. (Confirm the exact sandbox flag default is acceptable; prefer the
-  least-privileged flag that actually runs unattended on this box.)
+  enumeration picks it up.
+
+  **Spawn sandbox posture — resolved, do not "harden" this back.** The open question above
+  ("prefer the least-privileged flag that actually runs unattended") was once answered with
+  `--sandbox workspace-write`, and that answer was wrong. Evidence, verified live against
+  codex-cli 0.145.0 on this box:
+  - Under `workspace-write`, codex mounts `.git` **read-only** and leaves `network_access`
+    off. A probe run confirmed it directly: writing a file in the workspace exits 0, writing
+    `.git/PROBE_HEAD` exits 1. The same probe under
+    `--dangerously-bypass-approvals-and-sandbox` exits 0.
+  - A real viewer-spawned session ended with: *"No source files were changed. The sandbox
+    mounts `.git` read only, so the required branch and worktree could not be created.
+    `git fetch origin main` failed with `cannot open '.git/FETCH_HEAD': Read-only file
+    system`."* It burned a full turn on read-only triage and shipped nothing.
+  - Every task this viewer spawns is a git-shaped task (branch, worktree, commit) on the
+    user's own box, per the repo's branch-before-editing rule. A sandbox that blocks `.git`
+    turns those runs into silent no-ops, which is strictly worse than no sandbox: the session
+    still consumes tokens and still reports "done".
+  - `codex exec --help` (0.145.0) exposes only `writable_roots`, `network_access`,
+    `exclude_tmpdir_env_var`, and `exclude_slash_tmp` under `sandbox_workspace_write`. There
+    is no "make `.git` writable" switch. `--add-dir <repo>/.git` does unlock it, but only for
+    one repo's metadata dir, and it breaks for worktrees (whose `.git` is a *file* pointing
+    into the parent repo) — so it is not a general fix.
+
+  Viewer-spawned sessions therefore run `--dangerously-bypass-approvals-and-sandbox`: no
+  sandbox, no approval prompts. This matches how the sessions are actually used (the user's
+  own machine, the user's own repos, unattended) and is asserted by
+  `codex_spawn_command_runs_unsandboxed` in `crates/agent-viewer-core/src/codex/mod.rs`.
 - **Hide (req 3):** `codex archive <id>`; **unhide:** `codex unarchive <id>`;
   hard-delete (optional, guard behind a confirm): `codex delete <id>`.
 - **Attach/resume:** `codex resume <id>` (or `codex exec resume <id>`), exec'd into the
@@ -151,6 +177,30 @@ rollout for live tail.
 - Keys: `Enter` attach/resume; `n` new session (prompt dir + task, spawn detached);
   `h` hide (archive); `u` unhide; `a` toggle show-hidden; `space` collapse group;
   `/` filter; `j/k` + arrows navigate; `q` quit. Keep the set small and obvious.
+
+### Mouse capture must be escapable (`Ctrl+T`)
+
+The viewer enables mouse capture at startup, for two real reasons: click/hover row selection
+on the list, and forwarding wheel events to an attached child so the wheel scrolls the child's
+transcript instead of the terminal's alternate-scroll emitting arrow keys that codex reads as
+prompt-history navigation.
+
+The cost is that **capture swallows the terminal's own drag-select**, so text cannot be copied
+out of the viewer. This spec previously waved that away with "the terminal's native text
+selection still works with Shift held in most terminals" — "most" is the bug. That override is
+a per-terminal convention, not a protocol guarantee, and where it is absent the content on
+screen is simply uncopyable.
+
+`Ctrl+T` therefore toggles mouse reporting at runtime, sending the real
+`DisableMouseCapture`/`EnableMouseCapture` sequences and flipping `Ui::mouse_capture`. Rules:
+- The chord is claimed in **every** mode, attach included. The attached transcript is the
+  surface users most want to copy out of, so the child does not receive `Ctrl+T` (the same
+  deliberate theft as `Ctrl+]` for detach).
+- `handle_mouse` early-returns while capture is off, so a report still in flight — or one from
+  a terminal that ignored the disable sequence — cannot steer the selection.
+- Each toggle sets a footer notice naming the new mode and the way back, because the state is
+  otherwise invisible.
+- Capture starts **on**; the toggle is opt-out, not opt-in.
 
 ## Testing
 
