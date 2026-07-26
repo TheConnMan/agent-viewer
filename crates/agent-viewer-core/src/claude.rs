@@ -94,7 +94,7 @@ impl Backend for ClaudeBackend {
             attach: true,
             stop: false,
             remove: true,
-            rename: true,
+            rename: false,
             reply: true,
         }
     }
@@ -149,43 +149,19 @@ impl Backend for ClaudeBackend {
         // companions so spawn pinning is unnecessary.
         Ok(None)
     }
-    fn rename(&self, session: &Session, name: &str) -> Result<()> {
-        // Best-effort UDS rename against the live daemon worker (unofficial Fleet View
-        // protocol). Any failure -> Err so the TUI falls back to set_name_override. Current
-        // claude (2.1.207) authenticates the rendezvous socket's first frame as `attacher-caps`
-        // and rejects our rename frame with `{"type":"reply-rejected"}`; we honor that reply
-        // instead of assuming success, so the caller reliably falls back to the local override.
-        use std::io::{Read, Write};
-        let roster_path = crate::home_dir().join(".claude/daemon/roster.json");
-        let text = std::fs::read_to_string(&roster_path)?;
-        let roster: serde_json::Value = serde_json::from_str(&text)?;
-        let sock = roster
-            .get("workers")
-            .and_then(|w| w.as_object())
-            .and_then(|workers| {
-                workers.values().find(|worker| {
-                    crate::json_str(worker, "sessionId") == Some(session.id.as_str())
-                })
-            })
-            .and_then(|worker| crate::json_str(worker, "rendezvousSock"))
-            .ok_or_else(|| Error::Command("no live worker for session".into()))?;
-        let mut stream = std::os::unix::net::UnixStream::connect(sock)?;
-        let mut line =
-            serde_json::json!({ "subtype": "rename_session", "title": name }).to_string();
-        line.push('\n');
-        stream.write_all(line.as_bytes())?;
-        // The daemon replies on the same socket; only an explicit non-rejection ack counts as
-        // a native rename. A rejection, an empty read, or garbage all mean "not renamed here".
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-        let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        if rename_reply_accepted(&buf[..n]) {
-            Ok(())
-        } else {
-            Err(Error::Command(
-                "daemon rejected rename (no external rename channel)".into(),
-            ))
-        }
+    // No `rename` impl on purpose: claude exposes no external rename channel. The daemon's
+    // per-session rendezvous socket authenticates its FIRST frame as `attacher-caps` and
+    // rejects a `rename_session` frame, and merely opening it evicts the daemon's supervisor
+    // connection for that live session — so every attempt damaged a live session for a
+    // guaranteed failure. The trait default returns Err(Unsupported), which is the honest
+    // answer, and `capabilities().rename` is false so the TUI never reaches it.
+    fn can_remove(&self, session: &Session) -> bool {
+        // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
+        // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
+        session
+            .short_id
+            .as_deref()
+            .is_some_and(|short_id| !short_id.is_empty())
     }
     fn remove(&self, session: &Session) -> Result<()> {
         // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
@@ -219,30 +195,6 @@ impl Backend for ClaudeBackend {
             }
         }
         Some(cmd)
-    }
-}
-
-/// Whether the daemon's rendezvous reply to a `rename_session` frame indicates the rename was
-/// accepted natively. The Fleet View rv socket authenticates its first frame as `attacher-caps`
-/// and rejects everything else (`reply-rejected`, `auth-rejected`, `rv-reply-rejected`), so a
-/// native rename over it is not available in current claude. Only an explicit, typed,
-/// non-rejection reply counts as success; a rejection, an empty read (no reply within the
-/// timeout), or unparseable bytes all return false so the caller falls back to the reliable
-/// viewer-local name override. Forward-compatible: an older/future daemon that positively acks
-/// with a non-rejection `type` is still honored.
-pub fn rename_reply_accepted(reply: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(reply) else {
-        return false;
-    };
-    let Some(first) = text.lines().next().map(str::trim).filter(|l| !l.is_empty()) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(first) else {
-        return false;
-    };
-    match value.get("type").and_then(|t| t.as_str()) {
-        Some(kind) => !kind.contains("rejected"),
-        None => false,
     }
 }
 

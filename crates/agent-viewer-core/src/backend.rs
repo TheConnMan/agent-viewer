@@ -33,7 +33,8 @@ pub struct Capabilities {
     pub stop: bool,
     /// Second-stage Ctrl+X hard-remove (codex T archive, claude F, opencode T delete).
     pub remove: bool,
-    /// Rename in the backend's own store (codex T, claude T UDS best-effort, opencode T).
+    /// Rename in the backend's own store (codex T, claude F since no external rename
+    /// channel exists, opencode T).
     pub rename: bool,
     /// Reply into a blocked/live session (codex approval keystroke T, claude text T,
     /// opencode F).
@@ -151,6 +152,15 @@ pub trait Backend: Send {
     fn remove(&self, session: &Session) -> crate::error::Result<()> {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
+    }
+    /// Whether `remove` can actually act on THIS row. The backend-wide `remove` capability
+    /// is necessary but not sufficient: claude advertises remove, yet a row without a short
+    /// id has no bg job for `claude rm` to delete. Callers MUST consult this before any
+    /// destructive step, or an unsupported remove SIGTERMs a live session and then declines
+    /// to remove it. Defaults to the backend-wide capability.
+    fn can_remove(&self, session: &Session) -> bool {
+        let _ = session;
+        self.capabilities().remove
     }
     /// Rename in the backend's own store (never a raw DB write). Default Unsupported.
     fn rename(&self, session: &Session, name: &str) -> crate::error::Result<()> {
