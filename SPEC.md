@@ -140,10 +140,18 @@ Spawn is `claude --bg`, attach is `claude attach <short>`, remove is `claude rm 
 is the single exception to "delegate to a CLI subcommand": Claude ships no `rename` subcommand,
 so agent-viewer does what Claude's own fleet view does and writes the job's state file.
 
-**Mechanism.** Read `~/.claude/jobs/<short>/state.json`, set `name` and `nameSource: "user"`,
-write it back atomically (temp file in the same dir, then rename over the target). Read-modify-
-write, never a blind overwrite: that file also carries `respawnFlags`, `intent`, and the
-transcript path, and dropping them would break the job's respawn contract.
+**Mechanism.** Read `<jobs root>/<short>/state.json`, set `name`, `nameSource: "user"`, and
+`updatedAt` (Claude's writer stamps all three), write it back atomically (temp file in the same
+dir, then rename over the target). Read-modify-write, never a blind overwrite: that file also
+carries `respawnFlags`, `intent`, and the transcript path, and dropping them would break the
+job's respawn contract. The jobs root is `$CLAUDE_CONFIG_DIR/jobs` when that is set, else
+`~/.claude/jobs`, matching what `claude agents` lists.
+
+**The temp file is created 0600, not chmod'd afterwards.** Claude writes state.json 0600 while
+the jobs dir is group/other traversable, so a temp left at the umask default would publish that
+job's intent, output, respawn flags, and transcript path — and widening only after the write
+still leaves a window another local user can read. Create restricted, write, then match the
+target's own mode, then rename.
 
 **Evidence (2026-07-26, claude 2.1.220).** Fleet View's `Ctrl+R` has exactly two branches. For
 daemon-backed rows it calls the state writer above; its failure notice in the bundle is "the job

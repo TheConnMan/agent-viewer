@@ -217,7 +217,10 @@ impl Backend for ClaudeBackend {
         // Read-modify-write, never a blind overwrite: state.json carries the job's respawn
         // contract, and a missing file means the job is gone (Err, so the TUI reports it).
         let existing = std::fs::read_to_string(&path)?;
-        write_atomic(&path, &job_state_with_name(&existing, name)?)
+        write_atomic(
+            &path,
+            &job_state_with_name(&existing, name, SystemTime::now())?,
+        )
     }
     fn remove(&self, session: &Session) -> Result<()> {
         // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
@@ -527,7 +530,7 @@ pub fn job_state_path_in(jobs_root: &std::path::Path, short_id: &str) -> PathBuf
 /// from the filesystem so the merge itself is provable: a rename must never drop
 /// `respawnFlags`, `intent`, or anything else the job needs to respawn. `Err` when the file
 /// is not a JSON object, since a synthesized replacement would drop exactly those fields.
-fn job_state_with_name(existing: &str, name: &str) -> Result<String> {
+fn job_state_with_name(existing: &str, name: &str, now: SystemTime) -> Result<String> {
     let mut state: serde_json::Value = serde_json::from_str(existing)?;
     let Some(object) = state.as_object_mut() else {
         return Err(Error::Command(
@@ -538,7 +541,40 @@ fn job_state_with_name(existing: &str, name: &str) -> Result<String> {
     // `user` is what fleet view stamps for a human rename; it is what stops claude's own
     // auto-titler from overwriting the name later.
     object.insert("nameSource".to_string(), serde_json::Value::from("user"));
+    // Claude's own writer stamps this on every state write, so a rename that left it stale
+    // would be invisible to anything sorting or invalidating on the field.
+    object.insert(
+        "updatedAt".to_string(),
+        serde_json::Value::from(iso8601_utc_millis(now)),
+    );
     Ok(serde_json::to_string_pretty(&state)?)
+}
+
+/// `SystemTime` as `YYYY-MM-DDTHH:MM:SS.mmmZ` — the exact shape JavaScript's `toISOString()`
+/// produces, because the value lands in a field claude writes with that call. Pre-epoch times
+/// clamp to the epoch (they cannot occur for a job state and are not worth a signed path).
+pub fn iso8601_utc_millis(time: SystemTime) -> String {
+    let since = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (secs, millis) = (since.as_secs(), since.subsec_millis());
+    let (days, secs_of_day) = ((secs / 86_400) as i64, secs % 86_400);
+    // days_to_civil (Howard Hinnant's civil-from-days), shifted to an era starting 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    )
 }
 
 /// Replace `path`'s contents with `body` atomically: write a temp file beside it, then
@@ -560,13 +596,26 @@ fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
     let mode = std::fs::metadata(path)
         .ok()
         .map(|meta| std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
-    std::fs::write(&tmp, body)?;
-    if let Some(mode) = mode
-        && let Err(e) = std::fs::set_permissions(
-            &tmp,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+    // Create OWNER-ONLY, before a single byte is written: chmod-after-write leaves a window in
+    // which another local user can open the temp and read the whole job state. umask can only
+    // clear bits, so the file is never wider than 0600 at creation.
+    let write = |tmp: &std::path::Path| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::os::unix::fs::OpenOptionsExt::mode(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+            0o600,
         )
-    {
+        .open(tmp)?;
+        file.write_all(body.as_bytes())?;
+        // Widen to the target's own mode only once the content is in place.
+        if let Some(mode) = mode {
+            file.set_permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+            )?;
+        }
+        Ok(())
+    };
+    if let Err(e) = write(&tmp) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
