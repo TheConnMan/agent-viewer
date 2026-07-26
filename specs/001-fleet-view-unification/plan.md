@@ -29,9 +29,11 @@ Per backend:
   native TUI pointed at that daemon, `codex resume --remote unix://<socketPath> <id>`. Metadata
   from the same daemon - `thread/list` for enumeration with server-side subagent exclusion,
   `thread/name/set` for real rename.
-- **opencode**: has the same shape (`opencode serve` plus `opencode attach <url>`); whether to
-  bind it to the server API or stay on CLI plus read-only SQLite is being evaluated. Either way
-  its capability advertisements are corrected to match what it can actually do.
+- **opencode**: same shape, bound **opportunistically** (D-013). With an optional
+  `opencode.server_url` configured, status, rename and archive come from the HTTP API and attach
+  is `opencode attach <url> -s <id>`. Unset, it behaves as today. agent-viewer never starts a
+  server: `opencode serve` is strictly manual, the plain TUI embeds its server in-process, and
+  there is no on-disk port discovery.
 
 All three backends share one topology: **a headless host owns the session, and the vendor's own
 client attaches to it.** agent-viewer is a third-party client of each host - never a host, never

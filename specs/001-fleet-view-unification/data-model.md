@@ -86,16 +86,19 @@ rather than an error. D-010 makes truthfulness a hard requirement: **a capabilit
 advertised and then fails at press time is worse than one advertised as unsupported**, because
 the footer notice is the designed affordance for the latter.
 
-| Capability | Claude | Codex | Opencode |
-|---|---|---|---|
-| `attach` | yes, `Background` origin only | yes, via `--remote`; refuses only when an external process holds the thread | yes |
-| `rename` | **no** (D-006: no daemon op exists) | yes (`thread/name/set`) | yes (raw SQL via `opencode db`) |
-| `archive` | yes | yes | **no** (0 of 297 rows; no CLI writes it) |
-| `needs_input` | yes | yes (native `activeFlags`) | **no** (permission table has 0 rows) |
-| `stop` | yes | yes | **conditional** - pid-gated, and `list()` sets `pid: None`, so only sessions spawned by this process instance |
-| `delete` | yes | yes | yes |
-| `pr_refs` | yes | yes (`gitInfo`) | **no** |
-| `live_status` | yes | yes | **no** (process-presence only, backend-wide) |
+opencode has two tiers, selected by whether `opencode.server_url` is configured and reachable
+(D-013). The capability set MUST be computed from the live tier, not assumed.
+
+| Capability | Claude | Codex | Opencode (no server) | Opencode (server) |
+|---|---|---|---|---|
+| `attach` | yes, `Background` origin only | yes, via `--remote`; refuses only when an external process holds the thread | yes | yes, `opencode attach <url> -s <id>` |
+| `rename` | **no** (D-006: no daemon op exists) | yes (`thread/name/set`) | raw SQL via `opencode db` | yes, `PATCH {"title":...}` |
+| `archive` | yes | yes | **no** (0 of 297 rows; no CLI writes it) | yes, `PATCH {"time":{"archived":<ms>}}` |
+| `needs_input` | yes | yes (native `activeFlags`) | **no** (permission table has 0 rows) | yes, `GET /permission`, `GET /question` |
+| `stop` | yes | yes | **conditional** - pid-gated, and `list()` sets `pid: None`, so only sessions spawned by this process instance | same |
+| `delete` | yes | yes | yes | yes |
+| `pr_refs` | yes | yes (`gitInfo`) | **no** | **no** (only `GET /vcs`, branch names) |
+| `live_status` | yes | yes | **no** (process-presence only, backend-wide) | yes, `GET /session/status` per id |
 
 Capabilities that are conditional per row (attach, stop) must be evaluated **per session**, not
 per backend, or the advertisement lies again in a new way.
