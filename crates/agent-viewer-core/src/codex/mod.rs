@@ -14,10 +14,20 @@ use std::path::Path;
 // `thread/list`, `command/exec/terminate`) is the eventual "clean" backend and the v2
 // upgrade path. v1 reads the same SQLite + rollout files directly.
 
-/// Sandbox args passed to `codex exec` for viewer-spawned sessions. Least-privileged
-/// choice (verified working unattended on this box). If a workspace-write run ever fails
-/// to complete unattended, switch to ["--dangerously-bypass-approvals-and-sandbox"].
-const SANDBOX_ARGS: &[&str] = &["--sandbox", "workspace-write"];
+/// Sandbox args passed to `codex exec` for viewer-spawned sessions.
+///
+/// This WAS `["--sandbox", "workspace-write"]`. That is wrong for this tool: under
+/// `workspace-write` codex mounts `.git` read-only and leaves `network_access` off, so a
+/// spawned session cannot fetch, branch, create a worktree, or commit. Verified live against
+/// codex-cli 0.145.0 — a write to a file in the workspace exits 0 while a write to `.git/`
+/// exits 1, and a real viewer-spawned run ended with "the sandbox mounts `.git` read only, so
+/// the required branch and worktree could not be created". Every task this viewer spawns is a
+/// git-shaped task on the user's own box, so the sandbox only ever produced silent no-ops.
+///
+/// Viewer-spawned sessions therefore run unsandboxed with approvals off. This is deliberate
+/// and is the escape hatch the previous comment already named. See SPEC.md "Spawn sandbox
+/// posture" for the full evidence.
+const SANDBOX_ARGS: &[&str] = &["--dangerously-bypass-approvals-and-sandbox"];
 
 /// Build the `codex exec` spawn command (extracted so the model-flag wiring is unit-
 /// testable). `model` Some adds `-m <m>`; None uses codex's own default.
@@ -259,6 +269,32 @@ mod tests {
     use super::codex_spawn_command;
     use crate::backend::args;
     use std::path::Path;
+
+    #[test]
+    fn codex_spawn_command_runs_unsandboxed() {
+        // Regression: `--sandbox workspace-write` mounts `.git` read-only and disables
+        // network, so a spawned session could not fetch, branch, worktree, or commit and
+        // reported "Read-only file system" instead of doing the work. Viewer-spawned
+        // sessions run with the sandbox off; see SPEC.md "Spawn sandbox posture".
+        let cmd = codex_spawn_command(Path::new("/tmp"), "t", None);
+        let a = args(&cmd);
+        assert!(
+            a.iter()
+                .any(|x| x == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass flag missing: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|x| x == "--sandbox" || x == "-s"),
+            "a sandbox flag would re-impose the read-only .git mount: {a:?}"
+        );
+        // The flag must precede the positional prompt, or clap reads it as prompt text.
+        let bypass = a
+            .iter()
+            .position(|x| x == "--dangerously-bypass-approvals-and-sandbox")
+            .expect("bypass present");
+        let prompt = a.iter().position(|x| x == "t").expect("prompt present");
+        assert!(bypass < prompt, "bypass must precede the prompt: {a:?}");
+    }
 
     #[test]
     fn codex_spawn_command_carries_model_flag() {

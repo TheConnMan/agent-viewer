@@ -32,6 +32,15 @@ pub(crate) fn handle_key(
         ui.attached.clear(); // drop = kill owned children, same teardown as `q`
         return Ok(true);
     }
+    // Ctrl+T flips mouse capture, which is the only way to get the terminal's own text
+    // selection back (with capture on, drag-select is swallowed as mouse reports, and the
+    // Shift override is not universal across terminals). Claimed in EVERY mode, attach
+    // included: the attached transcript is the surface users most want to copy out of, so
+    // the child does not get this chord.
+    if is_mouse_toggle_chord(key, ctrl) {
+        set_mouse_capture(ui, !ui.mouse_capture);
+        return Ok(false);
+    }
     match &mut ui.mode {
         Mode::Attached => handle_attached_key(key, ui),
         Mode::Normal => return handle_normal_key(key, ctrl, backends, refresher, ui, terminal),
@@ -55,6 +64,11 @@ pub(crate) fn handle_key(
 /// geometry `draw` recorded on the last frame). Modals own their surface, so mouse is a no-op
 /// there (the terminal's own text selection still works with Shift held).
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
+    // Text-select mode: the terminal owns the mouse, so any report still in flight (or sent
+    // by a terminal that ignored the disable sequence) must not steer the selection.
+    if !ui.mouse_capture {
+        return;
+    }
     match &ui.mode {
         Mode::Attached => {
             let Some(fkey) = ui.focused.clone() else {
@@ -85,6 +99,35 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
         },
         _ => {}
     }
+}
+
+/// Ctrl+T is the app-wide mouse-capture toggle. Pure predicate so the chord is unit-testable
+/// without a live terminal; a bare `t` must stay composer text.
+fn is_mouse_toggle_chord(key: KeyEvent, ctrl: bool) -> bool {
+    ctrl && matches!(key.code, KeyCode::Char('t'))
+}
+
+/// Turn mouse reporting on or off, pushing the matching terminal mode change and telling the
+/// user which mode they are in. Off hands the mouse back to the terminal so drag-select and
+/// copy work natively; on restores click/hover row selection and wheel forwarding to an
+/// attached child. Best-effort: a terminal that rejects the sequence still gets the flag flip,
+/// which is what gates `handle_mouse`.
+pub(crate) fn set_mouse_capture(ui: &mut Ui, on: bool) {
+    use crossterm::execute;
+    ui.mouse_capture = on;
+    let _ = if on {
+        execute!(io::stdout(), crossterm::event::EnableMouseCapture)
+    } else {
+        execute!(io::stdout(), crossterm::event::DisableMouseCapture)
+    };
+    ui.set_notice(
+        if on {
+            "mouse on - click/hover selects, wheel scrolls (ctrl+t to select text)"
+        } else {
+            "mouse off - drag to select and copy (ctrl+t to restore mouse)"
+        }
+        .to_string(),
+    );
 }
 
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
@@ -391,6 +434,7 @@ mod tests {
             focused_exited: false,
             logos: None,
             list_hit: std::cell::RefCell::new(agent_viewer_tui::ui::ListHit::default()),
+            mouse_capture: true,
         }
     }
 
@@ -422,6 +466,84 @@ mod tests {
         open_filter(&mut ui);
         assert!(matches!(ui.mode, Mode::Filter));
         assert_eq!(ui.app.filter(), ""); // opens with a fresh, empty query
+    }
+
+    #[test]
+    fn ctrl_t_is_the_mouse_toggle_chord_in_every_mode() {
+        use super::is_mouse_toggle_chord;
+        // Ctrl+T is claimed app-wide, including while attached — the attached transcript is
+        // exactly where text most needs selecting, so the child does not get this chord.
+        assert!(is_mouse_toggle_chord(
+            key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            true
+        ));
+        // A bare `t` must still type into the composer, not toggle the mouse.
+        assert!(!is_mouse_toggle_chord(
+            key(KeyCode::Char('t'), KeyModifiers::NONE),
+            false
+        ));
+        assert!(!is_mouse_toggle_chord(
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            true
+        ));
+    }
+
+    #[test]
+    fn set_mouse_capture_flips_state_and_names_the_way_back() {
+        use super::set_mouse_capture;
+        let mut ui = test_ui_with(Vec::new());
+        assert!(ui.mouse_capture, "capture starts on");
+
+        // Off: the flag drops and the footer tells the user both what changed and how to undo
+        // it, because the mode is otherwise invisible on screen.
+        set_mouse_capture(&mut ui, false);
+        assert!(!ui.mouse_capture);
+        let off = ui.notice.text().to_string();
+        assert!(off.contains("drag to select"), "notice was {off:?}");
+        assert!(off.contains("ctrl+t"), "notice must name the way back: {off:?}");
+
+        // Back on: flag restored, and the notice again names the escape hatch.
+        set_mouse_capture(&mut ui, true);
+        assert!(ui.mouse_capture);
+        let on = ui.notice.text().to_string();
+        assert!(on.contains("click/hover"), "notice was {on:?}");
+        assert!(on.contains("ctrl+t"), "notice must name the way back: {on:?}");
+    }
+
+    #[test]
+    fn mouse_events_are_ignored_while_capture_is_off() {
+        use super::handle_mouse;
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let mut ui = test_ui_with(vec![
+            sess("a", "/tmp/agentviewer-mouse-a", 200),
+            sess("b", "/tmp/agentviewer-mouse-b", 100),
+        ]);
+        // The wheel walks the selection and needs no drawn geometry, unlike a click.
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Capture on: the wheel walks the selection down one row.
+        let start = ui.app.selected_index();
+        ui.mouse_capture = true;
+        handle_mouse(wheel, &mut ui);
+        let moved = ui.app.selected_index();
+        assert_ne!(moved, start, "with capture on the wheel must move selection");
+
+        // Capture off (text-select mode): the same wheel event changes nothing. While the
+        // terminal owns the mouse, a stray report must not steer the selection.
+        let before = ui.app.selected_index();
+        ui.mouse_capture = false;
+        handle_mouse(wheel, &mut ui);
+        assert_eq!(
+            ui.app.selected_index(),
+            before,
+            "the wheel must be inert while mouse capture is off"
+        );
     }
 
     #[test]
