@@ -209,7 +209,7 @@ fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) ->
 
 // --- Modals / modes -------------------------------------------------------------
 
-/// The `Ctrl+R` inline-rename state (prefilled with the current title). Rendered in the
+/// The `Ctrl+R` inline-rename state (opens blank, never prefilled). Rendered in the
 /// selected row itself, not a modal.
 #[derive(Debug, Clone)]
 pub struct RenameModal {

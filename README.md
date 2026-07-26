@@ -97,8 +97,9 @@ prior items collapsed to one line each above it. A blocked (needs-input) row lea
 prominent header: `Awaiting approval: <command/patch>` for Codex or `Awaiting input:
 <question>` for Claude. opencode previews its own real last message from its SQLite store,
 falling back to status and cwd only when it has none. `Space` again or moving the cursor
-collapses it. `Ctrl+R` turns the selected row itself into an edit field prefilled with the
-title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
+collapses it. `Ctrl+R` turns the selected row itself into an empty edit field — type the new
+name, `Enter` commits, `Esc` cancels, and `Enter` on a blank field cancels too. Neither is a
+modal.
 
 ## Keys
 
