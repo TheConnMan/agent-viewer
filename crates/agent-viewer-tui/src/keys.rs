@@ -114,12 +114,20 @@ fn is_mouse_toggle_chord(key: KeyEvent, ctrl: bool) -> bool {
 /// which is what gates `handle_mouse`.
 pub(crate) fn set_mouse_capture(ui: &mut Ui, on: bool) {
     use crossterm::execute;
-    ui.mouse_capture = on;
+    apply_mouse_capture_state(ui, on);
     let _ = if on {
         execute!(io::stdout(), crossterm::event::EnableMouseCapture)
     } else {
         execute!(io::stdout(), crossterm::event::DisableMouseCapture)
     };
+}
+
+/// The state half of `set_mouse_capture`: flip the flag and set the footer notice, with no
+/// terminal I/O. Split out so tests can exercise it without writing real mode sequences to
+/// the developer's stdout — a test that enabled capture and exited would leave the invoking
+/// shell unable to drag-select, which is the very bug this toggle exists to fix.
+fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
+    ui.mouse_capture = on;
     ui.set_notice(
         if on {
             "mouse on - click/hover selects, wheel scrolls (ctrl+t to select text)"
@@ -490,20 +498,20 @@ mod tests {
 
     #[test]
     fn set_mouse_capture_flips_state_and_names_the_way_back() {
-        use super::set_mouse_capture;
+        use super::apply_mouse_capture_state as set_capture;
         let mut ui = test_ui_with(Vec::new());
         assert!(ui.mouse_capture, "capture starts on");
 
         // Off: the flag drops and the footer tells the user both what changed and how to undo
         // it, because the mode is otherwise invisible on screen.
-        set_mouse_capture(&mut ui, false);
+        set_capture(&mut ui, false);
         assert!(!ui.mouse_capture);
         let off = ui.notice.text().to_string();
         assert!(off.contains("drag to select"), "notice was {off:?}");
         assert!(off.contains("ctrl+t"), "notice must name the way back: {off:?}");
 
         // Back on: flag restored, and the notice again names the escape hatch.
-        set_mouse_capture(&mut ui, true);
+        set_capture(&mut ui, true);
         assert!(ui.mouse_capture);
         let on = ui.notice.text().to_string();
         assert!(on.contains("click/hover"), "notice was {on:?}");
