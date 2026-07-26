@@ -409,7 +409,7 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_completions, is_quit_chord, open_filter};
+    use super::{ensure_completions, handle_rename_key, is_quit_chord, open_filter};
     use crate::{NoticeState, Ui};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer};
@@ -527,6 +527,128 @@ mod tests {
         open_filter(&mut ui);
         assert!(matches!(ui.mode, Mode::Filter));
         assert_eq!(ui.app.filter(), ""); // opens with a fresh, empty query
+    }
+
+    /// A bg row: it carries the short id that names its job dir, so rename applies to it.
+    fn bg_sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
+        Session {
+            short_id: Some(id.to_string()),
+            origin: agent_viewer_core::SessionOrigin::Background,
+            ..sess(id, cwd, updated_at_ms)
+        }
+    }
+
+    /// Move the selection onto the session row for `id` (row 0 is a section header).
+    fn select_session_row(ui: &mut Ui, id: &str) {
+        let idx = ui
+            .app
+            .visible()
+            .iter()
+            .position(
+                |r| matches!(r, agent_viewer_tui::app::Row::Session { id: rid, .. } if rid == id),
+            )
+            .expect("session row present");
+        assert!(ui.app.select_visible_index(idx));
+    }
+
+    /// A backend that advertises rename so `open_rename` gets past the capability gate.
+    /// Every other method is unreachable from these tests and panics if it is ever called,
+    /// so a test that accidentally reaches the real mutation path fails loudly.
+    struct RenamingBackend;
+
+    impl agent_viewer_core::Backend for RenamingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                rename: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+        /// Mirrors `ClaudeBackend`: rename needs the short id that names the job dir, so an
+        /// interactive row is unsupported even though the backend advertises rename.
+        fn capabilities_for(&self, session: &Session) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                rename: session.short_id.as_deref().is_some_and(|s| !s.is_empty()),
+                ..self.capabilities()
+            }
+        }
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by the rename key tests")
+        }
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<Option<u32>> {
+            unreachable!("spawn is not exercised by the rename key tests")
+        }
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by the rename key tests")
+        }
+    }
+
+    #[test]
+    fn ctrl_r_opens_rename_with_an_empty_buffer() {
+        // DELIBERATE DIVERGENCE from Fleet View, which prefills Ctrl+R with the current
+        // name. Renaming here always means typing a new name from scratch, so a prefill is
+        // only text to clear first.
+        let mut ui = test_ui_with(vec![bg_sess("s1", "/tmp/agentviewer-rename", 100)]);
+        select_session_row(&mut ui, "s1");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(RenamingBackend)];
+
+        crate::actions::open_rename(&backends, &mut ui);
+
+        match &ui.mode {
+            Mode::Rename(m) => {
+                assert_eq!(m.id, "s1");
+                assert_eq!(m.buffer, "", "rename opens blank, never prefilled");
+            }
+            _ => panic!("expected rename mode"),
+        }
+    }
+
+    #[test]
+    fn ctrl_r_is_gated_per_row_not_per_backend() {
+        // The claude backend advertises rename but only bg rows have the job dir it writes,
+        // so the gate must ask the ROW. A capability advertised and then failing at press
+        // time is worse than one advertised unsupported up front.
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-rename", 100)]);
+        select_session_row(&mut ui, "s1"); // sess() builds rows with no short id
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(RenamingBackend)];
+
+        crate::actions::open_rename(&backends, &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal), "must not open the editor");
+        assert_eq!(ui.notice.text, "claude does not support rename");
+    }
+
+    #[test]
+    fn enter_on_a_blank_rename_buffer_cancels_instead_of_renaming() {
+        // The blank-open above makes an accidental bare Enter easy, and an empty name is
+        // never a rename any backend should be asked to perform.
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-rename", 100)]);
+        ui.mode = Mode::Rename(agent_viewer_tui::ui::RenameModal {
+            backend: BackendKind::Claude,
+            id: "s1".to_string(),
+            buffer: "   ".to_string(),
+        });
+
+        // No backend is registered, so a submitted mutation would panic in the worker; the
+        // observable contract is that Enter leaves no "renaming…" notice behind.
+        handle_rename_key(KeyCode::Enter, &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.notice.text.starts_with("renaming"),
+            "blank rename must not submit a mutation, got notice {:?}",
+            ui.notice.text
+        );
     }
 
     #[test]
