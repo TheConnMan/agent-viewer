@@ -24,21 +24,29 @@ impl BackendKind {
     }
 }
 
+/// How a session was started, independent of backend — used to decide attachability and
+/// short-id expectations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionOrigin {
+    /// Daemon or job managed, carries a short id, and is attachable.
+    Background,
+    /// A human's own terminal session with no short id.
+    Interactive,
+    /// A one-shot, noninteractive run.
+    Exec,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub spawn: bool,
-    pub hide: bool,
     pub attach: bool,
-    /// SIGTERM the live process (codex T, claude F per I-4, opencode T).
-    pub stop: bool,
-    /// Second-stage Ctrl+X hard-remove (codex T archive, claude F, opencode T delete).
-    pub remove: bool,
-    /// Rename in the backend's own store (codex T, claude F since no external rename
-    /// channel exists, opencode T).
     pub rename: bool,
-    /// Reply into a blocked/live session (codex approval keystroke T, claude text T,
-    /// opencode F).
-    pub reply: bool,
+    pub archive: bool,
+    pub delete: bool,
+    pub stop: bool,
+    pub needs_input: bool,
+    pub pr_refs: bool,
+    pub live_status: bool,
 }
 
 impl Capabilities {
@@ -46,26 +54,41 @@ impl Capabilities {
     pub const fn none() -> Capabilities {
         Capabilities {
             spawn: false,
-            hide: false,
             attach: false,
-            stop: false,
-            remove: false,
             rename: false,
-            reply: false,
+            archive: false,
+            delete: false,
+            stop: false,
+            needs_input: false,
+            pr_refs: false,
+            live_status: false,
         }
     }
 }
 
-/// Six-state model (v2). `Working`/`Failed` are v1's `Running`/`Errored` renamed;
-/// `NeedsInput`, `Idle`, `Stopped` are new. `Hash` is used to key sections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Six-state model. `Working`/`NeedsInput`/`Idle` describe a live session; `Done`/`Error`
+/// describe a finished one. `Unknown` is the deliberate escape hatch for "the backend cannot
+/// say": a resolver that cannot determine status MUST return `Unknown` rather than
+/// fabricating `Idle` — a false idle reads as a live session with nothing happening, which is
+/// worse than an honest "we don't know".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Status {
     Working,
-    NeedsInput,
+    NeedsInput { reason: Option<String> },
     Idle,
     Done,
-    Failed,
-    Stopped,
+    Error,
+    Unknown,
+}
+
+impl Status {
+    pub fn needs_input() -> Status {
+        Status::NeedsInput { reason: None }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Status::Done | Status::Error)
+    }
 }
 
 /// A pull request associated with a session, from a claude jobs state.json child
@@ -81,34 +104,86 @@ pub struct PrRef {
 pub struct Session {
     pub backend: BackendKind,
     pub id: String,
-    /// Claude's short agents-JSON "id" (the jobs-dir key). Only claude sessions carry
-    /// one; every other backend leaves it None. Used for the live agents-view attach
-    /// and the jobs `state.json` path.
+    /// Claude's short agents-JSON `id` (the jobs-dir key). Only Claude sessions carry one;
+    /// every other backend leaves it `None`. Used for the live agents-view attach and the
+    /// jobs `state.json` path.
     pub short_id: Option<String>,
+    pub origin: SessionOrigin,
     pub title: String,
     pub cwd: std::path::PathBuf,
+    pub git_branch: Option<String>,
+    pub status: Status,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub status: Status,
     pub hidden: bool,
-    pub source_label: String,
-    /// One-line dim summary for the row. codex: threads.preview; claude:
-    /// state.json needs (blocked) else detail; opencode: "".
-    pub summary: String,
-    /// True for rows the default view hides: codex source Exec|Subagent(_),
-    /// opencode parent_id NOT NULL. Claude rows are never companions.
-    /// The overlay clears this for viewer-spawned (pinned) sessions.
+    /// True for a session that is a secondary view of one already shown elsewhere in the
+    /// list (a companion row for the same underlying session) and so hidden from the default
+    /// view. The overlay clears this for viewer-spawned (pinned) sessions so they always
+    /// show, even if their backend would otherwise mark them a companion.
     pub companion: bool,
-    /// Live PID when known — codex: the process holding the rollout fd;
-    /// claude: agents-json "pid" (present on working entries); opencode: filled
-    /// by the overlay from the viewer spawn record.
+    /// One-line dim summary for the row. codex: threads.preview; claude: state.json needs
+    /// (blocked) else detail; opencode: "".
+    pub summary: String,
+    /// Live PID when known — codex: the process holding the rollout fd; claude: agents-json
+    /// "pid" (present on working entries); opencode: filled by the overlay from the viewer
+    /// spawn record.
     pub pid: Option<u32>,
-    /// Some for codex — the rollout JSONL, OR the claude session JSONL
-    /// (state.json linkScanPath) for peek. None for opencode.
+    /// Some for codex — the rollout JSONL, OR the claude session JSONL (state.json
+    /// linkScanPath) for peek. None for opencode.
     pub rollout_path: Option<std::path::PathBuf>,
     /// Associated PR references (claude jobs `state.json` children where kind=="pr");
     /// rendered as a right-aligned badge. Empty for codex/opencode.
     pub pr_refs: Vec<PrRef>,
+}
+
+/// A push notification from a backend that supports `subscribe`: either one session's status
+/// changed, or the backend's whole listing should be treated as stale and re-fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusEvent {
+    Changed {
+        backend: BackendKind,
+        id: String,
+        status: Status,
+    },
+    Invalidated {
+        backend: BackendKind,
+    },
+}
+
+/// The callback a subscriber hands to a backend's `subscribe`. It may be called from
+/// whatever thread the backend's push mechanism runs on (not necessarily the UI thread), so
+/// it must be `Send + Sync` and cheap.
+pub type StatusSink = std::sync::Arc<dyn Fn(StatusEvent) + Send + Sync>;
+
+/// A live push subscription. Dropping it unsubscribes: the backend's `stop` closure runs
+/// exactly once, on drop, so a subscription can never outlive its owner and leak a
+/// background thread or listener.
+pub struct Subscription {
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Subscription {
+    pub fn inactive() -> Subscription {
+        Subscription { stop: None }
+    }
+
+    pub fn new(stop: impl FnOnce() + Send + 'static) -> Subscription {
+        Subscription {
+            stop: Some(Box::new(stop)),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.stop.is_some()
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+    }
 }
 
 /// `Send` so the TUI can move the listing backends onto a dedicated refresh thread
@@ -116,6 +191,15 @@ pub struct Session {
 pub trait Backend: Send {
     fn kind(&self) -> BackendKind;
     fn capabilities(&self) -> Capabilities;
+    /// Per-row capability override. Most rows just get the backend-wide `capabilities()`,
+    /// but some actions are only valid for particular rows (e.g. a row lacking the short id
+    /// a destructive action needs). This exists because a capability advertised and then
+    /// failing at press time is worse than one advertised unsupported up front: the UI
+    /// trusts this to decide what to gray out, not what to attempt and catch.
+    fn capabilities_for(&self, session: &Session) -> Capabilities {
+        let _ = session;
+        self.capabilities()
+    }
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
     /// Sessions are returned recency-sorted (updated_at_ms DESC).
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
@@ -153,22 +237,26 @@ pub trait Backend: Send {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
-    /// Whether `remove` can actually act on THIS row. The backend-wide `remove` capability
-    /// is necessary but not sufficient: claude advertises remove, yet a row without a short
-    /// id has no bg job for `claude rm` to delete. Callers MUST consult this before any
-    /// destructive step, or an unsupported remove SIGTERMs a live session and then declines
-    /// to remove it. Defaults to the backend-wide capability.
-    fn can_remove(&self, session: &Session) -> bool {
-        let _ = session;
-        self.capabilities().remove
-    }
     /// Rename in the backend's own store (never a raw DB write). Default Unsupported.
     fn rename(&self, session: &Session, name: &str) -> crate::error::Result<()> {
         let _ = (session, name);
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
-    /// None when attach is unsupported. Command is built, not run (TUI suspends into it).
-    fn attach_command(&self, session: &Session) -> Option<std::process::Command>;
+    /// Builds (never runs) the attach command; the TUI suspends into it. `Err` carries an
+    /// `AttachRefusal` with a human-readable reason (no live pid, unsupported backend, ...)
+    /// so the caller can show it verbatim in a footer notice instead of a generic failure.
+    fn attach_command(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<std::process::Command, crate::error::AttachRefusal>;
+    /// Opt-in push notifications for status changes. The default is a no-op (an inactive
+    /// `Subscription`) so backends can adopt push incrementally: every backend already works
+    /// correctly on the refresh worker's poll loop, so overriding this is a pure
+    /// optimization, never a requirement, and the poll loop stays as the backstop regardless.
+    fn subscribe(&self, sink: StatusSink) -> crate::error::Result<Subscription> {
+        let _ = sink;
+        Ok(Subscription::inactive())
+    }
 }
 
 /// Remove duplicates while preserving first-seen order (case-sensitive exact match).
@@ -249,8 +337,14 @@ mod tests {
             ) -> crate::error::Result<Option<u32>> {
                 Ok(None)
             }
-            fn attach_command(&self, _session: &Session) -> Option<std::process::Command> {
-                None
+            fn attach_command(
+                &self,
+                _session: &Session,
+            ) -> std::result::Result<std::process::Command, crate::error::AttachRefusal>
+            {
+                Err(crate::error::AttachRefusal::new(
+                    "dummy sessions cannot be attached",
+                ))
             }
         }
         assert_eq!(Dummy.available_models(), vec!["default".to_string()]);

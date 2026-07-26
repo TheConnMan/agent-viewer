@@ -1,4 +1,4 @@
-use agent_viewer_core::backend::{Backend, BackendKind, Status};
+use agent_viewer_core::backend::{Backend, BackendKind, SessionOrigin, Status};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::cli::name_set_request;
 use agent_viewer_core::error::Error;
@@ -9,15 +9,16 @@ fn claude_session(short_id: Option<&str>) -> agent_viewer_core::Session {
         backend: BackendKind::Claude,
         id: "3f9c1a2e-0000-4000-8000-000000000001".to_string(),
         short_id: short_id.map(str::to_string),
+        origin: SessionOrigin::Background,
         title: "probe".to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
+        git_branch: None,
+        status: Status::Working,
         created_at_ms: 0,
         updated_at_ms: 0,
-        status: Status::Working,
         hidden: false,
-        source_label: String::new(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),

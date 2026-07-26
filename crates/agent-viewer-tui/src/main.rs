@@ -398,7 +398,7 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
         matches!(
             r,
             Row::Session {
-                status: Status::Working | Status::NeedsInput,
+                status: Status::Working | Status::NeedsInput { .. },
                 ..
             }
         )
@@ -510,15 +510,12 @@ fn prune_exited(ui: &mut Ui) {
     }
 }
 
-/// Apply the viewer DB overlay: renames/pins/pids/stopped, clear stale stopped keys,
-/// resolve or expire spawn records. Returns the (backend, id) of any spawn record that
-/// resolved to a session this pass, so the caller can start its one-shot bloom.
+/// Apply the viewer DB overlay and resolve or expire spawn records. Returns the backend and
+/// id of any spawn record that resolved to a session this pass, so the caller can start its
+/// one-shot bloom.
 fn overlay(db: &ViewerDb, sessions: &mut [Session]) -> Vec<Key> {
     if let Ok(state) = db.viewer_state() {
-        let stale = apply_viewer_state(sessions, &state);
-        for (backend, id) in stale {
-            let _ = db.clear_stopped(backend, &id);
-        }
+        apply_viewer_state(sessions, &state);
     }
     let mut resolved = Vec::new();
     if let Ok(records) = db.unresolved_spawns() {

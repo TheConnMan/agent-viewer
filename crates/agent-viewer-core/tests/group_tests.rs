@@ -1,4 +1,4 @@
-use agent_viewer_core::backend::{BackendKind, Session, Status};
+use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::group::{group_by_project, project_root};
 use std::path::{Path, PathBuf};
 
@@ -7,15 +7,16 @@ fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         backend: BackendKind::Codex,
         id: id.to_string(),
         short_id: None,
+        origin: SessionOrigin::Exec,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
+        git_branch: None,
+        status: Status::Done,
         created_at_ms: updated_at_ms,
         updated_at_ms,
-        status: Status::Done,
         hidden: false,
-        source_label: "exec".to_string(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),

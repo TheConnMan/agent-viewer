@@ -14,4 +14,18 @@ pub enum Error {
     Unsupported(&'static str),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct AttachRefusal {
+    pub reason: String,
+}
+
+impl AttachRefusal {
+    pub fn new(reason: impl Into<String>) -> AttachRefusal {
+        AttachRefusal {
+            reason: reason.into(),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

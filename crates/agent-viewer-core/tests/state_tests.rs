@@ -75,11 +75,224 @@ fn viewer_db_recreates_on_corrupt() {
     let (_dir, path) = temp_db_path();
     std::fs::write(&path, b"this is not a sqlite database at all").unwrap();
 
-    // A corrupt file is replaced with a fresh empty DB, not an error.
+    // A file that is not a database at all is replaced with a fresh empty DB, not an error.
     let db = ViewerDb::open(&path).expect("recreate on corrupt");
     assert_eq!(
         db.viewer_state().expect("viewer state"),
         ViewerState::default()
+    );
+    // The replacement is a working DB, not just an openable one.
+    db.set_group_collapsed("project:/after-recreate", true)
+        .expect("write to recreated db");
+    assert!(
+        db.collapsed_groups()
+            .expect("collapsed groups")
+            .contains("project:/after-recreate")
+    );
+}
+
+#[test]
+fn viewer_db_recreates_on_malformed_pages() {
+    let (_dir, path) = temp_db_path();
+
+    // A real SQLite file (valid header magic) whose page 1 b-tree is shredded. This is the
+    // SQLITE_CORRUPT arm of the recreate rule, distinct from the not-a-database arm above.
+    {
+        let db = ViewerDb::open(&path).expect("seed real db");
+        db.set_group_collapsed("project:/doomed", true)
+            .expect("seed collapsed group");
+    }
+    let mut bytes = std::fs::read(&path).expect("read seeded db");
+    assert!(bytes.len() > 512, "seeded db unexpectedly small");
+    // Keep the 100-byte file header (so sqlite accepts the file) and shred everything after.
+    for byte in bytes.iter_mut().skip(100) {
+        *byte = 0xff;
+    }
+    std::fs::write(&path, &bytes).expect("write malformed db");
+
+    let db = ViewerDb::open(&path).expect("recreate on malformed pages");
+    assert!(
+        !db.collapsed_groups()
+            .expect("collapsed groups")
+            .contains("project:/doomed"),
+        "a malformed file must be replaced by a fresh empty DB"
+    );
+    db.set_group_collapsed("project:/after-recreate", true)
+        .expect("write to recreated db");
+    assert!(
+        db.collapsed_groups()
+            .expect("collapsed groups")
+            .contains("project:/after-recreate")
+    );
+}
+
+#[test]
+fn viewer_db_open_under_write_lock_errors_without_destroying_data() {
+    let (_dir, path) = temp_db_path();
+
+    // An existing user's viewer.db from before the `settings` table existed, holding the two
+    // things a user actually loses if the file is deleted: a resolved spawn pin and a
+    // collapsed group. Opening it now runs a genuine CREATE TABLE, which takes a write lock.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("build pre-settings db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.execute_batch(
+            "CREATE TABLE spawned (\
+               id INTEGER PRIMARY KEY,\
+               backend TEXT NOT NULL,\
+               session_id TEXT,\
+               cwd TEXT NOT NULL,\
+               pid INTEGER NOT NULL,\
+               spawned_at_ms INTEGER NOT NULL\
+             );\
+             CREATE TABLE collapsed_groups (group_key TEXT PRIMARY KEY);\
+             INSERT INTO spawned (backend, session_id, cwd, pid, spawned_at_ms) \
+               VALUES ('codex', 'pinned-sess', '/p/pinned', 4242, 1000);\
+             INSERT INTO collapsed_groups (group_key) VALUES ('project:/p/pinned');",
+        )
+        .expect("seed pre-settings db");
+        conn.close().expect("close seed writer");
+    }
+
+    // A second viewer holds the write lock, deterministically: BEGIN IMMEDIATE takes it up
+    // front, and the uncommitted INSERT proves it is genuinely held.
+    let blocker = rusqlite::Connection::open(&path).expect("open blocking connection");
+    blocker
+        .execute_batch(
+            "BEGIN IMMEDIATE;\
+             INSERT INTO collapsed_groups (group_key) VALUES ('project:/blocker');",
+        )
+        .expect("hold write lock");
+
+    let error = match ViewerDb::open(&path) {
+        Ok(_) => panic!("open must fail while another connection holds the write lock"),
+        Err(error) => error,
+    };
+    match &error {
+        agent_viewer_core::error::Error::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) => {
+            assert!(
+                matches!(
+                    failure.code,
+                    rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked
+                ),
+                "expected a busy/locked failure, got {failure:?}"
+            );
+        }
+        other => panic!("expected a sqlite busy/locked failure, got {other:?}"),
+    }
+    assert!(path.exists(), "the losing open must not unlink the database");
+
+    // Release the lock and roll the blocker's write back; the winner's data must be intact.
+    blocker.execute_batch("ROLLBACK;").expect("release lock");
+    blocker.close().expect("close blocking connection");
+
+    let db = ViewerDb::open(&path).expect("reopen after the lock is released");
+    let state = db.viewer_state().expect("viewer state");
+    assert!(
+        state
+            .pinned
+            .contains(&(BackendKind::Codex, "pinned-sess".to_string())),
+        "the spawn pin must survive a lost lock race"
+    );
+    assert_eq!(
+        state
+            .spawn_pids
+            .get(&(BackendKind::Codex, "pinned-sess".to_string())),
+        Some(&4242)
+    );
+    assert!(
+        db.collapsed_groups()
+            .expect("collapsed groups")
+            .contains("project:/p/pinned"),
+        "the collapsed group must survive a lost lock race"
+    );
+}
+
+#[test]
+fn viewer_db_open_drops_legacy_tables_and_keeps_supported_data() {
+    let (_dir, path) = temp_db_path();
+
+    // A pre-T012 viewer.db: the legacy shadow-state tables with rows in them, alongside the
+    // still-supported spawned and collapsed_groups data.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("build legacy db");
+        conn.execute_batch(
+            "CREATE TABLE spawned (\
+               id INTEGER PRIMARY KEY,\
+               backend TEXT NOT NULL,\
+               session_id TEXT,\
+               cwd TEXT NOT NULL,\
+               pid INTEGER NOT NULL,\
+               spawned_at_ms INTEGER NOT NULL\
+             );\
+             CREATE TABLE collapsed_groups (group_key TEXT PRIMARY KEY);\
+             CREATE TABLE stopped (\
+               backend TEXT NOT NULL,\
+               session_id TEXT NOT NULL,\
+               stopped_at_ms INTEGER NOT NULL,\
+               PRIMARY KEY(backend, session_id)\
+             );\
+             CREATE TABLE renames (\
+               backend TEXT NOT NULL,\
+               session_id TEXT NOT NULL,\
+               name TEXT NOT NULL,\
+               PRIMARY KEY(backend, session_id)\
+             );\
+             INSERT INTO spawned (backend, session_id, cwd, pid, spawned_at_ms) \
+               VALUES ('codex', 'legacy-sess', '/p/legacy', 4242, 1000);\
+             INSERT INTO collapsed_groups (group_key) VALUES ('project:/p/legacy');\
+             INSERT INTO stopped (backend, session_id, stopped_at_ms) \
+               VALUES ('codex', 'legacy-sess', 2000);\
+             INSERT INTO renames (backend, session_id, name) \
+               VALUES ('codex', 'legacy-sess', 'my old label');",
+        )
+        .expect("seed legacy db");
+        conn.close().expect("close legacy writer");
+    }
+
+    {
+        let db = ViewerDb::open(&path).expect("open legacy viewer db");
+
+        // The recreate path must NOT have fired: supported state survives the migration.
+        let state = db.viewer_state().expect("viewer state");
+        assert!(
+            state
+                .pinned
+                .contains(&(BackendKind::Codex, "legacy-sess".to_string())),
+            "spawned row must survive the legacy-table migration"
+        );
+        assert_eq!(
+            state
+                .spawn_pids
+                .get(&(BackendKind::Codex, "legacy-sess".to_string())),
+            Some(&4242)
+        );
+        assert!(
+            db.collapsed_groups()
+                .expect("collapsed groups")
+                .contains("project:/p/legacy"),
+            "collapsed group must survive the legacy-table migration"
+        );
+    }
+
+    // Both shadow-state tables are gone from the file.
+    let conn = rusqlite::Connection::open(&path).expect("reopen migrated db");
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .expect("prepare table list");
+    let tables = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query table list")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table list");
+    assert!(!tables.iter().any(|name| name == "renames"), "{tables:?}");
+    assert!(!tables.iter().any(|name| name == "stopped"), "{tables:?}");
+    assert!(tables.iter().any(|name| name == "spawned"), "{tables:?}");
+    assert!(
+        tables.iter().any(|name| name == "collapsed_groups"),
+        "{tables:?}"
     );
 }
 
@@ -239,24 +452,10 @@ fn apply_viewer_state_skips_pid_on_terminal_sessions() {
     // Terminal sessions never take the recorded pid because it may have been reused.
     assert_eq!(sessions[3].pid, None);
     assert_eq!(sessions[4].pid, None);
-    // Unknown is not one of the three statuses proven live.
-    assert_eq!(sessions[5].pid, None);
+    // Unknown is not terminal, so the recorded pid is still safe to hand out.
+    assert_eq!(sessions[5].pid, Some(777));
+    // An existing backend pid is never overwritten.
     assert_eq!(sessions[6].pid, Some(999));
-}
-
-#[test]
-fn apply_viewer_state_returns_unit() {
-    let mut sessions = vec![sess(
-        BackendKind::Codex,
-        "session",
-        "/p",
-        10,
-        Status::Working,
-    )];
-
-    let returned = apply_viewer_state(&mut sessions, &ViewerState::default());
-
-    assert_eq!(returned, ());
 }
 
 #[test]

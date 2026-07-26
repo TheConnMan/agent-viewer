@@ -124,7 +124,7 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
     let still_blocked = ui
         .app
         .session_for(&state.key)
-        .is_some_and(|s| matches!(s.status, agent_viewer_core::Status::NeedsInput));
+        .is_some_and(|s| matches!(s.status, agent_viewer_core::Status::NeedsInput { .. }));
 
     // The PTY-observable inputs: the child's exit (always) and, only for the claude run-view
     // gate, whether the "Waking…/Attaching…" attach transient is on screen. Read both under

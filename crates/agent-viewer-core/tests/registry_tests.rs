@@ -73,6 +73,7 @@ fn threads_maps_rows_and_orders_by_recency() {
     );
     assert_eq!(exec.source, Source::Exec);
     assert_eq!(exec.cwd, PathBuf::from("/home/user/proj"));
+    assert_eq!(exec.git_branch.as_deref(), Some("main"));
     assert_eq!(exec.title, "Exec Title");
     assert!(!exec.archived);
     assert_eq!(exec.preview, "preview exec");

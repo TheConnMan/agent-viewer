@@ -9,8 +9,11 @@ pub mod pty;
 pub mod spawn;
 pub mod state;
 
-pub use backend::{Backend, BackendKind, Capabilities, PrRef, Session, Status};
-pub use error::{Error, Result};
+pub use backend::{
+    Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status, StatusEvent,
+    StatusSink, Subscription,
+};
+pub use error::{AttachRefusal, Error, Result};
 pub use pr_status::PrBadgeColor;
 
 /// Flag any session whose cwd is a non-empty path that no longer exists on disk as a

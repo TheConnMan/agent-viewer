@@ -205,7 +205,7 @@ fn multi_backend_smoke() {
         println!("[smoke] {:?}: {} sessions", kind, sessions.len());
         for s in sessions.iter().take(3) {
             let _cwd: &PathBuf = &s.cwd;
-            println!("[smoke]   {} [{}] {}", kind.tag(), s.source_label, s.title);
+            println!("[smoke]   {} [{:?}] {}", kind.tag(), s.origin, s.title);
         }
     }
 }
@@ -259,7 +259,7 @@ fn claude_live_rename_is_rejected_not_falsely_ok() {
         .find(|s| worker_ids.contains(&s.id))
         .or_else(|| {
             sessions.iter().find(|s| {
-                s.pid.is_some() || matches!(s.status, Status::Working | Status::NeedsInput)
+                s.pid.is_some() || matches!(s.status, Status::Working | Status::NeedsInput { .. })
             })
         })
         .cloned();

@@ -21,7 +21,12 @@ fn open_with(path: &std::path::Path) -> HashMap<PathBuf, u32> {
 #[test]
 fn needs_input_when_open_and_awaiting() {
     let path = common::fixture_path("rollout_approval.jsonl");
-    assert_eq!(resolve_status(&path, &open_with(&path)), Status::NeedsInput);
+    assert_eq!(
+        resolve_status(&path, &open_with(&path)),
+        Status::NeedsInput {
+            reason: Some("awaiting approval".to_string())
+        }
+    );
 }
 
 #[test]
@@ -46,14 +51,14 @@ fn done_when_closed_and_complete() {
 #[test]
 fn failed_when_closed_and_midturn() {
     let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map()), Status::Failed);
+    assert_eq!(resolve_status(&path, &empty_map()), Status::Error);
 }
 
 #[test]
 fn failed_when_file_missing() {
     // Missing file, empty map: Failed, never panics.
     let path = PathBuf::from("/nonexistent/rollout-does-not-exist.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map()), Status::Failed);
+    assert_eq!(resolve_status(&path, &empty_map()), Status::Error);
 }
 
 #[test]
@@ -85,7 +90,7 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     // ...and invalidates its (mtime, len) cache when the file changes.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
-    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Failed);
+    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Error);
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
