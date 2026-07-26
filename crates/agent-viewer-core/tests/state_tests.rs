@@ -1,6 +1,9 @@
-use agent_viewer_core::backend::{BackendKind, Session, Status};
+//! Contract tests for viewer owned presentation state, spawn tracking, and overlays.
+
+use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::state::{
-    SpawnRecord, ViewerDb, ViewerState, apply_viewer_state, match_spawn,
+    DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
+    apply_viewer_state, match_spawn,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,15 +13,16 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: S
         backend,
         id: id.to_string(),
         short_id: None,
+        origin: SessionOrigin::Exec,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
+        git_branch: None,
+        status,
         created_at_ms,
         updated_at_ms: created_at_ms,
-        status,
         hidden: false,
-        source_label: "test".to_string(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
@@ -80,102 +84,179 @@ fn viewer_db_recreates_on_corrupt() {
 }
 
 #[test]
-fn viewer_db_stopped_and_rename_roundtrip() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    db.mark_stopped(BackendKind::Opencode, "ses_1")
-        .expect("mark");
-    assert!(
-        db.viewer_state()
-            .unwrap()
-            .stopped
-            .contains(&(BackendKind::Opencode, "ses_1".to_string()))
-    );
-    db.clear_stopped(BackendKind::Opencode, "ses_1")
-        .expect("clear");
-    assert!(
-        !db.viewer_state()
-            .unwrap()
-            .stopped
-            .contains(&(BackendKind::Opencode, "ses_1".to_string()))
-    );
-
-    // Codex, not claude: claude overrides are skipped at load (see
-    // viewer_state_skips_claude_name_overrides), so only a rename-capable backend
-    // exercises the store's set/load round-trip.
-    db.set_name_override(BackendKind::Codex, "abc", "My Renamed Session")
-        .expect("set name");
-    assert_eq!(
-        db.viewer_state()
-            .unwrap()
-            .renames
-            .get(&(BackendKind::Codex, "abc".to_string())),
-        Some(&"My Renamed Session".to_string())
-    );
-}
-
-#[test]
-fn apply_viewer_state_stops_and_stale() {
-    let mut sessions = vec![
-        sess(BackendKind::Codex, "failed", "/p", 10, Status::Failed),
-        sess(BackendKind::Codex, "done", "/p", 20, Status::Done),
-        sess(BackendKind::Codex, "live", "/p", 30, Status::Working),
-    ];
-    let mut stopped = HashSet::new();
-    stopped.insert((BackendKind::Codex, "failed".to_string()));
-    stopped.insert((BackendKind::Codex, "done".to_string()));
-    stopped.insert((BackendKind::Codex, "live".to_string()));
-    let state = ViewerState {
-        stopped,
-        ..Default::default()
-    };
-
-    let stale = apply_viewer_state(&mut sessions, &state);
-
-    // Failed / Done stopped rows fold to Stopped.
-    assert_eq!(sessions[0].status, Status::Stopped);
-    assert_eq!(sessions[1].status, Status::Stopped);
-    // A live session keeps its status and its stopped record is reported stale.
-    assert_eq!(sessions[2].status, Status::Working);
-    assert!(stale.contains(&(BackendKind::Codex, "live".to_string())));
-    assert!(!stale.contains(&(BackendKind::Codex, "failed".to_string())));
-}
-
-#[test]
-fn apply_viewer_state_pins_renames_pids() {
-    let mut companion = sess(BackendKind::Codex, "comp", "/p", 10, Status::Idle);
-    companion.companion = true;
-    let mut has_pid = sess(BackendKind::Opencode, "withpid", "/p", 20, Status::Working);
-    has_pid.pid = Some(999);
-    let none_pid = sess(BackendKind::Opencode, "nopid", "/p", 30, Status::Working);
-    let mut sessions = vec![companion, has_pid, none_pid];
+fn apply_viewer_state_preserves_backend_titles() {
+    let mut pinned = sess(BackendKind::Codex, "pinned", "/p", 10, Status::Idle);
+    pinned.title = "Backend Pinned Title".to_string();
+    let mut unpinned = sess(BackendKind::Claude, "unpinned", "/p", 20, Status::Working);
+    unpinned.title = "Backend Unpinned Title".to_string();
+    let mut spawned = sess(BackendKind::Opencode, "spawned", "/p", 30, Status::Working);
+    spawned.title = "Backend Spawn Title".to_string();
+    let mut sessions = vec![pinned, unpinned, spawned];
 
     let mut pinned = HashSet::new();
-    pinned.insert((BackendKind::Codex, "comp".to_string()));
-    let mut renames = HashMap::new();
-    renames.insert(
-        (BackendKind::Codex, "comp".to_string()),
-        "Pinned Name".to_string(),
-    );
+    pinned.insert((BackendKind::Codex, "pinned".to_string()));
     let mut spawn_pids = HashMap::new();
-    spawn_pids.insert((BackendKind::Opencode, "nopid".to_string()), 555);
-    spawn_pids.insert((BackendKind::Opencode, "withpid".to_string()), 111);
+    spawn_pids.insert((BackendKind::Opencode, "spawned".to_string()), 555);
+    let state = ViewerState { pinned, spawn_pids };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    assert_eq!(sessions[0].title, "Backend Pinned Title");
+    assert_eq!(sessions[1].title, "Backend Unpinned Title");
+    assert_eq!(sessions[2].title, "Backend Spawn Title");
+}
+
+#[test]
+fn apply_viewer_state_preserves_all_backend_statuses() {
+    let expected = vec![
+        Status::Working,
+        Status::NeedsInput {
+            reason: Some("awaiting approval".to_string()),
+        },
+        Status::Idle,
+        Status::Done,
+        Status::Error,
+        Status::Unknown,
+    ];
+    let mut sessions = expected
+        .iter()
+        .enumerate()
+        .map(|(index, status)| {
+            sess(
+                BackendKind::Codex,
+                &format!("status-{index}"),
+                "/p",
+                index as i64,
+                status.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let pinned = sessions
+        .iter()
+        .map(|session| (session.backend, session.id.clone()))
+        .collect();
+    let spawn_pids = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            (
+                (session.backend, session.id.clone()),
+                u32::try_from(index + 100).unwrap(),
+            )
+        })
+        .collect();
+    let state = ViewerState { pinned, spawn_pids };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    let actual = sessions
+        .iter()
+        .map(|session| session.status.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn apply_viewer_state_preserves_backend_hidden_flags() {
+    let mut hidden = sess(BackendKind::Codex, "hidden", "/p", 10, Status::Working);
+    hidden.hidden = true;
+    let visible = sess(BackendKind::Codex, "visible", "/p", 20, Status::Working);
+    let mut sessions = vec![hidden, visible];
+
+    let pinned = HashSet::from([(BackendKind::Codex, "hidden".to_string())]);
+    let spawn_pids = HashMap::from([((BackendKind::Codex, "visible".to_string()), 555)]);
+    let state = ViewerState { pinned, spawn_pids };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    assert!(sessions[0].hidden);
+    assert!(!sessions[1].hidden);
+}
+
+#[test]
+fn apply_viewer_state_clears_companion_only_for_pinned_session() {
+    let mut pinned = sess(BackendKind::Codex, "pinned", "/p", 10, Status::Idle);
+    pinned.companion = true;
+    let mut unpinned = sess(BackendKind::Codex, "unpinned", "/p", 20, Status::Idle);
+    unpinned.companion = true;
+    let mut sessions = vec![pinned, unpinned];
+
+    let pinned = HashSet::from([(BackendKind::Codex, "pinned".to_string())]);
     let state = ViewerState {
         pinned,
-        renames,
-        spawn_pids,
-        ..Default::default()
+        spawn_pids: HashMap::new(),
     };
 
     apply_viewer_state(&mut sessions, &state);
 
-    // Pinned session becomes visible (companion cleared) and takes the rename.
     assert!(!sessions[0].companion);
-    assert_eq!(sessions[0].title, "Pinned Name");
-    // spawn_pid fills a None pid but does not clobber an existing Some.
-    assert_eq!(sessions[1].pid, Some(999));
-    assert_eq!(sessions[2].pid, Some(555));
+    assert!(sessions[1].companion);
+}
+
+#[test]
+fn apply_viewer_state_skips_pid_on_terminal_sessions() {
+    let mut has_pid = sess(BackendKind::Opencode, "withpid", "/p", 60, Status::Working);
+    has_pid.pid = Some(999);
+    let mut sessions = vec![
+        sess(BackendKind::Opencode, "working", "/p", 10, Status::Working),
+        sess(
+            BackendKind::Opencode,
+            "needs-input",
+            "/p",
+            20,
+            Status::NeedsInput {
+                reason: Some("permission required".to_string()),
+            },
+        ),
+        sess(BackendKind::Opencode, "idle", "/p", 30, Status::Idle),
+        sess(BackendKind::Opencode, "done", "/p", 40, Status::Done),
+        sess(BackendKind::Opencode, "error", "/p", 50, Status::Error),
+        sess(BackendKind::Opencode, "unknown", "/p", 60, Status::Unknown),
+        has_pid,
+    ];
+    let mut spawn_pids = HashMap::new();
+    for id in [
+        "working",
+        "needs-input",
+        "idle",
+        "done",
+        "error",
+        "unknown",
+        "withpid",
+    ] {
+        spawn_pids.insert((BackendKind::Opencode, id.to_string()), 777);
+    }
+    let state = ViewerState {
+        pinned: HashSet::new(),
+        spawn_pids,
+    };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    assert_eq!(sessions[0].pid, Some(777));
+    assert_eq!(sessions[1].pid, Some(777));
+    assert_eq!(sessions[2].pid, Some(777));
+    // Terminal sessions never take the recorded pid because it may have been reused.
+    assert_eq!(sessions[3].pid, None);
+    assert_eq!(sessions[4].pid, None);
+    // Unknown is not one of the three statuses proven live.
+    assert_eq!(sessions[5].pid, None);
+    assert_eq!(sessions[6].pid, Some(999));
+}
+
+#[test]
+fn apply_viewer_state_returns_unit() {
+    let mut sessions = vec![sess(
+        BackendKind::Codex,
+        "session",
+        "/p",
+        10,
+        Status::Working,
+    )];
+
+    let returned = apply_viewer_state(&mut sessions, &ViewerState::default());
+
+    assert_eq!(returned, ());
 }
 
 #[test]
@@ -185,7 +266,7 @@ fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
     let eight_days = 8 * 24 * 60 * 60 * 1000;
     let db = ViewerDb::open(&path).expect("open viewer db");
 
-    // Old + live (session still exists): must survive despite its age.
+    // Old and live: must survive despite its age.
     let old_live = db
         .record_spawn(
             BackendKind::Codex,
@@ -196,7 +277,7 @@ fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
         .expect("record old-live");
     db.resolve_spawn(old_live, "old-live-sess")
         .expect("resolve");
-    // Old + dead (session gone): the only row that should be pruned.
+    // Old and dead: the only row that should be pruned.
     let old_dead = db
         .record_spawn(
             BackendKind::Codex,
@@ -207,7 +288,7 @@ fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
         .expect("record old-dead");
     db.resolve_spawn(old_dead, "old-dead-sess")
         .expect("resolve");
-    // Young + dead (session gone but row still fresh): survives (under the cutoff).
+    // Young and dead: survives while it remains under the cutoff.
     let young_dead = db
         .record_spawn(BackendKind::Codex, &PathBuf::from("/p/young"), 3, now)
         .expect("record young-dead");
@@ -235,83 +316,6 @@ fn prune_resolved_missing_keeps_live_and_young_prunes_old_dead() {
 }
 
 #[test]
-fn clear_name_override_removes_rename() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    // Codex, not claude: a claude key is absent from viewer_state either way, so it could
-    // not tell a real clear from the load-time skip.
-    db.set_name_override(BackendKind::Codex, "abc", "Local Name")
-        .expect("set name");
-    db.clear_name_override(BackendKind::Codex, "abc")
-        .expect("clear name");
-
-    assert!(
-        !db.viewer_state()
-            .unwrap()
-            .renames
-            .contains_key(&(BackendKind::Codex, "abc".to_string())),
-        "cleared override must leave no rename for the key"
-    );
-}
-
-// A legacy claude rename row (written by a build that still allowed the local fallback) must
-// never reach the overlay: applying it would show a fabricated title only the viewer believes,
-// and Ctrl+R on a claude row is now an unsupported notice, so the user could never clear it.
-// The row is left in the table; it is skipped at load.
-#[test]
-fn viewer_state_skips_claude_name_overrides() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    db.set_name_override(BackendKind::Claude, "legacy", "Fabricated Claude Name")
-        .expect("set claude name");
-    db.set_name_override(BackendKind::Codex, "live", "Real Codex Name")
-        .expect("set codex name");
-
-    let renames = db.viewer_state().expect("viewer state").renames;
-
-    assert!(
-        !renames.contains_key(&(BackendKind::Claude, "legacy".to_string())),
-        "a persisted claude override must be skipped at load, not applied"
-    );
-    // The control: a rename-capable backend still loads, so the skip is claude-specific and
-    // not an accidental disabling of the whole rename overlay.
-    assert_eq!(
-        renames.get(&(BackendKind::Codex, "live".to_string())),
-        Some(&"Real Codex Name".to_string()),
-        "a codex override must still load"
-    );
-}
-
-#[test]
-fn apply_viewer_state_skips_pid_on_terminal_sessions() {
-    let mut sessions = vec![
-        sess(BackendKind::Opencode, "done", "/p", 10, Status::Done),
-        sess(BackendKind::Opencode, "failed", "/p", 20, Status::Failed),
-        sess(BackendKind::Opencode, "stopped", "/p", 30, Status::Stopped),
-        sess(BackendKind::Opencode, "live", "/p", 40, Status::Working),
-    ];
-    let mut spawn_pids = HashMap::new();
-    for id in ["done", "failed", "stopped", "live"] {
-        spawn_pids.insert((BackendKind::Opencode, id.to_string()), 777);
-    }
-    let state = ViewerState {
-        spawn_pids,
-        ..Default::default()
-    };
-
-    apply_viewer_state(&mut sessions, &state);
-
-    // Terminal sessions never take the recorded pid (it may be reused by another process).
-    assert_eq!(sessions[0].pid, None);
-    assert_eq!(sessions[1].pid, None);
-    assert_eq!(sessions[2].pid, None);
-    // A live session still gets the overlay (opencode stop path).
-    assert_eq!(sessions[3].pid, Some(777));
-}
-
-#[test]
 fn match_spawn_window_and_nearest() {
     let record = SpawnRecord {
         rowid: 1,
@@ -321,7 +325,7 @@ fn match_spawn_window_and_nearest() {
         spawned_at_ms: 1_000_000,
     };
 
-    // In-window, correct cwd + backend -> matched.
+    // In-window, correct cwd and backend gives a match.
     let one = vec![sess(
         BackendKind::Codex,
         "in-window",
@@ -331,7 +335,7 @@ fn match_spawn_window_and_nearest() {
     )];
     assert_eq!(match_spawn(&record, &one), Some("in-window".to_string()));
 
-    // Two candidates -> nearest created_at wins (1_002_000 beats 1_020_000).
+    // Two candidates choose the nearest creation time.
     let two = vec![
         sess(
             BackendKind::Codex,
@@ -350,7 +354,7 @@ fn match_spawn_window_and_nearest() {
     ];
     assert_eq!(match_spawn(&record, &two), Some("near".to_string()));
 
-    // Outside window, wrong cwd, and wrong backend all miss.
+    // Outside the window, wrong cwd, and wrong backend all miss.
     let miss = vec![
         sess(
             BackendKind::Codex,
@@ -384,7 +388,7 @@ fn viewer_db_collapsed_groups_roundtrip() {
     {
         let db = ViewerDb::open(&path).expect("open viewer db");
 
-        // Insert two collapsed keys (opaque strings; the TUI owns their meaning).
+        // Insert two collapsed keys. The TUI owns the meaning of these opaque strings.
         db.set_group_collapsed("project:/a", true)
             .expect("set project");
         db.set_group_collapsed("state:done", true)
@@ -407,4 +411,126 @@ fn viewer_db_collapsed_groups_roundtrip() {
     let collapsed = db.collapsed_groups().expect("collapsed groups");
     assert!(collapsed.contains("state:done"));
     assert!(!collapsed.contains("project:/a"));
+}
+
+#[test]
+fn viewer_db_grouping_mode_defaults_and_roundtrips() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    assert_eq!(
+        db.grouping_mode().expect("default grouping"),
+        GroupingMode::Project
+    );
+
+    db.set_grouping_mode(GroupingMode::State)
+        .expect("set grouping");
+    assert_eq!(
+        db.grouping_mode().expect("read grouping"),
+        GroupingMode::State
+    );
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    assert_eq!(
+        db.grouping_mode().expect("read persisted grouping"),
+        GroupingMode::State
+    );
+
+    db.set_grouping_mode(GroupingMode::Project)
+        .expect("overwrite grouping");
+    assert_eq!(
+        db.grouping_mode().expect("read overwritten grouping"),
+        GroupingMode::Project
+    );
+}
+
+#[test]
+fn viewer_db_sort_order_defaults_and_roundtrips() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    assert_eq!(db.sort_order().expect("default sort"), SortOrder::Recency);
+
+    db.set_sort_order(SortOrder::Title).expect("set sort");
+    assert_eq!(db.sort_order().expect("read sort"), SortOrder::Title);
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    assert_eq!(
+        db.sort_order().expect("read persisted sort"),
+        SortOrder::Title
+    );
+
+    db.set_sort_order(SortOrder::Recency)
+        .expect("overwrite sort");
+    assert_eq!(
+        db.sort_order().expect("read overwritten sort"),
+        SortOrder::Recency
+    );
+}
+
+#[test]
+fn viewer_db_retention_window_defaults_and_roundtrips() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    assert_eq!(
+        db.retention_window_ms().expect("default retention"),
+        DEFAULT_RETENTION_WINDOW_MS
+    );
+
+    db.set_retention_window_ms(86_400_000)
+        .expect("set retention");
+    assert_eq!(
+        db.retention_window_ms().expect("read retention"),
+        86_400_000
+    );
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    assert_eq!(
+        db.retention_window_ms().expect("read persisted retention"),
+        86_400_000
+    );
+
+    db.set_retention_window_ms(172_800_000)
+        .expect("overwrite retention");
+    assert_eq!(
+        db.retention_window_ms()
+            .expect("read overwritten retention"),
+        172_800_000
+    );
+}
+
+#[test]
+fn viewer_db_opencode_server_url_defaults_roundtrips_and_clears() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    assert_eq!(db.opencode_server_url().expect("default url"), None);
+
+    db.set_opencode_server_url(Some("http://127.0.0.1:4096"))
+        .expect("set url");
+    assert_eq!(
+        db.opencode_server_url().expect("read url"),
+        Some("http://127.0.0.1:4096".to_string())
+    );
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    assert_eq!(
+        db.opencode_server_url().expect("read persisted url"),
+        Some("http://127.0.0.1:4096".to_string())
+    );
+
+    db.set_opencode_server_url(Some("http://localhost:4097"))
+        .expect("overwrite url");
+    assert_eq!(
+        db.opencode_server_url().expect("read overwritten url"),
+        Some("http://localhost:4097".to_string())
+    );
+
+    db.set_opencode_server_url(None).expect("clear url");
+    assert_eq!(db.opencode_server_url().expect("read cleared url"), None);
 }
