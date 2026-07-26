@@ -386,7 +386,77 @@ declare. Deserialization must be permissive. `Thread.path` is explicitly marked 
 
 ---
 
-## D-010: opencode capabilities are narrower than currently advertised
+## D-013: opencode binds to its server opportunistically, and never starts one
+
+**Decision**: Add an optional `opencode.server_url` setting. When set, use the opencode HTTP API
+for status, rename and archive, and attach with `opencode attach <url> -s <id>`. When unset,
+behave exactly as today (CLI plus read-only SQLite). **Never start a server.**
+
+**Rationale**: opencode has the same two-plane architecture as the other two backends, and both
+halves were proven:
+
+- **The server hosts sessions.** `POST /session/{id}/prompt_async` returned `HTTP=204` and the
+  curl client exited at 11:09:14.81. With **zero clients connected**, the server drove its own
+  provider-rate-limit retry ladder (attempts 1, 2, 3 observed via fresh polls) and completed the
+  assistant message at 11:09:31 - 16 seconds after the client disconnected.
+- **Attach rejoins in place.** Session count was `250` before, during and after
+  `opencode attach <url> -s <id>`, with `new_ids=[]`, and the native TUI replayed the existing
+  conversation history. No duplicate, and no renderer on our side.
+
+The OpenAPI spec is at `GET /doc` (467 KB, ~190 operations; `/openapi.json`, `/swagger` and
+`/docs` are SPA fallbacks). There is an SSE stream at `GET /event` emitting `session.status`
+with per-session payloads, plus `session.updated`, `message.updated` and `server.heartbeat`;
+the declared catalogue includes `EventPermissionAsked`, `EventQuestionAsked` and
+`EventSessionIdle`.
+
+**The blocker is the daemon, not the API.** `opencode serve` is strictly manual - nothing was
+running before the probe. The plain `opencode` TUI opens **no listening socket and no child
+process**; it embeds its server in-process. And there is **no on-disk discovery**: no pidfile,
+no port file, no registry. Discovery is a user-configured URL, opt-in mDNS, or a process scan.
+The server is also unsecured by default (`OPENCODE_SERVER_PASSWORD is not set`).
+
+That is why binding is opportunistic. Starting a server would be a silent user-visible side
+effect, and guessing at a port would be worse. A user who wants opencode sessions to persist
+like Claude's and Codex's must run `opencode serve` themselves (for example as a user service)
+and point `opencode.server_url` at it.
+
+**Scope**: a full binding is not proportionate for the third and least-used backend, especially
+since the API is visibly mid-migration (parallel `/session` and `/api/session` families,
+`experimental/` paths, `V2`/`Next` event names). The proportionate slice is four endpoints:
+`GET /session`, `GET /session/status`, and `PATCH /session/{id}` for rename and archive.
+
+**Two archive caveats that must be encoded**: plain `GET /session` does **not** filter archived
+sessions - only `/experimental/session` does (`?archived=true` returned 298, `false` or default
+returned 297). And unarchive is `archived: 0`; sending `{"time":{}}` is a silent no-op.
+
+**Alternatives considered**:
+
+- *Full server binding, treating opencode like Codex*: rejected as disproportionate for the
+  third backend against a mid-migration API that is usually not running.
+- *Have agent-viewer start `opencode serve` when absent*: rejected. Silent side effect, and it
+  would make agent-viewer the owner of a session host, which D-001 avoids on every backend.
+- *Stay on SQLite only*: rejected. It leaves a live defect in place (see D-010) that the server
+  fixes with one endpoint.
+
+---
+
+## D-010: opencode capabilities - SQLite floor, server ceiling
+
+**Superseded in part by D-013.** The verdicts below were derived from opencode's SQLite schema
+alone and describe the **no-server floor**. Four of the five "not possible" conclusions are
+wrong when a server is reachable:
+
+| Capability | SQLite-only (floor) | With server (D-013) |
+|---|---|---|
+| Per-session live status | not possible | **POSSIBLE** - `GET /session/status` returns per-id `idle`/`busy`/`retry{attempt,message,next}` |
+| needs-input / pending permission | not possible | **POSSIBLE** - `GET /permission`, `GET /question`, per-session variants, reply/reject endpoints |
+| Archive | not possible | **POSSIBLE** - `PATCH {"time":{"archived":<ms>}}` |
+| Rename | raw SQL via `opencode db` only | **POSSIBLE** - `PATCH {"title":"..."}`, no raw SQL |
+| PR association | not possible | **still NOT POSSIBLE** - zero `pull` matches in the spec; only `GET /vcs` returning `{"branch":"main","default_branch":"main"}` |
+
+The floor verdicts remain accurate as written and still govern when no server is configured.
+
+### Original SQLite-derived findings, retained as the no-server floor
 
 **Decision**: Gate opencode down to what it can actually do, and correct two capability bits
 that currently lie.
