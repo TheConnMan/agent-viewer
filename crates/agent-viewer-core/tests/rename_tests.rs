@@ -272,53 +272,48 @@ fn claude_rename_stamps_updated_at_like_claude_does() {
 }
 
 #[test]
-fn claude_rename_never_exposes_the_temp_file_to_other_users() {
-    // The temp must be CREATED restricted, not widened after the fact: another local user can
-    // read a 0644 temp in the window between write and chmod.
+fn claude_temp_state_file_is_created_owner_only() {
+    // The security property is that the temp is never group/other readable, not even for the
+    // instant between creation and a chmod - so assert the mode the moment it exists, before a
+    // byte is written. A watcher thread racing the write could only catch that by luck.
+    use agent_viewer_core::claude::create_owner_only;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json.tmp");
+
+    let file = create_owner_only(&path).expect("create temp");
+    let at_creation = file.metadata().expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(
+        at_creation, 0o600,
+        "temp must be owner-only from the instant it exists"
+    );
+
+    // create_new: an existing path is an error, never a silent truncate of someone else's file.
+    assert!(create_owner_only(&path).is_err());
+}
+
+#[test]
+fn claude_rename_temp_is_owner_only_and_the_result_keeps_the_target_mode() {
+    // End-to-end companion to the seam test above: the finished file carries the target's own
+    // mode, and the group-readable target proves the widening happens after the write, not by
+    // leaving the umask default in place.
     use std::os::unix::fs::PermissionsExt;
     let root = jobs_root_with("ab12", r#"{"name":"old","intent":"secret"}"#);
-    let dir = root.path().join("ab12");
-    std::fs::set_permissions(
-        dir.join("state.json"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("chmod 600");
-
-    // A writer that observes every file the rename creates, at the moment it is created.
-    let watch_dir = dir.clone();
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
-    let sink = std::sync::Arc::clone(&observed);
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_flag = std::sync::Arc::clone(&stop);
-    let watcher = std::thread::spawn(move || {
-        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok(entries) = std::fs::read_dir(&watch_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    if name.to_string_lossy().contains(".tmp")
-                        && let Ok(meta) = entry.metadata()
-                    {
-                        sink.lock()
-                            .expect("lock")
-                            .push(meta.permissions().mode() & 0o777);
-                    }
-                }
-            }
-        }
-    });
+    let path = root.path().join("ab12").join("state.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
 
     let backend = ClaudeBackend::with_binary_and_jobs_root("claude", root.path().to_path_buf());
-    for i in 0..40 {
-        backend
-            .rename(&claude_session(Some("ab12")), &format!("new {i}"))
-            .expect("rename succeeds");
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    watcher.join().expect("watcher joins");
+    backend
+        .rename(&claude_session(Some("ab12")), "new")
+        .expect("rename succeeds");
 
-    let seen = observed.lock().expect("lock").clone();
-    assert!(
-        seen.iter().all(|mode| mode & 0o077 == 0),
-        "temp file was group/other readable at some point: {seen:?}"
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o640,
+        "the target's own mode must be restored exactly"
     );
 }

@@ -577,6 +577,19 @@ pub fn iso8601_utc_millis(time: SystemTime) -> String {
     )
 }
 
+/// Create `path` for writing, owner-read/write only, failing if it already exists. Split out
+/// so the creation mode is directly assertable: the security property is that the file is
+/// NEVER group/other readable, not even for the instant between creation and a later chmod,
+/// and a test that watches for the temp from another thread can only observe that by luck.
+/// umask can only clear bits, so 0600 is an upper bound, never a floor.
+pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::os::unix::fs::OpenOptionsExt::mode(
+        std::fs::OpenOptions::new().write(true).create_new(true),
+        0o600,
+    )
+    .open(path)
+}
+
 /// Replace `path`'s contents with `body` atomically: write a temp file beside it, then
 /// rename over the target, so a concurrent reader (the claude daemon, our own list tick)
 /// sees either the old file or the new one, never a partial write. Mirrors claude's own
@@ -601,11 +614,7 @@ fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
     // clear bits, so the file is never wider than 0600 at creation.
     let write = |tmp: &std::path::Path| -> std::io::Result<()> {
         use std::io::Write;
-        let mut file = std::os::unix::fs::OpenOptionsExt::mode(
-            std::fs::OpenOptions::new().write(true).create_new(true),
-            0o600,
-        )
-        .open(tmp)?;
+        let mut file = create_owner_only(tmp)?;
         file.write_all(body.as_bytes())?;
         // Widen to the target's own mode only once the content is in place.
         if let Some(mode) = mode {
