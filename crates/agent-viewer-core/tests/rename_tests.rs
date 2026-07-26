@@ -317,3 +317,27 @@ fn claude_rename_temp_is_owner_only_and_the_result_keeps_the_target_mode() {
         "the target's own mode must be restored exactly"
     );
 }
+
+#[test]
+fn claude_state_write_refuses_to_resurrect_a_removed_job() {
+    // `claude rm` can unlink state.json between the rename's read and its write - the mutation
+    // runner keys rename and remove separately, so they overlap. Recreating the file there
+    // would leave a ghost job behind the removal, so a missing target must abort the write.
+    use agent_viewer_core::claude::replace_atomic;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.json");
+
+    let err = replace_atomic(&path, r#"{"name":"ghost"}"#)
+        .expect_err("a missing target must abort, never create");
+    assert!(
+        matches!(err, Error::Io(_)),
+        "expected an io error, got {err:?}"
+    );
+    assert!(!path.exists(), "the removed state file must stay removed");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("dir readable")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "no temp may survive: {leftovers:?}");
+}
