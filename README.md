@@ -16,9 +16,12 @@ no data or whose CLI is not installed simply list empty — they never error the
   `threads`) plus the rollout transcripts under `~/.codex/sessions/`, resolves live
   running/done/errored status, spawns detached `codex exec` jobs, attaches via
   `codex resume`, and archives/unarchives.
-- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), and remove
-  (`claude rm`). No archive/hide (Claude has no hide concept) and no rename (Claude exposes
-  no external rename channel, so `Ctrl+R` on a Claude row is a footer notice).
+- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), remove (`claude rm`),
+  and rename background sessions. Rename writes `name`/`nameSource` into that job's
+  `~/.claude/jobs/<short>/state.json`, which is what Claude's own fleet view does and the only
+  channel it has (there is no `claude rename` subcommand). It applies to background rows only:
+  an interactive row has no job dir, so `Ctrl+R` there is a footer notice. No archive/hide
+  (Claude has no hide concept).
 - **opencode** — enumerate, spawn, and attach from `~/.local/share/opencode/opencode.db`.
   No archive, no rename.
 
@@ -114,7 +117,8 @@ modal.
 - `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
   pressing it always reports a footer notice that reply is not supported.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
-  Capability-gated: unsupported backends (Claude) are a no-op with a footer notice.
+  Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
+  Claude row, which has no job dir) is a no-op with a footer notice.
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `a` — show all (companions + archived + deleted-dir rows).

@@ -210,77 +210,70 @@ fn multi_backend_smoke() {
     }
 }
 
-/// Session ids of every live worker in the claude daemon roster (empty if no daemon).
-fn roster_session_ids() -> std::collections::HashSet<String> {
-    let path = dirs_home().join(".claude/daemon/roster.json");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Default::default();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Default::default();
-    };
-    json.get("workers")
-        .and_then(|w| w.as_object())
-        .map(|workers| {
-            workers
-                .values()
-                .filter_map(|w| w.get("sessionId").and_then(|v| v.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn dirs_home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME set"))
-}
-
-/// Regression proof against the REAL claude daemon: a live-session rename must NOT report a
-/// false success. Current claude authenticates the rendezvous socket's first frame as
-/// `attacher-caps` and rejects our `rename_session` frame, so `ClaudeBackend::rename` must
-/// surface that as Err (which drives the TUI's viewer-local override fallback). Before the fix
-/// this returned Ok(()) on the rejected frame, so the override never fired and the row never
-/// updated. Skips cleanly when no live claude worker exists on the box. Sends only a rejected
-/// frame, so it mutates nothing.
+/// Live proof of the real rename channel: renaming a claude bg job must write that job's own
+/// `state.json`, and `claude agents` must echo the new name back on the next listing. This is
+/// the load-bearing check that agent-viewer and `claude agents` cannot disagree about a name.
+///
+/// Picks a FINISHED job (never a live one, so no worker is racing the write), snapshots its
+/// name, renames, re-lists, then restores the original name before asserting - so a failure
+/// leaves the box exactly as it found it. Skips cleanly when no finished claude job exists.
 #[test]
-#[ignore = "live: needs a running claude daemon with at least one live session"]
-fn claude_live_rename_is_rejected_not_falsely_ok() {
+#[ignore = "live: needs claude on PATH with at least one finished bg job"]
+fn claude_live_rename_round_trips_through_the_agents_listing() {
     let mut backend = ClaudeBackend::new();
     let Ok(sessions) = backend.list() else {
         eprintln!("[skip] claude backend not listable on this box");
         return;
     };
-    // Prefer a session that has a live rendezvous worker in the daemon roster, so the rename
-    // actually connects and is rejected (the exact path that used to false-succeed) rather than
-    // short-circuiting on "no live worker". Fall back to any live-status session.
-    let worker_ids = roster_session_ids();
-    let session = sessions
+    // Finished + has the short id that names its job dir + no live pid: nothing else is
+    // writing this state.json while we do.
+    let target = sessions
         .iter()
-        .find(|s| worker_ids.contains(&s.id))
-        .or_else(|| {
-            sessions.iter().find(|s| {
-                s.pid.is_some() || matches!(s.status, Status::Working | Status::NeedsInput { .. })
-            })
+        .find(|s| {
+            matches!(s.status, Status::Done | Status::Error)
+                && s.pid.is_none()
+                && s.short_id.as_deref().is_some_and(|id| !id.is_empty())
         })
         .cloned();
-    let Some(session) = session else {
-        eprintln!("[skip] no live claude session to exercise the rename reject path");
+    let Some(session) = target else {
+        eprintln!("[skip] no finished claude bg job to rename");
         return;
     };
-    let via_worker = worker_ids.contains(&session.id);
-    println!("[rename] target has live rendezvous worker: {via_worker}");
-
+    let original = session.title.clone();
+    let probe = "e2e-live-rename-probe";
     println!(
-        "[rename] exercising live session {} ({:?}) title={:?}",
-        &session.id[..session.id.len().min(12)],
-        session.status,
-        session.title
+        "[rename] target job {} title={original:?}",
+        session.short_id.as_deref().unwrap_or("?")
     );
-    let result = backend.rename(&session, "e2e-live-rename-probe-DO-NOT-KEEP");
-    println!("[rename] rename() -> {result:?}");
-    assert!(
-        result.is_err(),
-        "live claude rename must return Err so the override fallback fires; got Ok (the pre-fix \
-         false-success). The daemon rejects the frame, so a real rename never happened."
+
+    let renamed = backend.rename(&session, probe);
+    let seen_after_rename = renamed.as_ref().ok().and_then(|()| {
+        backend
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|s| s.id == session.id)
+            .map(|s| s.title)
+    });
+    // Restore FIRST, then assert, so an assertion failure never leaves the probe name behind.
+    let restored = backend.rename(&session, &original);
+    let seen_after_restore = backend
+        .list()
+        .ok()
+        .and_then(|all| all.into_iter().find(|s| s.id == session.id))
+        .map(|s| s.title);
+    println!("[rename] after rename: {seen_after_rename:?}, after restore: {seen_after_restore:?}");
+
+    renamed.expect("rename of a finished bg job must succeed");
+    assert_eq!(
+        seen_after_rename.as_deref(),
+        Some(probe),
+        "`claude agents` must report the name agent-viewer wrote"
+    );
+    restored.expect("restoring the original name must succeed");
+    assert_eq!(
+        seen_after_restore.as_deref(),
+        Some(original.as_str()),
+        "the original name must be back"
     );
 }

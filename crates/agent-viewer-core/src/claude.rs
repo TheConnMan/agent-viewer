@@ -7,6 +7,9 @@ use std::time::SystemTime;
 
 pub struct ClaudeBackend {
     binary: String,
+    /// Root of claude's per-job state dirs (`~/.claude/jobs`). Injectable so the rename
+    /// round-trip is testable against a real directory instead of the developer's own jobs.
+    jobs_root: PathBuf,
     /// Per-job state.json cache keyed by (mtime, len): the file is re-read and re-parsed
     /// only when it changes, not every tick (mirrors the codex StatusResolver pattern).
     detail_cache: HashMap<PathBuf, ((SystemTime, u64), JobDetail)>,
@@ -20,11 +23,21 @@ impl ClaudeBackend {
         ClaudeBackend::with_binary("claude")
     }
     pub fn with_binary(binary: &str) -> ClaudeBackend {
+        ClaudeBackend::with_binary_and_jobs_root(binary, default_jobs_root())
+    }
+    pub fn with_binary_and_jobs_root(binary: &str, jobs_root: PathBuf) -> ClaudeBackend {
         ClaudeBackend {
             binary: binary.to_string(),
+            jobs_root,
             detail_cache: HashMap::new(),
             models_cache: OnceLock::new(),
         }
+    }
+
+    /// `<jobs_root>/<short_id>/state.json` - claude's own store of record for a bg job's
+    /// name, summary, transcript path, and respawn contract.
+    fn job_state_path(&self, short_id: &str) -> PathBuf {
+        job_state_path_in(&self.jobs_root, short_id)
     }
 
     /// The parsed jobs state.json for `path`, plus its mtime (the caller's updated_at
@@ -99,7 +112,7 @@ impl Backend for ClaudeBackend {
         Capabilities {
             spawn: true,
             attach: true,
-            rename: false,
+            rename: true,
             archive: false,
             delete: true,
             stop: false,
@@ -111,12 +124,15 @@ impl Backend for ClaudeBackend {
     fn capabilities_for(&self, session: &Session) -> Capabilities {
         // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
         // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
+        // Rename rides the same gate for the same reason - the short id names the job dir
+        // whose state.json holds the name, and an interactive row has no job dir at all.
         let mut capabilities = self.capabilities();
         let has_short_id = session
             .short_id
             .as_deref()
             .is_some_and(|short_id| !short_id.is_empty());
         capabilities.delete = has_short_id;
+        capabilities.rename = has_short_id;
         capabilities
     }
     fn list(&mut self) -> Result<Vec<Session>> {
@@ -136,7 +152,7 @@ impl Backend for ClaudeBackend {
         for session in &mut sessions {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
             if let Some(short_id) = session.short_id.as_deref() {
-                let path = job_state_path(short_id);
+                let path = job_state_path_in(&self.jobs_root, short_id);
                 if let Some((mtime, detail)) = self.cached_job_detail(&path) {
                     session.summary = detail.summary;
                     session.rollout_path = detail.transcript_path;
@@ -172,12 +188,37 @@ impl Backend for ClaudeBackend {
         // companions so spawn pinning is unnecessary.
         Ok(None)
     }
-    // No `rename` impl on purpose: claude exposes no external rename channel. The daemon's
-    // per-session rendezvous socket authenticates its FIRST frame as `attacher-caps` and
-    // rejects a `rename_session` frame, and merely opening it evicts the daemon's supervisor
-    // connection for that live session — so every attempt damaged a live session for a
-    // guaranteed failure. The trait default returns Err(Unsupported), which is the honest
-    // answer, and `capabilities().rename` is false so the TUI never reaches it.
+    /// Rename a daemon-backed bg job the way claude itself does: a read-modify-write of
+    /// `name`/`nameSource` in that job's `state.json`. Verified against the 2.1.220 bundle,
+    /// whose fleet view Ctrl+R calls exactly this state writer for daemon rows (its failure
+    /// notice, "its state file is unwritable", is the tell), and verified live on this box -
+    /// writing the field made `claude agents --json` report the new name on the next listing.
+    ///
+    /// This is the one place the viewer writes another tool's store, and it is deliberate:
+    /// claude ships no `rename` subcommand, the state file IS the store of record for a job's
+    /// name, and the alternative (a viewer-local override) is the shadow state that makes the
+    /// list disagree with `claude agents`. The rendezvous socket is NOT the channel: it
+    /// authenticates its first frame as `attacher-caps`, merely opening it evicts the
+    /// daemon's supervisor connection for a live session, and the `rename_session` frame we
+    /// once sent there belongs to the unrelated SDK/bridge control protocol.
+    ///
+    /// Racing a live worker's own state write is possible and accepted: the worker re-reads
+    /// the file immediately before each write, so it merges this name rather than reverting
+    /// it, which is the same race claude's own fleet view runs.
+    fn rename(&self, session: &Session, name: &str) -> Result<()> {
+        let Some(short_id) = session
+            .short_id
+            .as_deref()
+            .filter(|short_id| !short_id.is_empty())
+        else {
+            return Err(Error::Unsupported(BackendKind::Claude.name()));
+        };
+        let path = self.job_state_path(short_id);
+        // Read-modify-write, never a blind overwrite: state.json carries the job's respawn
+        // contract, and a missing file means the job is gone (Err, so the TUI reports it).
+        let existing = std::fs::read_to_string(&path)?;
+        write_atomic(&path, &job_state_with_name(&existing, name)?)
+    }
     fn remove(&self, session: &Session) -> Result<()> {
         // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
         // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
@@ -458,12 +499,51 @@ pub fn parse_job_state(text: &str) -> JobDetail {
     }
 }
 
-/// $HOME/.claude/jobs/<short_id>/state.json
-pub fn job_state_path(short_id: &str) -> std::path::PathBuf {
-    crate::home_dir()
-        .join(".claude/jobs")
-        .join(short_id)
-        .join("state.json")
+/// $HOME/.claude/jobs
+pub fn default_jobs_root() -> PathBuf {
+    crate::home_dir().join(".claude/jobs")
+}
+
+/// <jobs_root>/<short_id>/state.json
+pub fn job_state_path_in(jobs_root: &std::path::Path, short_id: &str) -> PathBuf {
+    jobs_root.join(short_id).join("state.json")
+}
+
+/// Set `name`/`nameSource` on a parsed job state, preserving every other field. Split out
+/// from the filesystem so the merge itself is provable: a rename must never drop
+/// `respawnFlags`, `intent`, or anything else the job needs to respawn. `Err` when the file
+/// is not a JSON object, since a synthesized replacement would drop exactly those fields.
+fn job_state_with_name(existing: &str, name: &str) -> Result<String> {
+    let mut state: serde_json::Value = serde_json::from_str(existing)?;
+    let Some(object) = state.as_object_mut() else {
+        return Err(Error::Command(
+            "claude job state.json is not a JSON object".to_string(),
+        ));
+    };
+    object.insert("name".to_string(), serde_json::Value::from(name));
+    // `user` is what fleet view stamps for a human rename; it is what stops claude's own
+    // auto-titler from overwriting the name later.
+    object.insert("nameSource".to_string(), serde_json::Value::from("user"));
+    Ok(serde_json::to_string_pretty(&state)?)
+}
+
+/// Replace `path`'s contents with `body` atomically: write a temp file beside it, then
+/// rename over the target, so a concurrent reader (the claude daemon, our own list tick)
+/// sees either the old file or the new one, never a partial write. Mirrors claude's own
+/// state writer.
+fn write_atomic(path: &std::path::Path, body: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.agent-viewer.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Peek parser for the claude session JSONL (verified record shapes 2026-07-11):

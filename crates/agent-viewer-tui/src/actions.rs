@@ -83,13 +83,17 @@ pub(crate) fn ensure_models(ui: &mut Ui, backends: &[Box<dyn Backend>]) {
     }
 }
 
-/// `Ctrl+R` — open the rename modal for the selected session, gated on the backend
-/// advertising rename (claude has no external rename channel, so it is a footer notice).
+/// `Ctrl+R` — open the rename modal for the selected session, gated PER ROW on rename: claude
+/// renames a bg job by writing its job dir's state.json, so an interactive row (which has no
+/// job dir) is a footer notice even though the backend itself advertises rename.
 pub(crate) fn open_rename(backends: &[Box<dyn Backend>], ui: &mut Ui) {
     let Some(session) = ui.app.selected().cloned() else {
         return;
     };
-    if !caps_of(backends, session.backend).rename {
+    let caps = backend_of(backends, session.backend)
+        .map(|backend| backend.capabilities_for(&session))
+        .unwrap_or_else(Capabilities::none);
+    if !caps.rename {
         ui.set_notice(format!(
             "{} does not support rename",
             session.backend.name()
