@@ -3,21 +3,16 @@
 //! per-mode key routing. Every fn mutates the shared `Ui` state owned by the run loop.
 
 use std::io;
-use std::time::Instant;
 
-use agent_viewer_core::backend::{Backend, BackendKind, Capabilities};
+use agent_viewer_core::Session;
+use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
 use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_core::Session;
-use agent_viewer_tui::app::{
-    CodexReply, DetachTracker, KillStage, codex_reply_keystroke, file_stems, reply_allowed,
-    subdir_names,
-};
-use agent_viewer_tui::ui::{Mode, RenameModal, ReplyModal};
+use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
+use agent_viewer_tui::ui::{Mode, RenameModal};
 
 use crate::ops::{Mutation, run_mutation};
-use crate::pending_reply::PendingReply;
 use crate::{Key, Refresher, Ui};
 
 /// Enter/Space on a header toggles + persists the collapse. Returns true when a header was
@@ -95,7 +90,10 @@ pub(crate) fn open_rename(backends: &[Box<dyn Backend>], ui: &mut Ui) {
         return;
     };
     if !caps_of(backends, session.backend).rename {
-        ui.set_notice(format!("{} does not support rename", session.backend.name()));
+        ui.set_notice(format!(
+            "{} does not support rename",
+            session.backend.name()
+        ));
         return;
     }
     ui.mode = Mode::Rename(RenameModal {
@@ -105,104 +103,24 @@ pub(crate) fn open_rename(backends: &[Box<dyn Backend>], ui: &mut Ui) {
     });
 }
 
-/// `Ctrl+E` — focus a reply input for the selected session, gated on the
-/// backend supporting reply AND the session actually being blocked (the sole safety gate).
-/// Force the peek open so the pending ask stays visible above the input.
-pub(crate) fn open_reply(backends: &[Box<dyn Backend>], ui: &mut Ui) {
-    let Some(session) = ui.app.selected().cloned() else {
-        return;
-    };
-    let caps = caps_of(backends, session.backend);
-    if !reply_allowed(caps.reply, session.status) {
-        ui.set_notice(if !caps.reply {
-            format!("{} does not support reply", session.backend.name())
-        } else {
-            "only a needs-input session can be replied to".to_string()
-        });
+/// Reply is not supported by any backend.
+pub(crate) fn open_reply(_backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    if ui.app.selected().is_none() {
         return;
     }
-    ui.app.expand_selected();
-    ui.mode = Mode::Reply(ReplyModal {
-        backend: session.backend,
-        id: session.id.clone(),
-        buffer: String::new(),
-    });
+    ui.set_notice("reply is not supported".to_string());
 }
 
-/// Deliver the composed reply: re-resolve the target, re-check the safety gate (state may
-/// have changed while typing), attach (native `claude attach`, or a reused live PTY), then arm
-/// the one-shot injector to write the payload once we are safely in the run. Claude sends the
-/// text + Enter; codex maps y/n approvals to a single keystroke and otherwise attaches with
-/// focus for the user to finish; opencode is gated out upstream.
+/// Reply is not supported by any backend.
 pub(crate) fn send_reply(
-    backends: &[Box<dyn Backend>],
+    _backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    _terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<()> {
-    let Mode::Reply(modal) = &ui.mode else {
-        return Ok(());
-    };
-    let backend_kind = modal.backend;
-    let id = modal.id.clone();
-    let buffer = modal.buffer.clone();
-
-    // Re-resolve by (backend, id), NOT selected() — the background refresh reorders rows.
-    let Some(session) = ui.app.session_for(&(backend_kind, id.clone())).cloned() else {
-        ui.set_notice("session is gone".to_string());
-        return Ok(());
-    };
-    // Safety re-check: never send to a session that is no longer waiting for input.
-    if !reply_allowed(caps_of(backends, backend_kind).reply, session.status) {
-        ui.set_notice("session is no longer waiting for input".to_string());
+    if !matches!(ui.mode, Mode::Reply(_)) {
         return Ok(());
     }
-
-    // Decide the payload bytes per backend; None attaches with focus only (the run-view gate
-    // is derived from the backend/attach kind after attach, below).
-    let payload: Option<Vec<u8>> = match backend_kind {
-        BackendKind::Claude => Some(format!("{buffer}\r").into_bytes()),
-        BackendKind::Codex => match codex_reply_keystroke(&buffer) {
-            // Approve auto-sends the stable `y` approve key. Deny is deliberately NOT
-            // auto-injected: the reject key is Codex-version/config specific (0.144.1 binds
-            // deny to `d`, and `n` is a different decline-with-guidance action), so a guessed
-            // byte could invoke the wrong action. Attach with focus and let the user confirm
-            // the denial by hand rather than risk it.
-            CodexReply::Approve => Some(b"y".to_vec()),
-            CodexReply::Deny => {
-                ui.set_notice("confirm the denial in the attached session".to_string());
-                None
-            }
-            CodexReply::Freeform => {
-                ui.set_notice("type your reply in the attached session".to_string());
-                None
-            }
-        },
-        BackendKind::Opencode => None,
-    };
-
-    // Whether a live PTY already exists BEFORE we attach decides fresh-vs-reused for the
-    // reply gate: attach_session reuses an existing PTY (already in the run) and otherwise
-    // spawns a fresh `claude attach` (which must show its transient before we may type).
-    let key: Key = (backend_kind, id);
-    let reused = ui.attached.contains_key(&key);
-    if !attach_session(backends, ui, terminal, &session)? {
-        return Ok(());
-    }
-    if let Some(payload) = payload {
-        // require_run_view: only claude prints a "Waking…/Attaching…" transient before its
-        // prompt renders, so the injector must wait for that to clear before typing. Codex
-        // resume lands straight in the pending prompt (always ready).
-        let require_run_view = matches!(backend_kind, BackendKind::Claude);
-        ui.pending_reply = Some(PendingReply {
-            key,
-            payload,
-            require_run_view,
-            fresh_attach: !reused,
-            transient_seen: false,
-            armed_at: Instant::now(),
-            ready_since: None,
-        });
-    }
+    ui.set_notice("reply is not supported".to_string());
     Ok(())
 }
 
@@ -233,7 +151,9 @@ pub(crate) fn kill_selected(backends: &[Box<dyn Backend>], ui: &mut Ui) {
     let Some(session) = ui.app.selected().cloned() else {
         return;
     };
-    let caps = caps_of(backends, session.backend);
+    let caps = backend_of(backends, session.backend)
+        .map(|backend| backend.capabilities_for(&session))
+        .unwrap_or_else(Capabilities::none);
     match stage {
         KillStage::Stop => {
             if !caps.stop {
@@ -251,8 +171,7 @@ pub(crate) fn kill_selected(backends: &[Box<dyn Backend>], ui: &mut Ui) {
         KillStage::Remove => {
             // Per-row, not just per-backend: claude advertises remove but can only act on a
             // row carrying a short id. Asking the row keeps the notice honest at keypress.
-            let removable = backend_of(backends, session.backend)
-                .is_some_and(|backend| backend.can_remove(&session));
+            let removable = caps.delete;
             if !removable {
                 ui.set_notice(format!(
                     "{} does not support remove",
@@ -269,7 +188,13 @@ pub(crate) fn kill_selected(backends: &[Box<dyn Backend>], ui: &mut Ui) {
             );
         }
         KillStage::Noop => {
-            if !caps.stop {
+            // Noop is the FIRST press on a row a stop does not apply to: it arms the remove
+            // and the footer countdown hint is the whole signal, so arming stays silent.
+            // A refusal notice only belongs to a row that IS running yet cannot be stopped;
+            // gating it on the status keeps `caps.stop` being per-row (codex sets it from
+            // `pid`) from refusing an action the user never asked for.
+            let running = matches!(session.status, Status::Working | Status::NeedsInput { .. });
+            if running && !caps.stop {
                 ui.set_notice(format!("{} cannot be stopped", session.backend.name()));
             }
         }
@@ -281,7 +206,7 @@ pub(crate) fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bo
         return;
     };
     let caps = caps_of(backends, session.backend);
-    if !caps.hide {
+    if !caps.archive {
         ui.set_notice(format!("{} does not support hide", session.backend.name()));
         return;
     }
@@ -352,7 +277,7 @@ fn attach_session(
     let Some(backend) = backend_of(backends, session.backend) else {
         return Ok(false);
     };
-    if !backend.capabilities().attach {
+    if !backend.capabilities_for(session).attach {
         ui.set_notice(format!("{} does not support attach", backend.kind().name()));
         return Ok(false);
     }
@@ -370,8 +295,8 @@ fn attach_session(
     } else {
         // Pre-accept the trust dialog before a claude `-r` RESUME attach into a fresh project
         // (best-effort; only the no-short-id fallback resumes by full id and can hit the trust
-        // prompt — `claude attach <short_id>` resolves the trusted jobs cwd itself, and other
-        // backends never need it).
+        // prompt, since `claude attach <short_id>` resolves the trusted jobs cwd itself and
+        // other backends never need it).
         let claude_fallback = session.backend == BackendKind::Claude
             && session.short_id.as_deref().unwrap_or_default().is_empty();
         if claude_fallback {
@@ -379,9 +304,12 @@ fn attach_session(
             let config = std::path::PathBuf::from(&home).join(".claude.json");
             let _ = ensure_trusted(&config, &session.cwd);
         }
-        let Some(command) = backend.attach_command(session) else {
-            ui.set_notice(format!("{} does not support attach", backend.kind().name()));
-            return Ok(false);
+        let command = match backend.attach_command(session) {
+            Ok(command) => command,
+            Err(refusal) => {
+                ui.set_notice(refusal.reason);
+                return Ok(false);
+            }
         };
         let spec = spec_from_command(&command, rows, cols);
         match PtySession::spawn(spec) {

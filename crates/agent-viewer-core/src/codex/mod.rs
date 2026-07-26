@@ -4,8 +4,8 @@ pub mod rollout;
 pub mod source;
 pub mod status;
 
-use crate::backend::{Backend, BackendKind, Capabilities, Session};
-use crate::error::Result;
+use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin};
+use crate::error::{AttachRefusal, Result};
 use registry::Registry;
 use status::StatusResolver;
 use std::path::Path;
@@ -131,13 +131,29 @@ impl Backend for CodexBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             spawn: true,
-            hide: true,
             attach: true,
-            stop: true,
-            remove: true,
             rename: true,
-            reply: true,
+            archive: true,
+            delete: true,
+            stop: true,
+            needs_input: true,
+            pr_refs: true,
+            live_status: true,
         }
+    }
+
+    fn capabilities_for(&self, session: &Session) -> Capabilities {
+        let mut capabilities = self.capabilities();
+        // DELIBERATE DIVERGENCE from the capability table in
+        // specs/001-fleet-view-unification/data-model.md, which marks codex `stop` as an
+        // unconditional yes and pid-gates opencode only. Reason: `stop` below already
+        // returns Unsupported for a row with no pid, because with no pid there is no
+        // process to signal. Advertising stop there would be a promise this backend
+        // cannot keep, and a capability that is advertised and then fails at press time is
+        // worse than one advertised as unsupported. Keep the gate; the table is the
+        // coarser statement.
+        capabilities.stop = session.pid.is_some();
+        capabilities
     }
 
     fn list(&mut self) -> Result<Vec<Session>> {
@@ -149,20 +165,25 @@ impl Backend for CodexBackend {
             // same open map, so no per-tick canonicalize is needed here.
             let (status, pid) = self.resolver.resolve(&thread.rollout_path, &open);
             let companion = thread.source.is_companion();
-            let source_label = thread.source.label().to_string();
+            let origin = if matches!(thread.source, source::Source::Exec) {
+                SessionOrigin::Exec
+            } else {
+                SessionOrigin::Interactive
+            };
             sessions.push(Session {
                 backend: BackendKind::Codex,
                 id: thread.id,
                 short_id: None,
+                origin,
                 title: thread.title,
                 cwd: thread.cwd,
+                git_branch: thread.git_branch,
+                status,
                 created_at_ms: thread.created_at_ms,
                 updated_at_ms: thread.updated_at_ms,
-                status,
                 hidden: thread.archived,
-                source_label,
-                summary: thread.preview,
                 companion,
+                summary: thread.preview,
                 pid,
                 rollout_path: Some(thread.rollout_path),
                 pr_refs: Vec::new(),
@@ -218,7 +239,10 @@ impl Backend for CodexBackend {
         cli::rename(&session.id, name)
     }
 
-    fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
+    fn attach_command(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<std::process::Command, AttachRefusal> {
         let mut cmd = cli::resume_command(&session.id);
         // `codex resume` inherits the viewer's cwd and otherwise prompts "Choose working
         // directory" on attach. Pin it to the session's own cwd when that directory still
@@ -226,7 +250,7 @@ impl Backend for CodexBackend {
         if session.cwd.is_dir() {
             cmd.current_dir(&session.cwd);
         }
-        Some(cmd)
+        Ok(cmd)
     }
 }
 

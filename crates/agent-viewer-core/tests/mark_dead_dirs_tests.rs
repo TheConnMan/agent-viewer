@@ -1,7 +1,7 @@
 //! mark_dead_dirs — flags any session whose cwd no longer exists on disk as a companion
 //! (so the default view hides deleted-dir noise, e.g. agentos /tmp sessions).
 
-use agent_viewer_core::backend::{BackendKind, Session, Status};
+use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::mark_dead_dirs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -11,15 +11,16 @@ fn sess(cwd: PathBuf, companion: bool) -> Session {
         backend: BackendKind::Codex,
         id: "s".to_string(),
         short_id: None,
+        origin: SessionOrigin::Interactive,
         title: "t".to_string(),
         cwd,
+        git_branch: None,
+        status: Status::Done,
         created_at_ms: 0,
         updated_at_ms: 0,
-        status: Status::Done,
         hidden: false,
-        source_label: "test".to_string(),
-        summary: String::new(),
         companion,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),

@@ -219,7 +219,7 @@ impl App {
     pub fn needs_input_count(&self) -> usize {
         self.sessions
             .iter()
-            .filter(|s| matches!(s.status, Status::NeedsInput))
+            .filter(|s| matches!(s.status, Status::NeedsInput { .. }))
             .count()
     }
 
@@ -301,9 +301,13 @@ impl App {
     ///  - else arm (S, now): S.status in {Working, NeedsInput} -> Stop,
     ///    else Noop (armed silently; footer shows the countdown hint)
     pub fn kill_stage(&mut self, now_ms: i64) -> KillStage {
-        let Some((backend, id, status)) =
-            self.selected().map(|s| (s.backend, s.id.clone(), s.status))
-        else {
+        let Some((backend, id, should_stop)) = self.selected().map(|s| {
+            (
+                s.backend,
+                s.id.clone(),
+                matches!(s.status, Status::Working | Status::NeedsInput { .. }),
+            )
+        }) else {
             return KillStage::Noop;
         };
 
@@ -317,7 +321,7 @@ impl App {
         }
 
         self.armed_kill = Some((backend, id, now_ms));
-        if matches!(status, Status::Working | Status::NeedsInput) {
+        if should_stop {
             KillStage::Stop
         } else {
             KillStage::Noop
@@ -559,7 +563,7 @@ impl App {
             id: s.id.clone(),
             title: s.title.clone(),
             summary: s.summary.clone(),
-            status: s.status,
+            status: s.status.clone(),
             hidden: s.hidden,
             updated_at_ms: s.updated_at_ms,
             pr_refs: s.pr_refs.clone(),
@@ -618,7 +622,7 @@ impl App {
             let members: Vec<usize> = indices
                 .iter()
                 .copied()
-                .filter(|&i| section_of(self.sessions[i].status) == section)
+                .filter(|&i| section_of(&self.sessions[i].status) == section)
                 .collect();
             if members.is_empty() {
                 continue;
@@ -728,13 +732,13 @@ impl App {
     }
 }
 
-/// The ByState section a status folds into (Failed + Stopped -> Done).
-fn section_of(status: Status) -> Section {
+/// The state section a status folds into.
+fn section_of(status: &Status) -> Section {
     match status {
-        Status::NeedsInput => Section::NeedsInput,
+        Status::NeedsInput { .. } => Section::NeedsInput,
         Status::Working => Section::Working,
-        Status::Idle => Section::Idle,
-        Status::Done | Status::Failed | Status::Stopped => Section::Done,
+        Status::Idle | Status::Unknown => Section::Idle,
+        Status::Done | Status::Error => Section::Done,
     }
 }
 
@@ -785,13 +789,6 @@ pub fn row_layout(
     (name_out, detail_out, pad)
 }
 
-/// Whether a reply may be delivered to a session at all: the backend must support reply AND
-/// the session must actually be waiting for input. The sole safety gate against sending to a
-/// non-blocked session. Pure.
-pub fn reply_allowed(caps_reply: bool, status: Status) -> bool {
-    caps_reply && matches!(status, Status::NeedsInput)
-}
-
 /// How a typed codex approval reply maps to a decision. Approve auto-sends the stable `y`
 /// approve key; Deny and Freeform (anything else, including empty) attach with focus so the
 /// user finishes manually rather than guessing (the reject key is version/config specific,
@@ -833,26 +830,7 @@ pub fn format_elapsed(delta_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexReply, codex_reply_keystroke, reply_allowed};
-    use agent_viewer_core::Status;
-
-    #[test]
-    fn reply_allowed_only_for_capable_and_blocked() {
-        // Both conditions must hold: backend supports reply AND the session is blocked.
-        assert!(reply_allowed(true, Status::NeedsInput));
-        // Capable backend but the session is not blocked -> never.
-        for s in [
-            Status::Working,
-            Status::Idle,
-            Status::Done,
-            Status::Failed,
-            Status::Stopped,
-        ] {
-            assert!(!reply_allowed(true, s));
-        }
-        // Blocked session but the backend cannot reply -> never.
-        assert!(!reply_allowed(false, Status::NeedsInput));
-    }
+    use super::{CodexReply, codex_reply_keystroke};
 
     #[test]
     fn codex_reply_keystroke_maps_yes_no_and_freeform() {

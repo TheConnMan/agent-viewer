@@ -1,7 +1,7 @@
 mod common;
 
 use agent_viewer_core::Status;
-use agent_viewer_core::backend::{Backend, BackendKind};
+use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin};
 use agent_viewer_core::opencode::{
     OpencodeBackend, opencode_status, parse_opencode_models, read_opencode_last_message, rename_sql,
 };
@@ -37,11 +37,11 @@ fn opencode_lists_rows_hidden_and_order() {
     assert_eq!(parent.title, "Parent");
     assert_eq!(parent.created_at_ms, 1000);
     assert_eq!(parent.updated_at_ms, 3000);
-    assert_eq!(parent.source_label, "opencode");
+    assert_eq!(parent.origin, SessionOrigin::Interactive);
     assert!(!parent.hidden);
     assert_eq!(parent.short_id, None); // opencode sessions carry no claude short id
 
-    assert_eq!(sessions[1].source_label, "subagent"); // parent_id non-NULL
+    assert!(sessions[1].companion); // parent_id non-NULL
     assert!(!sessions[1].hidden);
     assert!(sessions[2].hidden); // time_archived IS NOT NULL
 }
@@ -206,6 +206,65 @@ github-copilot/gpt-5
             "openai/gpt-5.6",
             "github-copilot/gpt-5",
         ]
+    );
+}
+
+// --- per-row stop capability ---
+
+fn session_with_pid(pid: Option<u32>) -> Session {
+    Session {
+        backend: BackendKind::Opencode,
+        id: "ses_cap".to_string(),
+        short_id: None,
+        origin: SessionOrigin::Interactive,
+        title: "probe".to_string(),
+        cwd: PathBuf::from("/tmp"),
+        git_branch: None,
+        status: Status::Idle,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+    }
+}
+
+/// `stop` signals `session.pid`, so a row without one has no process to terminate. The
+/// capability must be advertised per row rather than backend wide, and `capabilities_for`
+/// must narrow nothing but `stop`.
+#[test]
+fn opencode_stop_capability_is_per_row_and_requires_a_pid() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = OpencodeBackend::with_db(dir.path().join("nope.db"));
+    let base = backend.capabilities();
+    assert!(base.stop, "backend wide stop stays true");
+
+    let with_pid = backend.capabilities_for(&session_with_pid(Some(4242)));
+    let without_pid = backend.capabilities_for(&session_with_pid(None));
+    assert!(with_pid.stop, "a row carrying a pid can be stopped");
+    assert!(!without_pid.stop, "no pid means no process to signal");
+    assert_eq!(
+        Capabilities {
+            stop: false,
+            ..with_pid
+        },
+        Capabilities {
+            stop: false,
+            ..base
+        }
+    );
+    assert_eq!(
+        Capabilities {
+            stop: false,
+            ..without_pid
+        },
+        Capabilities {
+            stop: false,
+            ..base
+        }
     );
 }
 

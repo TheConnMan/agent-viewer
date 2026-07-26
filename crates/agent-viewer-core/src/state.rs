@@ -1,8 +1,11 @@
 //! Viewer-owned state DB (the ONLY SQLite this tool writes) plus the pure overlay and
-//! spawn-matching functions. Backends stay ignorant of it; the overlay applies
-//! pins/stops/renames to the concatenated session list in the TUI loop.
+//! spawn-matching functions. Backends stay ignorant of it: they never read or write this
+//! file, so nothing here can alter what a backend reports. The overlay is presentation-only
+//! now - it unhides viewer-spawned sessions (clearing `companion`) and fills in the pid the
+//! viewer recorded at spawn time for rows the backend could not supply one for. Titles,
+//! statuses, and hidden flags come from the backend unchanged.
 
-use crate::backend::{BackendKind, Session, Status};
+use crate::backend::{BackendKind, Session};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 
@@ -15,19 +18,36 @@ CREATE TABLE IF NOT EXISTS spawned (\
   pid INTEGER NOT NULL,\
   spawned_at_ms INTEGER NOT NULL\
 );\
-CREATE TABLE IF NOT EXISTS stopped (\
-  backend TEXT NOT NULL,\
-  session_id TEXT NOT NULL,\
-  stopped_at_ms INTEGER NOT NULL,\
-  PRIMARY KEY(backend, session_id)\
-);\
-CREATE TABLE IF NOT EXISTS renames (\
-  backend TEXT NOT NULL,\
-  session_id TEXT NOT NULL,\
-  name TEXT NOT NULL,\
-  PRIMARY KEY(backend, session_id)\
-);\
-CREATE TABLE IF NOT EXISTS collapsed_groups (group_key TEXT PRIMARY KEY);";
+CREATE TABLE IF NOT EXISTS collapsed_groups (group_key TEXT PRIMARY KEY);\
+CREATE TABLE IF NOT EXISTS settings (\
+  key TEXT PRIMARY KEY,\
+  value TEXT NOT NULL\
+);";
+
+/// Legacy shadow-state tables the viewer no longer owns. Dropped once after a successful
+/// open, NOT as part of `SCHEMA`: a DROP takes a write lock and can return SQLITE_BUSY under
+/// the WAL multi-viewer concurrency this file designs for, and a failure inside `try_open`
+/// would send `open` down the delete-and-recreate path, costing the user their spawn pins and
+/// collapsed groups over a transient lock.
+const DROP_LEGACY_TABLES: &str = "\
+DROP TABLE IF EXISTS renames;\
+DROP TABLE IF EXISTS stopped;";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupingMode {
+    #[default]
+    Project,
+    State,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    #[default]
+    Recency,
+    Title,
+}
+
+pub const DEFAULT_RETENTION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
@@ -44,6 +64,21 @@ pub struct ViewerDb {
     conn: rusqlite::Connection,
 }
 
+/// Does this open failure mean the FILE ITSELF is unusable, so that a fresh empty DB is
+/// strictly better than what is on disk? Only two sqlite codes say that: the bytes are not a
+/// database at all, or the database is corrupt. Everything else - `DatabaseBusy` and
+/// `DatabaseLocked` most of all, but equally a permissions or disk error - describes the
+/// environment, not the file, and the file must survive it.
+fn is_unusable_file(error: &crate::error::Error) -> bool {
+    let crate::error::Error::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) = error else {
+        return false;
+    };
+    matches!(
+        failure.code,
+        rusqlite::ffi::ErrorCode::NotADatabase | rusqlite::ffi::ErrorCode::DatabaseCorrupt
+    )
+}
+
 /// An unresolved viewer-spawned session record (pin candidate awaiting a session id).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnRecord {
@@ -57,17 +92,17 @@ pub struct SpawnRecord {
 /// One snapshot read per tick feeding the overlay.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ViewerState {
-    /// resolved spawns (always-visible pins)
+    /// Resolved spawns that remain visible.
     pub pinned: HashSet<(BackendKind, String)>,
-    pub stopped: HashSet<(BackendKind, String)>,
-    pub renames: HashMap<(BackendKind, String), String>,
     pub spawn_pids: HashMap<(BackendKind, String), u32>,
 }
 
 impl ViewerDb {
     /// $HOME/.local/state/agent-viewer/viewer.db, parent dir created. Read-WRITE.
-    /// On any open/schema failure: delete the file, recreate fresh (all contents are
-    /// advisory; losing them costs pins/labels, nothing more).
+    /// A file that is not a database, or is corrupt, is deleted and recreated fresh (its
+    /// contents are advisory; losing them costs pins and collapsed groups, nothing more).
+    /// EVERY other open failure - lock contention above all - is returned to the caller with
+    /// the file left untouched.
     pub fn open_default() -> Result<ViewerDb> {
         ViewerDb::open(&crate::home_dir().join(".local/state/agent-viewer/viewer.db"))
     }
@@ -77,15 +112,35 @@ impl ViewerDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match ViewerDb::try_open(path) {
-            Ok(db) => Ok(db),
-            // Any open/schema failure means the file is unusable (corrupt or not a DB).
-            // The contents are advisory, so replace it with a fresh empty DB.
-            Err(_) => {
+        let db = match ViewerDb::try_open(path) {
+            Ok(db) => db,
+            // Delete-and-recreate ONLY when the file itself is garbage, never on contention.
+            // `SCHEMA` contains CREATE TABLE statements, and adding a table to an existing
+            // viewer.db is a real write that takes a write lock; under the WAL multi-viewer
+            // concurrency this file is designed for, a second viewer can lose that race and
+            // get SQLITE_BUSY after the 500ms busy_timeout. A busy loser must never destroy
+            // the winner's live database - that would wipe the running viewer's spawn pins
+            // and collapsed groups mid-session. Anything else (permissions, disk, an unmapped
+            // sqlite code) also errors out rather than deleting: an unreadable-for-some-other-
+            // reason database is not made better by being destroyed, and the failure is
+            // usually transient or environmental.
+            Err(error) if is_unusable_file(&error) => {
                 let _ = std::fs::remove_file(path);
-                ViewerDb::try_open(path)
+                // The WAL sidecars belong to the file we just removed; a stale -wal replayed
+                // over the fresh database would recreate the corruption we are recovering from.
+                for suffix in ["-wal", "-shm"] {
+                    let mut sidecar = path.as_os_str().to_os_string();
+                    sidecar.push(suffix);
+                    let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+                }
+                ViewerDb::try_open(path)?
             }
-        }
+            Err(error) => return Err(error),
+        };
+        // Best effort: a lock contention failure here leaves the legacy tables in place for
+        // the next open rather than discarding a usable DB.
+        let _ = db.conn.execute_batch(DROP_LEGACY_TABLES);
+        Ok(db)
     }
 
     fn try_open(path: &std::path::Path) -> Result<ViewerDb> {
@@ -202,46 +257,6 @@ impl ViewerDb {
         Ok(())
     }
 
-    pub fn mark_stopped(&self, backend: BackendKind, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO stopped (backend, session_id, stopped_at_ms) \
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![backend.name(), session_id, crate::spawn::now_ms()],
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_stopped(&self, backend: BackendKind, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM stopped WHERE backend = ?1 AND session_id = ?2",
-            rusqlite::params![backend.name(), session_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_name_override(
-        &self,
-        backend: BackendKind,
-        session_id: &str,
-        name: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO renames (backend, session_id, name) VALUES (?1, ?2, ?3)",
-            rusqlite::params![backend.name(), session_id, name],
-        )?;
-        Ok(())
-    }
-
-    /// Drop any name override for this session. Called on a successful native rename so a
-    /// stale override (left by an earlier daemon-down fallback) cannot shadow the real name.
-    pub fn clear_name_override(&self, backend: BackendKind, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM renames WHERE backend = ?1 AND session_id = ?2",
-            rusqlite::params![backend.name(), session_id],
-        )?;
-        Ok(())
-    }
-
     /// Persist a group's collapsed state: insert its key when collapsed, delete it when
     /// expanded. The key is an opaque text form owned by the TUI's GroupKey.
     pub fn set_group_collapsed(&self, group_key: &str, collapsed: bool) -> Result<()> {
@@ -272,6 +287,86 @@ impl ViewerDb {
         Ok(keys)
     }
 
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        let value = self.conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        );
+        match value {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn grouping_mode(&self) -> Result<GroupingMode> {
+        Ok(match self.setting("grouping_mode")?.as_deref() {
+            Some("state") => GroupingMode::State,
+            Some("project") | None => GroupingMode::Project,
+            Some(_) => GroupingMode::default(),
+        })
+    }
+
+    pub fn set_grouping_mode(&self, mode: GroupingMode) -> Result<()> {
+        let value = match mode {
+            GroupingMode::Project => "project",
+            GroupingMode::State => "state",
+        };
+        self.set_setting("grouping_mode", value)
+    }
+
+    pub fn sort_order(&self) -> Result<SortOrder> {
+        Ok(match self.setting("sort_order")?.as_deref() {
+            Some("title") => SortOrder::Title,
+            Some("recency") | None => SortOrder::Recency,
+            Some(_) => SortOrder::default(),
+        })
+    }
+
+    pub fn set_sort_order(&self, order: SortOrder) -> Result<()> {
+        let value = match order {
+            SortOrder::Recency => "recency",
+            SortOrder::Title => "title",
+        };
+        self.set_setting("sort_order", value)
+    }
+
+    pub fn retention_window_ms(&self) -> Result<i64> {
+        Ok(self
+            .setting("retention_window_ms")?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_RETENTION_WINDOW_MS))
+    }
+
+    pub fn set_retention_window_ms(&self, ms: i64) -> Result<()> {
+        self.set_setting("retention_window_ms", &ms.to_string())
+    }
+
+    pub fn opencode_server_url(&self) -> Result<Option<String>> {
+        self.setting("opencode.server_url")
+    }
+
+    pub fn set_opencode_server_url(&self, url: Option<&str>) -> Result<()> {
+        if let Some(url) = url {
+            self.set_setting("opencode.server_url", url)
+        } else {
+            self.conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                rusqlite::params!["opencode.server_url"],
+            )?;
+            Ok(())
+        }
+    }
+
     /// One snapshot read per tick feeding the overlay.
     pub fn viewer_state(&self) -> Result<ViewerState> {
         let mut state = ViewerState::default();
@@ -295,95 +390,26 @@ impl ViewerDb {
             state.spawn_pids.insert((backend, session_id), pid as u32);
         }
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT backend, session_id FROM stopped")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (backend, session_id) = row?;
-            if let Some(backend) = backend_from_str(&backend) {
-                state.stopped.insert((backend, session_id));
-            }
-        }
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT backend, session_id, name FROM renames")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (backend, session_id, name) = row?;
-            let Some(backend) = backend_from_str(&backend) else {
-                continue;
-            };
-            // Claude advertises rename: false (it exposes no external rename channel), so a
-            // persisted claude override can only be a legacy row from a build that allowed the
-            // local fallback. Applying it would resurrect the fabricated-name defect: a title
-            // only the viewer believes, disagreeing with `claude agents`, and now unclearable
-            // since Ctrl+R on a claude row is just an unsupported notice. Skip at load rather
-            // than delete: ignoring is non-destructive and sufficient.
-            if backend == BackendKind::Claude {
-                continue;
-            }
-            state.renames.insert((backend, session_id), name);
-        }
-
         Ok(state)
     }
 }
 
-/// PURE overlay, applied in the TUI loop after concatenating backend lists:
-///   - renames: replace title
-///   - pinned: set companion = false (viewer-spawned sessions always visible)
-///   - spawn_pids: fill session.pid when None (opencode stop path)
-///   - stopped: Done|Failed -> Stopped. If the session is live again
-///     (Working/NeedsInput/Idle) the record is STALE — status unchanged, key
-///     returned so the caller clears it from the DB.
-///
-/// Returns stale stopped keys. Visibility filtering is NOT done here (App owns it).
-pub fn apply_viewer_state(
-    sessions: &mut [Session],
-    state: &ViewerState,
-) -> Vec<(BackendKind, String)> {
-    let mut stale = Vec::new();
+/// Pure presentation overlay for sessions created by the viewer.
+pub fn apply_viewer_state(sessions: &mut [Session], state: &ViewerState) {
     for session in sessions.iter_mut() {
         let key = (session.backend, session.id.clone());
-        if let Some(name) = state.renames.get(&key) {
-            session.title = name.clone();
-        }
         if state.pinned.contains(&key) {
             session.companion = false;
         }
-        if state.stopped.contains(&key) {
-            match session.status {
-                Status::Done | Status::Failed => session.status = Status::Stopped,
-                // Already live again: the stopped record is stale, leave the status.
-                Status::Working | Status::NeedsInput | Status::Idle => stale.push(key.clone()),
-                Status::Stopped => {}
-            }
-        }
-        // Overlay the spawn pid only onto a still-live session (opencode stop path). A
-        // terminal row's recorded pid may have been reused by an unrelated process, so a
-        // later stop must never signal it — run this after the stopped fold above so a
-        // just-stopped row is excluded too.
+        // A terminal row's recorded pid may already have been recycled by an unrelated
+        // process, so never hand it out: a later stop would signal the wrong process.
         if session.pid.is_none()
-            && matches!(
-                session.status,
-                Status::Working | Status::NeedsInput | Status::Idle
-            )
+            && !session.status.is_finished()
             && let Some(pid) = state.spawn_pids.get(&key)
         {
             session.pid = Some(*pid);
         }
     }
-    stale
 }
 
 /// PURE spawn matching (runs per tick for unresolved records): a session of

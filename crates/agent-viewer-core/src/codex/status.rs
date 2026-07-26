@@ -38,17 +38,21 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, u32> {
 ///   open + tail MidTurn OR unreadable     -> Working   (spawn race: empty file)
 ///   open + tail Complete                  -> Idle      (live session between turns)
 ///   closed + Complete                     -> Done
-///   closed + anything else               -> Failed    (v1 Errored, renamed)
-/// Stopped is NOT resolved here — it is a viewer-DB overlay (section 5.7). Never panics.
+///   closed + anything else               -> Error
+/// `Unknown` is NOT produced here: the codex resolver always has an open/closed signal and a
+/// tail to reason from, so it never needs the "backend cannot say" escape hatch. `Unknown` is
+/// reserved for a resolver that genuinely has no signal to reason from. Never panics.
 fn status_from(open: bool, tail: Option<TailState>) -> Status {
     match (open, tail) {
-        (true, Some(TailState::AwaitingApproval)) => Status::NeedsInput,
+        (true, Some(TailState::AwaitingApproval)) => Status::NeedsInput {
+            reason: Some("awaiting approval".into()),
+        },
         (true, Some(TailState::Complete)) => Status::Idle,
         // MidTurn or an unreadable/empty file (spawn race) -> Working while held open.
         (true, _) => Status::Working,
         (false, Some(TailState::Complete)) => Status::Done,
-        // Closed and not cleanly complete (MidTurn, awaiting, or unreadable) -> Failed.
-        (false, _) => Status::Failed,
+        // Closed and not cleanly complete (MidTurn, awaiting, or unreadable) -> Error.
+        (false, _) => Status::Error,
     }
 }
 

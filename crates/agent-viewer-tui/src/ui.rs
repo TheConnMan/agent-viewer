@@ -39,7 +39,6 @@ pub mod theme {
     pub const OK: Color = Color::Rgb(0x7f, 0xae, 0x5e);
     pub const WARN: Color = Color::Rgb(0xd9, 0xa9, 0x3f);
     pub const ERR: Color = Color::Rgb(0xcf, 0x6a, 0x52);
-    pub const STOPPED: Color = Color::Rgb(0x85, 0x7e, 0x6a);
     pub const PR_MERGED: Color = Color::Rgb(0xb0, 0x8a, 0xc9);
     // Per-backend brand marks (row + composer): Claude terracotta, Codex teal, opencode green.
     pub const BRAND_CLAUDE: Color = Color::Rgb(0xd9, 0x77, 0x57);
@@ -167,25 +166,25 @@ pub fn bloom_glyph(elapsed_ms: i64) -> Option<&'static str> {
 
 /// Six-state glyph + color. Working shimmers its glyph (~120ms/frame); needs-input
 /// breathes its color (muted <-> accent-bright, ~1.2s). Both derive from `now_ms`.
-fn status_glyph(status: Status, now_ms: i64) -> (&'static str, ratatui::style::Color) {
+fn status_glyph(status: &Status, now_ms: i64) -> (&'static str, ratatui::style::Color) {
     match status {
         Status::Working => (shimmer_glyph(now_ms), theme::ACCENT),
-        Status::NeedsInput => ("◐", BREATH_STEPS[breath_phase(now_ms)]),
+        Status::NeedsInput { .. } => ("◐", BREATH_STEPS[breath_phase(now_ms)]),
         Status::Idle => ("∙", theme::MUTED),
         Status::Done => ("●", theme::OK),
-        Status::Failed => ("✗", theme::ERR),
-        Status::Stopped => ("○", theme::STOPPED),
+        Status::Error => ("✗", theme::ERR),
+        Status::Unknown => ("?", theme::MUTED),
     }
 }
 
-fn status_word(status: Status) -> &'static str {
+fn status_word(status: &Status) -> &'static str {
     match status {
         Status::Working => "working",
-        Status::NeedsInput => "needs-input",
+        Status::NeedsInput { .. } => "needs-input",
         Status::Idle => "idle",
         Status::Done => "done",
-        Status::Failed => "failed",
-        Status::Stopped => "stopped",
+        Status::Error => "error",
+        Status::Unknown => "unknown",
     }
 }
 
@@ -542,7 +541,7 @@ fn peek_expansion(
     // Metadata fallback for sessions with no transcript file (opencode) when items is empty.
     let meta = if session.rollout_path.is_none() {
         vec![
-            format!("status: {}", status_word(session.status)),
+            format!("status: {}", status_word(&session.status)),
             format!("cwd: {}", session.cwd.display()),
         ]
     } else {
@@ -550,7 +549,7 @@ fn peek_expansion(
     };
     // Surface WHAT a blocked session is waiting on: codex from the parsed pending approval,
     // claude from its state.json needs (session.summary), opencode has no needs-input signal.
-    let ask: Option<String> = if session.status == Status::NeedsInput {
+    let ask: Option<String> = if matches!(session.status, Status::NeedsInput { .. }) {
         match session.backend {
             BackendKind::Codex => peek.ask.as_ref().map(|s| format!("Awaiting approval: {s}")),
             BackendKind::Claude => (!session.summary.is_empty())
@@ -1092,7 +1091,7 @@ fn row_to_item(
                 .and_then(|(_, start)| bloom_glyph(now_ms - *start));
             let (glyph, gcolor) = match bloom {
                 Some(g) => (g, theme::ACCENT),
-                None => status_glyph(*status, now_ms),
+                None => status_glyph(status, now_ms),
             };
             let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
             let pr_color = pr_badge_theme_color(pr_status.badge_color(pr_refs));
@@ -1102,7 +1101,7 @@ fn row_to_item(
                 mark: backend_mark(*backend),
                 mark_color: backend_mark_color(*backend),
                 name: title,
-                status: *status,
+                status,
                 summary,
                 pr: &pr_badge(pr_refs),
                 pr_color,
@@ -1119,26 +1118,26 @@ fn row_to_item(
 }
 
 /// Title-case status word for a row (Claude Code style).
-fn status_display_word(status: Status) -> &'static str {
+fn status_display_word(status: &Status) -> &'static str {
     match status {
         Status::Working => "Working",
-        Status::NeedsInput => "Needs input",
+        Status::NeedsInput { .. } => "Needs input",
         Status::Idle => "Idle",
         Status::Done => "Done",
-        Status::Failed => "Failed",
-        Status::Stopped => "Stopped",
+        Status::Error => "Error",
+        Status::Unknown => "Unknown",
     }
 }
 
 /// The state's theme color for its status word.
-fn status_color(status: Status) -> ratatui::style::Color {
+fn status_color(status: &Status) -> ratatui::style::Color {
     match status {
         Status::Working => theme::ACCENT,
-        Status::NeedsInput => theme::WARN,
+        Status::NeedsInput { .. } => theme::WARN,
         Status::Idle => theme::MUTED,
         Status::Done => theme::OK,
-        Status::Failed => theme::ERR,
-        Status::Stopped => theme::STOPPED,
+        Status::Error => theme::ERR,
+        Status::Unknown => theme::MUTED,
     }
 }
 
@@ -1169,7 +1168,7 @@ struct SessionRow<'a> {
     mark: &'a str,
     mark_color: ratatui::style::Color,
     name: &'a str,
-    status: Status,
+    status: &'a Status,
     summary: &'a str,
     pr: &'a str,
     pr_color: ratatui::style::Color,
@@ -1286,7 +1285,7 @@ fn draw_attach(frame: &mut Frame, av: AttachView, now_ms: i64) {
 }
 
 fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms: i64, area: Rect) {
-    let (glyph, gcolor) = status_glyph(session.status, now_ms);
+    let (glyph, gcolor) = status_glyph(&session.status, now_ms);
     let right = if exited {
         "process exited · press any key"
     } else {
@@ -1341,7 +1340,6 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Space", "expand peek in row"),
         ("Enter/Space", "collapse group (on a header)"),
         ("Ctrl+R", "rename in row"),
-        ("Ctrl+E", "reply to a blocked session"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
         ("a", "show all (companions + archived)"),

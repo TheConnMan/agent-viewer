@@ -1,5 +1,5 @@
-use crate::backend::{Backend, BackendKind, Capabilities, Session, Status};
-use crate::error::{Error, Result};
+use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin, Status};
+use crate::error::{AttachRefusal, Error, Result};
 use std::sync::OnceLock;
 
 pub struct OpencodeBackend {
@@ -38,13 +38,20 @@ impl Backend for OpencodeBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             spawn: true,
-            hide: false,
             attach: true,
-            stop: true,
-            remove: true,
             rename: true,
-            reply: false,
+            archive: false,
+            delete: true,
+            stop: true,
+            needs_input: false,
+            pr_refs: false,
+            live_status: false,
         }
+    }
+    fn capabilities_for(&self, session: &Session) -> Capabilities {
+        let mut capabilities = self.capabilities();
+        capabilities.stop = session.pid.is_some();
+        capabilities
     }
     fn list(&mut self) -> Result<Vec<Session>> {
         // Missing DB file is a quiet empty backend, not an error.
@@ -69,19 +76,16 @@ impl Backend for OpencodeBackend {
                 backend: BackendKind::Opencode,
                 id: row.get(0)?,
                 short_id: None,
+                origin: SessionOrigin::Interactive,
                 title: row.get(3)?,
                 cwd: std::path::PathBuf::from(row.get::<_, String>(2)?),
+                git_branch: None,
+                status: opencode_status(live, time_updated, now),
                 created_at_ms: row.get(4)?,
                 updated_at_ms: time_updated,
-                status: opencode_status(live, time_updated, now),
                 hidden: time_archived.is_some(),
-                source_label: if parent_id.is_some() {
-                    "subagent".to_string()
-                } else {
-                    "opencode".to_string()
-                },
-                summary: String::new(),
                 companion: parent_id.is_some(),
+                summary: String::new(),
                 // Overlay fills the pid for viewer-spawned opencode sessions.
                 pid: None,
                 rollout_path: None,
@@ -140,7 +144,10 @@ impl Backend for OpencodeBackend {
                 .arg(rename_sql(&session.id, name)),
         )
     }
-    fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
+    fn attach_command(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<std::process::Command, AttachRefusal> {
         // The TUI command accepts `-s <id>` to open a session; the old `run -s <id> -i
         // --dir` form was invalid (`run` has no -i flag). Pin the cwd only when it exists,
         // so a deleted dir does not fail the spawn.
@@ -149,7 +156,7 @@ impl Backend for OpencodeBackend {
         if session.cwd.is_dir() {
             cmd.current_dir(&session.cwd);
         }
-        Some(cmd)
+        Ok(cmd)
     }
 }
 
@@ -275,8 +282,7 @@ const IDLE_MAX_AGE_MS: i64 = 1_800_000; // 30 min
 
 /// PURE three-tier status heuristic, unit-tested (the process check is injected, I-3):
 /// Working: live && age <= 1 min; Idle: live && age <= 30 min; Done: otherwise.
-/// Never NeedsInput/Failed/Stopped (no signal exists — the session table has no error
-/// column; verified live 2026-07-11).
+/// Never NeedsInput or Error because the session table has no error column.
 pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64) -> Status {
     if !live_opencode_proc {
         return Status::Done;

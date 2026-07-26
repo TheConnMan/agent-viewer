@@ -31,13 +31,13 @@ Every session resolves to one of six states, each with its own glyph in the list
   tail), so treat it as a hint rather than a guarantee.
 - `∙` idle — live but not doing anything.
 - `●` done — finished cleanly.
-- `✗` failed — exited with an error.
-- `○` stopped — stopped from the viewer.
+- `✗` error — exited with an error.
+- `?` unknown — the backend cannot say; never shown as a false idle.
 
 Each row is prefixed by its backend's mark in the backend's color — by default the textual
 tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) — followed by
-the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Failed`,
-`Stopped`) and a muted one-line summary. The status word and time sit right-aligned; Claude
+the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Error`,
+`Unknown`) and a muted one-line summary. The status word and time sit right-aligned; Claude
 jobs with associated pull requests show a badge just left of the time — `#315` for one PR,
 `2 PRs` for several. The badge is colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
@@ -48,7 +48,7 @@ Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual
 `✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
 
 The default list groups by project directory; `Ctrl+S` regroups by state (needs-input,
-working, idle, done, with failed and stopped folding into done). Every row renders — the
+working, idle, done, with error folding into done and unknown folding into idle). Every row renders — the
 list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
@@ -110,9 +110,8 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
 - `Space` — expand the selected row in place to peek its last message / metadata.
-- `Ctrl+E` — reply to the selected needs-input session (an input opens in the composer area;
-  `Enter` sends, `Esc` cancels). Capability-gated: unsupported backends (opencode) and
-  non-blocked rows are a no-op with a footer notice.
+- `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
+  pressing it always reports a footer notice that reply is not supported.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated: unsupported backends (Claude) are a no-op with a footer notice.
 - `Ctrl+X` — stop the selected session; press again within 2s to remove it.
@@ -136,18 +135,11 @@ job and a finished one (waking it in place); a row with no background-job id fal
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
 
-Replies (`Ctrl+E`) ride the same embedded attach. A Claude reply lands the typed text plus Enter
-into the run once the attach transient (`Waking…/Attaching…`) has cleared and the session
-is accepting input.
-A Codex approval reply of yes auto-sends the approve key; a denial or any free-text reply
-instead attaches you with focus so you can confirm it by hand (the Codex reject key is
-version and config specific, so denials are left to you). Codex needs-input is inferred from
-the transcript tail, which can briefly still show an already-answered approval until the turn
-advances, so a Codex reply is best-effort and should be sent only when the row is genuinely
-waiting. Delivery is
-best-effort: the auto-inject rides on detecting when the child is ready to accept input, and
-if that detection does not land, the reply is not sent blindly. In that case you are left
-attached in the session to type it yourself, and a footer notice says so.
+Peek and reply are deliberately out of scope for this rebuild (a divergence from Fleet View,
+which binds `space` to reply — noted here so it is not mistaken for an oversight; see the
+constitution's Additional Constraints). `Ctrl+E` is reserved in the key list but always
+reports a footer notice that reply is not supported. Revisiting either is a future,
+separately-specified decision.
 
 Quitting the viewer (`q`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

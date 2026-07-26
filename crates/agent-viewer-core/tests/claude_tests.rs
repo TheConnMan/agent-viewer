@@ -1,6 +1,6 @@
 mod common;
 
-use agent_viewer_core::backend::{Backend, BackendKind, PrRef, Status};
+use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
     ClaudeBackend, parse_agents_json, parse_claude_json_models, parse_job_state,
     read_claude_transcript,
@@ -35,7 +35,7 @@ fn claude_parse_maps_six_states_and_pid() {
     assert_eq!(working.cwd, PathBuf::from("/home/user/proj-working"));
     assert_eq!(working.created_at_ms, 1783659603260); // = startedAt
     assert_eq!(working.updated_at_ms, 1783659603260);
-    assert_eq!(working.source_label, "background"); // = kind
+    assert_eq!(working.origin, SessionOrigin::Background);
     assert!(!working.hidden);
     assert!(!working.companion); // claude rows are never companions
     assert_eq!(working.status, Status::Working);
@@ -43,17 +43,64 @@ fn claude_parse_maps_six_states_and_pid() {
     // short id (entry "id") is now folded into the Session itself.
     assert_eq!(working.short_id, Some("work0001".to_string()));
 
-    assert_eq!(by_title(&parsed, "Blocked Task").status, Status::NeedsInput);
+    assert_eq!(
+        by_title(&parsed, "Blocked Task").status,
+        Status::needs_input()
+    );
     assert_eq!(by_title(&parsed, "Idle Task").status, Status::Idle);
     assert_eq!(by_title(&parsed, "Done Task").status, Status::Done);
-    assert_eq!(by_title(&parsed, "Failed Task").status, Status::Failed);
-    assert_eq!(by_title(&parsed, "Stopped Task").status, Status::Stopped);
+    assert_eq!(by_title(&parsed, "Failed Task").status, Status::Error);
+    assert_eq!(by_title(&parsed, "Stopped Task").status, Status::Done);
 
-    // Missing state field -> Idle (verified live occurrence), pid absent -> None.
+    // Missing state field maps to Unknown, and pid remains absent.
     let nostate = by_title(&parsed, "No State Task");
-    assert_eq!(nostate.status, Status::Idle);
+    assert_eq!(nostate.status, Status::Unknown);
     assert_eq!(nostate.pid, None);
     assert_eq!(nostate.short_id, Some("nost0001".to_string()));
+}
+
+// `kind` is the only input to SessionOrigin: "background" -> Background, EVERYTHING else
+// (including an absent kind) -> Interactive. Both branches are asserted so a mapping that
+// collapsed every row onto a single origin cannot pass.
+#[test]
+fn claude_origin_is_background_only_for_kind_background() {
+    let json = common::read_fixture("claude_agents_all.json");
+    let parsed = parse_agents_json(&json).expect("parse agents json");
+    assert_eq!(
+        by_title(&parsed, "Working Task").origin,
+        SessionOrigin::Background
+    );
+    // The fixture's one kind=="interactive" row.
+    assert_eq!(
+        by_title(&parsed, "Idle Task").origin,
+        SessionOrigin::Interactive
+    );
+
+    // A missing kind and an unrecognized kind both land on Interactive too.
+    let inline = r#"[
+      {"id": "nkin0001",
+       "cwd": "/home/user/proj-nokind",
+       "startedAt": 1783711000000,
+       "sessionId": "nkin0001-5555-4133-a473-d3d004454cdd",
+       "name": "No Kind Task",
+       "state": "idle"},
+      {"id": "okin0001",
+       "cwd": "/home/user/proj-oddkind",
+       "kind": "vscode",
+       "startedAt": 1783711010000,
+       "sessionId": "okin0001-6666-4133-a473-d3d004454cee",
+       "name": "Odd Kind Task",
+       "state": "idle"}
+    ]"#;
+    let parsed = parse_agents_json(inline).expect("parse inline agents json");
+    assert_eq!(
+        by_title(&parsed, "No Kind Task").origin,
+        SessionOrigin::Interactive
+    );
+    assert_eq!(
+        by_title(&parsed, "Odd Kind Task").origin,
+        SessionOrigin::Interactive
+    );
 }
 
 #[test]
@@ -242,15 +289,16 @@ fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
         backend: BackendKind::Claude,
         id: "3f9c1a2e-0000-4000-8000-000000000001".to_string(),
         short_id: short_id.map(str::to_string),
+        origin: SessionOrigin::Background,
         title: "probe".to_string(),
         cwd: PathBuf::from("/tmp"),
+        git_branch: None,
+        status: Status::Working,
         created_at_ms: 0,
         updated_at_ms: 0,
-        status: Status::Working,
         hidden: false,
-        source_label: String::new(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
@@ -261,13 +309,28 @@ fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
 // short id and a row without one has no bg job to remove. The capability is therefore
 // per-row, and callers must be able to ask BEFORE taking any destructive step.
 #[test]
-fn claude_can_remove_is_per_row_and_requires_a_short_id() {
+fn claude_delete_capability_is_per_row_and_requires_a_short_id() {
     let backend = ClaudeBackend::new();
-    assert!(backend.capabilities().remove, "backend-wide remove stays true");
+    assert!(
+        backend.capabilities().delete,
+        "backend wide delete stays true"
+    );
 
-    assert!(backend.can_remove(&session_with_short_id(Some("ab12"))));
+    assert!(
+        backend
+            .capabilities_for(&session_with_short_id(Some("ab12")))
+            .delete
+    );
     // An interactive row carries no short id at all.
-    assert!(!backend.can_remove(&session_with_short_id(None)));
+    assert!(
+        !backend
+            .capabilities_for(&session_with_short_id(None))
+            .delete
+    );
     // A blank short id is the same absence wearing the historical unwrap_or_default shape.
-    assert!(!backend.can_remove(&session_with_short_id(Some(""))));
+    assert!(
+        !backend
+            .capabilities_for(&session_with_short_id(Some("")))
+            .delete
+    );
 }

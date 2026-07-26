@@ -1,5 +1,5 @@
-use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, Status};
-use crate::error::{Error, Result};
+use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status};
+use crate::error::{AttachRefusal, Error, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -88,15 +88,36 @@ impl Backend for ClaudeBackend {
         BackendKind::Claude
     }
     fn capabilities(&self) -> Capabilities {
+        // DELIBERATE DIVERGENCE from the capability table in
+        // specs/001-fleet-view-unification/data-model.md, which marks claude `archive` and
+        // `stop` as yes. Reason: `ClaudeBackend` implements neither the `hide` nor the `stop`
+        // trait method below, so the trait defaults return Unsupported for both. Advertising
+        // true here would be a promise this backend cannot keep, and a capability that is
+        // advertised and then fails at press time is worse than one advertised as
+        // unsupported, which is exactly what the footer notice exists to signal. Keep the
+        // gate; the table is the coarser statement.
         Capabilities {
             spawn: true,
-            hide: false,
             attach: true,
-            stop: false,
-            remove: true,
             rename: false,
-            reply: true,
+            archive: false,
+            delete: true,
+            stop: false,
+            needs_input: true,
+            pr_refs: true,
+            live_status: true,
         }
+    }
+    fn capabilities_for(&self, session: &Session) -> Capabilities {
+        // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
+        // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
+        let mut capabilities = self.capabilities();
+        let has_short_id = session
+            .short_id
+            .as_deref()
+            .is_some_and(|short_id| !short_id.is_empty());
+        capabilities.delete = has_short_id;
+        capabilities
     }
     fn list(&mut self) -> Result<Vec<Session>> {
         // A missing/failing binary or non-zero exit is a quiet empty backend, not an error.
@@ -114,13 +135,15 @@ impl Backend for ClaudeBackend {
         let mut sessions = parse_agents_json(&stdout)?;
         for session in &mut sessions {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
-            let path = job_state_path(session.short_id.as_deref().unwrap_or_default());
-            if let Some((mtime, detail)) = self.cached_job_detail(&path) {
-                session.summary = detail.summary;
-                session.rollout_path = detail.transcript_path;
-                session.pr_refs = detail.prs;
-                if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                    session.updated_at_ms = since.as_millis() as i64;
+            if let Some(short_id) = session.short_id.as_deref() {
+                let path = job_state_path(short_id);
+                if let Some((mtime, detail)) = self.cached_job_detail(&path) {
+                    session.summary = detail.summary;
+                    session.rollout_path = detail.transcript_path;
+                    session.pr_refs = detail.prs;
+                    if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        session.updated_at_ms = since.as_millis() as i64;
+                    }
                 }
             }
         }
@@ -155,14 +178,6 @@ impl Backend for ClaudeBackend {
     // connection for that live session — so every attempt damaged a live session for a
     // guaranteed failure. The trait default returns Err(Unsupported), which is the honest
     // answer, and `capabilities().rename` is false so the TUI never reaches it.
-    fn can_remove(&self, session: &Session) -> bool {
-        // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
-        // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
-        session
-            .short_id
-            .as_deref()
-            .is_some_and(|short_id| !short_id.is_empty())
-    }
     fn remove(&self, session: &Session) -> Result<()> {
         // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
         // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
@@ -176,10 +191,13 @@ impl Backend for ClaudeBackend {
             short_id,
         ))
     }
-    fn attach_command(&self, session: &Session) -> Option<std::process::Command> {
+    fn attach_command(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<std::process::Command, AttachRefusal> {
         let mut cmd = std::process::Command::new(&self.binary);
         // `claude attach <short_id>` resumes the SAME thread whether the session is live or
-        // done — it wakes a finished session in place and resolves the session's own cwd from
+        // done: it wakes a finished session in place and resolves the session's own cwd from
         // its jobs dir, so there is no cwd pin and no CLAUDE_AGENTS_SELECT. Only a row with no
         // short id (a rare jobs entry missing its "id" key) falls back to `claude -r <full id>`,
         // pinned to its cwd when that dir still exists.
@@ -194,7 +212,7 @@ impl Backend for ClaudeBackend {
                 }
             }
         }
-        Some(cmd)
+        Ok(cmd)
     }
 }
 
@@ -278,14 +296,14 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
     Ok(true)
 }
 
-/// PURE parser, unit-tested against the fixture. Input: stdout of
-/// `claude agents --json --all` — a JSON array of objects.
+/// PURE parser, unit tested against the fixture. Input: stdout of
+/// `claude agents --json --all`, a JSON array of objects.
 /// Mapping: id = sessionId (attach takes it); title = name; cwd = cwd;
-/// created_at_ms = updated_at_ms = startedAt; hidden = false; source_label = kind;
-/// companion = false; summary = "" (filled from state.json by list()).
+/// created_at_ms = updated_at_ms = startedAt; hidden = false;
+/// origin comes from kind; companion = false; summary = "".
 /// state: "working" -> Working, "blocked" -> NeedsInput, "idle" -> Idle,
-/// "done" -> Done, "failed" -> Failed, "stopped" -> Stopped,
-/// missing or unknown -> Idle. pid: entry "pid" as u32 when present.
+/// "done" -> Done, "failed" -> Error, "stopped" -> Done,
+/// missing or unknown -> Unknown. pid: entry "pid" as u32 when present.
 /// The SHORT id (entry "id") the caller needs for the jobs path is folded into
 /// `Session.short_id`. Entries missing sessionId/cwd/name are SKIPPED. Non-array top
 /// level -> Err(Json).
@@ -305,36 +323,38 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             continue;
         };
         let short_id = crate::json_str(&entry, "id")
-            .unwrap_or_default()
-            .to_string();
+            .filter(|short_id| !short_id.is_empty())
+            .map(str::to_string);
         let started_at = entry.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
-        let source_label = crate::json_str(&entry, "kind")
-            .unwrap_or_default()
-            .to_string();
+        let origin = if crate::json_str(&entry, "kind") == Some("background") {
+            SessionOrigin::Background
+        } else {
+            SessionOrigin::Interactive
+        };
         let status = match crate::json_str(&entry, "state") {
             Some("working") => Status::Working,
-            Some("blocked") => Status::NeedsInput,
+            Some("blocked") => Status::needs_input(),
             Some("idle") => Status::Idle,
             Some("done") => Status::Done,
-            Some("failed") => Status::Failed,
-            Some("stopped") => Status::Stopped,
-            // Missing or unknown state -> Idle (verified live: some entries have no state).
-            _ => Status::Idle,
+            Some("failed") => Status::Error,
+            Some("stopped") => Status::Done,
+            _ => Status::Unknown,
         };
         let pid = entry.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
         sessions.push(Session {
             backend: BackendKind::Claude,
             id: session_id.to_string(),
-            short_id: Some(short_id),
+            short_id,
+            origin,
             title: name.to_string(),
             cwd: std::path::PathBuf::from(cwd),
+            git_branch: None,
+            status,
             created_at_ms: started_at,
             updated_at_ms: started_at,
-            status,
             hidden: false,
-            source_label,
-            summary: String::new(),
             companion: false,
+            summary: String::new(),
             pid,
             rollout_path: None,
             pr_refs: Vec::new(),

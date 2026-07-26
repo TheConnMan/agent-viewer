@@ -1,4 +1,4 @@
-use agent_viewer_core::{BackendKind, Session, Status};
+use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{
     App, Composer, DetachTracker, GroupKey, GroupMode, KillStage, Row, Section, format_elapsed,
     row_layout,
@@ -13,15 +13,16 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, updated_at_ms: i64, status: S
         backend,
         id: id.to_string(),
         short_id: None,
+        origin: SessionOrigin::Interactive,
         title: id.to_string(),
         cwd: PathBuf::from(cwd),
+        git_branch: None,
+        status,
         created_at_ms: updated_at_ms,
         updated_at_ms,
-        status,
         hidden: false,
-        source_label: "test".to_string(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
@@ -163,12 +164,18 @@ fn filter_matches_title_and_cwd_case_insensitive() {
 #[test]
 fn state_sections_order_and_fold() {
     let sessions = vec![
-        sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
+        sess(
+            BackendKind::Codex,
+            "needs",
+            "/p",
+            600,
+            Status::needs_input(),
+        ),
         sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
         sess(BackendKind::Codex, "idle", "/p", 400, Status::Idle),
         sess(BackendKind::Codex, "done", "/p", 300, Status::Done),
-        sess(BackendKind::Codex, "failed", "/p", 200, Status::Failed),
-        sess(BackendKind::Codex, "stopped", "/p", 100, Status::Stopped),
+        sess(BackendKind::Codex, "error", "/p", 200, Status::Error),
+        sess(BackendKind::Codex, "unknown", "/p", 100, Status::Unknown),
     ];
     // v2.1 default is ByProject; toggle into ByState to inspect the state sections.
     let mut app = App::new(sessions);
@@ -176,7 +183,7 @@ fn state_sections_order_and_fold() {
     assert_eq!(app.group_mode(), GroupMode::ByState);
     let rows = app.visible();
 
-    // Section headers appear in the fixed order; Failed/Stopped have no headers.
+    // Section headers appear in the fixed order.
     assert_eq!(
         section_headers(rows),
         vec![
@@ -186,15 +193,14 @@ fn state_sections_order_and_fold() {
             Section::Done
         ]
     );
-    // Failed and Stopped rows keep their own status and sit in the Done section.
+    // Error stays terminal while Unknown remains a nonterminal status.
     assert!(
-        rows.iter().any(
-            |r| matches!(r, Row::Session { id, status: Status::Failed, .. } if id == "failed")
-        )
+        rows.iter()
+            .any(|r| matches!(r, Row::Session { id, status: Status::Error, .. } if id == "error"))
     );
     assert!(
         rows.iter().any(
-            |r| matches!(r, Row::Session { id, status: Status::Stopped, .. } if id == "stopped")
+            |r| matches!(r, Row::Session { id, status: Status::Unknown, .. } if id == "unknown")
         )
     );
 
@@ -335,7 +341,13 @@ fn spacer_rows_separate_groups_but_never_bookend() {
 #[test]
 fn arrow_navigation_stops_on_headers_and_wraps_at_ends() {
     let sessions = vec![
-        sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
+        sess(
+            BackendKind::Codex,
+            "needs",
+            "/p",
+            600,
+            Status::needs_input(),
+        ),
         sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
         sess(BackendKind::Codex, "idle", "/p", 400, Status::Idle),
         sess(BackendKind::Codex, "done", "/p", 300, Status::Done),
@@ -1418,7 +1430,13 @@ fn toggle_selected_group_none_on_session_row() {
 #[test]
 fn collapse_keyed_by_state_in_by_state_mode() {
     let sessions = vec![
-        sess(BackendKind::Codex, "needs", "/p", 600, Status::NeedsInput),
+        sess(
+            BackendKind::Codex,
+            "needs",
+            "/p",
+            600,
+            Status::needs_input(),
+        ),
         sess(BackendKind::Codex, "work", "/p", 500, Status::Working),
         sess(BackendKind::Codex, "done", "/p", 300, Status::Done),
     ];

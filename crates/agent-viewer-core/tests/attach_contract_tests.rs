@@ -2,7 +2,7 @@
 //! Claude splits live-vs-done; opencode drops the invalid `run -s -i` form. Commands are
 //! built, not run, so we assert via std::process::Command getters.
 
-use agent_viewer_core::backend::{Backend, BackendKind, Session, Status};
+use agent_viewer_core::backend::{Backend, BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::opencode::OpencodeBackend;
 use std::ffi::OsStr;
@@ -18,15 +18,16 @@ fn claude_session(
         backend: BackendKind::Claude,
         id: "sess-uuid-1234".to_string(),
         short_id: short_id.map(|s| s.to_string()),
+        origin: SessionOrigin::Background,
         title: "t".to_string(),
         cwd,
+        git_branch: None,
+        status,
         created_at_ms: 0,
         updated_at_ms: 0,
-        status,
         hidden: false,
-        source_label: "background".to_string(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid,
         rollout_path: None,
         pr_refs: Vec::new(),
@@ -38,15 +39,16 @@ fn opencode_session(cwd: PathBuf) -> Session {
         backend: BackendKind::Opencode,
         id: "ses_abc".to_string(),
         short_id: None,
+        origin: SessionOrigin::Interactive,
         title: "t".to_string(),
         cwd,
+        git_branch: None,
+        status: Status::Done,
         created_at_ms: 0,
         updated_at_ms: 0,
-        status: Status::Done,
         hidden: false,
-        source_label: "opencode".to_string(),
-        summary: String::new(),
         companion: false,
+        summary: String::new(),
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
@@ -74,12 +76,14 @@ fn claude_capabilities_advertise_native_remove() {
     // `claude rm <short_id>` deletes a bg session (and its worktree), so remove is now a
     // real capability. The rest of the claude caps are unchanged by this.
     let caps = ClaudeBackend::new().capabilities();
-    assert!(caps.remove, "claude now advertises native rm as remove");
+    assert!(caps.delete, "claude advertises native rm as delete");
     assert!(caps.spawn);
     assert!(caps.attach);
-    assert!(caps.reply);
-    assert!(!caps.hide);
+    assert!(!caps.archive);
     assert!(!caps.stop);
+    assert!(caps.needs_input);
+    assert!(caps.pr_refs);
+    assert!(caps.live_status);
     // Rename stays unsupported: claude has no external rename channel (see rename_tests).
     assert!(!caps.rename);
 }
@@ -164,7 +168,7 @@ fn claude_attach_empty_short_id_falls_back_and_leaves_cwd_unset() {
         Some(""),
         PathBuf::from("/nonexistent/deleted-claude-dir"),
         None,
-        Status::Stopped,
+        Status::Done,
     );
     let backend = ClaudeBackend::new();
     let cmd = backend
