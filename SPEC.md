@@ -97,10 +97,42 @@ All verified present in `codex --help` (0.144.1):
 - **Attach/resume:** `codex resume <id>` (or `codex exec resume <id>`), exec'd into the
   user's terminal from the TUI.
 
-Note the experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`, `thread/list`,
-`command/exec/terminate`) exists and is the eventual "clean" backend, but v1 does NOT use it:
+**Superseded (original v1 note, kept for the record).** This spec previously read: "Note the
+experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`, `thread/list`,
+`command/exec/terminate`) exists and is the eventual 'clean' backend, but v1 does NOT use it:
 it is labeled experimental, its control socket is already contended on this box, and it reads
-the same SQLite + files we read directly. Leave a comment marking it as the v2 upgrade path.
+the same SQLite + files we read directly. Leave a comment marking it as the v2 upgrade path."
+
+**Correction.** The contention half of that rejection was wrong. Research decision D-008
+(`specs/001-fleet-view-unification/research.md`) traced the claim to a misread log line: the
+failure is a **bind** failure from a second would-be *server*, not client contention. `lsof`
+shows a single LISTEN holder, and three simultaneous client connections all initialized and
+served different requests concurrently, reproduced independently with a stdlib WebSocket client
+while other clients were already connected. Concurrent app-server clients are safe. The residual
+risk is semantic (two clients steering one live thread), and D-004 forecloses that by never
+calling `thread/resume`.
+
+**Current design: agent-viewer binds to the app-server for Codex metadata.** Enumeration comes
+from `thread/list` with an explicit `sourceKinds` filter and `useStateDbOnly: true` (D-005),
+rename from `thread/name/set`, and attach from `codex resume --remote unix://<socketPath> <id>`
+(D-004). The transport is RFC6455-framed JSON-RPC over the Unix socket (D-009), discovered
+rather than hardcoded: `codex app-server daemon version` prints `socketPath`, and
+`"status":"running"` is the availability gate. Verified on this box on 2026-07-26 (output
+line-wrapped for readability):
+
+```
+$ codex app-server daemon version
+{"status":"running",
+ "managedCodexPath":"/home/example/.codex/packages/standalone/current/codex",
+ "managedCodexVersion":"0.144.4",
+ "socketPath":"/home/example/.codex/app-server-control/app-server-control.sock",
+ "cliVersion":"0.144.4","appServerVersion":"0.144.4"}
+```
+
+The other half of the original caution still stands: the API is marked `[experimental]` with
+shallow versioning, so deserialize permissively and fall back to read-only `state_*.sqlite`
+enumeration when `status` is not `running` or the handshake fails. agent-viewer never starts,
+stops, or restarts a daemon.
 
 ## Crate layout
 
