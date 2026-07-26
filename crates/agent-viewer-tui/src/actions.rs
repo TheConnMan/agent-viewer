@@ -96,10 +96,14 @@ pub(crate) fn open_rename(backends: &[Box<dyn Backend>], ui: &mut Ui) {
         ));
         return;
     }
+    // DELIBERATE DIVERGENCE from Fleet View, which prefills its Ctrl+R field with the current
+    // name (`J2(Uf(fu.state.name ?? ""))`). Renaming here always means typing a new name from
+    // scratch, so a prefill is only text to clear first. Enter on a blank buffer therefore
+    // cancels rather than renaming (see `apply_rename`).
     ui.mode = Mode::Rename(RenameModal {
         backend: session.backend,
         id: session.id.clone(),
-        buffer: session.title.clone(),
+        buffer: String::new(),
     });
 }
 
@@ -131,7 +135,12 @@ pub(crate) fn apply_rename(ui: &mut Ui) {
     };
     let backend_kind = modal.backend;
     let id = modal.id.clone();
-    let name = modal.buffer.clone();
+    let name = modal.buffer.trim().to_string();
+    // The field opens blank, so a bare Enter is an easy slip; an empty name is never a rename
+    // any backend should be asked to perform. Cancel silently, exactly as Fleet View does.
+    if name.is_empty() {
+        return;
+    }
     // Resolve the target by (backend, id), NOT by selected() — the background refresh
     // reorders rows while the user types, so selection may have drifted off the rename row
     // (which would silently no-op the rename).
