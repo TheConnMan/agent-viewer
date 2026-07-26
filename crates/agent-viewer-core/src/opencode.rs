@@ -65,13 +65,14 @@ impl Backend for OpencodeBackend {
         let live = live_opencode_proc();
         let now = crate::spawn::now_ms();
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, directory, title, time_created, time_updated, time_archived \
-             FROM session ORDER BY time_updated DESC",
+            "SELECT id, parent_id, directory, title, time_created, time_updated, time_archived, \
+             permission FROM session ORDER BY time_updated DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             let parent_id: Option<String> = row.get(1)?;
             let time_updated: i64 = row.get(5)?;
             let time_archived: Option<i64> = row.get(6)?;
+            let permission: Option<String> = row.get(7)?;
             Ok(Session {
                 backend: BackendKind::Opencode,
                 id: row.get(0)?,
@@ -84,7 +85,7 @@ impl Backend for OpencodeBackend {
                 created_at_ms: row.get(4)?,
                 updated_at_ms: time_updated,
                 hidden: time_archived.is_some(),
-                companion: parent_id.is_some(),
+                companion: parent_id.is_some() || is_run_mode_permission(permission.as_deref()),
                 summary: String::new(),
                 // Overlay fills the pid for viewer-spawned opencode sessions.
                 pid: None,
@@ -295,6 +296,36 @@ pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64
     } else {
         Status::Done
     }
+}
+
+/// Companion filter for one-shot `opencode run` sessions — opencode's equivalent of the
+/// codex `exec`/`subagent` rule in `codex::Source::is_companion`. A run started by a script
+/// (an `/implement` review pass, a CI job) is not a fleet member, but it carries no
+/// `parent_id`, so `parent_id` alone leaves it in the default list.
+///
+/// The signal is the `session.permission` column. `opencode run` denies the interactive
+/// `question` tool (plus `plan_enter`/`plan_exit`) when it creates the session; the TUI
+/// writes no session override at all. Verified live on this box 2026-07-26, both on
+/// opencode 1.17.20: `opencode run --title ...` stored
+/// `[{"permission":"question","pattern":"*","action":"deny"},{plan_enter deny},{plan_exit
+/// deny}]`, a TUI session driven through a pty stored NULL.
+///
+/// Matched semantically (a denied `question` entry anywhere in the array), not by string
+/// equality: the stored key order is not the source order, and the github-action path
+/// writes the `question` deny without the plan pair. Never panics — anything that is not
+/// a JSON array of objects is treated as interactive, the safe direction (a shown row a
+/// keypress away from hidden beats a hidden row you cannot find).
+pub fn is_run_mode_permission(permission: Option<&str>) -> bool {
+    let Some(raw) = permission.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return false;
+    };
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str(raw) else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        entry.get("permission").and_then(|p| p.as_str()) == Some("question")
+            && entry.get("action").and_then(|a| a.as_str()) == Some("deny")
+    })
 }
 
 /// PURE, unit-tested: `UPDATE session SET title='<t>' WHERE id='<id>'` with single
