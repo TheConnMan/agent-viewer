@@ -113,7 +113,7 @@ fn handle_normal_key(
     if ctrl {
         match key.code {
             KeyCode::Char('s') => ui.app.toggle_group_mode(),
-            KeyCode::Char('r') => open_rename(ui),
+            KeyCode::Char('r') => open_rename(backends, ui),
             KeyCode::Char('e') => open_reply(backends, ui),
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),

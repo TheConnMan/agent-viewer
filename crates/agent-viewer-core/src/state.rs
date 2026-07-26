@@ -320,9 +320,19 @@ impl ViewerDb {
         })?;
         for row in rows {
             let (backend, session_id, name) = row?;
-            if let Some(backend) = backend_from_str(&backend) {
-                state.renames.insert((backend, session_id), name);
+            let Some(backend) = backend_from_str(&backend) else {
+                continue;
+            };
+            // Claude advertises rename: false (it exposes no external rename channel), so a
+            // persisted claude override can only be a legacy row from a build that allowed the
+            // local fallback. Applying it would resurrect the fabricated-name defect: a title
+            // only the viewer believes, disagreeing with `claude agents`, and now unclearable
+            // since Ctrl+R on a claude row is just an unsupported notice. Skip at load rather
+            // than delete: ignoring is non-destructive and sufficient.
+            if backend == BackendKind::Claude {
+                continue;
             }
+            state.renames.insert((backend, session_id), name);
         }
 
         Ok(state)

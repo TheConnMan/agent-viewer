@@ -101,13 +101,16 @@ fn viewer_db_stopped_and_rename_roundtrip() {
             .contains(&(BackendKind::Opencode, "ses_1".to_string()))
     );
 
-    db.set_name_override(BackendKind::Claude, "abc", "My Renamed Session")
+    // Codex, not claude: claude overrides are skipped at load (see
+    // viewer_state_skips_claude_name_overrides), so only a rename-capable backend
+    // exercises the store's set/load round-trip.
+    db.set_name_override(BackendKind::Codex, "abc", "My Renamed Session")
         .expect("set name");
     assert_eq!(
         db.viewer_state()
             .unwrap()
             .renames
-            .get(&(BackendKind::Claude, "abc".to_string())),
+            .get(&(BackendKind::Codex, "abc".to_string())),
         Some(&"My Renamed Session".to_string())
     );
 }
@@ -236,17 +239,48 @@ fn clear_name_override_removes_rename() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");
 
-    db.set_name_override(BackendKind::Claude, "abc", "Local Name")
+    // Codex, not claude: a claude key is absent from viewer_state either way, so it could
+    // not tell a real clear from the load-time skip.
+    db.set_name_override(BackendKind::Codex, "abc", "Local Name")
         .expect("set name");
-    db.clear_name_override(BackendKind::Claude, "abc")
+    db.clear_name_override(BackendKind::Codex, "abc")
         .expect("clear name");
 
     assert!(
         !db.viewer_state()
             .unwrap()
             .renames
-            .contains_key(&(BackendKind::Claude, "abc".to_string())),
+            .contains_key(&(BackendKind::Codex, "abc".to_string())),
         "cleared override must leave no rename for the key"
+    );
+}
+
+// A legacy claude rename row (written by a build that still allowed the local fallback) must
+// never reach the overlay: applying it would show a fabricated title only the viewer believes,
+// and Ctrl+R on a claude row is now an unsupported notice, so the user could never clear it.
+// The row is left in the table; it is skipped at load.
+#[test]
+fn viewer_state_skips_claude_name_overrides() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    db.set_name_override(BackendKind::Claude, "legacy", "Fabricated Claude Name")
+        .expect("set claude name");
+    db.set_name_override(BackendKind::Codex, "live", "Real Codex Name")
+        .expect("set codex name");
+
+    let renames = db.viewer_state().expect("viewer state").renames;
+
+    assert!(
+        !renames.contains_key(&(BackendKind::Claude, "legacy".to_string())),
+        "a persisted claude override must be skipped at load, not applied"
+    );
+    // The control: a rename-capable backend still loads, so the skip is claude-specific and
+    // not an accidental disabling of the whole rename overlay.
+    assert_eq!(
+        renames.get(&(BackendKind::Codex, "live".to_string())),
+        Some(&"Real Codex Name".to_string()),
+        "a codex override must still load"
     );
 }
 
