@@ -12,6 +12,7 @@ use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
+use agent_viewer_tui::model_cache::{ModelCache, is_stale};
 use agent_viewer_tui::mutations::MutationRunner;
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
@@ -142,6 +143,8 @@ struct Ui {
     last_backend_error: String,
     /// Blocking backend mutations run off the render thread.
     mutations: MutationRunner,
+    /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
+    models: ModelCache,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
     pulses: Pulses,
     /// Background PR-status cache: colors the right-aligned PR badge by live GitHub state.
@@ -234,6 +237,33 @@ fn main() -> io::Result<()> {
                 .collect(),
         );
     }
+    // Seed the model catalogs from the last run so the composer's picker is populated on the
+    // first keystroke. A stale list is seeded too and serves until its refresh lands.
+    let mut models = ModelCache::new();
+    if let Some(db) = &db {
+        let now = now_ms();
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Opencode,
+        ] {
+            if let Ok(Some(cached)) = db.cached_models(backend) {
+                models.seed(backend, cached.models, !is_stale(cached.fetched_at_ms, now));
+            }
+        }
+    }
+    // Prime whatever the seeds did not cover, so a first run (or a day-old catalog) is
+    // discovering in the background while the user reads the list rather than starting a
+    // multi-second probe the moment they tab the composer onto that backend. A backend with
+    // a fresh seed is already marked attempted, so the steady state spawns nothing.
+    for backend in [
+        BackendKind::Codex,
+        BackendKind::Claude,
+        BackendKind::Opencode,
+    ] {
+        models.request(backend);
+    }
+
     let mut ui = Ui {
         app,
         mode: Mode::Normal,
@@ -244,6 +274,7 @@ fn main() -> io::Result<()> {
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
+        models,
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
         pending_reply: None,
@@ -309,6 +340,9 @@ fn run(
         if mutation_completed {
             refresher.force();
         }
+
+        // Fold in any model catalog that finished discovering (persisted for the next run).
+        actions::install_models(ui);
 
         // Fold in the freshest off-thread listing (a no-op until the worker sends one).
         apply_snapshot(refresher, ui);

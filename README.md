@@ -74,9 +74,12 @@ companion.
 The list view carries a persistent composer in a rounded box between the list and the
 footer: `[cc] claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab`
 cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model,
-and `Enter` spawns it detached with that model. The models are discovered live from each
-agent's CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
-opencode: `opencode models`), default first. `Shift+Tab` cycles the Claude/Codex lists;
+and `Enter` spawns it detached with that model. The models are discovered from each agent's
+CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
+opencode: `opencode models`), default first. Discovery runs in the background and is cached
+for a day, so the picker is populated from the first keystroke rather than waiting on a probe
+that takes seconds; a catalog that has never been discovered shows just the agent's default
+until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists;
 opencode has too many models to cycle, so it stays on its default there (use `/model`). The
 target directory is the selected row's project root (by-project view) or its exact cwd
 (by-state view). While the composer is empty, the single-letter command keys below still fire;

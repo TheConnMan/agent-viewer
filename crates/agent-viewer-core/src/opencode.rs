@@ -99,7 +99,7 @@ impl Backend for OpencodeBackend {
         // default first, then whatever `opencode models` lists (provider/model ids).
         self.models_cache
             .get_or_init(|| {
-                let mut models = vec!["default".to_string()];
+                let mut models = vec![self.kind().default_model().to_string()];
                 models.extend(opencode_models_via_cli());
                 crate::backend::dedup_preserve(models)
             })
@@ -171,7 +171,7 @@ pub fn default_opencode_db() -> std::path::PathBuf {
 fn opencode_models_via_cli() -> Vec<String> {
     let mut cmd = std::process::Command::new("opencode");
     cmd.arg("models");
-    match crate::spawn::run_with_timeout(cmd, std::time::Duration::from_secs(3)) {
+    match crate::spawn::run_with_timeout(cmd, crate::spawn::MODEL_PROBE_TIMEOUT) {
         Some(stdout) => parse_opencode_models(&stdout),
         None => Vec::new(),
     }

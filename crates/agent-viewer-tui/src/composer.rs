@@ -72,8 +72,8 @@ impl Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
-            model: "opus[1m]".to_string(),
-            models: vec!["opus[1m]".to_string()],
+            model: BackendKind::Claude.default_model().to_string(),
+            models: vec![BackendKind::Claude.default_model().to_string()],
             models_key: None,
             commands: Vec::new(),
             commands_key: None,
@@ -102,11 +102,17 @@ impl Composer {
     }
 
     /// Install the discovered model list (default-first) for `backend`, selecting index 0.
+    /// The one exception is a re-install for the SAME backend that still offers the current
+    /// selection: discovery lands asynchronously, and a catalog arriving mid-compose must not
+    /// silently rewrite a model the user deliberately picked.
     pub fn set_models(&mut self, models: Vec<String>, backend: BackendKind) {
-        self.model = models
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "default".to_string());
+        let keeps_selection = self.models_key == Some(backend) && models.contains(&self.model);
+        if !keeps_selection {
+            self.model = models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| backend.default_model().to_string());
+        }
         self.models = models;
         self.models_key = Some(backend);
     }

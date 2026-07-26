@@ -37,7 +37,7 @@ fn codex_spawn_command(dir: &Path, task: &str, model: Option<&str>) -> std::proc
 fn codex_catalog_via_cli() -> Vec<String> {
     let mut cmd = std::process::Command::new("codex");
     cmd.arg("debug").arg("models");
-    match crate::spawn::run_with_timeout(cmd, std::time::Duration::from_secs(3)) {
+    match crate::spawn::run_with_timeout(cmd, crate::spawn::MODEL_PROBE_TIMEOUT) {
         Some(stdout) => parse_codex_catalog(&stdout),
         None => Vec::new(),
     }
@@ -200,7 +200,7 @@ impl Backend for CodexBackend {
                 if discovered.is_empty() {
                     discovered = codex_models_via_registry(&self.codex_home);
                 }
-                let mut models = vec!["default".to_string()];
+                let mut models = vec![self.kind().default_model().to_string()];
                 models.extend(discovered);
                 crate::backend::dedup_preserve(models)
             })

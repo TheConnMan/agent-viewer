@@ -70,16 +70,34 @@ pub(crate) fn ensure_completions(ui: &mut Ui) {
     }
 }
 
-/// Keep the composer's discovered model list current: re-install from the backend's
-/// `available_models()` only when the composer's backend has changed (mirrors
-/// `ensure_completions`). Degrades to just "default" when the backend is absent.
-pub(crate) fn ensure_models(ui: &mut Ui, backends: &[Box<dyn Backend>]) {
+/// Keep the composer's discovered model list current: re-install from the model cache only
+/// when the composer's backend has changed (mirrors `ensure_completions`). Discovery itself
+/// never runs here: `request` hands it to a worker thread, because the CLI probe behind it
+/// takes seconds and this runs on the key path. Until a list exists the picker holds just the
+/// backend's default; `install_models` swaps the real one in when the probe lands.
+pub(crate) fn ensure_models(ui: &mut Ui) {
     let backend = ui.composer.backend();
+    ui.models.request(backend);
     if ui.composer.models_key() != Some(backend) {
-        let models = backend_of(backends, backend)
-            .map(|b| b.available_models())
-            .unwrap_or_else(|| vec!["default".to_string()]);
+        let models = ui
+            .models
+            .models(backend)
+            .map(|m| m.to_vec())
+            .unwrap_or_else(|| vec![backend.default_model().to_string()]);
         ui.composer.set_models(models, backend);
+    }
+}
+
+/// Drain landed model probes: persist each discovered catalog for the next viewer run, and
+/// install it into the composer when it is the backend the composer is currently on.
+pub(crate) fn install_models(ui: &mut Ui) {
+    for (backend, models) in ui.models.poll() {
+        if let Some(db) = &ui.db {
+            let _ = db.set_cached_models(backend, &models, now_ms());
+        }
+        if ui.composer.backend() == backend {
+            ui.composer.set_models(models, backend);
+        }
     }
 }
 

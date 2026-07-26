@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS collapsed_groups (group_key TEXT PRIMARY KEY);\
 CREATE TABLE IF NOT EXISTS settings (\
   key TEXT PRIMARY KEY,\
   value TEXT NOT NULL\
+);\
+CREATE TABLE IF NOT EXISTS model_cache (\
+  backend TEXT PRIMARY KEY,\
+  models TEXT NOT NULL,\
+  fetched_at_ms INTEGER NOT NULL\
 );";
 
 /// Legacy shadow-state tables the viewer no longer owns. Dropped once after a successful
@@ -48,6 +53,14 @@ pub enum SortOrder {
 }
 
 pub const DEFAULT_RETENTION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// A backend's stored model catalog and the epoch-ms it was fetched at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedModels {
+    /// Model ids in picker order (the backend's default first).
+    pub models: Vec<String>,
+    pub fetched_at_ms: i64,
+}
 
 /// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
@@ -349,6 +362,46 @@ impl ViewerDb {
 
     pub fn set_retention_window_ms(&self, ms: i64) -> Result<()> {
         self.set_setting("retention_window_ms", &ms.to_string())
+    }
+
+    /// Store a backend's discovered model catalog, stamped with the time it was fetched.
+    /// Ids are newline-joined: `available_models` builds them from single lines of CLI
+    /// output, so no id can contain the separator.
+    pub fn set_cached_models(
+        &self,
+        backend: BackendKind,
+        models: &[String],
+        fetched_at_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_cache (backend, models, fetched_at_ms) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![backend.name(), models.join("\n"), fetched_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// A backend's stored catalog, or None when it has never been discovered. Whether the
+    /// row is too old to trust is the caller's policy, not this file's - the fetch stamp is
+    /// returned unjudged.
+    pub fn cached_models(&self, backend: BackendKind) -> Result<Option<CachedModels>> {
+        let row = self.conn.query_row(
+            "SELECT models, fetched_at_ms FROM model_cache WHERE backend = ?1",
+            rusqlite::params![backend.name()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match row {
+            Ok((models, fetched_at_ms)) => Ok(Some(CachedModels {
+                models: models
+                    .split('\n')
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.to_string())
+                    .collect(),
+                fetched_at_ms,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn opencode_server_url(&self) -> Result<Option<String>> {
