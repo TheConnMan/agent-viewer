@@ -89,6 +89,14 @@ Type `/model` (optionally `/model <filter>`) to open a filterable picker of ever
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
 `Enter` picks the model (and clears the composer), `Esc` closes it.
 
+**Spawned sessions run unsandboxed.** Codex jobs are started with
+`--dangerously-bypass-approvals-and-sandbox`, so they can write files, use the network, and
+drive git (fetch, branch, worktree, commit) without prompting. This is deliberate: codex's
+`workspace-write` sandbox mounts `.git` read-only and blocks the network, which made every
+git-shaped task a silent no-op — the session would burn a turn and report back that it could
+not create a branch. Treat a task you type here as something you are running with your own
+shell privileges, because that is what it is.
+
 Typing any other slash command shows a completion popup above the box: the available commands
 for the selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
 opencode commands under `~/.config/opencode/command`; codex prompts under `~/.codex/prompts`),
@@ -126,6 +134,10 @@ title — type to edit, `Enter` commits, `Esc` cancels. Neither is a modal.
 - `a` — show all (companions + archived + deleted-dir rows).
 - `h` / `u` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
+- `Ctrl+T` — turn mouse reporting off / back on. Off hands the mouse back to your terminal so
+  you can drag-select and copy text out of the viewer; on restores click/hover row selection
+  and wheel scrolling. Works everywhere, including inside an attach, so the transcript is
+  copyable. A footer notice names the mode you just switched to.
 - `?` — key help.
 - `q` — quit.
 

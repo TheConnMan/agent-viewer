@@ -49,6 +49,79 @@ where
     None
 }
 
+/// The regression guard for the read-only-sandbox bug: a viewer-spawned session must be able
+/// to write `.git`, which is what branching, worktrees, and commits all require. Under the old
+/// `--sandbox workspace-write` this failed with "Read-only file system" while the run still
+/// reported success, so the failure mode is a SILENT no-op — only a real spawn catches it.
+/// Asserts on the git state the session leaves behind, never on what the agent says it did.
+#[test]
+#[ignore = "live: spawns a real codex exec (auth + network)"]
+fn codex_spawned_session_can_write_git_metadata() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "e2e@example.com"],
+        vec!["config", "user.name", "e2e"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+    // A commit so HEAD resolves and `git branch` has something to point at.
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    for args in [vec!["add", "seed.txt"], vec!["commit", "-m", "seed"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    let backend = CodexBackend::new(default_codex_home());
+    backend
+        .spawn(
+            &repo,
+            "Run exactly this one shell command and then stop: \
+             git checkout -b sandbox-probe. Do not do anything else.",
+            None,
+        )
+        .expect("spawn codex exec");
+
+    // Poll git itself for the branch. The agent's own summary is not evidence — under the old
+    // sandbox it cheerfully reported completion while having written nothing.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut created = false;
+    while Instant::now() < deadline {
+        let out = std::process::Command::new("git")
+            .args(["branch", "--list", "sandbox-probe"])
+            .current_dir(&repo)
+            .output()
+            .expect("run git branch");
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            created = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        created,
+        "spawned session could not create a branch — the spawn path is sandboxed again \
+         (check SANDBOX_ARGS / SPEC.md 'Spawn sandbox posture')"
+    );
+    println!("[e2e] viewer-spawned session created branch sandbox-probe");
+}
+
 #[test]
 #[ignore = "live: spawns a real codex exec (auth + network)"]
 fn codex_spawn_running_then_done() {
