@@ -152,6 +152,15 @@ pub trait Backend: Send {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
+    /// Whether `remove` can actually act on THIS row. The backend-wide `remove` capability
+    /// is necessary but not sufficient: claude advertises remove, yet a row without a short
+    /// id has no bg job for `claude rm` to delete. Callers MUST consult this before any
+    /// destructive step, or an unsupported remove SIGTERMs a live session and then declines
+    /// to remove it. Defaults to the backend-wide capability.
+    fn can_remove(&self, session: &Session) -> bool {
+        let _ = session;
+        self.capabilities().remove
+    }
     /// Rename in the backend's own store (never a raw DB write). Default Unsupported.
     fn rename(&self, session: &Session, name: &str) -> crate::error::Result<()> {
         let _ = (session, name);

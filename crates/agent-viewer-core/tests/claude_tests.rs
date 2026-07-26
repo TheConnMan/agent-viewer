@@ -234,3 +234,40 @@ fn claude_missing_binary_lists_empty() {
     let sessions = backend.list().expect("missing binary must be Ok(empty)");
     assert!(sessions.is_empty());
 }
+
+// --- Per-row remove capability ---
+
+fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
+    agent_viewer_core::Session {
+        backend: BackendKind::Claude,
+        id: "3f9c1a2e-0000-4000-8000-000000000001".to_string(),
+        short_id: short_id.map(str::to_string),
+        title: "probe".to_string(),
+        cwd: PathBuf::from("/tmp"),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        status: Status::Working,
+        hidden: false,
+        source_label: String::new(),
+        summary: String::new(),
+        companion: false,
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+    }
+}
+
+// `remove` is advertised true for the claude backend as a whole, but `claude rm` needs the
+// short id and a row without one has no bg job to remove. The capability is therefore
+// per-row, and callers must be able to ask BEFORE taking any destructive step.
+#[test]
+fn claude_can_remove_is_per_row_and_requires_a_short_id() {
+    let backend = ClaudeBackend::new();
+    assert!(backend.capabilities().remove, "backend-wide remove stays true");
+
+    assert!(backend.can_remove(&session_with_short_id(Some("ab12"))));
+    // An interactive row carries no short id at all.
+    assert!(!backend.can_remove(&session_with_short_id(None)));
+    // A blank short id is the same absence wearing the historical unwrap_or_default shape.
+    assert!(!backend.can_remove(&session_with_short_id(Some(""))));
+}
