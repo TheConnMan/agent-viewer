@@ -1345,6 +1345,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("a", "show all (companions + archived)"),
         ("h / u", "archive / unarchive"),
         ("Ctrl+F", "filter (searches hidden too)"),
+        ("Ctrl+T", "mouse off/on (off = drag to select + copy)"),
         ("?", "this help"),
         ("q / Ctrl+C", "quit"),
     ];

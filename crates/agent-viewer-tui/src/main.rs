@@ -168,6 +168,9 @@ struct Ui {
     /// Latest list geometry, written by `draw` each frame and read by the mouse handler to
     /// hit-test click/hover to a row. Interior mutability keeps the draw path `&`-only.
     list_hit: RefCell<ListHit>,
+    /// Whether mouse reporting is currently on (Ctrl+T toggles). Off hands the mouse back to
+    /// the terminal so the user can drag-select and copy; `handle_mouse` gates on this.
+    mouse_capture: bool,
 }
 
 impl Ui {
@@ -284,6 +287,7 @@ fn main() -> io::Result<()> {
         focused_exited: false,
         logos,
         list_hit: RefCell::new(ListHit::default()),
+        mouse_capture: true,
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate cheap set
@@ -296,8 +300,10 @@ fn main() -> io::Result<()> {
     // Mouse capture powers click/hover row selection on the list, and while attached it lets
     // us forward real mouse reports to the child so the wheel scrolls the transcript instead
     // of the terminal's alternate-scroll turning it into arrow keys codex reads as history
-    // navigation. The terminal's native text selection still works with Shift held in most
-    // terminals. Best-effort: a terminal that rejects the sequence leaves the keyboard nav.
+    // navigation. It also swallows drag-select, and the Shift-to-override convention is not
+    // universal, so Ctrl+T toggles it off on demand (see `keys::set_mouse_capture`). Starts on
+    // to match `ui.mouse_capture`. Best-effort: a terminal that rejects the sequence leaves
+    // the keyboard nav.
     let _ = execute!(io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, &action_backends, &refresher, &mut ui);
     let _ = execute!(io::stdout(), DisableMouseCapture);
