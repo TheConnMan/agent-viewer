@@ -330,3 +330,18 @@ the current build and can land immediately:
   the status resolver
 - Every commit builds clean with `cargo clippy --workspace` and passing tests
 - The test-writer and the implementer must run in separate contexts
+
+---
+
+## Phase 9: Convergence
+
+Assessed the existing codebase against spec.md, plan.md, research.md, and this task list. The
+majority of T001-T079 remains open and is not restated here. These are the gaps no existing task
+covers.
+
+- [ ] T080 CRITICAL: record the interactive-row resolution as an explicit divergence before T025 is implemented, since `specs/001-fleet-view-unification/spec.md` edge case (lines 183-185) requires interactive sessions to appear "with accurate state" while `research.md:526` found Fleet View lists none and T016/T025 drop them, and `crates/agent-viewer-core/src/claude.rs:307-322` currently keeps them via `unwrap_or_default()` with a fabricated `Status::Idle`, per Constitution I and FR-001 (contradicts)
+- [ ] T081 Extend the peek and reply removal beyond T072's three files to `crates/agent-viewer-tui/src/ui.rs`, `keys.rs` (the `Char('e')` reply binding), `app.rs`, `actions.rs`, and `main.rs` (which declares `mod pending_reply`, not `lib.rs`), and to `-core`'s `Capabilities::reply` in `crates/agent-viewer-core/src/backend.rs` with its `claude.rs` and `codex/mod.rs` advertisements plus `read_claude_transcript` in `crates/agent-viewer-core/src/claude.rs`, retaining only the parsing that feeds the row summary, per FR-015 (partial)
+- [ ] T082 Decide whether session creation traces to a principle or is removed, covering `crates/agent-viewer-core/src/spawn.rs`, `crates/agent-viewer-tui/src/composer.rs`, `Capabilities::spawn` and `available_models` in `crates/agent-viewer-core/src/backend.rs`, the Tab and BackTab bindings in `crates/agent-viewer-tui/src/keys.rs`, and the `spawned` pin overlay in `crates/agent-viewer-core/src/state.rs` that T012 would delete, since no FR or task carries it and `plan.md:88` asserts only the model picker as parity, per Constitution Governance (unrequested)
+- [ ] T083 Record or remove the backend-config write in `crates/agent-viewer-core/src/claude.rs:201-270`, where `ensure_trusted` sets `hasTrustDialogAccepted` in the user's Claude config to suppress the trust prompt, which no requirement or plan constraint sanctions, per Principle II (unrequested)
+- [ ] T084 Add a rename failure-path task in `crates/agent-viewer-core/tests/rename_tests.rs` and the backend rename implementations covering a backend process that exits mid-rename, so the attempt fails cleanly rather than hanging or reporting silent success, per spec.md edge case (line 177) (missing)
+- [ ] T085 Confirm mouse capture in `crates/agent-viewer-tui/src/mouse.rs` and `main.rs`, and filter mode in `crates/agent-viewer-tui/src/keys.rs` (`Char('f')`, `open_filter`), against the captured Fleet View surface or record each as a deliberate divergence, since neither maps to an FR and T074 audits only the seven named actions, per FR-011 and Principle I (unrequested)
