@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "result": {
+    "userAgent": "Codex Desktop/0.144.4 (Ubuntu 24.4.0; x86_64) unknown (agent-viewer; 0.1.0)",
+    "codexHome": "/home/user/.codex",
+    "platformFamily": "unix",
+    "platformOs": "linux"
+  }
+}

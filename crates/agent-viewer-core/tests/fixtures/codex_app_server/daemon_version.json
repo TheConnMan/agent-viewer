@@ -1,0 +1,8 @@
+{
+  "status": "running",
+  "managedCodexPath": "/home/user/.codex/packages/standalone/current/codex",
+  "managedCodexVersion": "0.144.4",
+  "socketPath": "/home/user/.codex/app-server-control/app-server-control.sock",
+  "cliVersion": "0.144.4",
+  "appServerVersion": "0.144.4"
+}

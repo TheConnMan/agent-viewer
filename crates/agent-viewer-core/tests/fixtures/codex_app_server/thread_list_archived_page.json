@@ -1,0 +1,94 @@
+{
+  "id": 5,
+  "result": {
+    "data": [
+      {
+        "id": "019f5303-c87c-7551-84d7-0d22e849697b",
+        "extra": null,
+        "sessionId": "019f5303-c87c-7551-84d7-0d22e849697b",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 002",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1783804184,
+        "updatedAt": 1783804193,
+        "recencyAt": 1783804184,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/archived_sessions/rollout-2026-07-11T21-09-44-019f5303-c87c-7551-84d7-0d22e849697b.jsonl",
+        "cwd": "/home/user/git/example/proj-epsilon",
+        "cliVersion": "0.144.1",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "fa446fad707b7a1e2062b5e6e6e43e6c9dc30fc2",
+          "branch": "dev",
+          "originUrl": "git@github.com:example/proj-epsilon.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f52d4-5724-72f3-b97b-6da07e257edf",
+        "extra": null,
+        "sessionId": "019f52d4-5724-72f3-b97b-6da07e257edf",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 037",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1783801075,
+        "updatedAt": 1783801092,
+        "recencyAt": 1783801075,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/archived_sessions/rollout-2026-07-11T20-17-55-019f52d4-5724-72f3-b97b-6da07e257edf.jsonl",
+        "cwd": "/tmp/e2e-web-XIjJgy",
+        "cliVersion": "0.144.1",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": null,
+        "name": "Neutral text 048",
+        "turns": []
+      },
+      {
+        "id": "019f528a-b64c-7c10-bda3-02814812b3d4",
+        "extra": null,
+        "sessionId": "019f528a-b64c-7c10-bda3-02814812b3d4",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 036",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1783796250,
+        "updatedAt": 1783796279,
+        "recencyAt": 1783796250,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/archived_sessions/rollout-2026-07-11T18-57-30-019f528a-b64c-7c10-bda3-02814812b3d4.jsonl",
+        "cwd": "/tmp",
+        "cliVersion": "0.144.1",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": null,
+        "name": null,
+        "turns": []
+      }
+    ],
+    "nextCursor": "2026-07-11T18:57:30.188Z",
+    "backwardsCursor": "2026-07-11T21:09:43.999Z"
+  }
+}

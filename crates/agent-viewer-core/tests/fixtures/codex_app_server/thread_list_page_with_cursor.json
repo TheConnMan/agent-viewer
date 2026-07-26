@@ -1,0 +1,195 @@
+{
+  "id": 4,
+  "result": {
+    "data": [
+      {
+        "id": "019f9e3c-daf6-7de3-b9e3-209c566fca71",
+        "extra": null,
+        "sessionId": "019f9e3c-daf6-7de3-b9e3-209c566fca71",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 038",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785066216,
+        "updatedAt": 1785066325,
+        "recencyAt": 1785066216,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/26/rollout-2026-07-26T11-43-36-019f9e3c-daf6-7de3-b9e3-209c566fca71.jsonl",
+        "cwd": "/home/user/git/example/proj-alpha/.worktrees/change-004",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "aacc49948f1887be453ad7a120b7adf1afad9952",
+          "branch": "task/change-004",
+          "originUrl": "git@github.com:example/proj-alpha.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f9ac7-52f2-7681-ab7a-28516f416af5",
+        "extra": null,
+        "sessionId": "019f9ac7-52f2-7681-ab7a-28516f416af5",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 039",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785008182,
+        "updatedAt": 1785008581,
+        "recencyAt": 1785008182,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/25/rollout-2026-07-25T19-36-22-019f9ac7-52f2-7681-ab7a-28516f416af5.jsonl",
+        "cwd": "/home/user/git/example/proj-beta",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "fb2d7da86e1d1440cf0e19e8af1d9c55351a7ab0",
+          "branch": "main",
+          "originUrl": "git@github.com:example/proj-beta.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f9a7a-70ff-7581-94dd-d8e348f3bfe0",
+        "extra": null,
+        "sessionId": "019f9a7a-70ff-7581-94dd-d8e348f3bfe0",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 040",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785003143,
+        "updatedAt": 1785003308,
+        "recencyAt": 1785003143,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/25/rollout-2026-07-25T18-12-23-019f9a7a-70ff-7581-94dd-d8e348f3bfe0.jsonl",
+        "cwd": "/home/user/git/example/proj-gamma/.worktrees/change-001",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "e0d4f1b295fb310c44d70d900e57ff61d6550306",
+          "branch": "task/change-001",
+          "originUrl": "git@github.com:example/proj-gamma.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f9a68-a159-7233-b46c-b4b392a9619c",
+        "extra": null,
+        "sessionId": "019f9a68-a159-7233-b46c-b4b392a9619c",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 040",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785001976,
+        "updatedAt": 1785002129,
+        "recencyAt": 1785001976,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/25/rollout-2026-07-25T17-52-56-019f9a68-a159-7233-b46c-b4b392a9619c.jsonl",
+        "cwd": "/home/user/git/example/proj-gamma/.worktrees/change-002",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "64cf3fa8034790d114bd9f5a6a1c5559199d41d7",
+          "branch": "task/change-002",
+          "originUrl": "git@github.com:example/proj-gamma.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f9a62-be1d-75e3-a69b-61ab3083793f",
+        "extra": null,
+        "sessionId": "019f9a62-be1d-75e3-a69b-61ab3083793f",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 040",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785001590,
+        "updatedAt": 1785001750,
+        "recencyAt": 1785001590,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/25/rollout-2026-07-25T17-46-30-019f9a62-be1d-75e3-a69b-61ab3083793f.jsonl",
+        "cwd": "/home/user/git/example/proj-gamma/.worktrees/change-003",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "5797113d8df1a537e7da6a0553ad13640e61c23d",
+          "branch": "task/change-003",
+          "originUrl": "git@github.com:example/proj-gamma.git"
+        },
+        "name": null,
+        "turns": []
+      },
+      {
+        "id": "019f9a60-8de8-7120-b35f-96a5c3861fe2",
+        "extra": null,
+        "sessionId": "019f9a60-8de8-7120-b35f-96a5c3861fe2",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "Neutral text 040",
+        "ephemeral": false,
+        "historyMode": "legacy",
+        "modelProvider": "openai",
+        "createdAt": 1785001446,
+        "updatedAt": 1785001584,
+        "recencyAt": 1785001447,
+        "status": {
+          "type": "notLoaded"
+        },
+        "path": "/home/user/.codex/sessions/2026/07/25/rollout-2026-07-25T17-44-06-019f9a60-8de8-7120-b35f-96a5c3861fe2.jsonl",
+        "cwd": "/home/user/git/example/proj-gamma/.worktrees/change-003",
+        "cliVersion": "0.144.4",
+        "source": "exec",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": {
+          "sha": "5797113d8df1a537e7da6a0553ad13640e61c23d",
+          "branch": "task/change-003",
+          "originUrl": "git@github.com:example/proj-gamma.git"
+        },
+        "name": null,
+        "turns": []
+      }
+    ],
+    "nextCursor": "2026-07-21T09:19:33.754Z",
+    "backwardsCursor": "2026-07-26T11:43:35.999Z"
+  }
+}
