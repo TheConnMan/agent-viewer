@@ -107,7 +107,7 @@ fn handle_normal_key(
     // or a background snapshot that moved the selected session/target could leave `suggesting`
     // (and a subsequent Tab accept) reading commands scanned for the PREVIOUS target.
     ensure_completions(ui);
-    ensure_models(ui, backends);
+    ensure_models(ui);
 
     // Ctrl-chords always act, regardless of composer state.
     if ctrl {
@@ -207,7 +207,7 @@ fn handle_normal_key(
     }
     // Refresh the slash-command list for the (possibly new) backend/target and text.
     ensure_completions(ui);
-    ensure_models(ui, backends);
+    ensure_models(ui);
     Ok(false)
 }
 
@@ -382,6 +382,7 @@ mod tests {
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
+            models: agent_viewer_tui::model_cache::ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
             pending_reply: None,
@@ -413,6 +414,58 @@ mod tests {
             rollout_path: None,
             pr_refs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ensure_models_fills_the_picker_from_the_cached_catalog() {
+        // A catalog seeded from the viewer DB must reach the `/model` picker on the key path,
+        // without waiting on (or spawning) the multi-second CLI probe behind discovery.
+        use super::ensure_models;
+        let mut ui = test_ui_with(Vec::new());
+        ui.models.seed(
+            BackendKind::Claude,
+            vec!["opus[1m]".to_string(), "sonnet-5".to_string()],
+            true,
+        );
+
+        ensure_models(&mut ui);
+        for c in "/model son".chars() {
+            ui.composer.push_char(c);
+        }
+
+        assert_eq!(ui.composer.models_key(), Some(BackendKind::Claude));
+        assert_eq!(
+            ui.composer.model_suggestions(),
+            vec!["sonnet-5".to_string()]
+        );
+    }
+
+    #[test]
+    fn install_models_lands_a_discovered_catalog_into_the_picker() {
+        // Nothing cached: the picker starts at the backend default and fills in when the
+        // background probe lands, which is the whole point of moving discovery off-thread.
+        use super::ensure_models;
+        use crate::actions::install_models;
+        use std::time::{Duration, Instant};
+        let mut ui = test_ui_with(Vec::new());
+        ui.models.request_with(BackendKind::Claude, || {
+            vec!["opus[1m]".to_string(), "kimi-k3".to_string()]
+        });
+
+        ensure_models(&mut ui);
+        for c in "/model kimi".chars() {
+            ui.composer.push_char(c);
+        }
+        assert_eq!(ui.composer.model(), "opus[1m]");
+        assert!(ui.composer.model_suggestions().is_empty());
+
+        let start = Instant::now();
+        while ui.composer.model_suggestions().is_empty() && start.elapsed() < Duration::from_secs(5)
+        {
+            install_models(&mut ui);
+        }
+
+        assert_eq!(ui.composer.model_suggestions(), vec!["kimi-k3".to_string()]);
     }
 
     #[test]

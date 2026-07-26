@@ -14,6 +14,16 @@ impl BackendKind {
             BackendKind::Opencode => "opencode",
         }
     }
+    /// The model label a spawn uses when the user has picked nothing: the leading entry of
+    /// `available_models`, and the composer's placeholder while discovery is still running.
+    /// Codex and opencode take "default" (their CLIs resolve it themselves); claude has no
+    /// such passthrough, so its label is a real model id.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            BackendKind::Codex | BackendKind::Opencode => "default",
+            BackendKind::Claude => "opus[1m]",
+        }
+    }
     /// "[cx]" | "[cc]" | "[oc]"  (row + composer prefix)
     pub fn tag(self) -> &'static str {
         match self {

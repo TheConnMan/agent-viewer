@@ -182,7 +182,10 @@ fn viewer_db_open_under_write_lock_errors_without_destroying_data() {
         }
         other => panic!("expected a sqlite busy/locked failure, got {other:?}"),
     }
-    assert!(path.exists(), "the losing open must not unlink the database");
+    assert!(
+        path.exists(),
+        "the losing open must not unlink the database"
+    );
 
     // Release the lock and roll the blocker's write back; the winner's data must be intact.
     blocker.execute_batch("ROLLBACK;").expect("release lock");
@@ -732,4 +735,93 @@ fn viewer_db_opencode_server_url_defaults_roundtrips_and_clears() {
 
     db.set_opencode_server_url(None).expect("clear url");
     assert_eq!(db.opencode_server_url().expect("read cleared url"), None);
+}
+
+// Model-catalog cache: a backend's discovered model ids survive a viewer restart, so the
+// composer's picker is populated instantly instead of waiting on a multi-second CLI probe.
+// The DB is dumb storage here - it stamps the fetch time and hands it back; whether that is
+// stale is the caller's policy.
+
+#[test]
+fn cached_models_round_trip_survives_reopen() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    let models = vec![
+        "default".to_string(),
+        "opencode-go/kimi-k3".to_string(),
+        "anthropic/claude-opus-5".to_string(),
+    ];
+
+    db.set_cached_models(BackendKind::Opencode, &models, 1_000)
+        .expect("write model cache");
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    let hit = db
+        .cached_models(BackendKind::Opencode)
+        .expect("read model cache")
+        .expect("row present");
+    assert_eq!(hit.models, models);
+    assert_eq!(hit.fetched_at_ms, 1_000);
+}
+
+#[test]
+fn cached_models_absent_backend_is_none() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    db.set_cached_models(BackendKind::Opencode, &["default".to_string()], 1_000)
+        .expect("write model cache");
+
+    // Another backend's row is not a hit; discovery still has to run for it.
+    assert!(
+        db.cached_models(BackendKind::Codex)
+            .expect("read model cache")
+            .is_none()
+    );
+}
+
+#[test]
+fn cached_models_overwrite_replaces_previous_list() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    db.set_cached_models(BackendKind::Opencode, &["default".to_string()], 1_000)
+        .expect("write first list");
+    db.set_cached_models(
+        BackendKind::Opencode,
+        &["default".to_string(), "opencode-go/glm-5.2".to_string()],
+        2_000,
+    )
+    .expect("overwrite list");
+
+    let hit = db
+        .cached_models(BackendKind::Opencode)
+        .expect("read model cache")
+        .expect("row present");
+    assert_eq!(
+        hit.models,
+        vec!["default".to_string(), "opencode-go/glm-5.2".to_string()]
+    );
+    assert_eq!(hit.fetched_at_ms, 2_000);
+}
+
+#[test]
+fn cached_models_preserve_order_and_survive_odd_ids() {
+    // Order is the picker's order (default first), so the encoding must not sort or split
+    // on characters that appear inside real provider/model ids.
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    let models = vec![
+        "default".to_string(),
+        "zzz/last-alphabetically".to_string(),
+        "opencode/big-pickle".to_string(),
+        "anthropic/claude-opus-5[1m]".to_string(),
+    ];
+    db.set_cached_models(BackendKind::Opencode, &models, 1_000)
+        .expect("write model cache");
+
+    let hit = db
+        .cached_models(BackendKind::Opencode)
+        .expect("read model cache")
+        .expect("row present");
+    assert_eq!(hit.models, models);
 }

@@ -189,6 +189,33 @@ shallow versioning, so deserialize permissively and fall back to read-only `stat
 enumeration when `status` is not `running` or the handshake fails. agent-viewer never starts,
 stops, or restarts a daemon.
 
+## Model discovery: probe off-thread, cache on disk
+
+Every backend advertises its spawnable models through `available_models()` (default first).
+Two of the three discover them by shelling out, and those shell-outs are slow enough to shape
+the design. Measured on this box, three consecutive runs: `opencode models` takes 3.72s /
+3.81s / 3.82s and prints 378 ids (12,991 bytes); `codex debug models` is comparable; Claude's
+list is a `~/.claude.json` read and effectively free.
+
+- **The probe never runs on the render thread.** The composer's key path reads memory only.
+  `ModelCache` (TUI) spawns discovery on a worker thread, results drain non-blocking via
+  `poll()`, and a backend is probed at most once per viewer session, including when that probe
+  found nothing. A probe deadline lost to a slow CLI is silent: the picker degrades to the
+  single built-in default with no error, which is exactly the bug this replaced (the old
+  3s deadline was under `opencode models`' real 3.8s, so opencode never had a picker).
+- **`MODEL_PROBE_TIMEOUT` is 15s.** Generous on purpose: it only bounds a worker thread, and
+  losing the race costs a whole catalog.
+- **Catalogs persist in the viewer DB** (`model_cache` table: backend, newline-joined ids,
+  `fetched_at_ms`), seeded into the cache at startup so the picker is populated from the first
+  keystroke on every run after the first. The TTL is a day and lives in the TUI, not the DB;
+  a stale list still serves the picker while its refresh runs behind it.
+- **A failed probe is not cached.** `available_models()` always seeds the backend's default
+  first, so a one-entry result means discovery failed; it is dropped rather than written,
+  which would otherwise pin an empty picker for the whole TTL.
+- **`run_with_timeout` drains stdout on a reader thread.** Reading after the wait deadlocks
+  against the 64KB pipe buffer for any catalog bigger than that, which presents identically to
+  a timeout (empty picker, no error).
+
 ## Crate layout
 
 - `agent-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),

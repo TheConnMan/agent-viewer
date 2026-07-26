@@ -1578,3 +1578,60 @@ fn spawn_target_falls_back_to_project_header_root() {
     select_section_header(&mut app, Section::Working);
     assert_eq!(app.spawn_target(), None);
 }
+
+#[test]
+fn composer_set_models_preserves_a_deliberate_pick_on_a_same_backend_refresh() {
+    // A background catalog refresh lands mid-compose. Re-installing the list must not throw
+    // away the model the user picked, or a slow probe silently rewrites the spawn.
+    let mut c = Composer::new();
+    c.cycle_backend(); // -> codex
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into()],
+        BackendKind::Codex,
+    );
+    c.cycle_model();
+    assert_eq!(c.model(), "gpt-5.6-sol");
+
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into(), "gpt-5.7".into()],
+        BackendKind::Codex,
+    );
+    assert_eq!(c.model(), "gpt-5.6-sol");
+}
+
+#[test]
+fn composer_set_models_resets_when_the_pick_vanishes_from_the_refreshed_list() {
+    // The selection must always be an entry of the installed list, or Shift+Tab has no
+    // anchor to advance from and the spawn carries a model the backend just dropped.
+    let mut c = Composer::new();
+    c.cycle_backend(); // -> codex
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into()],
+        BackendKind::Codex,
+    );
+    c.cycle_model();
+    assert_eq!(c.model(), "gpt-5.6-sol");
+
+    c.set_models(vec!["default".into(), "gpt-5.7".into()], BackendKind::Codex);
+    assert_eq!(c.model(), "default");
+}
+
+#[test]
+fn composer_set_models_resets_the_pick_when_the_backend_changes() {
+    // Codex's pick is meaningless to opencode; a backend switch always lands on its default.
+    let mut c = Composer::new();
+    c.cycle_backend(); // -> codex
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into()],
+        BackendKind::Codex,
+    );
+    c.cycle_model();
+    assert_eq!(c.model(), "gpt-5.6-sol");
+
+    c.cycle_backend(); // -> opencode
+    c.set_models(
+        vec!["default".into(), "gpt-5.6-sol".into()],
+        BackendKind::Opencode,
+    );
+    assert_eq!(c.model(), "default");
+}

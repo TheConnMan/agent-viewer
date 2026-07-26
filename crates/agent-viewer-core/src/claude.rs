@@ -153,7 +153,7 @@ impl Backend for ClaudeBackend {
         // opus[1m] (the non-pinned alias) first, then whatever ~/.claude.json advertises.
         self.models_cache
             .get_or_init(|| {
-                let mut models = vec!["opus[1m]".to_string()];
+                let mut models = vec![self.kind().default_model().to_string()];
                 let path = crate::home_dir().join(".claude.json");
                 if let Ok(text) = std::fs::read_to_string(&path) {
                     models.extend(parse_claude_json_models(&text));
