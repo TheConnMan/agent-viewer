@@ -1,0 +1,9 @@
+{
+  "method": "thread/status/changed",
+  "params": {
+    "threadId": "019f9e3c-daf6-7de3-b9e3-209c566fca71",
+    "status": {
+      "type": "systemError"
+    }
+  }
+}

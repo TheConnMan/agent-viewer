@@ -1,0 +1,21 @@
+{
+  "ses_092d96a86ffedMXIhVav3iY5gT": {
+    "type": "idle"
+  },
+  "ses_092d96a85ffedV1CUK1NESV5dW": {
+    "type": "busy"
+  },
+  "ses_092d96a84ffeDOdm1mThYgWHw7": {
+    "type": "retry",
+    "attempt": 1,
+    "message": "Temporary provider error",
+    "action": {
+      "reason": "retry available",
+      "provider": "example",
+      "title": "Retry request",
+      "message": "Try the request again",
+      "label": "Retry"
+    },
+    "next": 1784242705805
+  }
+}

@@ -1,0 +1,295 @@
+[
+  {
+    "id": "4f326264",
+    "cwd": "/home/user/git/example/proj-beta",
+    "kind": "background",
+    "startedAt": 1779704530047,
+    "sessionId": "4f326264-8a42-445f-9d3a-08361f73b7a4",
+    "name": "Neutral text 024",
+    "state": "done"
+  },
+  {
+    "id": "5dcf11d7",
+    "cwd": "/home/user/git/example/proj-lambda",
+    "kind": "background",
+    "startedAt": 1782381144504,
+    "sessionId": "5dcf11d7-9eea-42de-879f-b217e6b74053",
+    "name": "Neutral text 024",
+    "state": "done"
+  },
+  {
+    "id": "fc7d4027",
+    "cwd": "/home/user/git/example/proj-theta",
+    "kind": "background",
+    "startedAt": 1783591585405,
+    "sessionId": "fc7d4027-78d5-4fdc-b060-b2a228c3a6af",
+    "name": "Neutral text 024",
+    "state": "done"
+  },
+  {
+    "id": "20c385a3",
+    "cwd": "/home/user/git/example/proj-epsilon",
+    "kind": "background",
+    "startedAt": 1783659603260,
+    "sessionId": "20c385a3-6603-4ad5-be5b-f3ad6391d595",
+    "name": "Neutral text 019",
+    "state": "blocked"
+  },
+  {
+    "id": "51eb6739",
+    "cwd": "/home/user/git/example/proj-mu",
+    "kind": "background",
+    "startedAt": 1783686694393,
+    "sessionId": "51eb6739-a9e4-42b2-ab7f-a96d4c61b928",
+    "name": "Neutral text 020",
+    "state": "done"
+  },
+  {
+    "id": "c6645923",
+    "cwd": "/home/user/proj-nu",
+    "kind": "background",
+    "startedAt": 1784034133944,
+    "sessionId": "c6645923-5cb2-46df-b62a-44a455e72654",
+    "name": "Neutral text 024",
+    "state": "done"
+  },
+  {
+    "id": "2f6d4b65",
+    "cwd": "/home/user/proj-nu",
+    "kind": "background",
+    "startedAt": 1784213133586,
+    "sessionId": "2f6d4b65-78c7-4114-ad9d-ac87ed0e3ff2",
+    "name": "Neutral text 046",
+    "state": "blocked"
+  },
+  {
+    "id": "c2760261",
+    "cwd": "/home/user/proj-nu",
+    "kind": "background",
+    "startedAt": 1784555655663,
+    "sessionId": "c2760261-9782-4a7e-a497-bfe925aa3c03",
+    "name": "Neutral text 032",
+    "state": "done"
+  },
+  {
+    "id": "54c7e442",
+    "cwd": "/home/user/git/example/proj-iota",
+    "kind": "background",
+    "startedAt": 1784579235011,
+    "sessionId": "54c7e442-11cb-4e83-bcec-1aedb0ce4f30",
+    "name": "Neutral text 024",
+    "state": "stopped"
+  },
+  {
+    "id": "328168f7",
+    "cwd": "/home/user/git/example/proj-kappa",
+    "kind": "background",
+    "startedAt": 1784579261740,
+    "sessionId": "328168f7-fdb8-4523-94d9-a544062da234",
+    "name": "Neutral text 024",
+    "state": "stopped"
+  },
+  {
+    "id": "660ae812",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1784628782748,
+    "sessionId": "660ae812-678d-4d0b-8392-d763fa52be0f",
+    "name": "Neutral text 024",
+    "state": "done"
+  },
+  {
+    "id": "2d288cb8",
+    "cwd": "/home/user/git/example/proj-theta",
+    "kind": "background",
+    "startedAt": 1784637641111,
+    "sessionId": "2d288cb8-fb4d-428e-a447-421bfe2ab608",
+    "name": "Neutral text 029",
+    "state": "done"
+  },
+  {
+    "id": "375da76a",
+    "cwd": "/home/user/git/example/proj-kappa",
+    "kind": "background",
+    "startedAt": 1784737756057,
+    "sessionId": "375da76a-5725-4007-85e0-87428413b297",
+    "name": "Neutral text 011",
+    "state": "blocked"
+  },
+  {
+    "id": "6127d0bf",
+    "cwd": "/home/user/git/example/proj-theta",
+    "kind": "background",
+    "startedAt": 1784743201987,
+    "sessionId": "6127d0bf-c19a-4555-a8d0-fc52614d21a5",
+    "name": "Neutral text 030",
+    "state": "blocked"
+  },
+  {
+    "id": "ef0c08a6",
+    "cwd": "/home/user/git/example/proj-theta",
+    "kind": "background",
+    "startedAt": 1784802957797,
+    "sessionId": "ef0c08a6-0206-4810-bd40-e38261bde8d4",
+    "name": "Neutral text 049",
+    "state": "done"
+  },
+  {
+    "id": "a5c18745",
+    "cwd": "/home/user/git/example/proj-theta",
+    "kind": "background",
+    "startedAt": 1784823773225,
+    "sessionId": "a5c18745-1121-43b4-baf1-f672bb2304cb",
+    "name": "Neutral text 013",
+    "state": "failed"
+  },
+  {
+    "id": "b517c29c",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1784904197406,
+    "sessionId": "b517c29c-0695-47c0-a5e2-392933d2471d",
+    "name": "Neutral text 023",
+    "state": "done"
+  },
+  {
+    "id": "4acaeda7",
+    "cwd": "/home/user/git/example/proj-delta",
+    "kind": "background",
+    "startedAt": 1784909952331,
+    "sessionId": "4acaeda7-1a81-4c5e-b926-559a4167551e",
+    "name": "Neutral text 024",
+    "state": "stopped"
+  },
+  {
+    "id": "6b111d3b",
+    "cwd": "/home/user/git/example/proj-eta",
+    "kind": "background",
+    "startedAt": 1784911537003,
+    "sessionId": "6b111d3b-88e4-444f-bf63-ca8db225d1ac",
+    "name": "Neutral text 024",
+    "state": "stopped"
+  },
+  {
+    "id": "f965900b",
+    "cwd": "/home/user/proj-nu",
+    "kind": "background",
+    "startedAt": 1784911894913,
+    "sessionId": "f965900b-aa65-4e1e-a9f1-a6c873ed796a",
+    "name": "Neutral text 031",
+    "state": "done"
+  },
+  {
+    "id": "8c0bf9fb",
+    "cwd": "/home/user/git/example/proj-lambda",
+    "kind": "background",
+    "startedAt": 1784923426993,
+    "sessionId": "8c0bf9fb-2f87-4ea3-b9c7-c0da362289c9",
+    "name": "Neutral text 035",
+    "state": "blocked"
+  },
+  {
+    "id": "c27c2355",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1784967807281,
+    "sessionId": "c27c2355-ebfb-444c-a92c-06255d9fb9c0",
+    "name": "Neutral text 017",
+    "state": "done"
+  },
+  {
+    "id": "3f61a7fb",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1784967815059,
+    "sessionId": "3f61a7fb-1875-4406-b637-b8db97a725ff",
+    "name": "Neutral text 026",
+    "state": "done"
+  },
+  {
+    "id": "1e66df62",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1784967818041,
+    "sessionId": "1e66df62-2a18-4aa7-8c7f-1bb05ba51333",
+    "name": "Neutral text 043",
+    "state": "done"
+  },
+  {
+    "id": "7cecf3fd",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1785001436929,
+    "sessionId": "7cecf3fd-beae-48ff-af4e-f942586e4545",
+    "name": "Neutral text 003",
+    "state": "done"
+  },
+  {
+    "id": "c1145ace",
+    "cwd": "/home/user/git/example/proj-beta",
+    "kind": "background",
+    "startedAt": 1785008050344,
+    "sessionId": "c1145ace-f176-47b9-ad4c-247118d7c275",
+    "name": "Neutral text 016",
+    "state": "done"
+  },
+  {
+    "id": "5e63a0a1",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1785013305540,
+    "sessionId": "5e63a0a1-0aa7-4b42-970e-f410c3f1ad81",
+    "name": "Neutral text 045",
+    "state": "done"
+  },
+  {
+    "id": "6cd111dc",
+    "cwd": "/home/user/git/example/proj-gamma",
+    "kind": "background",
+    "startedAt": 1785052804136,
+    "sessionId": "6cd111dc-fbeb-4995-8525-b1d071ebffc8",
+    "name": "Neutral text 004",
+    "state": "done"
+  },
+  {
+    "pid": 367721,
+    "id": "bb59e063",
+    "cwd": "/home/user/git/example/proj-alpha",
+    "kind": "background",
+    "startedAt": 1785071012904,
+    "sessionId": "bb59e063-925b-4ef7-9025-29c12a1b93df",
+    "name": "Neutral text 021",
+    "status": "busy",
+    "state": "working"
+  },
+  {
+    "pid": 376272,
+    "id": "95016795",
+    "cwd": "/home/user/git/example/proj-alpha",
+    "kind": "background",
+    "startedAt": 1785071031299,
+    "sessionId": "95016795-7d4d-4ed9-90cf-551c7b435a47",
+    "name": "Neutral text 022",
+    "status": "busy",
+    "state": "working"
+  },
+  {
+    "pid": 377527,
+    "id": "9f7cf7f0",
+    "cwd": "/home/user/git/example/proj-alpha",
+    "kind": "background",
+    "startedAt": 1785071045194,
+    "sessionId": "9f7cf7f0-3f97-477f-a11b-de93f6038e99",
+    "name": "Neutral text 018",
+    "status": "idle",
+    "state": "done"
+  },
+  {
+    "pid": 488346,
+    "cwd": "/home/user/git/example/proj-alpha",
+    "kind": "interactive",
+    "startedAt": 1785071731766,
+    "sessionId": "79b88ee4-9efb-42ea-9d07-86fd4807426d",
+    "name": "Neutral text 047"
+  }
+]
