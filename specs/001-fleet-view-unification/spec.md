@@ -27,6 +27,20 @@ opencode. that's the vision of this project."
   → A: Show a clear inline error naming the reason and leave the user on the list with the row
   still selected. Never fall back to a path that could spawn a second client/session — a failed
   attach must not risk recreating the duplicate-session problem Principle IV exists to prevent.
+- Q: Must interactive (non-background) sessions appear in the list? The original Edge Cases entry
+  said yes, but Phase 0 research then measured Fleet View directly and found it lists none
+  (`research.md:526`, `research.md:534-542`). → A: Exclude them, matching Fleet View. This is
+  Principle I parity, not a divergence: showing them is what would diverge, and `research.md:546`
+  requires such a divergence to carry its own justification. Excluding them also removes the
+  `claude -r <uuid>` duplicate-client path at its source (D-003). The superseded Edge Cases entry
+  has been corrected below and FR-003 now names the exclusion. Recorded per Constitution I's
+  requirement that any Fleet View deviation be explicit rather than implicit.
+- Q: Is session creation (spawn, the composer, the model picker) in scope? It was implemented but
+  traced to no requirement. → A: In scope, as Fleet View parity under Principle I. Fleet View's
+  own model picker was confirmed present during Phase 0 capture (`plan.md:88`), so the
+  justification already existed and was simply never written down. Added as FR-016. Viewer-local
+  spawn records are presentation state, not shadow state, because they pin a session the viewer
+  itself created rather than overriding anything the backend reports.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -180,9 +194,10 @@ while a completed session older than the window does not (until "show all" is in
   perceptibly slower to open or refresh than a Claude-only session list would be today.
 - A session with an associated PR that has since been merged or closed must not linger in
   "Ready for review."
-- An interactive (non-background) session for any backend must still appear in the list with
-  accurate state, even where the backend's richer detail (summary, transcript) is only available
-  for background-style sessions.
+- An interactive (non-background) session must not appear in the list, matching Fleet View, which
+  lists none. Such rows carry no `id` and no `state`, so any row built from one would show a
+  fabricated status. (Corrected 2026-07-26 from an earlier reading that required them to appear;
+  see Clarifications.)
 - Attach cannot reach the live session (e.g. a stale daemon worker or dead socket) — the user
   sees a clear inline error naming the reason, remains on the list with the row still selected,
   and no fallback path is attempted that could spawn a second client/session.
@@ -196,8 +211,10 @@ while a completed session older than the window does not (until "show all" is in
 - **FR-002**: The system MUST visually match Fleet View's row format (status glyph, name, state
   word, summary, right-aligned age) and MUST NOT introduce a state vocabulary Fleet View does
   not use, except where required to distinguish backend identity. *(Principle I)*
-- **FR-003**: The system MUST exclude Codex subagent/companion threads, archived sessions, and
-  sessions whose working directory no longer exists from the default list. *(Principle III)*
+- **FR-003**: The system MUST exclude Codex subagent/companion threads, archived sessions,
+  interactive (non-background) sessions, and sessions whose working directory no longer exists
+  from the default list. *(Principle III; Principle I for interactive rows, which Fleet View
+  itself does not list; Clarification 2026-07-26)*
 - **FR-004**: The system MUST let a user attach to a session such that they join the actual
   running or resumable backend session, verified by the backend's own session count being
   unchanged by the attach action. *(Principle IV)*
@@ -236,11 +253,16 @@ while a completed session older than the window does not (until "show all" is in
   sessions currently visible in the list (post-filter, post-retention), never on backend history
   outside the current view. *(Edge case, Principle V)*
 - **FR-014**: `agent-viewer-core` MUST remain free of UI-toolkit types; all logic in FR-001
-  through FR-013 MUST be implemented in `-core` with the TUI as a thin renderer over it.
-  *(Principle VI)*
+  through FR-013 and FR-016 MUST be implemented in `-core` with the TUI as a thin renderer over
+  it. *(Principle VI)*
 - **FR-015**: Peek and reply are explicitly out of scope for this feature and MUST NOT be
   implemented as part of it. *(Additional Constraints — deliberate divergence from Fleet View's
   `space`-to-reply binding)*
+- **FR-016**: The system MUST support creating a new session from the list, including choosing the
+  target backend and model, matching Fleet View's own composer and model picker. A session the
+  viewer created MUST remain visible until the backend reports it, and that visibility record is
+  presentation state, not an override of any backend-reported field. *(Principle I; Clarification
+  2026-07-26)*
 
 ### Key Entities
 
