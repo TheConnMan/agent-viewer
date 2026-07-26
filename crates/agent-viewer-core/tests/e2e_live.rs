@@ -269,9 +269,16 @@ fn claude_live_rename_round_trips_through_the_agents_listing() {
     let mode_after_rename = std::fs::metadata(&state_path)
         .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()))
         .unwrap_or(0);
-    // Restore the exact bytes FIRST, then assert, so an assertion failure never leaves the
-    // probe name (or a stamped nameSource) behind.
+    // Restore the exact bytes AND mode FIRST, then assert, so an assertion failure never
+    // leaves the probe name, a stamped nameSource, or a widened mode behind. `fs::write`
+    // truncates in place and so keeps whatever mode the file currently has, which is exactly
+    // the wrong thing if the implementation under test just widened it.
     std::fs::write(&state_path, &snapshot).expect("restore state.json");
+    std::fs::set_permissions(
+        &state_path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(snapshot_mode),
+    )
+    .expect("restore state.json mode");
     let seen_after_restore = backend
         .list()
         .ok()
