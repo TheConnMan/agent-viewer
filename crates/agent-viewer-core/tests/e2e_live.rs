@@ -1,4 +1,4 @@
-//! Live end-to-end tests. Both are #[ignore] — they need real codex auth + network
+//! Live end-to-end tests are #[ignore] because they need real agent CLIs, auth, and network
 //! (and, for the smoke, whatever backends exist on the box), so plain `cargo test` skips
 //! them. Run explicitly:
 //!   cargo test -p agent-viewer-core --test e2e_live -- --ignored --nocapture
@@ -11,8 +11,10 @@ use agent_viewer_core::codex::app_server::{
 };
 use agent_viewer_core::codex::status::open_rollout_paths;
 use agent_viewer_core::default_codex_home;
+use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime, default_opencode_db};
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,46 @@ where
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+fn poll_opencode_session<F>(
+    backend: &mut OpencodeBackend,
+    timeout: Duration,
+    mut pred: F,
+) -> Option<agent_viewer_core::Session>
+where
+    F: FnMut(&agent_viewer_core::Session) -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(sessions) = backend.list()
+            && let Some(found) = sessions.iter().find(|session| pred(session))
+        {
+            return Some(found.clone());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+struct OpencodeLiveCleanup {
+    runtime: OpencodeRuntime,
+    session: Option<agent_viewer_core::Session>,
+}
+
+impl OpencodeLiveCleanup {
+    fn delete(&mut self) -> agent_viewer_core::Result<()> {
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        OpencodeBackend::with_runtime(self.runtime.clone()).remove(&session)
+    }
+}
+
+impl Drop for OpencodeLiveCleanup {
+    fn drop(&mut self) {
+        let _ = self.delete();
+    }
 }
 
 /// Read the latest valid persisted name for one thread from Codex's append only index.
@@ -312,6 +354,215 @@ fn multi_backend_smoke() {
             println!("[smoke]   {} [{:?}] {}", kind.tag(), s.origin, s.title);
         }
     }
+}
+
+#[test]
+#[ignore = "live: starts or reuses a real opencode server and mutates one unique session"]
+fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
+    let runtime = OpencodeRuntime::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock follows the Unix epoch")
+        .as_nanos();
+    let title_marker = format!("AV live {nonce}");
+    let prompt = format!(
+        "{title_marker}. Use the shell tool to run `sleep 20`, then reply with exactly \
+         OPENCODE LIVE COMPLETE."
+    );
+
+    let mut initiating = OpencodeBackend::with_runtime(runtime.clone());
+    let baseline: HashSet<String> = initiating
+        .list()
+        .expect("snapshot OpenCode ids")
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    let started = Instant::now();
+    let spawned = initiating
+        .spawn(&cwd, &prompt, None)
+        .expect("create session and accept prompt asynchronously");
+    let disconnected_after = started.elapsed();
+    assert_eq!(spawned.pid, None);
+    let session_id = spawned
+        .session_id
+        .expect("server create returns the exact session id");
+    assert!(
+        !baseline.contains(&session_id),
+        "create returned a preexisting session id"
+    );
+    assert!(
+        disconnected_after < Duration::from_secs(15),
+        "prompt_async did not return promptly: {disconnected_after:?}"
+    );
+    drop(initiating);
+
+    let seed_session = agent_viewer_core::Session {
+        backend: agent_viewer_core::BackendKind::Opencode,
+        id: session_id.clone(),
+        short_id: None,
+        origin: agent_viewer_core::SessionOrigin::Interactive,
+        title: title_marker.clone(),
+        cwd: cwd.clone(),
+        git_branch: None,
+        status: Status::Working,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+        daemon_hosted: true,
+    };
+    let mut cleanup = OpencodeLiveCleanup {
+        runtime: runtime.clone(),
+        session: Some(seed_session),
+    };
+
+    let mut fresh = OpencodeBackend::with_runtime(runtime.clone());
+    let working = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
+        session.id == session_id && session.status == Status::Working
+    })
+    .expect("fresh client never observed the disconnected session Working");
+    assert!(working.daemon_hosted);
+    assert_eq!(working.pid, None);
+    let attach = fresh
+        .attach_command(&working)
+        .expect("build native server attach");
+    let attach_args: Vec<String> = attach
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(attach_args.first().map(String::as_str), Some("attach"));
+    let server_url = attach_args
+        .iter()
+        .find(|arg| arg.starts_with("http://127.0.0.1:"))
+        .cloned()
+        .expect("attach uses a fixed loopback server URL");
+    assert!(
+        server_url.ends_with(":4096") || server_url.ends_with(":4097"),
+        "{server_url}"
+    );
+    assert!(
+        attach_args
+            .windows(2)
+            .any(|pair| pair == ["-s", session_id.as_str()])
+    );
+    assert!(!attach_args.iter().any(|arg| arg == "--fork"));
+
+    let ids_before_attach: HashSet<String> = fresh
+        .list()
+        .expect("list before attach")
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    let pty =
+        PtySession::spawn(spec_from_command(&attach, 30, 110)).expect("attach through a sized PTY");
+    let attach_started = Instant::now();
+    let mut attach_observed = false;
+    while attach_started.elapsed() < Duration::from_secs(20) {
+        let contents = pty.with_screen(|screen| screen.contents());
+        if contents.contains(&title_marker) || contents.contains(&prompt) {
+            attach_observed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let ids_after_attach: HashSet<String> = fresh
+        .list()
+        .expect("list after attach")
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    drop(pty);
+
+    fresh.stop(&working).expect("abort only the test session");
+    let stopped = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
+        session.id == session_id && session.status != Status::Working
+    })
+    .expect("aborted session never left Working");
+    fresh
+        .rename(&stopped, &format!("{title_marker} renamed"))
+        .expect("rename through server");
+    let renamed = poll_opencode_session(&mut fresh, Duration::from_secs(10), |session| {
+        session.id == session_id && session.title == format!("{title_marker} renamed")
+    })
+    .expect("renamed title did not round trip");
+    fresh.hide(&session_id).expect("archive through server");
+    let archived = poll_opencode_session(&mut fresh, Duration::from_secs(10), |session| {
+        session.id == session_id && session.hidden
+    })
+    .expect("archive did not round trip");
+    fresh.unhide(&session_id).expect("unarchive through server");
+    let unarchived = poll_opencode_session(&mut fresh, Duration::from_secs(10), |session| {
+        session.id == session_id && !session.hidden
+    })
+    .expect("unarchive did not round trip");
+    let message = runtime
+        .read_last_message(&default_opencode_db(), &session_id)
+        .expect("read server message history")
+        .expect("the test prompt remains in message history");
+
+    let cleanup_result = cleanup.delete();
+    let cleanup_ok = cleanup_result.is_ok();
+    cleanup_result.expect("delete only the unique live test session");
+    let cleanup_started = Instant::now();
+    let mut removed = false;
+    while cleanup_started.elapsed() < Duration::from_secs(10) {
+        if fresh
+            .list()
+            .is_ok_and(|sessions| sessions.iter().all(|session| session.id != session_id))
+        {
+            removed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let server_still_healthy = fresh.list().is_ok() && fresh.capabilities().live_status;
+
+    println!("[opencode] server {server_url}");
+    println!("[opencode] session {session_id}");
+    println!(
+        "[opencode] initiating client returned after {disconnected_after:?}; fresh client observed Working"
+    );
+    println!(
+        "[opencode] attach observed={attach_observed} duplicate_created={}",
+        ids_before_attach != ids_after_attach
+    );
+    println!(
+        "[opencode] abort transition {:?} -> {:?}; server healthy={server_still_healthy}",
+        working.status, stopped.status
+    );
+    println!(
+        "[opencode] archive hidden={} unarchive hidden={}",
+        archived.hidden, unarchived.hidden
+    );
+    println!("[opencode] cleanup result={cleanup_ok} removed={removed}");
+
+    assert!(
+        attach_observed,
+        "native attach did not replay the existing session"
+    );
+    assert_eq!(
+        ids_after_attach, ids_before_attach,
+        "attach created a duplicate session"
+    );
+    assert_eq!(renamed.title, format!("{title_marker} renamed"));
+    assert!(archived.hidden);
+    assert!(!unarchived.hidden);
+    assert!(
+        message.text.contains(&title_marker),
+        "server message history did not retain the submitted prompt: {:?}",
+        message.text
+    );
+    assert!(removed, "cleanup session remained in the server list");
+    assert!(
+        server_still_healthy,
+        "session abort or cleanup stopped the shared server"
+    );
 }
 
 /// Live proof of the real rename channel: renaming a claude bg job must write that job's own
