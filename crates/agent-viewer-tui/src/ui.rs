@@ -955,8 +955,7 @@ fn draw_list(
             }
         }
     }
-    let list =
-        List::new(items).highlight_style(Style::default().bg(theme::SEL_BG).fg(theme::SEL_FG));
+    let list = List::new(items).highlight_style(Style::default().bg(theme::SEL_BG));
     let mut state = ListState::default();
     if !rows.is_empty() {
         let sel = app.selected_index().min(rows.len() - 1);
@@ -1415,6 +1414,76 @@ mod tests {
             assert_eq!(backend_mark(b), "  ");
             assert_eq!(mark_width(backend_mark(b)), 2);
         }
+    }
+
+    #[test]
+    fn selected_row_keeps_title_and_summary_contrast() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = App::new(vec![Session {
+            backend: BackendKind::Codex,
+            id: "selected-row".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "TITLE".into(),
+            cwd: "/tmp/agent-viewer-selected-row".into(),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: "SUMMARY".into(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }]);
+        let selected_y = app.selected_index() as u16;
+        assert!(matches!(
+            app.visible()[selected_y as usize],
+            Row::Session { .. }
+        ));
+
+        let area = Rect::new(0, 0, 80, app.visible().len() as u16);
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::default();
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    &app,
+                    &pulses,
+                    0,
+                    &pr_status,
+                    ListDeco {
+                        rename: None,
+                        expanded: None,
+                        expand_lines: &[],
+                    },
+                    None,
+                    area,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let title = (0..area.width)
+            .map(|x| &buffer[(x, selected_y)])
+            .find(|cell| cell.symbol() == "T")
+            .expect("title cell");
+        let summary = (0..area.width)
+            .map(|x| &buffer[(x, selected_y)])
+            .find(|cell| cell.symbol() == "S")
+            .expect("summary cell");
+
+        assert_eq!(title.fg, theme::TEXT);
+        assert_eq!(summary.fg, theme::MUTED);
+        assert_eq!(title.bg, theme::SEL_BG);
+        assert_eq!(summary.bg, theme::SEL_BG);
+        assert_ne!(title.fg, summary.fg);
     }
 
     #[test]
