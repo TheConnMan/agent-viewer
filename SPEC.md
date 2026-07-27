@@ -25,7 +25,7 @@ config surfaces, or features not requested.
 
 ## Enumeration — the source of truth (requirements 2, 3-read, 4)
 
-Codex maintains a global session registry. **Read it; do not scrape JSONL for the list view.**
+Codex maintains a global session registry. Read it and its name index read only.
 
 - Path: `~/.codex/state_*.sqlite`. **Glob and pick the highest version number** (currently
   `state_5.sqlite`); do NOT hardcode `5`.
@@ -46,8 +46,10 @@ Codex maintains a global session registry. **Read it; do not scrape JSONL for th
 - Grouping key = `cwd`. Optionally fold `cwd` up to the nearest `.git` root so worktrees
   collapse under one project (mirrors the local `claude-usage` "aggregate worktrees" idea).
 
-A lighter index exists at `~/.codex/session_index.jsonl` but `threads` is strictly richer —
-use the SQLite.
+`~/.codex/session_index.jsonl` overlays the SQLite title on every list refresh. Read it read
+only. For each id, the latest valid entry with a nonempty name wins. Use the SQLite title when
+the index is missing, unreadable, malformed, invalid, or has no matching entry. The index never
+supplies rows, status, or any field other than the name.
 
 ## Enumeration — opencode, and the run-mode companion rule
 
@@ -333,8 +335,12 @@ observable end to end on the daemon path (`codex_spawn_running_then_done` and
 Implemented routing (all three seams are pure functions in `codex/mod.rs`, so they are unit
 tested without a daemon):
 - **spawn:** `ensure_daemon()`, then `thread/start` + `turn/start` on it; the thread id comes
-  back from `result.thread.id` and no pid is returned (the spawn record still resolves the new
-  row by cwd plus time window). There is NO silent fallback: any daemon failure, and the
+  back from `result.thread.id` and flows as `SpawnResult.session_id` through `Mutation::Spawn`
+  into `SpawnSelection`. It is not stored in the viewer database `SpawnRecord`, which remains
+  PID based; a daemon spawn still has no killable PID. The TUI selects the first selectable
+  snapshot containing that id and preserves the selection. For a backend without an id, row
+  discovery excludes the complete session set captured before submission, including hidden,
+  filtered, and collapsed rows. There is NO silent fallback: any daemon failure, and the
   absence of a daemon, is a visible failed spawn carrying the daemon's own error. `codex exec`
   is reachable only via `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`. See "No silent exec fallback".
 - **attach:** daemon-hosted plus a reachable daemon -> `codex resume --remote <endpoint> <id>`;
@@ -376,10 +382,11 @@ risk is semantic (two clients steering one live thread), and D-004 forecloses th
 calling `thread/resume` from the viewer's own client: the join happens in the `codex resume
 --remote` TUI the viewer execs into, which is the user's single steering client.
 
-**Current design: agent-viewer binds to the app-server for Codex metadata.** Enumeration comes
-from `thread/list` with an explicit `sourceKinds` filter and `useStateDbOnly: true` (D-005),
-rename from `thread/name/set`, and attach from `codex resume --remote unix://<socketPath> <id>`
-(D-004). The transport is RFC6455-framed JSON-RPC over the Unix socket (D-009), discovered
+**Current design: agent-viewer binds to the app-server for Codex mutation and attach.**
+Enumeration reads `state_*.sqlite` with the read only session index overlay above. Rename remains
+`thread/name/set`, which persists an explicit Codex name to `session_index.jsonl`, and attach uses
+`codex resume --remote unix://<socketPath> <id>` (D-004).
+The transport is RFC6455-framed JSON-RPC over the Unix socket (D-009), discovered
 rather than hardcoded: `codex app-server daemon version` prints `socketPath`, and
 `"status":"running"` is the availability gate. Verified on this box on 2026-07-26 (output
 line-wrapped for readability):
@@ -394,8 +401,8 @@ $ codex app-server daemon version
 ```
 
 The other half of the original caution still stands: the API is marked `[experimental]` with
-shallow versioning, so deserialize permissively and fall back to read-only `state_*.sqlite`
-enumeration when `status` is not `running` or the handshake fails.
+shallow versioning. Enumeration is always the read only SQLite registry with the session index
+overlay, so it remains available when `status` is not `running` or the handshake fails.
 
 **Correction (daemon lifecycle).** This previously read "agent-viewer never starts, stops, or
 restarts a daemon". It now MAY start one, because a spawn that lands on no daemon produces a

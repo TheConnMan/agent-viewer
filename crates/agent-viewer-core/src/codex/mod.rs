@@ -5,7 +5,9 @@ pub mod rollout;
 pub mod source;
 pub mod status;
 
-use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin, Status};
+use crate::backend::{
+    Backend, BackendKind, Capabilities, Session, SessionOrigin, SpawnResult, Status,
+};
 use crate::error::{AttachRefusal, Result};
 use registry::Registry;
 use status::StatusResolver;
@@ -354,7 +356,7 @@ impl Backend for CodexBackend {
             .clone()
     }
 
-    fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
+    fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<SpawnResult> {
         // Prefer the shared daemon: a thread it hosts is the only kind that can be joined
         // later, and it may be started here (never stopped, never restarted). Skip the probe
         // entirely when exec is forced, so an opt-in never starts a daemon it will not use.
@@ -369,15 +371,13 @@ impl Backend for CodexBackend {
         match spawn_route(daemon.as_ref(), exec_opt_in) {
             SpawnRoute::Daemon(daemon) => {
                 return match app_server::try_spawn_thread(daemon, dir, task, model) {
-                    // No pid to return: the daemon owns the thread, and its pid must never be
-                    // handed back as a killable one (it is every other hosted thread's pid
-                    // too). The costs of that are real but small: `record_spawn` is pid-keyed,
-                    // so a daemon-hosted row gets no viewer spawn record, which means no pin
-                    // (it does not need one - a `vscode`-source row is not a companion) and no
-                    // first-sight bloom. Stop goes through turn/interrupt instead of a signal.
-                    // Same shape as the claude backend, which also self-detaches and returns
-                    // None.
-                    app_server::SpawnAttempt::Started(_) => Ok(None),
+                    // The daemon owns the thread, so its pid must never be handed back as a
+                    // killable one. The exact thread id is safe to return and lets the TUI
+                    // select the new row without guessing from cwd and creation time.
+                    app_server::SpawnAttempt::Started(thread_id) => Ok(SpawnResult {
+                        pid: None,
+                        session_id: Some(thread_id),
+                    }),
                     // Every other outcome is a hard failure carrying the daemon's own error.
                     // There is deliberately no exec fallback: it would either double-run the
                     // task (the thread already exists after `thread/start`) or silently hand
@@ -398,7 +398,10 @@ impl Backend for CodexBackend {
             .join("bg-logs")
             .join(format!("{}.log", crate::spawn::now_ms()));
         let pid = crate::spawn::spawn_detached(cmd, &log_path)?;
-        Ok(Some(pid))
+        Ok(SpawnResult {
+            pid: Some(pid),
+            session_id: None,
+        })
     }
 
     fn hide(&self, id: &str) -> Result<()> {

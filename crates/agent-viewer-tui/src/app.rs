@@ -190,6 +190,14 @@ impl App {
         &self.rows
     }
 
+    pub fn session_ids_for_backend(&self, backend: BackendKind) -> HashSet<String> {
+        self.sessions
+            .iter()
+            .filter(|session| session.backend == backend)
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
     /// key 'a' (I-2): one show-all toggle covering companions + archived rows.
     pub fn toggle_show_all(&mut self) {
         self.show_all = !self.show_all;

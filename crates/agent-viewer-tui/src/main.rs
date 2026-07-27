@@ -8,12 +8,12 @@ use std::time::Duration;
 use agent_viewer_core::backend::{Backend, BackendKind, all_backends};
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn};
+use agent_viewer_core::state::{SpawnRecord, ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
-use agent_viewer_tui::mutations::MutationRunner;
+use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
 
@@ -149,6 +149,8 @@ struct Ui {
     pulses: Pulses,
     /// Background PR-status cache: colors the right-aligned PR badge by live GitHub state.
     pr_status: PrStatusCache,
+    /// The latest successful spawn whose row has not yet become visible and selectable.
+    pending_spawn: Option<SpawnSelection>,
     /// A one-shot reply injection armed by `send_reply`. While set, the run loop watches the
     /// focused PTY and writes the reply payload once it is safe (in the run, settled).
     /// Cleared on write, timeout, user takeover, or PTY prune.
@@ -281,6 +283,7 @@ fn main() -> io::Result<()> {
         models,
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
+        pending_spawn: None,
         pending_reply: None,
         attached: HashMap::new(),
         focused: None,
@@ -324,6 +327,13 @@ fn run(
 ) -> io::Result<()> {
     loop {
         let now = now_ms();
+        if ui
+            .pending_spawn
+            .as_ref()
+            .is_some_and(|spawn| now - spawn.spawned_at_ms > SPAWN_ABANDON_MS)
+        {
+            ui.pending_spawn = None;
+        }
         ui.peek.refresh(ui.app.selected());
 
         // Drain completed PR-status fetches, then request statuses for the visible rows.
@@ -342,10 +352,7 @@ fn run(
         // Drain completed background mutations: show the result and hasten a fresh listing.
         let mut mutation_completed = false;
         while let Some(result) = ui.mutations.poll() {
-            ui.set_notice(match result {
-                Ok(msg) => msg,
-                Err(msg) => msg,
-            });
+            apply_mutation_result(ui, result);
             mutation_completed = true;
         }
         if mutation_completed {
@@ -499,11 +506,20 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
     {
         ui.focused_session = Some(s.clone());
     }
+    let spawned_key = ui
+        .pending_spawn
+        .as_ref()
+        .and_then(|spawn| match_pending_spawn(spawn, &sessions));
     ui.app.set_sessions(sessions);
     // Keep the inline rename edit row pinned under the cursor across a reorder so it does not
     // visually jump away mid-edit (the rename still targets by id regardless).
     if let Mode::Rename(modal) = &ui.mode {
         ui.app.select_by_key(&(modal.backend, modal.id.clone()));
+    } else if let Some(key) = spawned_key
+        && ui.app.select_by_key(&key)
+    {
+        ui.pulses.entry(key).or_insert_with(now_ms);
+        ui.pending_spawn = None;
     }
     // Surface a backend-error notice, but do not let a per-second recurring error restamp
     // (which would starve spawn/mutation feedback and make the error effectively permanent):
@@ -523,6 +539,46 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
         ui.set_notice(notice);
     }
     prune_exited(ui);
+}
+
+fn apply_mutation_result(ui: &mut Ui, result: Result<MutationOutcome, String>) {
+    match result {
+        Ok(outcome) => {
+            if let Some(spawned) = outcome.spawned {
+                ui.pending_spawn = Some(spawned);
+            }
+            ui.set_notice(outcome.notice);
+        }
+        Err(msg) => ui.set_notice(msg),
+    }
+}
+
+/// Resolve a successful spawn against a fresh backend listing. An exact backend identity
+/// always wins. Backends without one reuse the viewer database's cwd and creation time rule.
+fn match_pending_spawn(spawn: &SpawnSelection, sessions: &[Session]) -> Option<Key> {
+    if let Some(session_id) = &spawn.session_id {
+        return sessions
+            .iter()
+            .find(|session| {
+                session.backend == spawn.backend && session.id.as_str() == session_id.as_str()
+            })
+            .map(|session| (session.backend, session.id.clone()));
+    }
+    let record = SpawnRecord {
+        rowid: 0,
+        backend: spawn.backend,
+        cwd: spawn.cwd.clone(),
+        pid: 0,
+        spawned_at_ms: spawn.spawned_at_ms,
+    };
+    let candidates = sessions
+        .iter()
+        .filter(|session| {
+            session.backend != spawn.backend || !spawn.preexisting_ids.contains(&session.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match_spawn(&record, &candidates).map(|id| (spawn.backend, id))
 }
 
 /// Whether a snapshot's backend-error `err` should replace the current footer notice, given
@@ -610,7 +666,286 @@ fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTICE_MS, NoticeState, backend_error_should_show};
+    use super::*;
+    use agent_viewer_core::SessionOrigin;
+    use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
+    use std::path::PathBuf;
+
+    const CWD: &str = "/tmp";
+
+    fn session(backend: BackendKind, id: &str, created_at_ms: i64, hidden: bool) -> Session {
+        Session {
+            backend,
+            id: id.to_string(),
+            short_id: None,
+            origin: SessionOrigin::Background,
+            title: id.to_string(),
+            cwd: PathBuf::from(CWD),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            hidden,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: backend == BackendKind::Codex,
+        }
+    }
+
+    fn pending(
+        backend: BackendKind,
+        session_id: Option<&str>,
+        spawned_at_ms: i64,
+    ) -> SpawnSelection {
+        SpawnSelection {
+            backend,
+            session_id: session_id.map(str::to_string),
+            cwd: PathBuf::from(CWD),
+            spawned_at_ms,
+            preexisting_ids: HashSet::new(),
+        }
+    }
+
+    fn pending_with_preexisting(
+        backend: BackendKind,
+        session_id: Option<&str>,
+        spawned_at_ms: i64,
+        preexisting_ids: &[&str],
+    ) -> SpawnSelection {
+        SpawnSelection {
+            backend,
+            session_id: session_id.map(str::to_string),
+            cwd: PathBuf::from(CWD),
+            spawned_at_ms,
+            preexisting_ids: preexisting_ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    fn test_ui(sessions: Vec<Session>) -> Ui {
+        Ui {
+            app: App::new(sessions),
+            mode: Mode::Normal,
+            notice: NoticeState::new(),
+            db: None,
+            peek: PeekCache::new(),
+            composer: Composer::new(),
+            detach_trackers: HashMap::new(),
+            last_backend_error: String::new(),
+            mutations: MutationRunner::new(),
+            models: ModelCache::new(),
+            pulses: Pulses::new(),
+            pr_status: PrStatusCache::new(),
+            pending_spawn: None,
+            pending_reply: None,
+            attached: HashMap::new(),
+            focused: None,
+            focused_session: None,
+            focused_exited: false,
+            logos: None,
+            list_hit: RefCell::new(ListHit::default()),
+            mouse_capture: true,
+        }
+    }
+
+    fn apply_listing(ui: &mut Ui, sessions: Vec<Session>) {
+        let (snapshot_tx, snapshots) = channel();
+        let (wake, _wake_rx) = channel::<()>();
+        snapshot_tx
+            .send((sessions, String::new(), 1))
+            .expect("queue snapshot");
+        apply_snapshot(&Refresher { snapshots, wake }, ui);
+    }
+
+    fn selected_id(ui: &Ui) -> Option<&str> {
+        ui.app.selected().map(|session| session.id.as_str())
+    }
+
+    #[test]
+    fn exact_spawn_identity_beats_a_closer_same_cwd_session() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, Some("exact"), 10_000));
+
+        let decoy = session(BackendKind::Codex, "decoy", 10_001, false);
+        let exact = session(BackendKind::Codex, "exact", 39_000, false);
+        apply_listing(&mut ui, vec![decoy, old, exact]);
+
+        assert_eq!(selected_id(&ui), Some("exact"));
+        assert!(ui.pending_spawn.is_none());
+        assert!(
+            ui.pulses
+                .contains_key(&(BackendKind::Codex, "exact".to_string()))
+        );
+    }
+
+    #[test]
+    fn successful_spawn_outcome_drives_selection_through_the_main_loop_bridge() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let new = session(BackendKind::Codex, "new", 10_100, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+
+        apply_mutation_result(
+            &mut ui,
+            Ok(MutationOutcome {
+                notice: "spawned on codex".to_string(),
+                spawned: Some(pending(BackendKind::Codex, Some("new"), 10_000)),
+            }),
+        );
+        apply_listing(&mut ui, vec![old, new]);
+
+        assert_eq!(selected_id(&ui), Some("new"));
+        assert!(ui.pending_spawn.is_none());
+        assert_eq!(ui.notice.text(), "spawned on codex");
+    }
+
+    #[test]
+    fn spawn_without_identity_uses_nearest_same_cwd_time_match() {
+        let old = session(BackendKind::Opencode, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Opencode, old.id.clone()))
+        );
+        ui.pending_spawn = Some(pending(BackendKind::Opencode, None, 10_000));
+
+        let target = session(BackendKind::Opencode, "target", 10_150, false);
+        let farther = session(BackendKind::Opencode, "farther", 11_000, false);
+        let wrong_backend = session(BackendKind::Claude, "wrong", 10_001, false);
+        apply_listing(&mut ui, vec![farther, wrong_backend, old, target]);
+
+        assert_eq!(selected_id(&ui), Some("target"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
+    #[test]
+    fn spawn_without_identity_waits_for_a_row_absent_before_submission() {
+        let selected = session(BackendKind::Opencode, "selected", 1_000, false);
+        let preexisting = session(BackendKind::Opencode, "preexisting", 9_999, false);
+        let mut ui = test_ui(vec![selected.clone(), preexisting.clone()]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Opencode, selected.id.clone()))
+        );
+        let pending = pending_with_preexisting(
+            BackendKind::Opencode,
+            None,
+            10_000,
+            &["selected", "preexisting"],
+        );
+        ui.pending_spawn = Some(pending.clone());
+
+        apply_listing(&mut ui, vec![preexisting.clone(), selected.clone()]);
+
+        assert_eq!(selected_id(&ui), Some("selected"));
+        assert_eq!(ui.pending_spawn, Some(pending));
+
+        let spawned = session(BackendKind::Opencode, "spawned", 10_150, false);
+        apply_listing(&mut ui, vec![preexisting, spawned, selected]);
+
+        assert_eq!(selected_id(&ui), Some("spawned"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
+    #[test]
+    fn snapshot_without_spawned_row_preserves_selection_and_pending_target() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, Some("new"), 10_000));
+
+        apply_listing(
+            &mut ui,
+            vec![old, session(BackendKind::Codex, "other", 10_001, false)],
+        );
+
+        assert_eq!(selected_id(&ui), Some("old"));
+        assert_eq!(
+            ui.pending_spawn,
+            Some(pending(BackendKind::Codex, Some("new"), 10_000))
+        );
+        assert!(
+            !ui.pulses
+                .contains_key(&(BackendKind::Codex, "new".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_snapshot_containing_spawned_row_selects_and_consumes_it() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let new = session(BackendKind::Codex, "new", 10_100, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, Some("new"), 10_000));
+
+        apply_listing(&mut ui, vec![old, new]);
+
+        assert_eq!(selected_id(&ui), Some("new"));
+        assert!(ui.pending_spawn.is_none());
+        assert!(
+            ui.pulses
+                .contains_key(&(BackendKind::Codex, "new".to_string()))
+        );
+    }
+
+    #[test]
+    fn following_reordered_snapshot_stays_anchored_to_spawned_row() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let new = session(BackendKind::Codex, "new", 10_100, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, Some("new"), 10_000));
+
+        apply_listing(&mut ui, vec![old.clone(), new.clone()]);
+        assert_eq!(selected_id(&ui), Some("new"));
+        let first_pulse = ui
+            .pulses
+            .get(&(BackendKind::Codex, "new".to_string()))
+            .copied();
+
+        apply_listing(
+            &mut ui,
+            vec![
+                session(BackendKind::Codex, "newest", 20_000, false),
+                new,
+                old,
+            ],
+        );
+
+        assert_eq!(selected_id(&ui), Some("new"));
+        assert!(ui.pending_spawn.is_none());
+        assert_eq!(
+            ui.pulses
+                .get(&(BackendKind::Codex, "new".to_string()))
+                .copied(),
+            first_pulse
+        );
+    }
+
+    #[test]
+    fn invisible_spawned_row_does_not_consume_pending_selection() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let hidden = session(BackendKind::Codex, "new", 10_100, true);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, Some("new"), 10_000));
+
+        apply_listing(&mut ui, vec![old, hidden]);
+
+        assert_eq!(selected_id(&ui), Some("old"));
+        assert_eq!(
+            ui.pending_spawn,
+            Some(pending(BackendKind::Codex, Some("new"), 10_000))
+        );
+        assert!(
+            !ui.pulses
+                .contains_key(&(BackendKind::Codex, "new".to_string()))
+        );
+    }
 
     #[test]
     fn backend_error_show_dedups_and_respects_action_notice() {

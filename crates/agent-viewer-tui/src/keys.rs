@@ -535,6 +535,7 @@ pub(crate) mod tests {
             models: agent_viewer_tui::model_cache::ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
+            pending_spawn: None,
             pending_reply: None,
             attached: HashMap::new(),
             focused: None,
@@ -844,7 +845,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
-        ) -> agent_viewer_core::Result<Option<u32>> {
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by the rename key tests")
         }
         fn attach_command(

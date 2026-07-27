@@ -96,6 +96,9 @@ opencode has too many models to cycle, so it stays on its default there (use `/m
 target directory is the selected row's project root (by-project view) or its exact cwd
 (by-state view). While the composer is empty, the single-letter command keys below still fire;
 once you have typed anything, every printable key (and space) is task text, and `Esc` clears it.
+After a spawn, the list selects the new row in the first selectable snapshot that contains it and
+keeps that selection. When a backend does not return a new identifier, rows that existed before
+submission are excluded while finding the new one.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
@@ -128,7 +131,8 @@ prominent header: `Awaiting approval: <command/patch>` for Codex or `Awaiting in
 falling back to status and cwd only when it has none. `Space` again or moving the cursor
 collapses it. `Ctrl+R` turns the selected row itself into an empty edit field — type the new
 name, `Enter` commits, `Esc` cancels, and `Enter` on a blank field cancels too. Neither is a
-modal.
+modal. A Codex rename is retained immediately in its session index, even when its SQLite title
+still shows the prompt.
 
 ## Keys
 

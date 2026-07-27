@@ -12,7 +12,8 @@ use agent_viewer_core::codex::app_server::{
 use agent_viewer_core::codex::status::open_rollout_paths;
 use agent_viewer_core::default_codex_home;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Poll `list()` until `pred` matches a session or the deadline passes.
@@ -51,6 +52,32 @@ where
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+/// Read the latest valid persisted name for one thread from Codex's append only index.
+fn latest_indexed_thread_name(path: &Path, thread_id: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut latest = None;
+
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object.get("id").and_then(Value::as_str) != Some(thread_id) {
+            continue;
+        }
+        let Some(name) = object.get("thread_name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !name.is_empty() {
+            latest = Some(name.to_string());
+        }
+    }
+
+    latest
 }
 
 /// The regression guard for the read-only-sandbox bug: a viewer-spawned session must be able
@@ -521,6 +548,99 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
 
     // Tidy: keep the box's session list clean.
     let _ = backend.hide(&thread_id);
+}
+
+#[test]
+#[ignore = "live: needs a reachable codex app server daemon and network"]
+fn codex_spawn_identity_and_immediate_rename_persists() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo)
+            .status()
+            .expect("run git init")
+            .success(),
+        "git init failed"
+    );
+
+    let codex_home = default_codex_home();
+    let session_index = codex_home.join("session_index.jsonl");
+    let mut backend = CodexBackend::new(codex_home);
+    let spawned = backend
+        .spawn(
+            &repo,
+            "Run exactly this one shell command and then stop: sleep 12. \
+             Do not do anything else.",
+            None,
+        )
+        .expect("spawn through the shared daemon");
+    assert_eq!(
+        spawned.pid, None,
+        "a daemon hosted thread has no killable process id"
+    );
+    let thread_id = spawned
+        .session_id
+        .expect("daemon spawn must return its exact thread identity");
+
+    let session = poll_session(&mut backend, Duration::from_secs(30), |session| {
+        session.id == thread_id
+    })
+    .expect("the exact spawned thread never appeared in list()");
+    assert!(
+        session.daemon_hosted,
+        "the returned identity must resolve to a row hosted by the shared daemon"
+    );
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock follows the Unix epoch")
+        .as_nanos();
+    let user_name = format!("viewer immediate rename {nonce}");
+    backend
+        .rename(&session, &user_name)
+        .expect("rename immediately on the hosting daemon");
+
+    let index_start = Instant::now();
+    let mut indexed_name = None;
+    while index_start.elapsed() < Duration::from_secs(30) {
+        indexed_name = latest_indexed_thread_name(&session_index, &thread_id);
+        if indexed_name.as_deref() == Some(user_name.as_str()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        indexed_name.as_deref(),
+        Some(user_name.as_str()),
+        "thread name set must persist the requested name in the session index"
+    );
+
+    poll_session(&mut backend, Duration::from_secs(180), |session| {
+        session.id == thread_id && session.status == Status::Done
+    })
+    .expect("renamed thread never finished");
+
+    let mut later_titles = Vec::new();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(1));
+        let title = backend
+            .list()
+            .expect("list after completion")
+            .into_iter()
+            .find(|session| session.id == thread_id)
+            .expect("spawned thread remains listed")
+            .title;
+        later_titles.push(title);
+    }
+
+    let cleanup = backend.hide(&thread_id);
+    assert!(
+        later_titles.iter().all(|title| title == &user_name),
+        "backend listing did not overlay the persisted user name: {later_titles:?}"
+    );
+    cleanup.expect("hide the live test thread");
 }
 
 /// A real `codex exec` session must be classified as unjoinable on live data, and its attach
