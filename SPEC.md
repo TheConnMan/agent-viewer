@@ -54,13 +54,13 @@ supplies rows, status, or any field other than the name.
 ## Enumeration and runtime: opencode
 
 The primary OpenCode authority is a secured loopback server. The viewer probes fixed candidates
-`127.0.0.1:4096`, then `127.0.0.1:4097`. It never stops or restarts a server. Spawn alone may
+`127.0.0.1:4097`, then `127.0.0.1:4098`. It never stops or restarts a server. Spawn alone may
 start `opencode serve --hostname 127.0.0.1 --port <port>`, always from the user home directory.
 The child inherits the normal environment and overrides only `OPENCODE_SERVER_USERNAME` and
-`OPENCODE_SERVER_PASSWORD`.
+`OPENCODE_SERVER_PASSWORD`. Task shells receive neither credential.
 
 Credentials use nonempty environment overrides when supplied, otherwise a generated stable
-secret in viewer SQLite. The viewer stores no OpenCode jobs there. `~/.local/share/opencode/opencode.db`
+secret in owner only credential files. SQLite stores only viewer presentation state. `~/.local/share/opencode/opencode.db`
 is opened read only as compatibility enumeration when no secure server is available.
 That fallback retains parent and run mode companion classification through the stored `permission`
 field.
@@ -75,9 +75,9 @@ same stream requirement is load bearing because Linux `TCP_DEFER_ACCEPT` delayed
 until the initial health write.
 
 The pin contains pid, start time, listener inode, effective uid, and exact argv. Runtime state
-contains a generation, pin, healthy state, and managed ids. A short state lock protects state;
-a separate startup mutex serializes starts. An occupied listener that returns `200` to unauthenticated
-health is insecure and rejected, never stopped or restarted. Spawn may use `4097` if it is free.
+contains a generation, pin, healthy state, and managed ids. Process shared ownership uses only
+`flock`; each viewer process serializes its own work locally. An occupied listener that returns `200` to unauthenticated
+health is insecure and rejected, never stopped or restarted. Spawn may use `4098` if it is free.
 
 The HTTP client is bounded HTTP/1.1 over `TcpStream`, with strict content framing, bodyless
 `204` handling, no redirects, and bounded headers, body, and timeouts.
@@ -95,10 +95,9 @@ and question are fetched once per unique active managed directory. A failure aff
 directory's rows, including external rows, which become `Unknown`. Otherwise external server
 enumerated rows use compatibility `Idle` status.
 
-Server mutations apply only to exact managed rows. Managed sessions attach through the authenticated
-server with `opencode attach http://<endpoint> -s <session_id>` and username and password environment
-values. External rows use `opencode -s <session_id>`. External deletion remains local
-`opencode session delete <id>`. `read_last_message` remains a core live proof.
+Server mutations apply only to exact managed rows. Managed attach is refused because it would
+expose credentials. External rows use `opencode -s <session_id>`. External deletion remains local
+`opencode session delete <id>`.
 
 ## Enumeration — claude, and the nested `claude -p` companion rule
 

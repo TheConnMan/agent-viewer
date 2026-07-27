@@ -1352,6 +1352,48 @@ pub(crate) mod tests {
         }
     }
 
+    struct RowScopedArchivingBackend;
+
+    impl agent_viewer_core::Backend for RowScopedArchivingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Opencode
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                archive: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+
+        fn capabilities_for(&self, session: &Session) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                archive: session.daemon_hosted,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by row scoped archive tests")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawn is not exercised by row scoped archive tests")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by row scoped archive tests")
+        }
+    }
+
     #[test]
     fn ctrl_r_opens_rename_with_an_empty_buffer() {
         // DELIBERATE DIVERGENCE from Fleet View, which prefills Ctrl+R with the current
@@ -2506,6 +2548,27 @@ pub(crate) mod tests {
             );
             assert!(ui.composer.is_empty());
         }
+    }
+
+    #[test]
+    fn archive_action_refuses_external_row_and_submits_managed_row() {
+        let mut external = sess("external", "/tmp/external", 200);
+        external.backend = BackendKind::Opencode;
+        let mut managed = sess("managed", "/tmp/managed", 100);
+        managed.backend = BackendKind::Opencode;
+        managed.daemon_hosted = true;
+        let mut ui = test_ui_with(vec![external, managed]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(RowScopedArchivingBackend)];
+
+        select_session_row(&mut ui, "external");
+        crate::actions::hide_selected(&backends, &mut ui, true);
+        assert!(!ui.mutations.in_flight("opencode:external:hide"));
+        assert_eq!(ui.notice.text(), "opencode does not support hide");
+
+        select_session_row(&mut ui, "managed");
+        crate::actions::hide_selected(&backends, &mut ui, true);
+        assert!(ui.mutations.in_flight("opencode:managed:hide"));
     }
 
     #[test]

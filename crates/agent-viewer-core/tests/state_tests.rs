@@ -39,6 +39,14 @@ fn temp_db_path() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path)
+        .expect("path metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
 #[test]
 fn opencode_server_secret_is_stable_random_and_shared_by_concurrent_openers() {
     let (_dir, path) = temp_db_path();
@@ -87,7 +95,35 @@ fn opencode_server_secret_is_stable_random_and_shared_by_concurrent_openers() {
 }
 
 #[test]
-fn viewer_db_enforces_private_state_directory_mode() {
+fn opencode_server_secrets_are_distinct_across_independent_databases() {
+    let roots = (0..6)
+        .map(|_| tempfile::TempDir::new().unwrap())
+        .collect::<Vec<_>>();
+    let secrets = roots
+        .iter()
+        .map(|root| {
+            ViewerDb::open(&root.path().join("viewer.db"))
+                .expect("open independent viewer db")
+                .opencode_server_secret()
+                .expect("create independent server secret")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        secrets.iter().collect::<HashSet<_>>().len(),
+        secrets.len(),
+        "independent databases must not share a server secret"
+    );
+    for secret in secrets {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(secret)
+            .expect("secret is standard Base64");
+        assert_eq!(decoded.len(), 32, "the stored secret has 256 bits");
+    }
+}
+
+#[test]
+fn viewer_db_open_preserves_an_existing_parent_directory_mode() {
     let root = tempfile::TempDir::new().unwrap();
     let state_dir = root.path().join("state");
     std::fs::create_dir(&state_dir).unwrap();
@@ -95,32 +131,43 @@ fn viewer_db_enforces_private_state_directory_mode() {
 
     ViewerDb::open(&state_dir.join("viewer.db")).expect("open viewer db");
 
-    let mode = std::fs::metadata(&state_dir)
-        .expect("state directory metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o700);
+    assert_eq!(mode(&state_dir), 0o755);
 }
 
 #[test]
-fn detached_spawn_log_is_private_even_when_preexisting_mode_is_permissive() {
+fn viewer_db_open_creates_a_new_state_leaf_with_owner_only_mode() {
     let root = tempfile::TempDir::new().unwrap();
-    let log_path = root.path().join("logs").join("opencode-server.log");
-    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
-    std::fs::write(&log_path, b"existing\n").unwrap();
-    std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o666)).unwrap();
-    let mut command = std::process::Command::new("sh");
-    command.args(["-c", "printf started"]);
+    let state_parent = root.path().join("state");
+    std::fs::create_dir(&state_parent).unwrap();
+    std::fs::set_permissions(&state_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state_leaf = state_parent.join("agent-viewer");
 
-    agent_viewer_core::spawn::spawn_detached(command, &log_path).expect("spawn writer");
+    ViewerDb::open(&state_leaf.join("viewer.db")).expect("open viewer db");
 
-    let mode = std::fs::metadata(&log_path)
-        .expect("log metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o600);
+    assert_eq!(mode(&state_parent), 0o755);
+    assert_eq!(mode(&state_leaf), 0o700);
+}
+
+#[test]
+fn viewer_db_open_keeps_database_and_sqlite_sidecars_owner_only() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    db.set_group_collapsed("project:/sidecars", true)
+        .expect("write state to create sqlite sidecars");
+
+    for path in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        assert!(path.exists(), "SQLite must create {}", path.display());
+        assert_eq!(
+            mode(&path) & 0o077,
+            0,
+            "{} must be owner only",
+            path.display()
+        );
+    }
 }
 
 #[test]

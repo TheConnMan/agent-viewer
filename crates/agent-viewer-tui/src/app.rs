@@ -119,6 +119,38 @@ pub enum KillStage {
 /// How long an armed Ctrl+X stays live before the second press re-arms instead of removing.
 const KILL_ARM_WINDOW_MS: i64 = 2_000;
 
+fn sanitize_session_titles(sessions: &mut [Session]) {
+    for session in sessions {
+        session.title.retain(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{00AD}'
+                        | '\u{0600}'..='\u{0605}'
+                        | '\u{061C}'
+                        | '\u{06DD}'
+                        | '\u{070F}'
+                        | '\u{0890}'..='\u{0891}'
+                        | '\u{08E2}'
+                        | '\u{180E}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2066}'..='\u{206F}'
+                        | '\u{FEFF}'
+                        | '\u{FFF9}'..='\u{FFFB}'
+                        | '\u{110BD}'
+                        | '\u{110CD}'
+                        | '\u{13430}'..='\u{1343F}'
+                        | '\u{1BCA0}'..='\u{1BCA3}'
+                        | '\u{1D173}'..='\u{1D17A}'
+                        | '\u{E0001}'
+                        | '\u{E0020}'..='\u{E007F}'
+                )
+        });
+    }
+}
+
 pub struct App {
     sessions: Vec<Session>,
     selected: usize,
@@ -144,6 +176,8 @@ pub struct App {
 
 impl App {
     pub fn new(sessions: Vec<Session>) -> App {
+        let mut sessions = sessions;
+        sanitize_session_titles(&mut sessions);
         let mut app = App {
             sessions,
             selected: 0,
@@ -168,6 +202,8 @@ impl App {
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let session_anchor = self.selected().map(|s| (s.backend, s.id.clone()));
         let header_anchor = self.selected_header_key();
+        let mut sessions = sessions;
+        sanitize_session_titles(&mut sessions);
         self.sessions = sessions;
         self.rebuild_rows();
         if let Some(anchor) = session_anchor

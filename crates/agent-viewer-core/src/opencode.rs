@@ -1,18 +1,19 @@
 use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin, Status};
-use crate::codex::rollout::TranscriptItem;
 use crate::error::{AttachRefusal, Error, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -52,7 +53,6 @@ struct RuntimeInner {
     launcher: Arc<Launcher>,
     secure: Option<SecureRuntimeConfig>,
     state: Mutex<RuntimeState>,
-    startup: Mutex<()>,
 }
 
 struct SecureRuntimeConfig {
@@ -69,8 +69,8 @@ struct RuntimeState {
     pin: Option<ServerPin>,
     healthy: bool,
     managed_ids: HashSet<String>,
-    rejected_endpoint: Option<SocketAddr>,
-    legacy_endpoint: Option<SocketAddr>,
+    managed_ids_pin: Option<ServerPin>,
+    managed_server_pin: Option<ServerPin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +82,19 @@ struct ServerPin {
     argv: Vec<OsString>,
     endpoint: SocketAddr,
     generation: u64,
+}
+
+#[derive(Clone)]
+struct ManagedLease {
+    pin: ServerPin,
+    id: String,
+}
+
+#[derive(Clone, Copy)]
+enum RequestAuthority<'a> {
+    CurrentPin,
+    ManagedServer,
+    ManagedId(&'a str),
 }
 
 #[derive(Clone)]
@@ -131,6 +144,16 @@ enum PreflightFailure {
     Unavailable(String),
 }
 
+struct AdvisoryLockEntry {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+struct AdvisoryLockGuard {
+    local: Arc<AdvisoryLockEntry>,
+    file: File,
+}
+
 impl PreflightFailure {
     fn into_message(self) -> String {
         match self {
@@ -151,8 +174,8 @@ impl OpencodeRuntime {
         let launcher_log_path = log_path.clone();
         Self::from_parts(
             [
-                SocketAddr::from(([127, 0, 0, 1], 4096)),
                 SocketAddr::from(([127, 0, 0, 1], 4097)),
+                SocketAddr::from(([127, 0, 0, 1], 4098)),
             ],
             SERVER_STARTUP_TIMEOUT,
             durable_cwd,
@@ -171,30 +194,6 @@ impl OpencodeRuntime {
                 before_authorized_write: None,
                 startup_log_path: Some(log_path),
             }),
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn for_test<L>(
-        candidates: [SocketAddr; 2],
-        startup_timeout: Duration,
-        durable_cwd: PathBuf,
-        launcher: L,
-    ) -> Self
-    where
-        L: Fn(Command) -> io::Result<()> + Send + Sync + 'static,
-    {
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.ip().is_loopback())
-        );
-        Self::from_parts(
-            candidates,
-            startup_timeout,
-            durable_cwd,
-            Arc::new(move |command| launcher(command).map(|()| 0)),
-            None,
         )
     }
 
@@ -236,20 +235,20 @@ impl OpencodeRuntime {
                 launcher,
                 secure,
                 state: Mutex::new(RuntimeState::default()),
-                startup: Mutex::new(()),
             }),
         }
     }
 
     fn compatibility_only() -> Self {
-        Self::for_test(
+        Self::from_parts(
             [
                 SocketAddr::from(([127, 0, 0, 1], 0)),
                 SocketAddr::from(([127, 0, 0, 1], 0)),
             ],
             Duration::from_millis(20),
             PathBuf::from("/"),
-            |_| Err(io::Error::other("compatibility runtime cannot launch")),
+            Arc::new(|_| Err(io::Error::other("compatibility runtime cannot launch"))),
+            None,
         )
     }
 
@@ -261,14 +260,9 @@ impl OpencodeRuntime {
     }
 
     fn health_timeout(&self) -> Duration {
-        let probe_timeout = if self.inner.secure.is_some() {
-            SECURE_HEALTH_PROBE_TIMEOUT
-        } else {
-            HEALTH_PROBE_TIMEOUT
-        };
         self.inner
             .startup_timeout
-            .min(probe_timeout)
+            .min(SECURE_HEALTH_PROBE_TIMEOUT)
             .max(Duration::from_millis(1))
     }
 
@@ -280,12 +274,8 @@ impl OpencodeRuntime {
         body: Option<&Value>,
         timeout: Duration,
     ) -> std::result::Result<HttpReply, String> {
-        if self.inner.secure.is_some() {
-            let credentials = self.credentials()?;
-            self.authorized_request(endpoint, method, target, body, timeout, &credentials)
-        } else {
-            raw_http_request(endpoint, method, target, body, None, timeout)
-        }
+        let credentials = self.credentials()?;
+        self.authorized_request(endpoint, method, target, body, timeout, &credentials)
     }
 
     fn request_json<T: serde::de::DeserializeOwned>(
@@ -304,7 +294,6 @@ impl OpencodeRuntime {
                 method,
                 target,
                 reply.status,
-                &String::from_utf8_lossy(&reply.body),
             )));
         }
         serde_json::from_slice(&reply.body).map_err(|error| {
@@ -312,16 +301,63 @@ impl OpencodeRuntime {
         })
     }
 
-    fn expect_status(
+    fn managed_request_json<T: serde::de::DeserializeOwned>(
         &self,
-        endpoint: SocketAddr,
+        lease: &ManagedLease,
+        method: &str,
+        target: &str,
+        body: Option<&Value>,
+        expected_status: u16,
+    ) -> Result<T> {
+        self.revalidate_managed_lease(lease)?;
+        let credentials = self.credentials().map_err(Error::Command)?;
+        let reply = self
+            .authorized_request_with_pin(
+                &lease.pin,
+                RequestParts {
+                    method,
+                    target,
+                    body,
+                },
+                HTTP_REQUEST_TIMEOUT,
+                &credentials,
+                RequestAuthority::ManagedId(&lease.id),
+            )
+            .map_err(Error::Command)?;
+        if reply.status != expected_status {
+            return Err(Error::Command(http_status_error(
+                method,
+                target,
+                reply.status,
+            )));
+        }
+        serde_json::from_slice(&reply.body).map_err(|error| {
+            Error::Command(format!("{method} {target} returned invalid JSON: {error}"))
+        })
+    }
+
+    fn managed_expect_status(
+        &self,
+        lease: &ManagedLease,
         method: &str,
         target: &str,
         body: Option<&Value>,
         expected_status: u16,
     ) -> Result<()> {
+        self.revalidate_managed_lease(lease)?;
+        let credentials = self.credentials().map_err(Error::Command)?;
         let reply = self
-            .request(endpoint, method, target, body, HTTP_REQUEST_TIMEOUT)
+            .authorized_request_with_pin(
+                &lease.pin,
+                RequestParts {
+                    method,
+                    target,
+                    body,
+                },
+                HTTP_REQUEST_TIMEOUT,
+                &credentials,
+                RequestAuthority::ManagedId(&lease.id),
+            )
             .map_err(Error::Command)?;
         if reply.status == expected_status {
             Ok(())
@@ -330,236 +366,114 @@ impl OpencodeRuntime {
                 method,
                 target,
                 reply.status,
-                &String::from_utf8_lossy(&reply.body),
             )))
         }
     }
 
-    fn probe_health_legacy(
+    fn managed_server_request_json<T: serde::de::DeserializeOwned>(
         &self,
-        candidate: SocketAddr,
-        timeout: Duration,
-    ) -> std::result::Result<(), String> {
-        let reply = raw_http_request(
-            candidate,
-            "GET",
-            "/global/health",
-            None,
-            None,
-            timeout.min(self.health_timeout()),
-        )?;
-        if reply.status != 200 {
-            return Err(http_status_error(
-                "GET",
-                "/global/health",
+        pin: &ServerPin,
+        method: &str,
+        target: &str,
+        body: Option<&Value>,
+        expected_status: u16,
+    ) -> Result<T> {
+        let credentials = self.credentials().map_err(Error::Command)?;
+        let reply = self
+            .authorized_request_with_pin(
+                pin,
+                RequestParts {
+                    method,
+                    target,
+                    body,
+                },
+                HTTP_REQUEST_TIMEOUT,
+                &credentials,
+                RequestAuthority::ManagedServer,
+            )
+            .map_err(Error::Command)?;
+        if reply.status != expected_status {
+            return Err(Error::Command(http_status_error(
+                method,
+                target,
                 reply.status,
-                &String::from_utf8_lossy(&reply.body),
-            ));
+            )));
         }
-        let health: HealthResponse = serde_json::from_slice(&reply.body)
-            .map_err(|error| format!("invalid health JSON: {error}"))?;
-        if health.healthy && !health.version.is_empty() {
+        serde_json::from_slice(&reply.body).map_err(|error| {
+            Error::Command(format!("{method} {target} returned invalid JSON: {error}"))
+        })
+    }
+
+    fn managed_server_expect_status(
+        &self,
+        pin: &ServerPin,
+        method: &str,
+        target: &str,
+        body: Option<&Value>,
+        expected_status: u16,
+    ) -> Result<()> {
+        let credentials = self.credentials().map_err(Error::Command)?;
+        let reply = self
+            .authorized_request_with_pin(
+                pin,
+                RequestParts {
+                    method,
+                    target,
+                    body,
+                },
+                HTTP_REQUEST_TIMEOUT,
+                &credentials,
+                RequestAuthority::ManagedServer,
+            )
+            .map_err(Error::Command)?;
+        if reply.status == expected_status {
             Ok(())
         } else {
-            Err("health response did not contain healthy true and a version".to_string())
+            Err(Error::Command(http_status_error(
+                method,
+                target,
+                reply.status,
+            )))
         }
     }
 
-    fn probe_candidates_legacy(
-        &self,
-        deadline: Option<Instant>,
-    ) -> (Option<SocketAddr>, Vec<(SocketAddr, String)>) {
-        let mut failures = Vec::new();
-        for (index, candidate) in self.inner.candidates.iter().copied().enumerate() {
-            let timeout = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        failures.push((candidate, "startup deadline elapsed".to_string()));
-                        continue;
-                    }
-                    let slots = (self.inner.candidates.len() - index) as u32;
-                    (remaining / slots)
-                        .min(self.health_timeout())
-                        .max(Duration::from_millis(1))
-                }
-                None => self.health_timeout(),
-            };
-            match self.probe_health_legacy(candidate, timeout) {
-                Ok(()) => return (Some(candidate), failures),
-                Err(error) => failures.push((candidate, error)),
-            }
+    fn revalidate_managed_lease(&self, lease: &ManagedLease) -> Result<()> {
+        if !self.managed_lease_is_current(&lease.pin, &lease.id) {
+            return Err(Error::Unsupported(BackendKind::Opencode.name()));
         }
-        (None, failures)
+        let credentials = self.credentials().map_err(Error::Command)?;
+        if let Err(error) = self.authenticated_health(&lease.pin, &credentials) {
+            self.publish_health(&lease.pin, false);
+            return Err(Error::Command(credentials.sanitize(&error)));
+        }
+        if self.managed_lease_is_current(&lease.pin, &lease.id) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(BackendKind::Opencode.name()))
+        }
     }
 
-    fn probe(&self) -> Option<SocketAddr> {
-        if self.inner.secure.is_some() {
-            return match self.probe_secure() {
-                Ok(SecureProbe::Healthy(pin)) => Some(pin.endpoint),
-                Ok(SecureProbe::Missing | SecureProbe::PinnedUnhealthy(_)) | Err(_) => None,
-            };
+    fn ensure_server(&self) -> std::result::Result<ServerPin, String> {
+        if self.inner.secure.is_none() {
+            return Err("secure OpenCode server runtime is unavailable".to_string());
         }
-        self.probe_legacy()
-    }
-
-    fn ensure_server(&self) -> std::result::Result<SocketAddr, String> {
-        if self.inner.secure.is_some() {
-            return self.ensure_secure_server().map(|pin| pin.endpoint);
-        }
-        self.ensure_legacy_server()
-    }
-
-    fn probe_legacy(&self) -> Option<SocketAddr> {
-        let cached = self.state().legacy_endpoint;
-        if let Some(endpoint) = cached {
-            let _ = self.probe_health_legacy(endpoint, self.health_timeout());
-            return Some(endpoint);
-        }
-        let (endpoint, _) = self.probe_candidates_legacy(None);
-        self.state().legacy_endpoint = endpoint;
-        endpoint
-    }
-
-    fn ensure_legacy_server(&self) -> std::result::Result<SocketAddr, String> {
-        let _startup = self.startup();
-        if let Some(endpoint) = self.probe_legacy() {
-            return Ok(endpoint);
-        }
-        let deadline = Instant::now() + self.inner.startup_timeout;
-        let (endpoint, mut failures) = self.probe_candidates_legacy(Some(deadline));
-        if let Some(endpoint) = endpoint {
-            self.state().legacy_endpoint = Some(endpoint);
-            return Ok(endpoint);
-        }
-
-        for (index, candidate) in self.inner.candidates.iter().copied().enumerate() {
-            if Instant::now() >= deadline {
-                note_candidate_failure(
-                    &mut failures,
-                    candidate,
-                    "startup deadline elapsed".to_string(),
-                );
-                break;
-            }
-            match TcpListener::bind(candidate) {
-                Ok(listener) => drop(listener),
-                Err(error) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let candidates_left = (self.inner.candidates.len() - index) as u32;
-                    let candidate_deadline = Instant::now() + remaining / candidates_left;
-                    let mut health_error = "server did not become healthy".to_string();
-                    while Instant::now() < candidate_deadline {
-                        let remaining =
-                            candidate_deadline.saturating_duration_since(Instant::now());
-                        match self
-                            .probe_health_legacy(candidate, remaining.min(self.health_timeout()))
-                        {
-                            Ok(()) => {
-                                self.state().legacy_endpoint = Some(candidate);
-                                return Ok(candidate);
-                            }
-                            Err(error) => health_error = error,
-                        }
-                        std::thread::sleep(
-                            READINESS_POLL_INTERVAL
-                                .min(candidate_deadline.saturating_duration_since(Instant::now())),
-                        );
-                    }
-                    note_candidate_failure(
-                        &mut failures,
-                        candidate,
-                        format!("port is occupied ({error}); health failed: {health_error}"),
-                    );
-                    continue;
-                }
-            }
-
-            let mut command = Command::new("opencode");
-            command
-                .arg("serve")
-                .arg("--hostname")
-                .arg("127.0.0.1")
-                .arg("--port")
-                .arg(candidate.port().to_string())
-                .current_dir(&self.inner.durable_cwd);
-            if let Err(error) = (self.inner.launcher)(command) {
-                note_candidate_failure(
-                    &mut failures,
-                    candidate,
-                    format!("could not start server: {error}"),
-                );
-                continue;
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let candidates_left = (self.inner.candidates.len() - index) as u32;
-            let candidate_deadline = Instant::now() + remaining / candidates_left;
-            let mut last_health_error = "server did not become healthy".to_string();
-            while Instant::now() < candidate_deadline {
-                let remaining = candidate_deadline.saturating_duration_since(Instant::now());
-                match self.probe_health_legacy(candidate, remaining.min(self.health_timeout())) {
-                    Ok(()) => {
-                        self.state().legacy_endpoint = Some(candidate);
-                        return Ok(candidate);
-                    }
-                    Err(error) => last_health_error = error,
-                }
-                std::thread::sleep(
-                    READINESS_POLL_INTERVAL
-                        .min(candidate_deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            note_candidate_failure(
-                &mut failures,
-                candidate,
-                format!("readiness timed out: {last_health_error}"),
-            );
-        }
-
-        let failure = format_candidate_failures(&failures);
-        Err(failure)
+        self.ensure_secure_server()
     }
 
     fn healthy_tier(&self) -> bool {
         let state = self.state();
-        if self.inner.secure.is_some() {
-            state.healthy && state.pin.is_some()
-        } else {
-            state.legacy_endpoint.is_some()
-        }
+        self.inner.secure.is_some() && state.healthy && state.pin.is_some()
     }
 
-    fn require_server(&self) -> Result<SocketAddr> {
-        if self.inner.secure.is_some() {
-            match self.probe_secure().map_err(Error::Command)? {
-                SecureProbe::Healthy(pin) => Ok(pin.endpoint),
-                SecureProbe::Missing => Err(Error::Unsupported(BackendKind::Opencode.name())),
-                SecureProbe::PinnedUnhealthy(error) => Err(Error::Command(error)),
-            }
-        } else {
-            self.probe()
-                .ok_or(Error::Unsupported(BackendKind::Opencode.name()))
+    fn server_for_listing(&self) -> Result<Option<ServerPin>> {
+        if self.inner.secure.is_none() {
+            return Ok(None);
         }
-    }
-
-    fn server_for_listing(&self) -> Result<Option<SocketAddr>> {
-        if self.inner.secure.is_some() {
-            match self.probe_secure().map_err(Error::Command)? {
-                SecureProbe::Healthy(pin) => Ok(Some(pin.endpoint)),
-                SecureProbe::Missing => Ok(None),
-                SecureProbe::PinnedUnhealthy(error) => Err(Error::Command(error)),
-            }
-        } else {
-            Ok(self.probe())
+        match self.probe_secure().map_err(Error::Command)? {
+            SecureProbe::Healthy(pin) => Ok(Some(pin)),
+            SecureProbe::Missing => Ok(None),
+            SecureProbe::PinnedUnhealthy(error) => Err(Error::Command(error)),
         }
-    }
-
-    fn startup(&self) -> MutexGuard<'_, ()> {
-        self.inner
-            .startup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn credentials(&self) -> std::result::Result<Credentials, String> {
@@ -605,19 +519,13 @@ impl OpencodeRuntime {
     }
 
     fn probe_secure(&self) -> std::result::Result<SecureProbe, String> {
-        let credentials = self.credentials()?;
         let current_pin = { self.state().pin.clone() };
         if let Some(pin) = current_pin {
             if !identity_still_matches(self.secure_config()?.proc_root.as_path(), &pin) {
                 self.reject_pin(&pin);
-                return self.discover_secure(&credentials, Some(pin.endpoint));
+                return self.discover_secure(Some(pin.endpoint));
             }
-            if !self.state().healthy {
-                return Ok(SecureProbe::PinnedUnhealthy(format!(
-                    "OpenCode server on port {} is pinned but unhealthy",
-                    pin.endpoint.port()
-                )));
-            }
+            let credentials = self.credentials()?;
             match self.authenticated_health(&pin, &credentials) {
                 Ok(()) => return Ok(SecureProbe::Healthy(pin)),
                 Err(error) => {
@@ -626,28 +534,40 @@ impl OpencodeRuntime {
                         return Ok(SecureProbe::PinnedUnhealthy(error));
                     }
                     self.reject_pin(&pin);
-                    return self.discover_secure(&credentials, Some(pin.endpoint));
+                    return self.discover_secure(Some(pin.endpoint));
                 }
             }
         }
-        self.discover_secure(&credentials, None)
+        self.discover_secure(None)
     }
 
     fn discover_secure(
         &self,
-        credentials: &Credentials,
         skip: Option<SocketAddr>,
     ) -> std::result::Result<SecureProbe, String> {
-        let rejected = self.state().rejected_endpoint;
         let mut unavailable = Vec::new();
+        let mut credentials = None;
         for candidate in self.inner.candidates.iter().copied() {
-            if Some(candidate) == skip || Some(candidate) == rejected {
+            if Some(candidate) == skip {
                 continue;
             }
-            match self.probe_secure_candidate(candidate, credentials, None, self.health_timeout()) {
+            let deadline = Instant::now() + self.health_timeout();
+            let (stream, identity) = match self.preflight_connection(candidate, None, deadline) {
+                Ok(connection) => connection,
+                Err(PreflightFailure::Missing(_)) => continue,
+                Err(PreflightFailure::Unavailable(error)) => {
+                    note_candidate_failure(&mut unavailable, candidate, error);
+                    continue;
+                }
+            };
+            let credentials = match credentials.as_ref() {
+                Some(credentials) => credentials,
+                None => credentials.insert(self.credentials()?),
+            };
+            match self.authenticate_secure_candidate(stream, identity, credentials, deadline) {
                 CandidateProbe::Healthy(pin) => return Ok(SecureProbe::Healthy(pin)),
                 CandidateProbe::PinnedUnhealthy(error) => {
-                    return Ok(SecureProbe::PinnedUnhealthy(error));
+                    note_candidate_failure(&mut unavailable, candidate, error);
                 }
                 CandidateProbe::Unavailable(error) => {
                     note_candidate_failure(&mut unavailable, candidate, error);
@@ -672,30 +592,33 @@ impl OpencodeRuntime {
         timeout: Duration,
     ) -> CandidateProbe {
         let deadline = Instant::now() + timeout;
-        let (mut stream, identity) =
-            match self.preflight_connection(endpoint, expected_pid, deadline) {
-                Ok(connection) => connection,
-                Err(PreflightFailure::Missing(error)) => {
-                    return CandidateProbe::Missing(error);
-                }
-                Err(PreflightFailure::Unavailable(error)) => {
-                    return CandidateProbe::Unavailable(error);
-                }
-            };
-        let pin = self.publish_pin(identity);
+        let (stream, identity) = match self.preflight_connection(endpoint, expected_pid, deadline) {
+            Ok(connection) => connection,
+            Err(PreflightFailure::Missing(error)) => {
+                return CandidateProbe::Missing(error);
+            }
+            Err(PreflightFailure::Unavailable(error)) => {
+                return CandidateProbe::Unavailable(error);
+            }
+        };
+        self.authenticate_secure_candidate(stream, identity, credentials, deadline)
+    }
+
+    fn authenticate_secure_candidate(
+        &self,
+        mut stream: TcpStream,
+        identity: ProcessIdentity,
+        credentials: &Credentials,
+        deadline: Instant,
+    ) -> CandidateProbe {
+        let pin = match self.publish_pin(identity) {
+            Ok(pin) => pin,
+            Err(error) => return CandidateProbe::Unavailable(error),
+        };
         match self.authenticated_health_on_stream(&mut stream, &pin, credentials, deadline) {
             Ok(()) => CandidateProbe::Healthy(pin),
             Err(error) => {
-                if identity_still_matches(
-                    self.secure_config()
-                        .map(|config| config.proc_root.as_path())
-                        .unwrap_or_else(|_| Path::new("/proc")),
-                    &pin,
-                ) {
-                    self.publish_health(&pin, false);
-                } else {
-                    self.reject_pin(&pin);
-                }
+                self.reject_pin(&pin);
                 CandidateProbe::PinnedUnhealthy(error)
             }
         }
@@ -708,11 +631,14 @@ impl OpencodeRuntime {
     ) -> std::result::Result<(), String> {
         let reply = self.authorized_request_with_pin(
             pin,
-            "GET",
-            "/global/health",
-            None,
+            RequestParts {
+                method: "GET",
+                target: "/global/health",
+                body: None,
+            },
             self.health_timeout(),
             credentials,
+            RequestAuthority::CurrentPin,
         )?;
         self.accept_authenticated_health(pin, reply)
     }
@@ -734,6 +660,7 @@ impl OpencodeRuntime {
             },
             credentials,
             deadline,
+            RequestAuthority::CurrentPin,
         )?;
         self.accept_authenticated_health(pin, reply)
     }
@@ -744,12 +671,7 @@ impl OpencodeRuntime {
         reply: HttpReply,
     ) -> std::result::Result<(), String> {
         if reply.status != 200 {
-            return Err(http_status_error(
-                "GET",
-                "/global/health",
-                reply.status,
-                &String::from_utf8_lossy(&reply.body),
-            ));
+            return Err(http_status_error("GET", "/global/health", reply.status));
         }
         let health: HealthResponse = serde_json::from_slice(&reply.body)
             .map_err(|error| format!("invalid health JSON: {error}"))?;
@@ -760,8 +682,11 @@ impl OpencodeRuntime {
             self.reject_pin(pin);
             return Err("server identity changed while health was in flight".to_string());
         }
-        self.publish_health(pin, true);
-        Ok(())
+        if self.publish_health(pin, true) {
+            Ok(())
+        } else {
+            Err("server generation changed while health was in flight".to_string())
+        }
     }
 
     fn authorized_request(
@@ -779,17 +704,26 @@ impl OpencodeRuntime {
             .clone()
             .filter(|pin| pin.endpoint == endpoint)
             .ok_or_else(|| "verified OpenCode server identity is unavailable".to_string())?;
-        self.authorized_request_with_pin(&pin, method, target, body, timeout, credentials)
+        self.authorized_request_with_pin(
+            &pin,
+            RequestParts {
+                method,
+                target,
+                body,
+            },
+            timeout,
+            credentials,
+            RequestAuthority::CurrentPin,
+        )
     }
 
     fn authorized_request_with_pin(
         &self,
         pin: &ServerPin,
-        method: &str,
-        target: &str,
-        body: Option<&Value>,
+        request: RequestParts<'_>,
         timeout: Duration,
         credentials: &Credentials,
+        authority: RequestAuthority<'_>,
     ) -> std::result::Result<HttpReply, String> {
         let deadline = Instant::now() + timeout;
         let (mut stream, identity) = self
@@ -802,13 +736,10 @@ impl OpencodeRuntime {
         self.authorized_request_on_preflighted_stream(
             &mut stream,
             pin,
-            RequestParts {
-                method,
-                target,
-                body,
-            },
+            request,
             credentials,
             deadline,
+            authority,
         )
     }
 
@@ -870,6 +801,7 @@ impl OpencodeRuntime {
         request: RequestParts<'_>,
         credentials: &Credentials,
         deadline: Instant,
+        authority: RequestAuthority<'_>,
     ) -> std::result::Result<HttpReply, String> {
         if let Some(hook) = self.secure_config()?.before_authorized_write.as_ref() {
             hook();
@@ -881,8 +813,12 @@ impl OpencodeRuntime {
             Some(pin.pid),
             remaining_timeout(deadline)?,
         )?;
+        let authority_is_current = match authority {
+            RequestAuthority::CurrentPin => self.pin_is_current(pin),
+            RequestAuthority::ManagedServer => self.managed_server_is_current(pin),
+            RequestAuthority::ManagedId(id) => self.managed_lease_is_current(pin, id),
+        };
         if !pin_matches_identity(pin, &identity)
-            || !self.pin_is_current(pin)
             || accepted_connection_matches(
                 self.secure_config()?.proc_root.as_path(),
                 stream,
@@ -893,6 +829,9 @@ impl OpencodeRuntime {
         {
             self.reject_pin(pin);
             return Err("server identity changed before authorized request".to_string());
+        }
+        if !authority_is_current {
+            return Err("server authorization lease expired before request".to_string());
         }
         write_and_read_request(
             stream,
@@ -912,8 +851,14 @@ impl OpencodeRuntime {
             .ok_or_else(|| "secure runtime configuration is unavailable".to_string())
     }
 
-    fn publish_pin(&self, identity: ProcessIdentity) -> ServerPin {
+    fn publish_pin(&self, identity: ProcessIdentity) -> std::result::Result<ServerPin, String> {
         let mut state = self.state();
+        if let Some(pin) = state.pin.as_ref() {
+            if pin_matches_identity(pin, &identity) {
+                return Ok(pin.clone());
+            }
+            return Err("server identity changed during concurrent discovery".to_string());
+        }
         state.generation = state.generation.wrapping_add(1);
         let pin = ServerPin {
             pid: identity.pid,
@@ -927,14 +872,22 @@ impl OpencodeRuntime {
         state.pin = Some(pin.clone());
         state.healthy = false;
         state.managed_ids.clear();
-        state.rejected_endpoint = None;
-        pin
+        state.managed_ids_pin = None;
+        state.managed_server_pin = None;
+        Ok(pin)
     }
 
-    fn publish_health(&self, pin: &ServerPin, healthy: bool) {
+    fn publish_health(&self, pin: &ServerPin, healthy: bool) -> bool {
         let mut state = self.state();
         if state.pin.as_ref() == Some(pin) && state.generation == pin.generation {
             state.healthy = healthy;
+            if !healthy {
+                state.managed_ids.clear();
+                state.managed_ids_pin = None;
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -945,7 +898,8 @@ impl OpencodeRuntime {
             state.pin = None;
             state.healthy = false;
             state.managed_ids.clear();
-            state.rejected_endpoint = Some(pin.endpoint);
+            state.managed_ids_pin = None;
+            state.managed_server_pin = None;
         }
     }
 
@@ -954,14 +908,77 @@ impl OpencodeRuntime {
         state.generation == pin.generation && state.pin.as_ref() == Some(pin)
     }
 
-    fn ensure_secure_server(&self) -> std::result::Result<ServerPin, String> {
-        let credentials = self.credentials()?;
-        let _startup = self.startup();
-        match self.probe_secure()? {
-            SecureProbe::Healthy(pin) => return Ok(pin),
-            SecureProbe::PinnedUnhealthy(error) => return Err(error),
-            SecureProbe::Missing => {}
+    fn retire_pin(&self, pin: &ServerPin) {
+        self.reject_pin(pin);
+    }
+
+    fn publish_managed_server(&self, pin: &ServerPin) {
+        let mut state = self.state();
+        if state.healthy && state.pin.as_ref() == Some(pin) && state.generation == pin.generation {
+            state.managed_server_pin = Some(pin.clone());
         }
+    }
+
+    fn pin_allows_new_work(&self, pin: &ServerPin) -> bool {
+        {
+            let state = self.state();
+            if state.healthy
+                && state.pin.as_ref() == Some(pin)
+                && state.managed_server_pin.as_ref() == Some(pin)
+            {
+                return true;
+            }
+        }
+        if process_has_managed_server_marker(self.secure_config().ok(), pin) {
+            self.publish_managed_server(pin);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn managed_server_is_current(&self, pin: &ServerPin) -> bool {
+        let state = self.state();
+        state.healthy
+            && state.generation == pin.generation
+            && state.pin.as_ref() == Some(pin)
+            && state.managed_server_pin.as_ref() == Some(pin)
+    }
+
+    fn ensure_secure_server(&self) -> std::result::Result<ServerPin, String> {
+        match self.probe_secure()? {
+            SecureProbe::Healthy(pin) if self.pin_allows_new_work(&pin) => return Ok(pin),
+            SecureProbe::Healthy(_) | SecureProbe::Missing => {}
+            SecureProbe::PinnedUnhealthy(error) if self.state().pin.is_some() => {
+                return Err(error);
+            }
+            SecureProbe::PinnedUnhealthy(_) => {}
+        }
+
+        let _launch_lock = acquire_advisory_launch_lock(
+            &self.secure_config()?.viewer_db_path,
+            self.inner.startup_timeout,
+        )?;
+        match self.probe_secure()? {
+            SecureProbe::Healthy(pin) if self.pin_allows_new_work(&pin) => return Ok(pin),
+            SecureProbe::Healthy(pin) => {
+                let skipped = pin.endpoint;
+                self.retire_pin(&pin);
+                if let Ok(SecureProbe::Healthy(alternative)) = self.discover_secure(Some(skipped)) {
+                    if self.pin_allows_new_work(&alternative) {
+                        return Ok(alternative);
+                    }
+                    self.retire_pin(&alternative);
+                }
+            }
+            SecureProbe::PinnedUnhealthy(error) if self.state().pin.is_some() => {
+                return Err(error);
+            }
+            SecureProbe::Missing | SecureProbe::PinnedUnhealthy(_) => {}
+        }
+
+        let credentials = self.credentials()?;
+        let config_content = self.private_server_config_content()?;
         let deadline = Instant::now() + self.inner.startup_timeout;
         let mut failures = Vec::new();
         for candidate in self.inner.candidates.iter().copied() {
@@ -976,6 +993,22 @@ impl OpencodeRuntime {
             match TcpListener::bind(candidate) {
                 Ok(listener) => drop(listener),
                 Err(error) => {
+                    match self.probe_secure_candidate(
+                        candidate,
+                        &credentials,
+                        None,
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(self.health_timeout()),
+                    ) {
+                        CandidateProbe::Healthy(pin) if self.pin_allows_new_work(&pin) => {
+                            return Ok(pin);
+                        }
+                        CandidateProbe::Healthy(pin) => self.retire_pin(&pin),
+                        CandidateProbe::Missing(_)
+                        | CandidateProbe::Unavailable(_)
+                        | CandidateProbe::PinnedUnhealthy(_) => {}
+                    }
                     note_candidate_failure(
                         &mut failures,
                         candidate,
@@ -993,15 +1026,19 @@ impl OpencodeRuntime {
                 .arg(candidate.port().to_string())
                 .current_dir(&self.inner.durable_cwd)
                 .env("OPENCODE_SERVER_USERNAME", &credentials.username)
-                .env("OPENCODE_SERVER_PASSWORD", &credentials.password);
+                .env("OPENCODE_SERVER_PASSWORD", &credentials.password)
+                .env("AGENT_VIEWER_OPENCODE_SERVER", "1")
+                .env("OPENCODE_CONFIG_CONTENT", &config_content);
             let launched_pid = match (self.inner.launcher)(command) {
                 Ok(pid) => pid,
                 Err(error) => {
                     let failure = credentials.sanitize(&error.to_string());
                     note_candidate_failure(&mut failures, candidate, failure);
-                    if let Ok(SecureProbe::Healthy(pin)) = self.discover_secure(&credentials, None)
-                    {
-                        return Ok(pin);
+                    if let Ok(SecureProbe::Healthy(pin)) = self.discover_secure(None) {
+                        if self.pin_allows_new_work(&pin) {
+                            return Ok(pin);
+                        }
+                        self.retire_pin(&pin);
                     }
                     continue;
                 }
@@ -1015,9 +1052,17 @@ impl OpencodeRuntime {
                     Some(launched_pid),
                     remaining.min(self.health_timeout()),
                 ) {
-                    CandidateProbe::Healthy(pin) => return Ok(pin),
-                    CandidateProbe::PinnedUnhealthy(error) => return Err(error),
-                    CandidateProbe::Missing(error) | CandidateProbe::Unavailable(error) => {
+                    CandidateProbe::Healthy(pin) => {
+                        if self.pin_allows_new_work(&pin) {
+                            return Ok(pin);
+                        }
+                        last_error =
+                            "launched server process did not retain its managed marker".to_string();
+                        self.retire_pin(&pin);
+                    }
+                    CandidateProbe::PinnedUnhealthy(error)
+                    | CandidateProbe::Missing(error)
+                    | CandidateProbe::Unavailable(error) => {
                         last_error = error;
                     }
                 }
@@ -1025,12 +1070,20 @@ impl OpencodeRuntime {
                     READINESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
                 );
             }
+            if let Ok(SecureProbe::Healthy(pin)) = self.discover_secure(None) {
+                if self.pin_allows_new_work(&pin) {
+                    return Ok(pin);
+                }
+                self.retire_pin(&pin);
+            }
             note_candidate_failure(
                 &mut failures,
                 candidate,
                 format!("readiness timed out: {last_error}"),
             );
-            break;
+            if let Some(pin) = self.state().pin.clone() {
+                self.retire_pin(&pin);
+            }
         }
         let failure = format_candidate_failures(&failures);
         if let Some(log_path) = self.secure_config()?.startup_log_path.as_ref() {
@@ -1040,44 +1093,57 @@ impl OpencodeRuntime {
         }
     }
 
-    fn replace_managed_ids(&self, ids: HashSet<String>) {
+    fn replace_managed_ids(&self, pin: &ServerPin, ids: HashSet<String>) {
         let mut state = self.state();
-        if state.pin.is_some() && state.healthy {
+        if state.healthy && state.generation == pin.generation && state.pin.as_ref() == Some(pin) {
             state.managed_ids = ids;
+            state.managed_ids_pin = Some(pin.clone());
         }
+    }
+
+    fn managed_lease(&self, id: &str) -> Option<ManagedLease> {
+        let state = self.state();
+        let pin = state.pin.as_ref()?;
+        if !state.healthy
+            || state.managed_ids_pin.as_ref() != Some(pin)
+            || !state.managed_ids.contains(id)
+        {
+            return None;
+        }
+        Some(ManagedLease {
+            pin: pin.clone(),
+            id: id.to_string(),
+        })
+    }
+
+    fn managed_lease_is_current(&self, pin: &ServerPin, id: &str) -> bool {
+        let state = self.state();
+        state.healthy
+            && state.generation == pin.generation
+            && state.pin.as_ref() == Some(pin)
+            && state.managed_ids_pin.as_ref() == Some(pin)
+            && state.managed_ids.contains(id)
     }
 
     fn is_managed_id(&self, id: &str) -> bool {
-        if self.inner.secure.is_none() {
-            return true;
-        }
-        self.state().managed_ids.contains(id)
+        self.managed_lease(id).is_some()
     }
 
-    fn attach_credentials(&self, command: &mut Command) -> std::result::Result<(), String> {
-        if self.inner.secure.is_some() {
-            let credentials = self.credentials()?;
-            command
-                .env("OPENCODE_SERVER_USERNAME", credentials.username)
-                .env("OPENCODE_SERVER_PASSWORD", credentials.password);
-        }
-        Ok(())
-    }
-
-    pub fn read_last_message(
-        &self,
-        db_path: &Path,
-        session_id: &str,
-    ) -> Result<Option<TranscriptItem>> {
-        let Some(endpoint) = self.probe() else {
-            return read_opencode_last_message(db_path, session_id);
-        };
-        let target = format!(
-            "/session/{}/message?limit=200",
-            percent_encode(session_id.as_bytes())
-        );
-        let messages: Vec<Value> = self.request_json(endpoint, "GET", &target, None, 200)?;
-        Ok(last_server_message(messages))
+    fn private_server_config_content(&self) -> std::result::Result<String, String> {
+        let state_dir = self
+            .secure_config()?
+            .viewer_db_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| "server credential state directory is unavailable".to_string())?;
+        ensure_owner_only_directory(state_dir)?;
+        let plugin_path =
+            state_dir.join("shell.env_OPENCODE_SERVER_USERNAME_OPENCODE_SERVER_PASSWORD.js");
+        write_private_plugin(&plugin_path)?;
+        merge_opencode_config(
+            std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+            &plugin_path,
+        )
     }
 }
 
@@ -1086,6 +1152,284 @@ impl Credentials {
         message
             .replace(&self.password, "[redacted]")
             .replace(&self.authorization, "[redacted]")
+    }
+}
+
+impl Drop for AdvisoryLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+        release_local_advisory_lock(&self.local);
+    }
+}
+
+fn advisory_lock_entries() -> &'static Mutex<HashMap<PathBuf, Arc<AdvisoryLockEntry>>> {
+    static ENTRIES: OnceLock<Mutex<HashMap<PathBuf, Arc<AdvisoryLockEntry>>>> = OnceLock::new();
+    ENTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn release_local_advisory_lock(entry: &AdvisoryLockEntry) {
+    let mut held = entry
+        .held
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *held = false;
+    entry.released.notify_one();
+}
+
+fn acquire_advisory_launch_lock(
+    viewer_db_path: &Path,
+    timeout: Duration,
+) -> std::result::Result<AdvisoryLockGuard, String> {
+    let state_dir = viewer_db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "server credential state directory is unavailable".to_string())?;
+    ensure_owner_only_directory(state_dir)?;
+    let lock_path = state_dir.join("opencode_server.lock");
+    let deadline = Instant::now() + timeout;
+    let local = {
+        let mut entries = advisory_lock_entries()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(entries.entry(lock_path.clone()).or_insert_with(|| {
+            Arc::new(AdvisoryLockEntry {
+                held: Mutex::new(false),
+                released: Condvar::new(),
+            })
+        }))
+    };
+    let mut held = local
+        .held
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *held {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("server credential state launch lock timed out".to_string());
+        }
+        let (next, timeout_result) = local
+            .released
+            .wait_timeout(held, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held = next;
+        if timeout_result.timed_out() && *held {
+            return Err("server credential state launch lock timed out".to_string());
+        }
+    }
+    *held = true;
+    drop(held);
+
+    let result = (|| {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!("could not open server credential state launch lock: {error}")
+            })?;
+        if !file
+            .metadata()
+            .map_err(|error| {
+                format!("could not inspect server credential state launch lock: {error}")
+            })?
+            .is_file()
+        {
+            return Err("server credential state launch lock is not a regular file".to_string());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                format!("could not secure server credential state launch lock: {error}")
+            })?;
+
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(file);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(format!(
+                    "could not lock server credential state launch lock: {error}"
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("server credential state launch lock timed out".to_string());
+            }
+            std::thread::sleep(READINESS_POLL_INTERVAL.min(remaining));
+        }
+    })();
+
+    match result {
+        Ok(file) => Ok(AdvisoryLockGuard { local, file }),
+        Err(error) => {
+            release_local_advisory_lock(&local);
+            Err(error)
+        }
+    }
+}
+
+fn ensure_owner_only_directory(path: &Path) -> std::result::Result<(), String> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(format!(
+                    "server credential state path {} is not a directory",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or_else(|| {
+                    format!(
+                        "server credential state directory {} has no existing ancestor",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect server credential state directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) => {
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not create server credential state directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_private_plugin(path: &Path) -> std::result::Result<(), String> {
+    const PLUGIN: &str = r#"export const AgentViewerShellEnvironment = async () => ({
+  "shell.env": async (_input, output) => {
+    output.env.OPENCODE_SERVER_USERNAME = ""
+    output.env.OPENCODE_SERVER_PASSWORD = ""
+  },
+})
+"#;
+    let _write_guard = private_plugin_write_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            format!("could not write private OpenCode server credential state plugin: {error}")
+        })?;
+    if !file
+        .metadata()
+        .map_err(|error| {
+            format!("could not inspect private OpenCode server credential state plugin: {error}")
+        })?
+        .is_file()
+    {
+        return Err(
+            "private OpenCode server credential state plugin is not a regular file".to_string(),
+        );
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            format!("could not secure private OpenCode server credential state plugin: {error}")
+        })?;
+    file.write_all(PLUGIN.as_bytes()).map_err(|error| {
+        format!("could not write private OpenCode server credential state plugin: {error}")
+    })?;
+    file.sync_all().map_err(|error| {
+        format!("could not persist private OpenCode server credential state plugin: {error}")
+    })
+}
+
+fn private_plugin_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn merge_opencode_config(
+    existing: Option<&str>,
+    plugin_path: &Path,
+) -> std::result::Result<String, String> {
+    let mut config = match existing {
+        Some(content) => serde_json::from_str::<Value>(content)
+            .map_err(|_| "OPENCODE_CONFIG_CONTENT is not valid JSON".to_string())?,
+        None => json!({}),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT must contain a JSON object".to_string())?;
+    let plugin_url = private_plugin_url(plugin_path);
+    let plugins = object.entry("plugin").or_insert_with(|| json!([]));
+    let plugins = plugins
+        .as_array_mut()
+        .ok_or_else(|| "OPENCODE_CONFIG_CONTENT plugin must be an array".to_string())?;
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.as_str() == Some(&plugin_url))
+    {
+        plugins.push(Value::String(plugin_url));
+    }
+    serde_json::to_string(&config)
+        .map_err(|error| format!("could not serialize OpenCode server config: {error}"))
+}
+
+fn private_plugin_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        match *byte {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' => {
+                url.push(*byte as char);
+            }
+            byte => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
+}
+
+fn process_has_managed_server_marker(
+    config: Option<&SecureRuntimeConfig>,
+    pin: &ServerPin,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    match fs::read(config.proc_root.join(pin.pid.to_string()).join("environ")) {
+        Ok(environment) => environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"AGENT_VIEWER_OPENCODE_SERVER=1"),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && config.proc_root != Path::new("/proc") =>
+        {
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -1131,29 +1475,6 @@ struct RequestParts<'a> {
     method: &'a str,
     target: &'a str,
     body: Option<&'a Value>,
-}
-
-fn raw_http_request(
-    endpoint: SocketAddr,
-    method: &str,
-    target: &str,
-    body: Option<&Value>,
-    authorization: Option<&str>,
-    timeout: Duration,
-) -> std::result::Result<HttpReply, String> {
-    let mut stream = connect_stream(endpoint, timeout)?;
-    write_and_read_request(
-        &mut stream,
-        endpoint,
-        RequestParts {
-            method,
-            target,
-            body,
-        },
-        authorization,
-        HttpConnection::Close,
-        timeout,
-    )
 }
 
 fn write_and_read_request(
@@ -1252,7 +1573,7 @@ fn read_http_reply(
         ));
     }
     if (300..400).contains(&status) {
-        return Err(format!("{method} {target} redirect response was rejected"));
+        return Err(http_status_error(method, target, status));
     }
     let mut headers = HashMap::new();
     for line in lines {
@@ -1781,7 +2102,8 @@ impl OpencodeBackend {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn list_from_server(&self, endpoint: SocketAddr) -> Result<Vec<Session>> {
+    fn list_from_server(&self, pin: &ServerPin) -> Result<Vec<Session>> {
+        let endpoint = pin.endpoint;
         let mut sessions = Vec::new();
         let mut cursor = None::<String>;
         let mut seen_cursors = HashSet::new();
@@ -1804,7 +2126,6 @@ impl OpencodeBackend {
                     "GET",
                     &target,
                     reply.status,
-                    &String::from_utf8_lossy(&reply.body),
                 )));
             }
             let mut page: Vec<ServerSession> =
@@ -1910,7 +2231,7 @@ impl OpencodeBackend {
                 }
             }
         }
-        self.runtime.replace_managed_ids(managed_ids);
+        self.runtime.replace_managed_ids(pin, managed_ids);
 
         let mut listed = sessions
             .into_iter()
@@ -1985,11 +2306,19 @@ impl Backend for OpencodeBackend {
     }
 
     fn capabilities_for(&self, session: &Session) -> Capabilities {
-        if session.daemon_hosted
-            && self.runtime.is_managed_id(&session.id)
-            && self.runtime.healthy_tier()
-        {
-            server_capabilities()
+        if session.daemon_hosted {
+            if self.runtime.is_managed_id(&session.id) && self.runtime.healthy_tier() {
+                Capabilities {
+                    attach: false,
+                    ..server_capabilities()
+                }
+            } else {
+                Capabilities {
+                    attach: false,
+                    delete: false,
+                    ..compatibility_capabilities()
+                }
+            }
         } else {
             compatibility_capabilities()
         }
@@ -1997,7 +2326,7 @@ impl Backend for OpencodeBackend {
 
     fn list(&mut self) -> Result<Vec<Session>> {
         match self.runtime.server_for_listing()? {
-            Some(endpoint) => self.list_from_server(endpoint),
+            Some(pin) => self.list_from_server(&pin),
             None => self.list_from_sqlite(),
         }
     }
@@ -2013,8 +2342,28 @@ impl Backend for OpencodeBackend {
     }
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<crate::SpawnResult> {
+        if self.runtime.inner.secure.is_none() {
+            let title = crate::spawn::truncated_title(task);
+            let mut command = Command::new("opencode");
+            command
+                .arg("run")
+                .arg("--dir")
+                .arg(dir)
+                .arg("--title")
+                .arg(&title);
+            if let Some(model) = model {
+                command.arg("-m").arg(model);
+            }
+            command.arg(task);
+            let log_path = crate::spawn::viewer_log_path("opencode");
+            let pid = crate::spawn::spawn_detached(command, &log_path)?;
+            return Ok(crate::SpawnResult {
+                pid: Some(pid),
+                session_id: None,
+            });
+        }
         let model = selected_model(model)?;
-        let endpoint = self.runtime.ensure_server().map_err(Error::Command)?;
+        let pin = self.runtime.ensure_server().map_err(Error::Command)?;
         let directory = percent_encode(dir.as_os_str().as_bytes());
         let mut create = json!({
             "title": crate::spawn::truncated_title(task),
@@ -2024,9 +2373,13 @@ impl Backend for OpencodeBackend {
             create["model"] = json!({"providerID": model.provider, "id": model.id});
         }
         let create_target = format!("/session?directory={directory}");
-        let created: CreatedSession =
-            self.runtime
-                .request_json(endpoint, "POST", &create_target, Some(&create), 200)?;
+        let created: CreatedSession = self.runtime.managed_server_request_json(
+            &pin,
+            "POST",
+            &create_target,
+            Some(&create),
+            200,
+        )?;
         if created.id.is_empty() {
             return Err(Error::Command(
                 "POST /session returned an empty session id".to_string(),
@@ -2041,10 +2394,13 @@ impl Backend for OpencodeBackend {
             "/session/{}/prompt_async?directory={directory}",
             percent_encode(created.id.as_bytes())
         );
-        if let Err(error) =
-            self.runtime
-                .expect_status(endpoint, "POST", &prompt_target, Some(&prompt), 204)
-        {
+        if let Err(error) = self.runtime.managed_server_expect_status(
+            &pin,
+            "POST",
+            &prompt_target,
+            Some(&prompt),
+            204,
+        ) {
             return Err(Error::Command(format!(
                 "session {} was created but prompt acceptance failed: {error}",
                 created.id
@@ -2057,24 +2413,30 @@ impl Backend for OpencodeBackend {
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
-        if !session.daemon_hosted || !self.runtime.is_managed_id(&session.id) {
+        if !session.daemon_hosted {
             return Err(Error::Unsupported(self.kind().name()));
         }
-        let endpoint = self.runtime.require_server()?;
+        let lease = self
+            .runtime
+            .managed_lease(&session.id)
+            .ok_or_else(|| Error::Unsupported(self.kind().name()))?;
         let target = format!("/session/{}/abort", percent_encode(session.id.as_bytes()));
         let _: bool = self
             .runtime
-            .request_json(endpoint, "POST", &target, None, 200)?;
+            .managed_request_json(&lease, "POST", &target, None, 200)?;
         Ok(())
     }
 
     fn remove(&self, session: &Session) -> Result<()> {
-        if session.daemon_hosted && self.runtime.is_managed_id(&session.id) {
-            let endpoint = self.runtime.require_server()?;
+        if session.daemon_hosted {
+            let lease = self
+                .runtime
+                .managed_lease(&session.id)
+                .ok_or_else(|| Error::Unsupported(self.kind().name()))?;
             let target = format!("/session/{}", percent_encode(session.id.as_bytes()));
             let _: Value = self
                 .runtime
-                .request_json(endpoint, "DELETE", &target, None, 200)?;
+                .managed_request_json(&lease, "DELETE", &target, None, 200)?;
             return Ok(());
         }
         crate::spawn::run_checked(
@@ -2086,55 +2448,49 @@ impl Backend for OpencodeBackend {
     }
 
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
-        if !session.daemon_hosted || !self.runtime.is_managed_id(&session.id) {
+        if !session.daemon_hosted {
             return Err(Error::Unsupported(self.kind().name()));
         }
-        let endpoint = self.runtime.require_server()?;
+        let lease = self
+            .runtime
+            .managed_lease(&session.id)
+            .ok_or_else(|| Error::Unsupported(self.kind().name()))?;
         let target = format!("/session/{}", percent_encode(session.id.as_bytes()));
         let body = json!({"title": name});
         self.runtime
-            .expect_status(endpoint, "PATCH", &target, Some(&body), 200)
+            .managed_expect_status(&lease, "PATCH", &target, Some(&body), 200)
     }
 
     fn hide(&self, id: &str) -> Result<()> {
-        if !self.runtime.is_managed_id(id) {
-            return Err(Error::Unsupported(self.kind().name()));
-        }
-        let endpoint = self.runtime.require_server()?;
+        let lease = self
+            .runtime
+            .managed_lease(id)
+            .ok_or_else(|| Error::Unsupported(self.kind().name()))?;
         let target = format!("/session/{}", percent_encode(id.as_bytes()));
         let body = json!({"time": {"archived": crate::spawn::now_ms()}});
         self.runtime
-            .expect_status(endpoint, "PATCH", &target, Some(&body), 200)
+            .managed_expect_status(&lease, "PATCH", &target, Some(&body), 200)
     }
 
     fn unhide(&self, id: &str) -> Result<()> {
-        if !self.runtime.is_managed_id(id) {
-            return Err(Error::Unsupported(self.kind().name()));
-        }
-        let endpoint = self.runtime.require_server()?;
+        let lease = self
+            .runtime
+            .managed_lease(id)
+            .ok_or_else(|| Error::Unsupported(self.kind().name()))?;
         let target = format!("/session/{}", percent_encode(id.as_bytes()));
         let body = json!({"time": {"archived": 0}});
         self.runtime
-            .expect_status(endpoint, "PATCH", &target, Some(&body), 200)
+            .managed_expect_status(&lease, "PATCH", &target, Some(&body), 200)
     }
 
     fn attach_command(&self, session: &Session) -> std::result::Result<Command, AttachRefusal> {
         let mut command = Command::new("opencode");
-        if session.daemon_hosted && self.runtime.is_managed_id(&session.id) {
-            let endpoint = self.runtime.probe().ok_or_else(|| {
-                AttachRefusal::new("the OpenCode server that hosted this session is unavailable")
-            })?;
-            command
-                .arg("attach")
-                .arg(format!("http://{endpoint}"))
-                .arg("-s")
-                .arg(&session.id);
-            self.runtime
-                .attach_credentials(&mut command)
-                .map_err(AttachRefusal::new)?;
-        } else {
-            command.arg("-s").arg(&session.id);
+        if session.daemon_hosted {
+            return Err(AttachRefusal::new(
+                "managed OpenCode sessions cannot be attached safely",
+            ));
         }
+        command.arg("-s").arg(&session.id);
         if session.cwd.is_dir() {
             command.current_dir(&session.cwd);
         }
@@ -2283,23 +2639,8 @@ fn format_candidate_failures(failures: &[(SocketAddr, String)]) -> String {
         .join("; ")
 }
 
-fn http_status_error(method: &str, target: &str, status: u16, body: &str) -> String {
-    let excerpt = body
-        .chars()
-        .take(512)
-        .map(|character| {
-            if character == '\r' || character == '\n' {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    if excerpt.trim().is_empty() {
-        format!("{method} {target} returned HTTP {status}")
-    } else {
-        format!("{method} {target} returned HTTP {status}: {excerpt}")
-    }
+fn http_status_error(method: &str, target: &str, status: u16) -> String {
+    format!("{method} {target} returned HTTP {status}")
 }
 
 fn percent_encode(bytes: &[u8]) -> String {
@@ -2342,142 +2683,129 @@ fn server_permission_is_run_mode(permission: &Value) -> bool {
     })
 }
 
-fn last_server_message(messages: Vec<Value>) -> Option<TranscriptItem> {
-    messages
-        .into_iter()
-        .filter_map(|message| {
-            let role = message
-                .pointer("/info/role")
-                .and_then(Value::as_str)
-                .unwrap_or("assistant")
-                .to_string();
-            let created = message
-                .pointer("/info/time/created")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let mut text = String::new();
-            if let Some(parts) = message.get("parts").and_then(Value::as_array) {
-                for part in parts {
-                    if part.get("type").and_then(Value::as_str) == Some("text")
-                        && let Some(part_text) = part.get("text").and_then(Value::as_str)
-                    {
-                        text.push_str(part_text);
-                    }
-                }
-            }
-            if text.trim().is_empty() && role == "assistant" {
-                text = message
-                    .pointer("/info/error/data/message")
-                    .or_else(|| message.pointer("/info/error/message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-            }
-            (!text.trim().is_empty()).then_some((created, TranscriptItem { role, text }))
-        })
-        .max_by_key(|(created, _)| *created)
-        .map(|(_, item)| item)
-}
-
-pub fn default_opencode_db() -> PathBuf {
+/// Default opencode DB path (mirrors OpencodeBackend::new()).
+pub fn default_opencode_db() -> std::path::PathBuf {
     crate::home_dir().join(".local/share/opencode/opencode.db")
 }
 
+/// Run `opencode models` and parse stdout. Any failure (spawn error, non-zero exit) is a
+/// quiet empty Vec — discovery is best-effort.
 fn opencode_models_via_cli() -> Vec<String> {
-    let mut command = Command::new("opencode");
-    command.arg("models");
-    match crate::spawn::run_with_timeout(command, crate::spawn::MODEL_PROBE_TIMEOUT) {
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.arg("models");
+    match crate::spawn::run_with_timeout(cmd, crate::spawn::MODEL_PROBE_TIMEOUT) {
         Some(stdout) => parse_opencode_models(&stdout),
         None => Vec::new(),
     }
 }
 
+/// PURE: each non-empty trimmed line of `opencode models` stdout is a model id
+/// (format `provider/model`). Blank/whitespace-only lines are dropped.
 pub fn parse_opencode_models(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .map(str::trim)
+        .map(|line| line.trim())
         .filter(|line| !line.is_empty())
-        .map(str::to_string)
+        .map(|line| line.to_string())
         .collect()
 }
 
+/// The most recent opencode message that has text, as a TranscriptItem (role + concatenated
+/// text parts). Reads the `message`/`part` tables read-only. Ok(None) when the DB is missing
+/// or the session has no text message. Never creates/writes the DB.
 pub fn read_opencode_last_message(
-    db_path: &Path,
+    db_path: &std::path::Path,
     session_id: &str,
-) -> Result<Option<TranscriptItem>> {
+) -> Result<Option<crate::codex::rollout::TranscriptItem>> {
+    use crate::codex::rollout::TranscriptItem;
     if !db_path.exists() {
         return Ok(None);
     }
     let conn = crate::open_readonly(db_path)?;
+    // Rows arrive grouped by message (most-recent message first), parts in creation order.
     let mut stmt = conn.prepare(
         "SELECT m.id, m.data, p.data FROM message m JOIN part p ON p.message_id = m.id \
          WHERE m.session_id = ?1 ORDER BY m.time_created DESC, m.id DESC, p.time_created ASC",
     )?;
     let rows = stmt.query_map([session_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        let mid: String = row.get(0)?;
+        let mdata: String = row.get(1)?;
+        let pdata: String = row.get(2)?;
+        Ok((mid, mdata, pdata))
     })?;
 
-    let mut current_id: Option<String> = None;
-    let mut current_role = String::from("assistant");
-    let mut current_text = String::new();
+    // Walk the grouped rows, accumulating each message's text parts. Return the first
+    // (most-recent) message whose accumulated text is non-empty.
+    let mut cur_id: Option<String> = None;
+    let mut cur_role = String::from("assistant");
+    let mut cur_text = String::new();
     for row in rows {
-        let (message_id, message_data, part_data) = row?;
-        if current_id.as_deref() != Some(message_id.as_str()) {
-            if current_id.is_some() && !current_text.trim().is_empty() {
+        let (mid, mdata, pdata) = row?;
+        if cur_id.as_deref() != Some(mid.as_str()) {
+            // Boundary: the previous message is complete — return it if it had non-blank text
+            // (a whitespace-only message, e.g. newline-only parts around tool transitions,
+            // would otherwise hide the real prior message behind blank lines). Return the
+            // original untrimmed text so the real message's internal formatting is preserved.
+            if cur_id.is_some() && !cur_text.trim().is_empty() {
                 return Ok(Some(TranscriptItem {
-                    role: current_role,
-                    text: current_text,
+                    role: cur_role,
+                    text: cur_text,
                 }));
             }
-            current_id = Some(message_id);
-            current_role = parsed_role(&message_data);
-            current_text.clear();
+            cur_id = Some(mid);
+            cur_role = parsed_role(&mdata);
+            cur_text = String::new();
         }
-        if let Some(text) = parsed_text_part(&part_data) {
-            current_text.push_str(&text);
+        if let Some(text) = parsed_text_part(&pdata) {
+            cur_text.push_str(&text);
         }
     }
-    if current_id.is_some() && !current_text.trim().is_empty() {
+    // The final message (no boundary follows it).
+    if cur_id.is_some() && !cur_text.trim().is_empty() {
         return Ok(Some(TranscriptItem {
-            role: current_role,
-            text: current_text,
+            role: cur_role,
+            text: cur_text,
         }));
     }
     Ok(None)
 }
 
-fn parsed_role(message_data: &str) -> String {
-    serde_json::from_str::<Value>(message_data)
+/// message.data JSON "role" (defaulting to "assistant" when absent/unparseable).
+fn parsed_role(mdata: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(mdata)
         .ok()
         .as_ref()
-        .and_then(|value| crate::json_str(value, "role").map(str::to_string))
+        .and_then(|v| crate::json_str(v, "role").map(String::from))
         .unwrap_or_else(|| "assistant".to_string())
 }
 
-fn parsed_text_part(part_data: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(part_data).ok()?;
+/// part.data JSON text, only for `{"type":"text","text":...}` parts (else None so
+/// tool/step-start/step-finish parts are skipped). Returns an owned String.
+fn parsed_text_part(pdata: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(pdata).ok()?;
     if crate::json_str(&value, "type") != Some("text") {
         return None;
     }
-    crate::json_str(&value, "text").map(str::to_string)
+    crate::json_str(&value, "text").map(String::from)
 }
 
+/// IMPURE process check (live-verified only): does any process named `opencode*` exist.
+/// All opencode sessions share one process, so this is a single best-effort signal.
 fn live_opencode_proc() -> bool {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    system
-        .processes()
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.processes()
         .values()
-        .any(|process| process.name().to_string_lossy().starts_with("opencode"))
+        .any(|p| p.name().to_string_lossy().starts_with("opencode"))
 }
 
-const WORKING_MAX_AGE_MS: i64 = 60_000;
-const IDLE_MAX_AGE_MS: i64 = 1_800_000;
+/// Recency thresholds for the status heuristic below.
+const WORKING_MAX_AGE_MS: i64 = 60_000; // 1 min
+const IDLE_MAX_AGE_MS: i64 = 1_800_000; // 30 min
 
+/// PURE three-tier status heuristic, unit-tested (the process check is injected, I-3):
+/// Working: live && age <= 1 min; Idle: live && age <= 30 min; Done: otherwise.
+/// Never NeedsInput or Error because the session table has no error column.
 pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64) -> Status {
     if !live_opencode_proc {
         return Status::Done;
@@ -2492,12 +2820,32 @@ pub fn opencode_status(live_opencode_proc: bool, updated_at_ms: i64, now_ms: i64
     }
 }
 
+/// Companion filter for one-shot `opencode run` sessions — opencode's equivalent of the
+/// codex `exec`/`subagent` rule in `codex::Source::is_companion`. A run started by a script
+/// (an `/implement` review pass, a CI job) is not a fleet member, but it carries no
+/// `parent_id`, so `parent_id` alone leaves it in the default list.
+///
+/// The signal is the `session.permission` column. `opencode run` denies the interactive
+/// `question` tool (plus `plan_enter`/`plan_exit`) when it creates the session; the TUI
+/// writes no session override at all. Verified live on this box 2026-07-26, both on
+/// opencode 1.17.20: `opencode run --title ...` stored
+/// `[{"permission":"question","pattern":"*","action":"deny"},{plan_enter deny},{plan_exit
+/// deny}]`, a TUI session driven through a pty stored NULL.
+///
+/// Matched semantically (a denied `question` entry anywhere in the array), not by string
+/// equality: the stored key order is not the source order, and the github-action path
+/// writes the `question` deny without the plan pair. Never panics — anything that is not
+/// a JSON array of objects is treated as interactive, the safe direction (a shown row a
+/// keypress away from hidden beats a hidden row you cannot find).
 pub fn is_run_mode_permission(permission: Option<&str>) -> bool {
     let Some(raw) = permission.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return false;
     };
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str(raw) else {
         return false;
     };
-    server_permission_is_run_mode(&value)
+    entries.iter().any(|entry| {
+        entry.get("permission").and_then(|p| p.as_str()) == Some("question")
+            && entry.get("action").and_then(|a| a.as_str()) == Some("deny")
+    })
 }

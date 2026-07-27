@@ -96,7 +96,7 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
     run_mutation_with_opencode(m, OpencodeRuntime::new())
 }
 
-/// Run one mutation with the OpenCode runtime shared by listing, actions, and peek.
+/// Run one mutation with the OpenCode runtime shared by listing and actions.
 pub(crate) fn run_mutation_with_opencode(
     m: Mutation,
     opencode_runtime: OpencodeRuntime,

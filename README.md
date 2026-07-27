@@ -32,10 +32,11 @@ no data or whose CLI is not installed simply list empty — they never error the
   (Claude has no hide concept).
 - **opencode**: uses a secured local server when one is available, with read only SQLite
   compatibility enumeration otherwise. The fallback retains its process and recency status
-  heuristic and companion filtering. The viewer discovers loopback servers on ports `4096` and
-  `4097`; only spawn may start one, from the user home directory, and it never stops or restarts
-  one. Exact viewer marked sessions receive live status, pending input, attach, rename, archive,
-  stop, and delete through that server. Other server enumerated rows use compatibility idle status
+  heuristic and companion filtering. The viewer discovers loopback servers on ports `4097` and
+  `4098`; only spawn may start one, from the user home directory, and it never stops or restarts
+  one. Exact viewer marked sessions receive live status, pending input, rename, archive, stop,
+  and delete through that server. Managed attach is refused because it would expose credentials.
+  Other server enumerated rows use compatibility idle status
   unless hydration fails for their shared active managed directory, when every row there is unknown.
   External sessions attach locally.
 
@@ -118,9 +119,12 @@ that existed before submission are excluded while finding the new one.
 
 An opencode spawn may start a secured loopback server when neither verified candidate is usable.
 It starts from the user home directory and the viewer never stops or restarts it. The viewer uses
-an environment password override when present, otherwise a stable generated secret in its own
-SQLite state. An existing listener that allows unauthenticated health requests is rejected; it is
-left untouched and the viewer may use port `4097` instead.
+an environment password override when present, otherwise a stable generated secret in owner only
+credential files. SQLite stores only viewer presentation state. Task shells receive neither
+`OPENCODE_SERVER_USERNAME` nor `OPENCODE_SERVER_PASSWORD`. An existing listener that allows
+unauthenticated health requests is rejected; it is left untouched and the viewer may use port
+`4098` instead. Process shared ownership uses only `flock`; each viewer process serializes its
+own work locally.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
@@ -187,8 +191,8 @@ never freezes the list; a `…` notice shows while the action is in flight.
 `→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
 full-screen embedded terminal. Codex joins the `codex app-server` daemon that hosts the session
 (`codex resume --remote unix://<socket>`) when it hosts one, and otherwise runs a plain
-`codex resume`; an exact viewer marked opencode session attaches through its authenticated local
-server, while an external opencode session runs `opencode -s`;
+`codex resume`; an exact viewer marked opencode session is refused because attach would expose
+credentials, while an external opencode session runs `opencode -s`;
 Claude runs `claude attach`, which resumes the same thread for both a running background
 job and a finished one (waking it in place); a row with no background-job id falls back to
 `claude -r`. `←` returns to the list when the
@@ -221,10 +225,10 @@ the conversations live in each backend's own store and re-attach by session ID n
 If a child exits while you are attached, its final screen stays visible and any key
 except `Ctrl+T` returns you to the list; `Ctrl+T` toggles the mouse instead.
 
-Viewer-local state (archive flags, stop markers, spawn records, and the generated OpenCode server
-secret) is kept in a SQLite database at `~/.local/state/agent-viewer/viewer.db`, separate from
-every backend's own store. OpenCode's own SQLite database is read only compatibility enumeration,
-not job authority.
+Viewer-local presentation state is kept in a SQLite database at
+`~/.local/state/agent-viewer/viewer.db`, separate from every backend's own store. OpenCode's own
+SQLite database is read only compatibility enumeration, not job authority. OpenCode credentials
+are stored only in owner only credential files.
 
 Built in Rust. See `SPEC.md` for the full architecture and the evidence behind it.
 

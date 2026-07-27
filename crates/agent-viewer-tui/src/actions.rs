@@ -249,7 +249,9 @@ pub(crate) fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bo
     let Some(session) = ui.app.selected().cloned() else {
         return;
     };
-    let caps = caps_of(backends, session.backend);
+    let caps = backend_of(backends, session.backend)
+        .map(|backend| backend.capabilities_for(&session))
+        .unwrap_or_else(Capabilities::none);
     if !caps.archive {
         ui.set_notice(format!("{} does not support hide", session.backend.name()));
         return;
@@ -289,13 +291,6 @@ fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn B
         .iter()
         .find(|b| b.kind() == kind)
         .map(|b| b.as_ref())
-}
-
-/// Capabilities for a backend kind from the live slice (falls back to none if absent).
-fn caps_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Capabilities {
-    backend_of(backends, kind)
-        .map(|b| b.capabilities())
-        .unwrap_or_else(Capabilities::none)
 }
 
 pub(crate) fn attach_selected<B: ratatui::backend::Backend>(
