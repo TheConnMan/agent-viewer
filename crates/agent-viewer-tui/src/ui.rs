@@ -1273,7 +1273,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · a all · Ctrl+F filter · ? help · q/Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -1349,14 +1349,14 @@ fn draw_attach_header(frame: &mut Frame, session: &Session, exited: bool, now_ms
 // --- Help overlay ---------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(56, 70, area);
+    let popup = centered_rect(75, 100, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(fg(theme::ACCENT))
         .title("keys");
     let entries = [
-        ("↑/↓  j/k", "move selection"),
+        ("↑/↓", "move selection"),
         ("→ / Enter", "attach selected (empty composer)"),
         ("type · Tab", "compose task · switch agent"),
         ("Shift+Tab", "cycle agent model"),
@@ -1369,12 +1369,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
-        ("a", "show all (companions + archived)"),
-        ("h / u", "archive / unarchive"),
+        ("Ctrl+A", "show all (companions + archived)"),
+        ("Ctrl+D / Ctrl+U", "archive / unarchive"),
         ("Ctrl+F", "filter (searches hidden too)"),
         ("Ctrl+T", "mouse off/on (off = drag to select + copy)"),
         ("?", "this help"),
-        ("q / Ctrl+C", "quit"),
+        ("Ctrl+C", "quit"),
     ];
     let mut lines = Vec::new();
     for (k, v) in entries {
@@ -1764,6 +1764,16 @@ mod tests {
             .collect();
         let pos = term.get_cursor_position().unwrap();
         (rows, (pos.x, pos.y))
+    }
+
+    #[test]
+    fn help_popup_shows_modifier_shortcuts_at_80_by_24() {
+        let (rows, _) = render_viewer(80, 24, "", Mode::Help);
+        let rendered = rows.concat();
+
+        for shortcut in ["Ctrl+A", "Ctrl+D", "Ctrl+U", "Ctrl+C"] {
+            assert!(rendered.contains(shortcut), "missing {shortcut}");
+        }
     }
 
     fn composer_bounds(rows: &[String]) -> (usize, usize) {

@@ -74,7 +74,7 @@ are companions too, because they are steps inside somebody else's job and not fl
 you would ever attach to: Codex `exec` and subagent threads, and `opencode run` sessions
 (the review passes an `/implement` run fires off, for example). Archived sessions are hidden
 too, and so are sessions whose working directory no longer exists on disk (e.g. deleted
-`/tmp` scratch dirs). Press `a` to reveal all of them; the footer shows how many rows are
+`/tmp` scratch dirs). Press `Ctrl+A` to reveal all of them; the footer shows how many rows are
 currently hidden, and `Ctrl+F` searches the hidden rows too. Sessions you spawn from the
 viewer are pinned, so they always show even if another source would have marked them a
 companion.
@@ -97,11 +97,11 @@ that takes seconds; a catalog that has never been discovered shows just the agen
 until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists;
 opencode has too many models to cycle, so it stays on its default there (use `/model`). The
 target directory is the selected row's project root (by-project view) or its exact cwd
-(by-state view). While the composer is empty, the single-letter command keys below still fire;
-once you have typed anything, every printable key (and space) is task text, and `Esc` clears it.
-After a spawn, the list selects the new row in the first selectable snapshot that contains it and
-keeps that selection. When a backend does not return a new identifier, rows that existed before
-submission are excluded while finding the new one.
+(by-state view). Bare letters, numbers, and slash always type into the composer, including when
+it is empty; once you have typed anything, every printable key (and space) is task text, and
+`Esc` clears it. After a spawn, the list selects the new row in the first selectable snapshot
+that contains it and keeps that selection. When a backend does not return a new identifier, rows
+that existed before submission are excluded while finding the new one.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
@@ -157,15 +157,15 @@ still shows the prompt.
   signalling a process: the daemon runs every session it hosts, so a signal would take all of
   them down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
-- `a` — show all (companions + archived + deleted-dir rows).
-- `h` / `u` — archive / unarchive (Codex only).
+- `Ctrl+A` — show all (companions + archived + deleted-dir rows).
+- `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `Ctrl+T` — turn mouse reporting off / back on. Off hands the mouse back to your terminal so
   you can drag-select and copy text out of the viewer; on restores left click row activation,
   hover row selection, and wheel scrolling. Works everywhere, including inside an attach, so
   the transcript is copyable. A footer notice names the mode you just switched to.
 - `?` — key help.
-- `q` — quit.
+- `Ctrl+C` — quit.
 
 Renames, stops, removes, and archives run on a background worker so a slow backend call
 never freezes the list; a `…` notice shows while the action is in flight.
@@ -199,7 +199,7 @@ constitution's Additional Constraints). `Ctrl+E` is reserved in the key list but
 reports a footer notice that reply is not supported. Revisiting either is a future,
 separately-specified decision.
 
-Quitting the viewer (`q`) kills the attach PTYs it owns, but that does not lose any work:
+Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
 If a child exits while you are attached, its final screen stays visible and any key
 returns you to the list.

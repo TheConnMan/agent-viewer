@@ -536,7 +536,7 @@ fn show_all_covers_companions_and_archived() {
     assert_eq!(ids, vec!["vis".to_string()]);
     assert_eq!(app.hidden_count(), 2);
 
-    // 'a' reveals both hidden classes.
+    // Ctrl+A reveals both hidden classes.
     app.toggle_show_all();
     let shown: Vec<String> = session_rows(app.visible())
         .iter()

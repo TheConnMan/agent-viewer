@@ -601,7 +601,7 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
         let _ = db.prune_resolved_missing(&live);
     }
     // Hide sessions whose cwd was deleted (after the overlay, so viewer-spawn pins in live
-    // dirs stay visible while deleted-dir noise defaults to hidden — `a` still reveals it).
+    // dirs stay visible while deleted-dir noise defaults to hidden; `Ctrl+A` still reveals it).
     mark_dead_dirs(&mut sessions);
     // Update the focused-session header snapshot from the fresh list.
     if let Some(key) = &ui.focused

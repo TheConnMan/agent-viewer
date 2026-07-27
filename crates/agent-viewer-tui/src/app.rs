@@ -198,7 +198,7 @@ impl App {
             .collect()
     }
 
-    /// key 'a' (I-2): one show-all toggle covering companions + archived rows.
+    /// Ctrl+A (I-2): one show-all toggle covering companions + archived rows.
     pub fn toggle_show_all(&mut self) {
         self.show_all = !self.show_all;
         self.rebuild_rows();
@@ -346,14 +346,14 @@ impl App {
                 && now_ms.saturating_sub(*at) <= KILL_ARM_WINDOW_MS)
     }
 
-    /// key '/'
+    /// Ctrl+F opens filtering.
     pub fn set_filter(&mut self, s: String) {
         self.filter = s;
         self.rebuild_rows();
         self.clamp_selection();
     }
 
-    /// j/k/arrows — cursor only, never rebuilds the row cache. Lands on selectable rows
+    /// Arrow keys move the cursor only and never rebuild the row cache. Lands on selectable rows
     /// (headers AND session rows), skipping only Spacer rows in the direction of travel (a
     /// collapsed group's session rows are simply not emitted, so they need no extra skip). A
     /// single-step move (±1) off the last/first selectable row WRAPS to the first/last one;
