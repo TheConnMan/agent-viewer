@@ -3,17 +3,40 @@
 //! run loop in `main.rs`.
 
 use std::io;
+use std::path::PathBuf;
 
-use agent_viewer_core::backend::Backend;
+use agent_viewer_core::backend::{Backend, BackendKind};
+use agent_viewer_tui::app::{Row, Section};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::ui::Mode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
-    apply_rename, attach_selected, ensure_completions, ensure_models, hide_selected, kill_selected,
-    open_filter, open_rename, open_reply, send_reply, spawn_from_composer, toggle_group_if_header,
+    activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
+    hide_selected, kill_selected, open_filter, open_rename, open_reply, send_reply,
+    spawn_from_composer, toggle_group_if_header,
 };
 use crate::{Refresher, Ui};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseAction {
+    None,
+    ActivateSelected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MouseTarget {
+    StateHeader(Section),
+    ProjectHeader(PathBuf),
+    Session(BackendKind, String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MousePress {
+    target: MouseTarget,
+    column: u16,
+    row: u16,
+}
 
 /// Returns `true` when the app should quit.
 pub(crate) fn handle_key(
@@ -23,6 +46,7 @@ pub(crate) fn handle_key(
     ui: &mut Ui,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<bool> {
+    ui.mouse_press = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Ctrl+C kills the whole viewer (like `claude agents`) from every mode except an active
     // attach — there Ctrl+C must reach the child as an interrupt (0x03) so a runaway agent can
@@ -63,19 +87,23 @@ pub(crate) fn handle_key(
 /// selects the row under the cursor and the wheel walks the selection (hit-testing reads the
 /// geometry `draw` recorded on the last frame). Modals own their surface, so mouse is a no-op
 /// there (the terminal's own text selection still works with Shift held).
-pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
+pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     // Text-select mode: the terminal owns the mouse, so any report still in flight (or sent
     // by a terminal that ignored the disable sequence) must not steer the selection.
     if !ui.mouse_capture {
-        return;
+        ui.mouse_press = None;
+        return MouseAction::None;
+    }
+    if !matches!(ui.mode, Mode::Normal) {
+        ui.mouse_press = None;
     }
     match &ui.mode {
         Mode::Attached => {
             let Some(fkey) = ui.focused.clone() else {
-                return;
+                return MouseAction::None;
             };
             let Some(pty) = ui.attached.get_mut(&fkey) else {
-                return;
+                return MouseAction::None;
             };
             let (mode, encoding) =
                 pty.with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()));
@@ -84,20 +112,87 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) {
             {
                 let _ = pty.write_input(&bytes);
             }
+            MouseAction::None
         }
         Mode::Normal => match me.kind {
-            // Left click and bare hover both land the selection on the row under the cursor.
-            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Moved => {
+                ui.mouse_press = None;
                 if let Some(idx) = ui.list_hit.borrow().row_at(me.column, me.row) {
                     ui.app.select_visible_index(idx);
                 }
+                MouseAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = ui.list_hit.borrow().row_at(me.column, me.row);
+                let target = hit.and_then(|idx| mouse_target(ui, idx));
+                ui.mouse_press = target.map(|target| MousePress {
+                    target,
+                    column: me.column,
+                    row: me.row,
+                });
+                if let Some(idx) = hit
+                    && ui.mouse_press.is_some()
+                {
+                    ui.app.select_visible_index(idx);
+                }
+                MouseAction::None
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pressed) = ui.mouse_press.take() else {
+                    return MouseAction::None;
+                };
+                let hit = ui.list_hit.borrow().row_at(me.column, me.row);
+                let released = hit.and_then(|idx| mouse_target(ui, idx));
+                if released.as_ref() == Some(&pressed.target) {
+                    ui.app
+                        .select_visible_index(hit.expect("released target has an index"));
+                } else if me.column != pressed.column
+                    || me.row != pressed.row
+                    || mouse_target(ui, ui.app.selected_index()).as_ref() != Some(&pressed.target)
+                {
+                    return MouseAction::None;
+                }
+                MouseAction::ActivateSelected
             }
             // The wheel nudges the selection one selectable row at a time (same as arrows).
-            MouseEventKind::ScrollDown => ui.app.move_selection(1),
-            MouseEventKind::ScrollUp => ui.app.move_selection(-1),
-            _ => {}
+            MouseEventKind::ScrollDown => {
+                ui.mouse_press = None;
+                ui.app.move_selection(1);
+                MouseAction::None
+            }
+            MouseEventKind::ScrollUp => {
+                ui.mouse_press = None;
+                ui.app.move_selection(-1);
+                MouseAction::None
+            }
+            MouseEventKind::Drag(MouseButton::Left) => MouseAction::None,
+            _ => {
+                ui.mouse_press = None;
+                MouseAction::None
+            }
         },
-        _ => {}
+        _ => MouseAction::None,
+    }
+}
+
+fn mouse_target(ui: &Ui, index: usize) -> Option<MouseTarget> {
+    match ui.app.visible().get(index)? {
+        Row::SectionHeader { section, .. } => Some(MouseTarget::StateHeader(*section)),
+        Row::ProjectHeader { root, .. } => Some(MouseTarget::ProjectHeader(root.clone())),
+        Row::Session { backend, id, .. } => Some(MouseTarget::Session(*backend, id.clone())),
+        Row::Spacer => None,
+    }
+}
+
+pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
+    me: MouseEvent,
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    match handle_mouse(me, ui) {
+        MouseAction::None => Ok(()),
+        MouseAction::ActivateSelected => activate_selected(backends, ui, terminal),
     }
 }
 
@@ -128,6 +223,7 @@ pub(crate) fn set_mouse_capture(ui: &mut Ui, on: bool) {
 /// shell unable to drag-select, which is the very bug this toggle exists to fix.
 fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     ui.mouse_capture = on;
+    ui.mouse_press = None;
     ui.set_notice(
         if on {
             "mouse on - click/hover selects, wheel scrolls (ctrl+t to select text)"
@@ -213,9 +309,7 @@ fn handle_normal_key(
             } else if ui.composer.is_empty() {
                 // On a group header, Enter collapses/expands the group (and persists) instead
                 // of attaching; on a session it attaches as before.
-                if !toggle_group_if_header(ui) {
-                    attach_selected(backends, ui, terminal)?;
-                }
+                activate_selected(backends, ui, terminal)?;
             } else {
                 spawn_from_composer(backends, refresher, ui);
             }
@@ -409,13 +503,18 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ensure_completions, handle_rename_key, is_quit_chord, open_filter};
+    use super::{
+        MouseAction, ensure_completions, handle_mouse_event, handle_rename_key, is_quit_chord,
+        open_filter,
+    };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::{BackendKind, Session, Status};
-    use agent_viewer_tui::app::{App, Composer};
+    use agent_viewer_tui::app::{App, Composer, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::MutationRunner;
     use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use std::collections::HashMap;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -444,7 +543,132 @@ pub(crate) mod tests {
             logos: None,
             list_hit: std::cell::RefCell::new(agent_viewer_tui::ui::ListHit::default()),
             mouse_capture: true,
+            mouse_press: None,
         }
+    }
+
+    type TestTerminal = ratatui::Terminal<ratatui::backend::TestBackend>;
+
+    fn test_terminal() -> TestTerminal {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 24;
+        let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
+        ratatui::Terminal::new(backend).expect("test terminal")
+    }
+
+    fn point_for_visible_row(ui: &Ui, terminal: &mut TestTerminal, row_idx: usize) -> (u16, u16) {
+        let size = terminal.size().expect("test terminal size");
+        terminal
+            .draw(|frame| {
+                agent_viewer_tui::ui::draw(
+                    frame,
+                    agent_viewer_tui::ui::Draw {
+                        app: &ui.app,
+                        mode: &ui.mode,
+                        notice: ui.notice.text(),
+                        peek: &ui.peek,
+                        composer: &ui.composer,
+                        pulses: &ui.pulses,
+                        expanded: ui.app.expanded(),
+                        now_ms: 0,
+                        attach: None,
+                        pr_status: &ui.pr_status,
+                        logos: None,
+                        list_hit: &ui.list_hit,
+                    },
+                );
+            })
+            .expect("draw list geometry");
+
+        let hit = ui.list_hit.borrow();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                if hit.row_at(x, y) == Some(row_idx) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("visible row {row_idx} has no mouse hit");
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn visible_session_index(ui: &Ui, id: &str) -> usize {
+        ui.app
+            .visible()
+            .iter()
+            .position(|row| matches!(row, Row::Session { id: row_id, .. } if row_id == id))
+            .expect("session row present")
+    }
+
+    fn wait_for_pty_screen(ui: &Ui, key: &(BackendKind, String), needle: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if ui
+                .attached
+                .get(key)
+                .is_some_and(|pty| pty.with_screen(|screen| screen.contents().contains(needle)))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attached child screen did not contain {needle:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn mouse_recording_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
+                    "bytes=$(timeout 0.5 dd bs=1 count=9 2>/dev/null | od -An -tx1); ",
+                    "if [ -n \"$bytes\" ]; then ",
+                    "printf 'BYTES:%s\\r\\n' \"$bytes\"; ",
+                    "else printf 'CLEAN\\r\\n'; fi; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("mouse recording child")
+    }
+
+    fn mouse_forwarding_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
+                    "dd bs=1 count=9 2>/dev/null | od -An -tx1; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("mouse forwarding child")
     }
 
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
@@ -466,6 +690,43 @@ pub(crate) mod tests {
             rollout_path: None,
             pr_refs: Vec::new(),
             daemon_hosted: false,
+        }
+    }
+
+    struct AttachingBackend;
+
+    impl agent_viewer_core::Backend for AttachingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Opencode
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                attach: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by mouse activation")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<Option<u32>> {
+            unreachable!("spawn is not exercised by mouse activation")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            Ok(command)
         }
     }
 
@@ -702,13 +963,16 @@ pub(crate) mod tests {
 
     #[test]
     fn mouse_events_are_ignored_while_capture_is_off() {
-        use super::handle_mouse;
-        use crossterm::event::{MouseEvent, MouseEventKind};
-
-        let mut ui = test_ui_with(vec![
+        let mut sessions = vec![
             sess("a", "/tmp/agentviewer-mouse-a", 200),
             sess("b", "/tmp/agentviewer-mouse-b", 100),
-        ]);
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
         // The wheel walks the selection and needs no drawn geometry, unlike a click.
         let wheel = MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -720,23 +984,661 @@ pub(crate) mod tests {
         // Capture on: the wheel walks the selection down one row.
         let start = ui.app.selected_index();
         ui.mouse_capture = true;
-        handle_mouse(wheel, &mut ui);
+        handle_mouse_event(wheel, &backends, &mut ui, &mut terminal).expect("wheel event");
         let moved = ui.app.selected_index();
         assert_ne!(
             moved, start,
             "with capture on the wheel must move selection"
         );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.attached.is_empty());
 
         // Capture off (text-select mode): the same wheel event changes nothing. While the
         // terminal owns the mouse, a stray report must not steer the selection.
         let before = ui.app.selected_index();
         ui.mouse_capture = false;
-        handle_mouse(wheel, &mut ui);
+        handle_mouse_event(wheel, &backends, &mut ui, &mut terminal).expect("wheel event");
         assert_eq!(
             ui.app.selected_index(),
             before,
             "the wheel must be inert while mouse capture is off"
         );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.attached.is_empty());
+    }
+
+    #[test]
+    fn left_click_on_header_toggles_and_persists_group() {
+        use agent_viewer_core::state::ViewerDb;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut ui = test_ui_with(vec![sess(
+            "a",
+            temp.path().to_str().expect("utf8 temp path"),
+            100,
+        )]);
+        ui.db = Some(ViewerDb::open(&temp.path().join("viewer.db")).expect("viewer db"));
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+
+        let (header_idx, group_key) = ui
+            .app
+            .visible()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, row)| match row {
+                Row::ProjectHeader { root, .. } => Some((idx, GroupKey::Project(root.clone()))),
+                _ => None,
+            })
+            .expect("project header");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, header_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("header button down");
+
+        assert_eq!(ui.app.selected_index(), header_idx);
+        assert!(!ui.app.is_group_collapsed(&group_key));
+        assert!(
+            !ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button down must not persist a compact state"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("header button up");
+
+        assert!(ui.app.is_group_collapsed(&group_key));
+        assert!(
+            ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button up must persist the compact state"
+        );
+
+        let header_idx = ui
+            .app
+            .visible()
+            .iter()
+            .position(|row| matches!(row, Row::ProjectHeader { .. }))
+            .expect("collapsed project header");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, header_idx);
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("expanded header button down");
+
+        assert!(ui.app.is_group_collapsed(&group_key));
+        assert!(
+            ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button down must not persist an expanded state"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("expanded header button up");
+
+        assert!(!ui.app.is_group_collapsed(&group_key));
+        assert!(
+            !ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button up must persist the expanded state"
+        );
+    }
+
+    #[test]
+    fn left_click_on_state_header_toggles_and_persists_group() {
+        use agent_viewer_core::state::ViewerDb;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut ui = test_ui_with(vec![sess(
+            "a",
+            temp.path().to_str().expect("utf8 temp path"),
+            100,
+        )]);
+        ui.app.toggle_group_mode();
+        assert_eq!(ui.app.group_mode(), GroupMode::ByState);
+        ui.db = Some(ViewerDb::open(&temp.path().join("viewer.db")).expect("viewer db"));
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+        let group_key = GroupKey::State(Section::Done);
+        let header_idx = ui
+            .app
+            .visible()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    Row::SectionHeader {
+                        section: Section::Done,
+                        ..
+                    }
+                )
+            })
+            .expect("done section header");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, header_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("state header button down");
+
+        assert_eq!(ui.app.selected_index(), header_idx);
+        assert!(!ui.app.is_group_collapsed(&group_key));
+        assert!(
+            !ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button down must not persist a compact state"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("state header button up");
+
+        assert!(ui.app.is_group_collapsed(&group_key));
+        assert!(
+            ui.db
+                .as_ref()
+                .expect("viewer db")
+                .collapsed_groups()
+                .expect("collapsed groups")
+                .contains(&group_key.to_storage()),
+            "button up must persist the compact state"
+        );
+    }
+
+    #[test]
+    fn left_click_on_session_attaches_the_clicked_row() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-activate", 200),
+            sess("b", "/tmp/agentviewer-mouse-activate", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button down");
+
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b"),
+            "button down must select the clicked session"
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+        assert!(
+            ui.attached.is_empty(),
+            "button down must not attach before release"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button up");
+
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert_eq!(
+            ui.focused_session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("b"),
+            "the clicked session must become focused"
+        );
+        assert!(
+            ui.attached
+                .contains_key(&(BackendKind::Opencode, "b".to_string())),
+            "the clicked session must own an attached child"
+        );
+    }
+
+    #[test]
+    fn left_click_on_session_survives_inline_peek_reflow_between_button_events() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-reflow", 200),
+            sess("b", "/tmp/agentviewer-mouse-reflow", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let expanded_idx = visible_session_index(&ui, "a");
+        assert!(ui.app.select_visible_index(expanded_idx));
+        ui.app.toggle_expanded();
+        assert_eq!(
+            ui.app.expanded(),
+            Some(&(BackendKind::Opencode, "a".to_string()))
+        );
+
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button down");
+
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b")
+        );
+        assert_eq!(ui.app.expanded(), None);
+        let _ = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button up");
+
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert_eq!(
+            ui.focused_session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("b")
+        );
+        assert!(
+            ui.attached
+                .contains_key(&(BackendKind::Opencode, "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn left_release_without_a_matching_press_is_inert() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-unmatched", 200),
+            sess("b", "/tmp/agentviewer-mouse-unmatched", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+        let selected_before = ui.app.selected().map(|session| session.id.clone());
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("unmatched release");
+
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.clone()),
+            selected_before
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+        assert!(ui.attached.is_empty());
+    }
+
+    #[test]
+    fn left_press_and_release_on_different_rows_is_inert() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-mismatch", 200),
+            sess("b", "/tmp/agentviewer-mouse-mismatch", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let pressed_idx = visible_session_index(&ui, "b");
+        let released_idx = visible_session_index(&ui, "a");
+        let (down_x, down_y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
+        let (up_x, up_y) = point_for_visible_row(&ui, &mut terminal, released_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), down_x, down_y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("press first row");
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b")
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), up_x, up_y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("release second row");
+
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b")
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+        assert!(ui.attached.is_empty());
+    }
+
+    #[test]
+    fn left_press_off_list_then_release_on_session_is_inert() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-off-list", 200),
+            sess("b", "/tmp/agentviewer-mouse-off-list", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+        let selected_before = ui.app.selected_index();
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), u16::MAX, u16::MAX),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("off list button down");
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button up");
+
+        assert_eq!(ui.app.selected_index(), selected_before);
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+        assert!(ui.attached.is_empty());
+    }
+
+    #[test]
+    fn activating_release_is_not_forwarded_to_the_reused_session_pty() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-consumed", 200),
+            sess("b", "/tmp/agentviewer-mouse-consumed", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button down");
+        assert!(ui.attached.is_empty());
+
+        let key = (BackendKind::Opencode, "b".to_string());
+        ui.attached.insert(key.clone(), mouse_recording_pty());
+        wait_for_pty_screen(&ui, &key, "READY");
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button up");
+
+        assert!(matches!(ui.mode, Mode::Attached));
+        wait_for_pty_screen(&ui, &key, "CLEAN");
+    }
+
+    #[test]
+    fn mouse_move_over_session_only_selects() {
+        use super::handle_mouse;
+
+        let mut ui = test_ui_with(vec![
+            sess("a", "/tmp/agentviewer-mouse-hover", 200),
+            sess("b", "/tmp/agentviewer-mouse-hover", 100),
+        ]);
+        let mut terminal = test_terminal();
+        let target_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+        let action = handle_mouse(mouse(MouseEventKind::Moved, x, y), &mut ui);
+
+        assert_eq!(action, MouseAction::None);
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b")
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+        assert!(ui.attached.is_empty());
+    }
+
+    #[test]
+    fn left_click_without_a_list_hit_is_inert() {
+        use super::handle_mouse;
+
+        let mut ui = test_ui_with(vec![
+            sess("a", "/tmp/agentviewer-mouse-miss", 200),
+            sess("b", "/tmp/agentviewer-mouse-miss", 100),
+        ]);
+        let selected_before = ui.app.selected().map(|session| session.id.clone());
+
+        let action = handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), u16::MAX, u16::MAX),
+            &mut ui,
+        );
+
+        assert_eq!(action, MouseAction::None);
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.clone()),
+            selected_before
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused_session.is_none());
+    }
+
+    #[test]
+    fn right_and_middle_clicks_do_not_activate() {
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            let mut session = sess("a", "/tmp/agentviewer-mouse-other-button", 100);
+            session.backend = BackendKind::Opencode;
+            let mut ui = test_ui_with(vec![session]);
+            let mut terminal = test_terminal();
+            let target_idx = visible_session_index(&ui, "a");
+            let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+            handle_mouse_event(
+                mouse(MouseEventKind::Down(button), x, y),
+                &backends,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("nonleft click");
+            handle_mouse_event(
+                mouse(MouseEventKind::Up(button), x, y),
+                &backends,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("nonleft release");
+
+            assert!(matches!(ui.mode, Mode::Normal));
+            assert!(ui.focused_session.is_none());
+            assert!(ui.attached.is_empty());
+        }
+    }
+
+    #[test]
+    fn mouse_click_is_inert_in_every_modal_mode() {
+        use agent_viewer_tui::ui::{RenameModal, ReplyModal};
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let modes = [
+            Mode::Filter,
+            Mode::Help,
+            Mode::Rename(RenameModal {
+                backend: BackendKind::Opencode,
+                id: "b".to_string(),
+                buffer: String::new(),
+            }),
+            Mode::Reply(ReplyModal {
+                backend: BackendKind::Opencode,
+                id: "b".to_string(),
+                buffer: String::new(),
+            }),
+        ];
+
+        for mode in modes {
+            let mut sessions = vec![
+                sess("a", "/tmp/agentviewer-mouse-modal", 200),
+                sess("b", "/tmp/agentviewer-mouse-modal", 100),
+            ];
+            for session in &mut sessions {
+                session.backend = BackendKind::Opencode;
+            }
+            let mut ui = test_ui_with(sessions);
+            let mut terminal = test_terminal();
+            let target_idx = visible_session_index(&ui, "b");
+            let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+
+            handle_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                &backends,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("normal button down");
+            assert!(ui.mouse_press.is_some());
+
+            let selected_before = ui.app.selected().map(|session| session.id.clone());
+            let expected_mode = std::mem::discriminant(&mode);
+            ui.mode = mode;
+            handle_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                &backends,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("modal button down");
+            assert!(
+                ui.mouse_press.is_none(),
+                "modal button down must clear a stale normal mode press"
+            );
+            handle_mouse_event(
+                mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+                &backends,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("modal button up");
+
+            assert_eq!(std::mem::discriminant(&ui.mode), expected_mode);
+            assert_eq!(
+                ui.app.selected().map(|session| session.id.clone()),
+                selected_before
+            );
+            assert!(ui.focused_session.is_none());
+            assert!(ui.attached.is_empty());
+            assert!(ui.mouse_press.is_none());
+        }
+    }
+
+    #[test]
+    fn mouse_event_in_attached_mode_reaches_the_child_without_list_activation() {
+        let mut ui = test_ui_with(vec![sess("a", "/tmp/agentviewer-mouse-attached", 100)]);
+        let key = (BackendKind::Claude, "a".to_string());
+        ui.attached.insert(key.clone(), mouse_forwarding_pty());
+        ui.focused = Some(key.clone());
+        ui.mode = Mode::Attached;
+        wait_for_pty_screen(&ui, &key, "READY");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("forward attached mouse event");
+
+        wait_for_pty_screen(&ui, &key, "1b 5b 3c 30 3b 36 3b 35 4d");
+        assert!(matches!(ui.mode, Mode::Attached));
     }
 
     #[test]

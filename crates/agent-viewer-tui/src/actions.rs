@@ -27,6 +27,17 @@ pub(crate) fn toggle_group_if_header(ui: &mut Ui) -> bool {
     true
 }
 
+pub(crate) fn activate_selected<B: ratatui::backend::Backend>(
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    if !toggle_group_if_header(ui) {
+        attach_selected(backends, ui, terminal)?;
+    }
+    Ok(())
+}
+
 /// Ctrl+F — enter filter mode with a fresh, empty query.
 pub(crate) fn open_filter(ui: &mut Ui) {
     ui.app.set_filter(String::new());
@@ -284,10 +295,10 @@ fn caps_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Capabilities {
         .unwrap_or_else(Capabilities::none)
 }
 
-pub(crate) fn attach_selected(
+pub(crate) fn attach_selected<B: ratatui::backend::Backend>(
     backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     let Some(session) = ui.app.selected().cloned() else {
         return Ok(());
@@ -321,10 +332,10 @@ fn apply_attach_refusal(ui: &mut Ui, session: &Session, refusal: AttachRefusal) 
 /// Attach a GIVEN session (shared by `attach_selected` and the reply delivery path): reuse a
 /// live PTY (resize) or spawn one, and focus it. Returns true when it ended attached
 /// (Mode::Attached), false when it bailed with a notice.
-fn attach_session(
+fn attach_session<B: ratatui::backend::Backend>(
     backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
     session: &Session,
 ) -> io::Result<bool> {
     let Some(backend) = backend_of(backends, session.backend) else {
@@ -336,7 +347,9 @@ fn attach_session(
     }
 
     let key: Key = (session.backend, session.id.clone());
-    let size = terminal.size()?;
+    let size = terminal
+        .size()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let rows = size.height.saturating_sub(1).max(1);
     let cols = size.width.max(1);
 
