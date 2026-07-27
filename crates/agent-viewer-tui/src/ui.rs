@@ -336,12 +336,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // The composer box keeps one metadata row above its wrapped input and grows to a cap so
     // a long task description stays visible. Reply mode sizes its prompt prefixed box to the
     // reply buffer.
-    let composer_margin = (frame.area().width / 2).min(2);
-    let composer_width = frame
-        .area()
-        .width
-        .saturating_sub(composer_margin.saturating_mul(2));
-    let inner_w = composer_width.saturating_sub(2);
+    let inner_w = frame.area().width.saturating_sub(2);
     let composer_h = match &d.mode {
         Mode::Reply(m) => {
             let title = d
@@ -361,7 +356,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     };
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
-    // (grows with wrapped input) · blank gap · footer.
+    // (grows with wrapped input) · footer.
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -370,14 +365,8 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             Constraint::Length(1),
             Constraint::Length(composer_h),
             Constraint::Length(1),
-            Constraint::Length(1),
         ])
         .split(frame.area());
-    let composer_area = Rect {
-        x: vertical[3].x.saturating_add(composer_margin),
-        width: composer_width,
-        ..vertical[3]
-    };
 
     // Inline rename edits the selected row in place; inline peek expands it downward.
     let rename = match d.mode {
@@ -410,7 +399,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         vertical[1],
     );
     if matches!(d.mode, Mode::Normal) {
-        hit.blocked = slash_popup_area(d.composer, composer_area);
+        hit.blocked = slash_popup_area(d.composer, vertical[3]);
     }
     *d.list_hit.borrow_mut() = hit;
     // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
@@ -421,18 +410,18 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             .session_for(&(m.backend, m.id.clone()))
             .map(|s| s.title.clone())
             .unwrap_or_default();
-        draw_reply(frame, m, composer_area, &title);
+        draw_reply(frame, m, vertical[3], &title);
     } else {
         draw_composer(
             frame,
             d.app,
             d.composer,
             d.logos,
-            composer_area,
+            vertical[3],
             matches!(d.mode, Mode::Normal),
         );
     }
-    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[5]);
+    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, vertical[4]);
 
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup.
@@ -444,7 +433,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
                 &d.composer.model_suggestions(),
                 highlight,
                 "",
-                composer_area,
+                vertical[3],
             );
         } else {
             draw_suggestion_popup(
@@ -452,7 +441,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
                 &d.composer.suggestions(),
                 highlight,
                 "/",
-                composer_area,
+                vertical[3],
             );
         }
     }
@@ -654,8 +643,7 @@ fn composer_box_height(text: &str, inner_width: u16) -> u16 {
         1usize
     } else {
         let segments = wrap_by_width(text, inner_width as usize, inner_width as usize);
-        segments.len()
-            + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
+        segments.len() + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
     };
     input_lines.clamp(1, COMPOSER_MAX_LINES as usize) as u16 + 3
 }
@@ -786,7 +774,10 @@ fn draw_composer(
 
     frame.render_widget(
         Paragraph::new(Line::from(metadata_spans)),
-        Rect { height: 1, ..inner },
+        Rect {
+            height: 1,
+            ..inner
+        },
     );
 
     let input = Rect {
@@ -1714,7 +1705,12 @@ mod tests {
         (rows, (pos.x, pos.y))
     }
 
-    fn render_viewer(w: u16, h: u16, text: &str, mode: Mode) -> (Vec<String>, (u16, u16)) {
+    fn render_viewer(
+        w: u16,
+        h: u16,
+        text: &str,
+        mode: Mode,
+    ) -> (Vec<String>, (u16, u16)) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1773,46 +1769,15 @@ mod tests {
     fn composer_bounds(rows: &[String]) -> (usize, usize) {
         let top = rows
             .iter()
-            .position(|row| row.contains('╭'))
+            .position(|row| row.starts_with('╭'))
             .expect("composer top border");
         let bottom = rows
             .iter()
             .enumerate()
             .skip(top + 1)
-            .find_map(|(index, row)| row.contains('╰').then_some(index))
+            .find_map(|(index, row)| row.starts_with('╰').then_some(index))
             .expect("composer bottom border");
         (top, bottom)
-    }
-
-    #[test]
-    fn composer_and_reply_keep_inset_balanced_spacing() {
-        let (composer_rows, _) = render_viewer(40, 16, "task", Mode::Normal);
-        let (composer_top, composer_bottom) = composer_bounds(&composer_rows);
-        let composer_border = &composer_rows[composer_top];
-
-        assert_eq!(composer_border.chars().position(|ch| ch == '╭'), Some(2));
-        assert_eq!(
-            composer_border.chars().rev().position(|ch| ch == '╮'),
-            Some(2)
-        );
-        assert!(composer_rows[composer_top - 1].trim().is_empty());
-        assert!(composer_rows[composer_bottom + 1].trim().is_empty());
-        assert_eq!(composer_bottom + 2, composer_rows.len() - 1);
-
-        let reply = ReplyModal {
-            backend: BackendKind::Claude,
-            id: "reply".into(),
-            buffer: "yes".into(),
-        };
-        let (reply_rows, _) = render_viewer(40, 16, "", Mode::Reply(reply));
-        let (reply_top, reply_bottom) = composer_bounds(&reply_rows);
-        let reply_border = &reply_rows[reply_top];
-
-        assert_eq!(reply_border.chars().position(|ch| ch == '╭'), Some(2));
-        assert_eq!(reply_border.chars().rev().position(|ch| ch == '╮'), Some(2));
-        assert!(reply_rows[reply_top - 1].trim().is_empty());
-        assert!(reply_rows[reply_bottom + 1].trim().is_empty());
-        assert_eq!(reply_bottom + 2, reply_rows.len() - 1);
     }
 
     #[test]
@@ -1887,19 +1852,19 @@ mod tests {
         assert!(metadata.contains("gpt-5.3-codex"));
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
-        assert_eq!(&rows[top + 2], &format!("  │hello{}│  ", " ".repeat(39)));
-        assert_eq!((cursor.x, cursor.y), (8, (top + 2) as u16));
+        assert_eq!(&rows[top + 2], &format!("│hello{}│", " ".repeat(43)));
+        assert_eq!((cursor.x, cursor.y), (6, (top + 2) as u16));
     }
 
     #[test]
     fn composer_exact_width_input_adds_a_cursor_continuation_row() {
-        let (rows, cursor) = render_viewer(12, 18, "012345", Mode::Normal);
+        let (rows, cursor) = render_viewer(12, 18, "0123456789", Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "  │012345│  ");
-        assert_eq!(&rows[top + 3], "  │      │  ");
-        assert_eq!(cursor, (3, (top + 3) as u16));
+        assert_eq!(&rows[top + 2], "│0123456789│");
+        assert_eq!(&rows[top + 3], "│          │");
+        assert_eq!(cursor, (1, (top + 3) as u16));
     }
 
     #[test]
@@ -1908,16 +1873,13 @@ mod tests {
         let (rows, cursor) = render_viewer(12, 18, text, Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
-        assert_eq!(bottom - top + 1, 9);
-        assert!(rows[top + 1].chars().any(|ch| ch.is_alphabetic()));
-        assert!(!rows[top + 1].contains("abcdef"));
-        assert_eq!(&rows[top + 2], "  │abcdef│  ");
-        assert_eq!(&rows[top + 3], "  │界gh  │  ");
-        assert_eq!(&rows[top + 4], "  │      │  ");
-        assert_eq!(&rows[top + 5], "  │ijklmn│  ");
-        assert_eq!(&rows[top + 6], "  │opqrst│  ");
-        assert_eq!(&rows[top + 7], "  │      │  ");
-        assert_eq!(cursor, (3, (top + 7) as u16));
+        assert_eq!(bottom - top + 1, 7);
+        assert!(rows[top + 1].contains("claude"));
+        assert_eq!(&rows[top + 2], "│abcdef界gh│");
+        assert_eq!(&rows[top + 3], "│          │");
+        assert_eq!(&rows[top + 4], "│ijklmnopqr│");
+        assert_eq!(&rows[top + 5], "│st        │");
+        assert_eq!(cursor, (3, (top + 5) as u16));
     }
 
     #[test]
@@ -1933,7 +1895,7 @@ mod tests {
         assert!(rows[top + 1].contains("claude"));
         assert!(rows[top + 2].contains("line05"));
         assert!(rows[bottom - 1].contains("line14"));
-        assert_eq!(cursor, (9, (bottom - 1) as u16));
+        assert_eq!(cursor, (7, (bottom - 1) as u16));
     }
 
     #[test]
