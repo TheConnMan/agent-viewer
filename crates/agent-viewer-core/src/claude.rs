@@ -10,6 +10,10 @@ pub struct ClaudeBackend {
     /// Root of claude's per-job state dirs (`~/.claude/jobs`). Injectable so the rename
     /// round-trip is testable against a real directory instead of the developer's own jobs.
     jobs_root: PathBuf,
+    /// Root of claude's per-process registry (`~/.claude/sessions`), the only publisher of
+    /// `entrypoint`. Injectable for the same reason as `jobs_root`: the companion rule must be
+    /// testable against a fixture directory, not the developer's own live sessions.
+    sessions_root: PathBuf,
     /// Per-job state.json cache keyed by (mtime, len): the file is re-read and re-parsed
     /// only when it changes, not every tick (mirrors the codex StatusResolver pattern).
     detail_cache: HashMap<PathBuf, ((SystemTime, u64), JobDetail)>,
@@ -26,9 +30,13 @@ impl ClaudeBackend {
         ClaudeBackend::with_binary_and_jobs_root(binary, default_jobs_root())
     }
     pub fn with_binary_and_jobs_root(binary: &str, jobs_root: PathBuf) -> ClaudeBackend {
+        ClaudeBackend::with_roots(binary, jobs_root, default_sessions_root())
+    }
+    pub fn with_roots(binary: &str, jobs_root: PathBuf, sessions_root: PathBuf) -> ClaudeBackend {
         ClaudeBackend {
             binary: binary.to_string(),
             jobs_root,
+            sessions_root,
             detail_cache: HashMap::new(),
             models_cache: OnceLock::new(),
         }
@@ -163,6 +171,16 @@ impl Backend for ClaudeBackend {
                 }
             }
         }
+        // Hide nested `claude -p` children. The entrypoint lives only in the per-process
+        // registry, so this is a second (tiny, uncached) read per LIVE row; rows with no pid
+        // are finished jobs and are skipped without touching the disk.
+        let sessions_root = self.sessions_root.clone();
+        mark_sdk_companions(&mut sessions, |pid| {
+            std::fs::read_to_string(session_state_path_in(&sessions_root, pid))
+                .ok()
+                .as_deref()
+                .and_then(parse_session_registry)
+        });
         Ok(sessions)
     }
     fn available_models(&self) -> Vec<String> {
@@ -345,11 +363,103 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
     Ok(true)
 }
 
+/// Companion filter for claude - the peer of the codex `Source::is_companion` rule and the
+/// opencode `is_run_mode_permission` rule, which claude previously had no equivalent of.
+///
+/// Every live claude process registers itself in `~/.claude/sessions/<pid>.json`, and
+/// `claude agents --json --all` returns all of them. That includes a NESTED `claude -p` (the
+/// Agent SDK's headless entrypoint) that another session shelled out to - a skill, a hook, an
+/// `/implement` planning pass. It is a real process, but not a fleet member anyone started,
+/// and it carries no `jobId`, so claude derives its name from the cwd as `<dir-basename>-<n>`
+/// ("opencode-server-runtime-69"). Those rows read as mystery sessions in the default view and
+/// vanish when the child exits, since the pid file is removed on exit.
+///
+/// The discriminator is `entrypoint`, matched on the `sdk-` PREFIX so the whole Agent SDK
+/// family (`sdk-cli`, `sdk-ts`, `sdk-py`) is one rule. Two alternatives were rejected because
+/// a genuine interactive terminal session is indistinguishable from a nested `claude -p` under
+/// both: `kind == "interactive"` is what a real terminal session reports too, and the absence
+/// of `id`/`jobId` is equally true of one. A `--bg` job and an interactive session BOTH report
+/// `entrypoint: "cli"`, which is exactly what makes the `sdk-` prefix the safe cut.
+///
+/// Same safe direction as the opencode rule: anything unrecognized is treated as a real
+/// session, because a shown row one keypress from hidden beats a hidden row you cannot find.
+/// Companion only HIDES (Ctrl+A reveals); it never drops the row.
+pub fn is_sdk_entrypoint(entrypoint: Option<&str>) -> bool {
+    entrypoint.is_some_and(|value| value.starts_with("sdk-"))
+}
+
+/// `<sessions_root>/<pid>.json` - the per-process registry entry claude writes for every live
+/// session and removes on exit. This is the ONLY place `entrypoint` is published: `claude
+/// agents --json --all` projects just cwd/id/kind/name/sessionId/startedAt/state/pid, so the
+/// companion rule cannot be decided from the agents output alone (verified live on this box
+/// 2026-07-27 against claude 2.1.220 - reading `entrypoint` off an agents row always yields
+/// None, which is why this second read exists).
+fn session_state_path_in(sessions_root: &std::path::Path, pid: u32) -> PathBuf {
+    sessions_root.join(format!("{pid}.json"))
+}
+
+/// The two fields of a `~/.claude/sessions/<pid>.json` the companion rule needs: what kind of
+/// process it is, and WHICH session it is (the identity the pid-reuse guard checks).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRegistryEntry {
+    pub session_id: Option<String>,
+    pub entrypoint: Option<String>,
+}
+
+/// PURE: parse a `~/.claude/sessions/<pid>.json`. Absent, non-string, or unparseable fields
+/// come back as None rather than an error, so a schema drift degrades to "real session".
+/// Never panics.
+pub fn parse_session_registry(text: &str) -> Option<SessionRegistryEntry> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(SessionRegistryEntry {
+        session_id: crate::json_str(&value, "sessionId").map(str::to_string),
+        entrypoint: crate::json_str(&value, "entrypoint").map(str::to_string),
+    })
+}
+
+/// PURE, unit-tested: flag every session whose registry entry is an SDK one as a companion.
+/// `registry_of` resolves a pid to that entry (the caller reads the file; the test passes a
+/// map), so the rule itself is testable with no filesystem at all.
+///
+/// Sessions with NO pid are left alone: a pid is absent exactly for finished background jobs,
+/// which are real fleet members. Only ever SETS companion, mirroring `mark_dead_dirs` - a
+/// session another rule already flagged stays flagged.
+///
+/// **Pid-reuse guard.** The registry is keyed by pid and the kernel recycles pids, so between
+/// the `claude agents` snapshot and this read the file at `<pid>.json` can belong to a
+/// DIFFERENT session - and if that new process is an SDK one, a real row would be hidden. The
+/// entry's own `sessionId` must therefore match the row's before the flag is applied. A
+/// missing or mismatched `sessionId` means "not proven to be this session", so the row stays
+/// visible: the same safe direction the rest of this rule takes.
+pub fn mark_sdk_companions(
+    sessions: &mut [Session],
+    registry_of: impl Fn(u32) -> Option<SessionRegistryEntry>,
+) {
+    for session in sessions.iter_mut() {
+        if session.companion {
+            continue;
+        }
+        let Some(pid) = session.pid else {
+            continue;
+        };
+        let Some(entry) = registry_of(pid) else {
+            continue;
+        };
+        if entry.session_id.as_deref() != Some(session.id.as_str()) {
+            continue;
+        }
+        if is_sdk_entrypoint(entry.entrypoint.as_deref()) {
+            session.companion = true;
+        }
+    }
+}
+
 /// PURE parser, unit tested against the fixture. Input: stdout of
 /// `claude agents --json --all`, a JSON array of objects.
 /// Mapping: id = sessionId (attach takes it); title = name; cwd = cwd;
 /// created_at_ms = updated_at_ms = startedAt; hidden = false;
-/// origin comes from kind; companion = false; summary = "".
+/// origin comes from kind; companion = false (decided later by `mark_sdk_companions`, since
+/// the agents output does not publish `entrypoint`); summary = "".
 /// state: "working" -> Working, "blocked" -> NeedsInput, "idle" -> Idle,
 /// "done" -> Done, "failed" -> Error, "stopped" -> Done,
 /// missing or unknown -> Unknown. pid: entry "pid" as u32 when present.
@@ -402,6 +512,8 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             created_at_ms: started_at,
             updated_at_ms: started_at,
             hidden: false,
+            // The agents output does not publish `entrypoint`; `list()` applies the companion
+            // rule afterwards via `mark_sdk_companions`.
             companion: false,
             summary: String::new(),
             pid,
@@ -514,6 +626,24 @@ pub fn default_jobs_root() -> PathBuf {
         std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
         &crate::home_dir(),
     )
+}
+
+/// $CLAUDE_CONFIG_DIR/sessions if set, else $HOME/.claude/sessions. Same env precedence as
+/// the jobs root, and for the same reason: a viewer that inherited `CLAUDE_CONFIG_DIR` must
+/// read the same tree the `claude` it shells out to is writing.
+pub fn default_sessions_root() -> PathBuf {
+    sessions_root_from(
+        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        &crate::home_dir(),
+    )
+}
+
+/// PURE peer of `jobs_root_from` for the per-process registry dir.
+pub fn sessions_root_from(config_dir: Option<&str>, home: &std::path::Path) -> PathBuf {
+    match config_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("sessions"),
+        None => home.join(".claude/sessions"),
+    }
 }
 
 /// The jobs root for a given config dir, split out from the env read so the precedence is
