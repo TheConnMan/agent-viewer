@@ -2,13 +2,16 @@
 //! rename, stop/remove, hide). Everything here mutates the shared `Ui` state owned by the
 //! run loop in `main.rs`.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 
-use agent_viewer_core::backend::{Backend, BackendKind};
-use agent_viewer_tui::app::{Row, Section};
+use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
+use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
-use agent_viewer_tui::ui::Mode;
+use agent_viewer_tui::ui::{
+    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
@@ -68,6 +71,9 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     match &mut ui.mode {
         Mode::Attached => handle_attached_key(key, ui),
         Mode::Normal => return handle_normal_key(key, ctrl, backends, refresher, ui, terminal),
+        Mode::Palette(_) => {
+            handle_palette_key(key, backends, ui, terminal)?;
+        }
         Mode::Filter => handle_filter_key(key.code, ui),
         Mode::Help => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
@@ -249,6 +255,7 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
         }
         Mode::Rename(modal) => modal.buffer.push_str(&single_line_paste(text)),
         Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
+        Mode::Palette(palette) => palette.push_str(&single_line_paste(text)),
         Mode::Help => {}
     }
 }
@@ -336,6 +343,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('e') => open_reply(backends, ui),
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
+            KeyCode::Char('k') => open_palette(backends, ui),
             _ => {}
         }
         return Ok(false);
@@ -435,6 +443,385 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     ensure_completions(ui);
     ensure_models(ui);
     Ok(false)
+}
+
+fn open_palette(backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    let items = palette_items(backends, ui);
+    ui.mode = Mode::Palette(PaletteState::new(items));
+}
+
+fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
+    let selected = ui.app.selected();
+    let capabilities = selected
+        .and_then(|session| {
+            backend_of(backends, session.backend).map(|b| b.capabilities_for(session))
+        })
+        .unwrap_or_else(Capabilities::none);
+    let mut items = palette_action_items(selected, capabilities);
+
+    let mut seen = HashSet::new();
+    let mut sessions = ui
+        .app
+        .visible()
+        .iter()
+        .filter_map(|row| {
+            let Row::Session {
+                backend,
+                id,
+                updated_at_ms,
+                ..
+            } = row
+            else {
+                return None;
+            };
+            let key = (*backend, id.clone());
+            if !seen.insert(key.clone()) {
+                return None;
+            }
+            let session = ui.app.session_for(&key)?;
+            Some((*updated_at_ms, palette_session_item(session)))
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|(left_time, left), (right_time, right)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    items.extend(sessions.into_iter().map(|(_, item)| item));
+
+    for backend in [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Opencode,
+    ] {
+        let mut models = ui
+            .models
+            .models(backend)
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(|| vec![backend.default_model().to_string()]);
+        if backend == ui.composer.backend()
+            && !models.iter().any(|model| model == ui.composer.model())
+        {
+            models.push(ui.composer.model().to_string());
+        }
+        models.sort();
+        models.dedup();
+        items.extend(models.into_iter().map(|name| {
+            PaletteItem::new(
+                PaletteGroup::Models,
+                "◇",
+                name.clone(),
+                format!("{} · set composer model", backend.name()),
+                None,
+                true,
+                None,
+                PaletteTarget::Model { backend, name },
+            )
+        }));
+    }
+
+    items.extend(
+        palette_commands(ui.composer.backend(), ui.app.spawn_target().as_deref())
+            .into_iter()
+            .map(|command| {
+                PaletteItem::new(
+                    PaletteGroup::Commands,
+                    "/",
+                    format!("/{command}"),
+                    format!("{} slash command", ui.composer.backend().name()),
+                    None,
+                    true,
+                    None,
+                    PaletteTarget::Command(command),
+                )
+            }),
+    );
+    items
+}
+
+fn palette_action_items(
+    selected: Option<&Session>,
+    capabilities: Capabilities,
+) -> Vec<PaletteItem> {
+    [
+        action_item(
+            PaletteAction::Attach,
+            "Attach session",
+            "open the selected session",
+            Some("⏎"),
+            capability_reason(selected, capabilities.attach, "attach"),
+        ),
+        action_item(
+            PaletteAction::Archive,
+            "Archive session",
+            "hide the selected session",
+            Some("⌃D"),
+            selected
+                .filter(|session| session.hidden)
+                .map(|_| "unavailable · session is already archived".to_string())
+                .or_else(|| capability_reason(selected, capabilities.archive, "archive")),
+        ),
+        action_item(
+            PaletteAction::Unarchive,
+            "Unarchive session",
+            "restore the selected session",
+            Some("⌃U"),
+            selected
+                .filter(|session| !session.hidden)
+                .map(|_| "unavailable · session is not archived".to_string())
+                .or_else(|| capability_reason(selected, capabilities.archive, "unarchive")),
+        ),
+        action_item(
+            PaletteAction::Rename,
+            "Rename session",
+            "rename the selected session",
+            Some("⌃R"),
+            capability_reason(selected, capabilities.rename, "rename"),
+        ),
+        action_item(
+            PaletteAction::Reply,
+            "Reply to session",
+            "answer a session that needs input",
+            Some("⌃E"),
+            Some("unavailable · reply is not supported".to_string()),
+        ),
+        action_item(
+            PaletteAction::StopOrRemove,
+            "Stop or remove session",
+            "stop once, remove on the next press",
+            Some("⌃X"),
+            capability_reason(
+                selected,
+                capabilities.stop || capabilities.delete,
+                "stop or remove",
+            ),
+        ),
+        action_item(
+            PaletteAction::ShowAll,
+            "Show all sessions",
+            "toggle archived and companion sessions",
+            Some("⌃A"),
+            None,
+        ),
+        action_item(
+            PaletteAction::Group,
+            "Group sessions",
+            "toggle state and project grouping",
+            Some("⌃S"),
+            None,
+        ),
+        action_item(
+            PaletteAction::Filter,
+            "Filter sessions",
+            "open the list filter",
+            Some("⌃F"),
+            None,
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn action_item(
+    action: PaletteAction,
+    name: &str,
+    detail: &str,
+    key_hint: Option<&str>,
+    disabled_reason: Option<String>,
+) -> PaletteItem {
+    PaletteItem::new(
+        PaletteGroup::Actions,
+        "▸",
+        name,
+        detail,
+        key_hint,
+        disabled_reason.is_none(),
+        disabled_reason,
+        PaletteTarget::Action(action),
+    )
+}
+
+fn capability_reason(selected: Option<&Session>, supported: bool, action: &str) -> Option<String> {
+    match selected {
+        None => Some("unavailable · no session selected".to_string()),
+        Some(_) if supported => None,
+        Some(session) => Some(format!(
+            "unavailable · {} does not support {action}",
+            session.backend.name()
+        )),
+    }
+}
+
+fn palette_session_item(session: &Session) -> PaletteItem {
+    PaletteItem::new(
+        PaletteGroup::Sessions,
+        status_icon(&session.status),
+        session.title.clone(),
+        format!(
+            "{} · {} · {}",
+            session.backend.name(),
+            session.cwd.display(),
+            status_word(&session.status)
+        ),
+        Some("⏎"),
+        true,
+        None,
+        PaletteTarget::Session {
+            backend: session.backend,
+            id: session.id.clone(),
+        },
+    )
+}
+
+fn status_icon(status: &Status) -> &'static str {
+    match status {
+        Status::Working => "✽",
+        Status::NeedsInput { .. } => "◐",
+        Status::Idle => "∙",
+        Status::Done => "●",
+        Status::Error => "✗",
+        Status::Unknown => "?",
+    }
+}
+
+fn status_word(status: &Status) -> &'static str {
+    match status {
+        Status::Working => "working",
+        Status::NeedsInput { .. } => "needs input",
+        Status::Idle => "idle",
+        Status::Done => "done",
+        Status::Error => "error",
+        Status::Unknown => "unknown",
+    }
+}
+
+fn palette_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<String> {
+    let home = agent_viewer_core::home_dir();
+    let mut commands = match backend {
+        BackendKind::Claude => {
+            let mut commands = subdir_names(&home.join(".claude/skills"));
+            if let Some(target) = target {
+                commands.extend(subdir_names(&target.join(".claude/skills")));
+            }
+            commands
+        }
+        BackendKind::Opencode => file_stems(&home.join(".config/opencode/command")),
+        BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
+    };
+    commands.extend(["model".to_string(), "theme".to_string()]);
+    commands.retain(|command| !matches!(command.as_str(), "wall" | "tail"));
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn Backend> {
+    backends
+        .iter()
+        .find(|backend| backend.kind() == kind)
+        .map(|backend| backend.as_ref())
+}
+
+fn handle_palette_key<B: ratatui::backend::Backend>(
+    key: KeyEvent,
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let mut close = false;
+    let mut execute = false;
+    {
+        let Mode::Palette(palette) = &mut ui.mode else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Down => palette.move_highlight(1),
+            KeyCode::Up => palette.move_highlight(-1),
+            KeyCode::Tab => palette.scope_highlighted(),
+            KeyCode::Backspace => palette.backspace(),
+            KeyCode::Esc if palette.escape() => close = true,
+            KeyCode::Esc => {}
+            KeyCode::Char(character) if !ctrl => palette.push(character),
+            KeyCode::Enter => execute = true,
+            _ => {}
+        }
+    }
+    if close {
+        ui.mode = Mode::Normal;
+    } else if execute {
+        execute_palette_selection(backends, ui, terminal)?;
+    }
+    Ok(())
+}
+
+fn execute_palette_selection<B: ratatui::backend::Backend>(
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    let Some(item) = (match &ui.mode {
+        Mode::Palette(palette) => palette.highlighted().cloned(),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    if !item.enabled {
+        if let Some(reason) = item.disabled_reason {
+            ui.set_notice(reason);
+        }
+        return Ok(());
+    }
+
+    ui.mode = Mode::Normal;
+    match item.target {
+        PaletteTarget::Action(action) => match action {
+            PaletteAction::Attach => attach_selected(backends, ui, terminal)?,
+            PaletteAction::Archive => hide_selected(backends, ui, true),
+            PaletteAction::Unarchive => hide_selected(backends, ui, false),
+            PaletteAction::Rename => open_rename(backends, ui),
+            PaletteAction::Reply => open_reply(backends, ui),
+            PaletteAction::StopOrRemove => kill_selected(backends, ui),
+            PaletteAction::ShowAll => ui.app.toggle_show_all(),
+            PaletteAction::Group => ui.app.toggle_group_mode(),
+            PaletteAction::Filter => open_filter(ui),
+        },
+        PaletteTarget::Session { backend, id } => {
+            if ui.app.select_by_key(&(backend, id)) {
+                attach_selected(backends, ui, terminal)?;
+            } else {
+                ui.set_notice("session is no longer visible".to_string());
+            }
+        }
+        PaletteTarget::Model { backend, name } => {
+            select_palette_model(ui, backend, name);
+        }
+        PaletteTarget::Command(command) => {
+            ui.composer.clear();
+            ui.composer.push_str(&format!("/{command} "));
+            if command == "theme" {
+                ui.themes.open_picker();
+            }
+            ensure_completions(ui);
+        }
+    }
+    Ok(())
+}
+
+fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
+    while ui.composer.backend() != backend {
+        ui.composer.cycle_backend();
+    }
+    let mut models = ui
+        .models
+        .models(backend)
+        .map(<[String]>::to_vec)
+        .unwrap_or_else(|| vec![backend.default_model().to_string()]);
+    if !models.contains(&name) {
+        models.push(name.clone());
+    }
+    ui.composer.set_models(vec![name], backend);
+    ui.composer.set_models(models, backend);
 }
 
 /// While attached: Ctrl+] always detaches; Left detaches when the input line is empty
@@ -587,7 +974,8 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 pub(crate) mod tests {
     use super::{
         MouseAction, MouseTarget, ensure_completions, handle_attached_key, handle_mouse_event,
-        handle_normal_key, handle_paste, handle_rename_key, is_quit_chord, open_filter,
+        handle_normal_key, handle_palette_key, handle_paste, handle_rename_key, is_quit_chord,
+        open_filter, open_palette,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec};
@@ -1424,6 +1812,101 @@ pub(crate) mod tests {
         ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
             unreachable!("attach is not exercised by row scoped archive tests")
         }
+    }
+
+    #[test]
+    fn ctrl_k_escape_restores_selection_and_preserves_the_composer() {
+        let mut ui = test_ui_with(vec![
+            sess("first", "/tmp/agentviewer-palette-first", 100),
+            sess("second", "/tmp/agentviewer-palette-second", 200),
+        ]);
+        select_session_row(&mut ui, "first");
+        ui.composer.push_str("draft stays");
+        let selected = ui.app.selected_index();
+
+        assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
+        assert!(matches!(ui.mode, Mode::Palette(_)));
+        let mut terminal = test_terminal();
+        handle_palette_key(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("escape palette");
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.app.selected_index(), selected);
+        assert_eq!(ui.composer.text(), "draft stays");
+    }
+
+    #[test]
+    fn enter_on_a_disabled_palette_action_has_no_mutation() {
+        let mut ui = test_ui_with(vec![sess(
+            "external",
+            "/tmp/agentviewer-palette-disabled",
+            100,
+        )]);
+        select_session_row(&mut ui, "external");
+        assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
+        let mut terminal = test_terminal();
+        for character in "arch".chars() {
+            handle_palette_key(
+                key(KeyCode::Char(character), KeyModifiers::NONE),
+                &[],
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("type palette query");
+        }
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("accept disabled action");
+
+        assert!(matches!(ui.mode, Mode::Palette(_)));
+        assert!(!ui.mutations.in_flight("claude:external:hide"));
+        assert!(ui.notice.text().contains("does not support archive"));
+    }
+
+    #[test]
+    fn palette_model_accept_sets_the_model_without_touching_the_draft() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_models(
+            vec!["sonnet".to_string(), "opus[1m]".to_string()],
+            BackendKind::Claude,
+        );
+        ui.models.seed(
+            BackendKind::Claude,
+            vec!["sonnet".to_string(), "opus[1m]".to_string()],
+            true,
+        );
+        ui.composer.push_str("existing draft");
+        open_palette(&[], &mut ui);
+        let mut terminal = test_terminal();
+        for character in "opus".chars() {
+            handle_palette_key(
+                key(KeyCode::Char(character), KeyModifiers::NONE),
+                &[],
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("type palette query");
+        }
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("accept palette model");
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.composer.model(), "opus[1m]");
+        assert_eq!(ui.composer.text(), "existing draft");
     }
 
     #[test]
