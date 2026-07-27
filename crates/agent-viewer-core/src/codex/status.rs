@@ -117,13 +117,16 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, RolloutOwner> {
 /// ARGV ALONE, because this single predicate is what keeps `stop` from SIGTERMing the daemon
 /// and every session inside it.
 ///
-/// The rule is `app-server` present and the `daemon` subcommand absent. The live daemon's
-/// cmdline is `codex app-server --listen unix://` (captured from /proc/<pid>/cmdline), while
-/// the short-lived `codex app-server daemon version` / `daemon start` probes carry `daemon`
-/// and host nothing. Matching on `app-server` rather than on `--listen` errs toward calling a
-/// host a host: the costly mistake here is the FALSE NEGATIVE (Ctrl+X SIGTERMs a process
-/// hosting other people's threads), while a false positive only routes stop through
-/// `turn/interrupt`, which fails visibly instead of killing anything.
+/// The rule is `app-server` as the SUBCOMMAND (argv[1]) and `daemon` not the word after it.
+/// The live daemon's cmdline is `codex app-server --listen unix://` (captured from
+/// /proc/<pid>/cmdline), while the short-lived `codex app-server daemon version` /
+/// `daemon start` probes carry `daemon` and host nothing. Matching on `app-server` rather than
+/// on `--listen` errs toward calling a host a host: the costly mistake here is the FALSE
+/// NEGATIVE (Ctrl+X SIGTERMs a process hosting other people's threads), while a false positive
+/// only routes stop through `turn/interrupt`, which fails visibly instead of killing anything.
+///
+/// Position matters, not mere presence: a task prompt is a single argv token, so
+/// `codex exec ... "app-server"` would otherwise read as the daemon and lose its real pid.
 ///
 /// This USED to also treat "holds more than one rollout fd" as proof of the daemon. That is
 /// measurably false and was removed: a plain
@@ -137,8 +140,10 @@ fn is_daemon_process(args: &[std::borrow::Cow<'_, str>]) -> bool {
 }
 
 /// PURE: the argv test above, kept as its own name because it is what the rule reads as.
+/// argv[0] is the binary, so the subcommand is argv[1] and its own subcommand is argv[2].
 fn is_app_server(args: &[std::borrow::Cow<'_, str>]) -> bool {
-    args.iter().any(|arg| arg == "app-server") && !args.iter().any(|arg| arg == "daemon")
+    let at = |i: usize| args.get(i).map(|arg| arg.as_ref());
+    at(1) == Some("app-server") && at(2) != Some("daemon")
 }
 
 /// PURE: does this argv token have the shape of a codex thread id (a 36-char UUID)? Shape-based
@@ -360,6 +365,9 @@ mod tests {
             // host nothing. These are the reason the rule excludes `daemon`.
             argv(&["codex", "app-server", "daemon", "version"]),
             argv(&["codex", "app-server", "daemon", "start"]),
+            // A task prompt is ONE argv token, so a bare-presence test would score this
+            // ordinary exec session as the daemon and strip its real pid.
+            argv(&["codex", "exec", "--json", "-C", "/tmp", "app-server"]),
             // sysinfo returns an empty argv for a process it could not read.
             argv(&[]),
         ];

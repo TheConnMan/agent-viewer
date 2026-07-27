@@ -10,7 +10,8 @@ use agent_viewer_core::backend::{
 };
 use agent_viewer_core::codex::app_server::{Daemon, remote_endpoint};
 use agent_viewer_core::codex::{
-    AttachRoute, CodexBackend, SpawnRoute, StopRoute, attach_route, spawn_route, stop_route,
+    AttachRoute, CodexBackend, SpawnRoute, StopRoute, attach_route, no_daemon_spawn_refusal,
+    spawn_route, stop_route,
 };
 use std::path::PathBuf;
 
@@ -202,6 +203,22 @@ fn spawn_route_refuses_rather_than_silently_spawning_an_unjoinable_session() {
     // exactly like a good one. A daemon poisoned by a deleted cwd then stayed invisible for
     // hours while every viewer spawn quietly degraded. No daemon now means a visible refusal.
     assert_eq!(spawn_route(None, false), SpawnRoute::Refuse);
+}
+
+#[test]
+fn the_spawn_refusal_leads_with_the_reason_the_daemon_could_not_be_reached() {
+    // A refusal is the whole of what the user gets to act on, so it has to distinguish a
+    // missing binary from a wedged one. The old constant said only "no daemon could be
+    // started", which makes a misconfigured box look like a broken viewer.
+    let refusal = no_daemon_spawn_refusal("`codex app-server daemon start` exited 1: bad config");
+    assert!(
+        refusal.starts_with("`codex app-server daemon start` exited 1: bad config"),
+        "the concrete reason must lead, got {refusal:?}"
+    );
+    assert!(
+        refusal.contains("AGENT_VIEWER_CODEX_EXEC_SPAWN=1"),
+        "and it must name the escape hatch, got {refusal:?}"
+    );
 }
 
 #[test]

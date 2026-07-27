@@ -30,10 +30,15 @@ pub enum SpawnRoute<'a> {
 /// Opt-in env var for the unjoinable `codex exec` spawn path.
 pub const EXEC_SPAWN_ENV: &str = "AGENT_VIEWER_CODEX_EXEC_SPAWN";
 
-/// Shown verbatim when a spawn is refused because no daemon could be reached or started.
-const NO_DAEMON_SPAWN_REFUSAL: &str = "no codex app-server daemon could be started, and a \
-    session spawned without one can never be joined; start one with `codex app-server daemon \
-    start` (or set AGENT_VIEWER_CODEX_EXEC_SPAWN=1 to spawn an unjoinable exec session)";
+/// PURE: the spawn refusal shown when no daemon could be reached, wrapped around `why` (the
+/// concrete reason `ensure_daemon` failed). The reason leads, because that is the part the
+/// user can act on; a bare "no daemon" makes a missing binary and a wedged one look alike.
+pub fn no_daemon_spawn_refusal(why: &str) -> String {
+    format!(
+        "{why}. A session spawned without a daemon can never be joined, so this spawn was \
+         refused; set {EXEC_SPAWN_ENV}=1 to spawn an unjoinable exec session anyway"
+    )
+}
 
 /// PURE: the daemon wins whenever one is reachable, and there is NO silent fallback.
 ///
@@ -354,7 +359,13 @@ impl Backend for CodexBackend {
         // later, and it may be started here (never stopped, never restarted). Skip the probe
         // entirely when exec is forced, so an opt-in never starts a daemon it will not use.
         let exec_opt_in = exec_spawn_opt_in();
-        let daemon = (!exec_opt_in).then(app_server::ensure_daemon).flatten();
+        let daemon = (!exec_opt_in).then(app_server::ensure_daemon);
+        // Keep the concrete reason: it is the whole content of the refusal below.
+        let why = daemon
+            .as_ref()
+            .and_then(|d| d.as_ref().err().cloned())
+            .unwrap_or_else(|| "no codex app-server daemon is listening".to_string());
+        let daemon = daemon.and_then(std::result::Result::ok);
         match spawn_route(daemon.as_ref(), exec_opt_in) {
             SpawnRoute::Daemon(daemon) => {
                 return match app_server::try_spawn_thread(daemon, dir, task, model) {
@@ -378,7 +389,7 @@ impl Backend for CodexBackend {
                 };
             }
             SpawnRoute::Refuse => {
-                return Err(crate::error::Error::Command(NO_DAEMON_SPAWN_REFUSAL.into()));
+                return Err(crate::error::Error::Command(no_daemon_spawn_refusal(&why)));
             }
             SpawnRoute::Exec => {}
         }
