@@ -45,16 +45,14 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         open_rollouts: HashMap::new(),
         attached_threads: HashSet::new(),
     };
-    let listening = std::fs::read_to_string("/proc/net/unix")
-        .map(|table| {
-            listening_socket_inodes(&table, &crate::default_codex_home().join(CONTROL_DIR))
-        })
+    // The argv backstop is consulted ONLY when the kernel's socket table could not be read at
+    // all. Whenever it can, "holds a listening socket" answers per process and decides alone,
+    // so a session whose PROMPT happens to be "app-server" keeps its own pid.
+    let table = std::fs::read_to_string("/proc/net/unix");
+    let trust_argv = table.is_err();
+    let listening = table
+        .map(|t| listening_socket_inodes(&t))
         .unwrap_or_default();
-    // The argv backstop is consulted ONLY when the socket table named no daemon at all: an
-    // unreadable /proc/net/unix, or a daemon listening somewhere other than the control dir
-    // (`--listen unix:///somewhere/else`). Whenever the exact signal is available it decides
-    // alone, so a session whose PROMPT happens to be "app-server" keeps its own pid.
-    let trust_argv = listening.is_empty();
     for (pid, process) in sys.processes() {
         if !process.name().to_string_lossy().starts_with("codex") {
             continue;
@@ -74,14 +72,14 @@ pub fn scan_codex_processes() -> CodexProcessScan {
             continue;
         };
         let mut held: Vec<PathBuf> = Vec::new();
-        let mut holds_the_control_socket = false;
+        let mut holds_a_listening_socket = false;
         for entry in entries.flatten() {
             let Ok(target) = std::fs::read_link(entry.path()) else {
                 continue;
             };
             let display = target.to_string_lossy();
             if let Some(inode) = socket_inode(&display) {
-                holds_the_control_socket |= listening.contains(&inode);
+                holds_a_listening_socket |= listening.contains(&inode);
                 continue;
             }
             let stripped = display.strip_suffix(" (deleted)").unwrap_or(&display);
@@ -92,7 +90,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         }
         let owner = RolloutOwner {
             pid: pid.as_u32(),
-            daemon: holds_the_control_socket || (trust_argv && is_daemon_process(&args)),
+            daemon: holds_a_listening_socket || (trust_argv && is_daemon_process(&args)),
         };
         for path in held {
             record_owner(&mut scan.open_rollouts, path, owner);
@@ -100,10 +98,6 @@ pub fn scan_codex_processes() -> CodexProcessScan {
     }
     scan
 }
-
-/// The control-socket directory, relative to the codex home. Derived like every other codex
-/// path in this crate, never hardcoded absolute.
-const CONTROL_DIR: &str = "app-server-control";
 
 /// PURE: the inode of an fd whose /proc link target is `socket:[N]`, else None.
 fn socket_inode(link_target: &str) -> Option<u64> {
@@ -114,21 +108,27 @@ fn socket_inode(link_target: &str) -> Option<u64> {
         .ok()
 }
 
-/// PURE: inodes of the LISTENING unix sockets bound under `control_dir`, from /proc/net/unix.
+/// PURE: inodes of every LISTENING unix socket, from /proc/net/unix.
 ///
 /// Columns are `Num RefCount Protocol Flags Type St Inode Path`, and `St == 01` is
-/// SS_LISTENING (the accepting end, not a client connection). A process holding one of these
-/// fds IS the server bound to that path, which is the whole point: it is a fact about the
-/// kernel's socket table rather than a guess about a command line.
-fn listening_socket_inodes(proc_net_unix: &str, control_dir: &Path) -> HashSet<u64> {
+/// SS_LISTENING: the accepting end, never a client connection. Intersected against a codex
+/// process's own fds this says "this process is a server", which is what an app-server hosting
+/// other people's threads IS. A `codex exec` session runs its app-server in process and listens
+/// on nothing; an interactive session holds a CONNECTED socket to the daemon (`St == 03`),
+/// which is deliberately not matched.
+///
+/// Deliberately NOT filtered to the control-socket path. A second app-server on a custom
+/// `--listen` endpoint hosts threads exactly as the managed daemon does, and a path filter
+/// would classify it as an ordinary session, exposing its pid to a SIGTERM that would kill
+/// every thread inside it.
+fn listening_socket_inodes(proc_net_unix: &str) -> HashSet<u64> {
     proc_net_unix
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
-            let inode = fields.nth(6)?.parse().ok()?;
-            let path = fields.next()?;
-            let listening = line.split_whitespace().nth(5) == Some("01");
-            (listening && Path::new(path).starts_with(control_dir)).then_some(inode)
+            let listening = fields.nth(5)? == "01";
+            let inode = fields.next()?.parse().ok()?;
+            listening.then_some(inode)
         })
         .collect()
 }
@@ -371,7 +371,6 @@ mod tests {
     };
     use std::borrow::Cow;
     use std::collections::HashMap;
-    use std::path::Path;
     use std::path::PathBuf;
 
     fn argv(args: &[&str]) -> Vec<Cow<'static, str>> {
@@ -444,64 +443,49 @@ mod tests {
         }
     }
 
-    /// THE decisive signal, and why the argv backstop above is allowed to be crude: the daemon
-    /// is whoever holds the LISTENING control socket. That is a kernel fact, so no command line
-    /// a user invents can produce a false negative, and a process merely CONNECTED to the
-    /// socket (any client, including the viewer) must not be mistaken for it.
+    /// THE decisive signal, and why the argv backstop above is allowed to be crude: an
+    /// app-server is a SERVER, so it holds a listening socket. That is a kernel fact, so no
+    /// command line a user invents can produce a false negative, and a process merely
+    /// CONNECTED to a socket (any client, the interactive TUI and this viewer included) must
+    /// not be mistaken for one.
     #[test]
-    fn the_listening_control_socket_identifies_the_daemon() {
-        let home = Path::new("/home/user/.codex/app-server-control");
+    fn a_listening_socket_identifies_a_host_and_a_connected_one_does_not() {
         // Real /proc/net/unix shape: Num RefCount Protocol Flags Type St Inode Path.
         let table = "\
 Num       RefCount Protocol Flags    Type St Inode Path
 ffff0001: 00000002 00000000 00010000 0001 01 111111 /home/user/.codex/app-server-control/app-server-control.sock
 ffff0002: 00000003 00000000 00000000 0001 03 222222 /home/user/.codex/app-server-control/app-server-control.sock
-ffff0003: 00000002 00000000 00010000 0001 01 333333 /run/user/1000/other.sock
-ffff0004: 00000002 00000000 00010000 0001 01 444444
+ffff0003: 00000002 00000000 00010000 0001 01 333333 /tmp/second-app-server.sock
+ffff0004: 00000003 00000000 00000000 0001 03 444444
 ";
-        let found = listening_socket_inodes(table, home);
+        let found = listening_socket_inodes(table);
 
-        assert!(found.contains(&111111), "the listening end IS the daemon");
+        assert!(found.contains(&111111), "the listening end IS a host");
         assert!(
             !found.contains(&222222),
-            "a CONNECTED client on the same path is not the daemon"
+            "a CONNECTED client on the same path is not a host"
         );
+        // The finding that killed the control-dir filter: a second app-server on a custom
+        // --listen endpoint hosts threads exactly as the managed daemon does, and filtering by
+        // path would classify it as an ordinary session, exposing its pid to a SIGTERM that
+        // kills every thread inside it.
         assert!(
-            !found.contains(&333333),
-            "a listening socket somewhere else is not the daemon"
+            found.contains(&333333),
+            "a host on a custom listen endpoint is still a host"
         );
-        assert!(
-            !found.contains(&444444),
-            "an unbound socket has no path to match"
-        );
+        assert!(!found.contains(&444444), "an unbound client socket is not");
     }
 
-    /// The two signals are not peers. Whenever the socket table names a daemon, it decides
-    /// ALONE, so an ordinary session whose prompt happens to be the word `app-server` keeps
-    /// its own pid; the crude argv test is reached only when nothing was named, which is the
-    /// only situation where being wrong in the safe direction beats being silent.
+    /// The two signals are not peers. Whenever the socket table can be read it decides ALONE
+    /// and per process, so an ordinary session whose prompt happens to be the word
+    /// `app-server` keeps its own pid. The crude argv test is reached only when the table is
+    /// unreadable, the one situation where being wrong in the safe direction beats silence.
     #[test]
-    fn the_argv_backstop_is_reached_only_when_no_daemon_was_named() {
-        let control = Path::new("/home/user/.codex/app-server-control");
-        let with_daemon = "\
-ffff0001: 00000002 00000000 00010000 0001 01 111111 /home/user/.codex/app-server-control/app-server-control.sock
-";
-        let without = "\
-ffff0003: 00000002 00000000 00010000 0001 01 333333 /run/user/1000/other.sock
-";
-        assert!(
-            !listening_socket_inodes(with_daemon, control).is_empty(),
-            "a named daemon must switch the argv backstop OFF"
-        );
-        assert!(
-            listening_socket_inodes(without, control).is_empty(),
-            "no named daemon must leave the argv backstop ON"
-        );
-        // And the row the gate protects: a prompt that is exactly the subcommand name. The
-        // backstop says daemon (safe bias); the socket signal must be allowed to overrule it.
+    fn the_argv_backstop_is_deliberately_wrong_where_the_socket_signal_is_right() {
         assert!(
             is_daemon_process(&argv(&["codex", "exec", "app-server"])),
-            "the backstop alone is deliberately wrong here, which is why it is gated"
+            "the backstop alone reads a PROMPT as a host, which is why it is gated behind an \
+             unreadable /proc/net/unix rather than consulted alongside the socket table"
         );
     }
 
