@@ -348,7 +348,7 @@ fn handle_normal_key(
     match key.code {
         KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
         KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
-        // Arrows navigate/act at all times (App collapses any inline peek on the move).
+        // Arrows navigate or act at all times.
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
         KeyCode::Right => attach_selected(backends, ui, terminal)?,
@@ -388,16 +388,11 @@ fn handle_normal_key(
                 // number starts a task.
                 match c {
                     '?' => ui.mode = Mode::Help,
-                    // On a header, Space collapses/expands the group (and persists), never
-                    // typing a space; on a session it toggles the inline peek; otherwise it
-                    // is composer text.
+                    // On a header, Space toggles the group and persists it. On a session it
+                    // does nothing. With no selected session or header it is composer text.
                     ' ' => {
-                        if !toggle_group_if_header(ui) {
-                            if ui.app.selected().is_some() {
-                                ui.app.toggle_expanded();
-                            } else {
-                                ui.composer.push_char(' ');
-                            }
+                        if !toggle_group_if_header(ui) && ui.app.selected().is_none() {
+                            ui.composer.push_char(' ');
                         }
                     }
                     // '/' is no longer a filter hotkey — it types into the composer so a
@@ -565,17 +560,15 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        MouseAction, ensure_completions, handle_attached_key, handle_mouse_event, handle_paste,
-        handle_normal_key, handle_rename_key, is_quit_chord, open_filter,
+        MouseAction, MouseTarget, ensure_completions, handle_attached_key, handle_mouse_event,
+        handle_normal_key, handle_paste, handle_rename_key, is_quit_chord, open_filter,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec};
     use agent_viewer_core::{BackendKind, Session, Status};
-    use agent_viewer_tui::app::{
-        App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section,
-    };
+    use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
-    use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
+    use agent_viewer_tui::ui::{Mode, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -597,8 +590,7 @@ pub(crate) mod tests {
             vec![ui.composer.model().to_string()],
             true,
         );
-        let (_snapshot_tx, snapshots) =
-            std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
+        let (_snapshot_tx, snapshots) = std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
         let (wake, _wake_rx) = std::sync::mpsc::channel();
         let refresher = crate::Refresher { snapshots, wake };
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
@@ -628,7 +620,6 @@ pub(crate) mod tests {
             mode: Mode::Normal,
             notice: NoticeState::default(),
             db: None,
-            peek: PeekCache::new(),
             composer: Composer::new(),
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
@@ -676,10 +667,8 @@ pub(crate) mod tests {
                         workspace: &ui.workspace,
                         mode: &ui.mode,
                         notice: ui.notice.text(),
-                        peek: &ui.peek,
                         composer: &ui.composer,
                         pulses: &ui.pulses,
-                        expanded: ui.app.expanded(),
                         now_ms: 0,
                         attach: None,
                         pr_status: &ui.pr_status,
@@ -1546,7 +1535,7 @@ pub(crate) mod tests {
             &mut ui,
             &mut terminal,
         )
-        .expect("expanded header button down");
+        .expect("open header button down");
 
         assert!(ui.app.is_group_collapsed(&group_key));
         assert!(
@@ -1556,7 +1545,7 @@ pub(crate) mod tests {
                 .collapsed_groups()
                 .expect("collapsed groups")
                 .contains(&group_key.to_storage()),
-            "button down must not persist an expanded state"
+            "button down must not persist an open state"
         );
 
         handle_mouse_event(
@@ -1565,7 +1554,7 @@ pub(crate) mod tests {
             &mut ui,
             &mut terminal,
         )
-        .expect("expanded header button up");
+        .expect("open header button up");
 
         assert!(!ui.app.is_group_collapsed(&group_key));
         assert!(
@@ -1575,7 +1564,7 @@ pub(crate) mod tests {
                 .collapsed_groups()
                 .expect("collapsed groups")
                 .contains(&group_key.to_storage()),
-            "button up must persist the expanded state"
+            "button up must persist the open state"
         );
     }
 
@@ -1709,10 +1698,14 @@ pub(crate) mod tests {
         );
     }
 
+    /// The background refresh rebuilds the list every 1-2s, so rows can be inserted above the
+    /// pressed one while the physical cursor never moves: by the time the button comes up, the
+    /// pressed coordinate resolves to a different session. The click must still activate the row
+    /// the user actually pressed on.
     #[test]
-    fn left_click_on_session_survives_inline_peek_reflow_between_button_events() {
+    fn left_click_activates_the_pressed_row_when_the_list_reflows_between_button_events() {
         let mut sessions = vec![
-            sess("a", "/tmp/agentviewer-mouse-reflow", 200),
+            sess("a", "/tmp/agentviewer-mouse-reflow", 300),
             sess("b", "/tmp/agentviewer-mouse-reflow", 100),
         ];
         for session in &mut sessions {
@@ -1721,16 +1714,8 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
-        let expanded_idx = visible_session_index(&ui, "a");
-        assert!(ui.app.select_visible_index(expanded_idx));
-        ui.app.toggle_expanded();
-        assert_eq!(
-            ui.app.expanded(),
-            Some(&(BackendKind::Opencode, "a".to_string()))
-        );
-
-        let target_idx = visible_session_index(&ui, "b");
-        let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
+        let pressed_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
             &backends,
@@ -1743,8 +1728,41 @@ pub(crate) mod tests {
             ui.app.selected().map(|session| session.id.as_str()),
             Some("b")
         );
-        assert_eq!(ui.app.expanded(), None);
-        let _ = point_for_visible_row(&ui, &mut terminal, target_idx);
+        assert_eq!(
+            ui.mouse_press.as_ref().map(|press| &press.target),
+            Some(&MouseTarget::Session(
+                BackendKind::Opencode,
+                "b".to_string()
+            ))
+        );
+
+        // A refresh lands a newer session between "a" and "b", pushing "b" one row down.
+        let mut refreshed = vec![
+            sess("a", "/tmp/agentviewer-mouse-reflow", 300),
+            sess("c", "/tmp/agentviewer-mouse-reflow", 200),
+            sess("b", "/tmp/agentviewer-mouse-reflow", 100),
+        ];
+        for session in &mut refreshed {
+            session.backend = BackendKind::Opencode;
+        }
+        ui.app.set_sessions(refreshed);
+        let reflowed_idx = visible_session_index(&ui, "b");
+        assert_ne!(
+            reflowed_idx, pressed_idx,
+            "the reflow must move the pressed session to a different row"
+        );
+        // Re-render so list_hit carries the new geometry, exactly as the event loop does.
+        point_for_visible_row(&ui, &mut terminal, reflowed_idx);
+        assert_eq!(
+            ui.list_hit.borrow().row_at(x, y),
+            Some(visible_session_index(&ui, "c")),
+            "the pressed point must now resolve to the inserted row"
+        );
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b"),
+            "the refresh must keep the selection anchored to the pressed session"
+        );
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
@@ -1759,12 +1777,82 @@ pub(crate) mod tests {
             ui.focused_session
                 .as_ref()
                 .map(|session| session.id.as_str()),
-            Some("b")
+            Some("b"),
+            "the pressed session, not the row now under the cursor, must be activated"
         );
         assert!(
             ui.attached
                 .contains_key(&(BackendKind::Opencode, "b".to_string()))
         );
+        assert!(
+            !ui.attached
+                .contains_key(&(BackendKind::Opencode, "c".to_string())),
+            "the row that slid under the cursor must never be attached"
+        );
+    }
+
+    /// The same refresh with a harsher outcome: the pressed session leaves the list and another
+    /// row slides under the unmoved cursor. Activating whatever is selected now would attach a
+    /// session the user never pressed on, so the release must be inert.
+    #[test]
+    fn left_click_release_is_inert_when_a_reflow_drops_the_pressed_row() {
+        let mut sessions = vec![
+            sess("a", "/tmp/agentviewer-mouse-reflow-drop", 300),
+            sess("b", "/tmp/agentviewer-mouse-reflow-drop", 100),
+        ];
+        for session in &mut sessions {
+            session.backend = BackendKind::Opencode;
+        }
+        let mut ui = test_ui_with(sessions);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        let mut terminal = test_terminal();
+        let pressed_idx = visible_session_index(&ui, "b");
+        let (x, y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button down");
+
+        // The refresh archives "b" out of the list and adds "c" in its place.
+        let mut refreshed = vec![
+            sess("a", "/tmp/agentviewer-mouse-reflow-drop", 300),
+            sess("c", "/tmp/agentviewer-mouse-reflow-drop", 200),
+        ];
+        for session in &mut refreshed {
+            session.backend = BackendKind::Opencode;
+        }
+        ui.app.set_sessions(refreshed);
+        let newcomer_idx = visible_session_index(&ui, "c");
+        // Re-render so list_hit carries the new geometry, exactly as the event loop does.
+        point_for_visible_row(&ui, &mut terminal, newcomer_idx);
+        assert_eq!(
+            ui.list_hit.borrow().row_at(x, y),
+            Some(newcomer_idx),
+            "the pressed point must now resolve to the replacement row"
+        );
+        assert_ne!(
+            ui.app.selected().map(|session| session.id.as_str()),
+            Some("b"),
+            "the pressed session is gone, so the selection cannot still be anchored to it"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Up(MouseButton::Left), x, y),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("session button up");
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            ui.focused_session.is_none(),
+            "a release whose pressed row vanished must not activate anything"
+        );
+        assert!(ui.attached.is_empty());
     }
 
     #[test]
@@ -2227,16 +2315,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn bare_space_on_a_session_toggles_its_inline_peek() {
-        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-peek", 100)]);
+    fn bare_space_on_a_session_does_nothing() {
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-space", 100)]);
         select_session_row(&mut ui, "s1");
+        let selected = ui.app.selected_index();
+        let visible_rows = ui.app.visible().len();
 
         assert!(!press_normal_key(&mut ui, &[], ' ', KeyModifiers::NONE));
-        assert_eq!(
-            ui.app.expanded(),
-            Some(&(BackendKind::Claude, "s1".to_string()))
+        assert!(
+            ui.composer.is_empty(),
+            "space must not become composer text"
         );
-        assert!(ui.composer.is_empty(), "peek must not become composer text");
+        assert_eq!(ui.app.selected_index(), selected);
+        assert_eq!(ui.app.visible().len(), visible_rows);
     }
 
     #[test]
@@ -2258,8 +2349,10 @@ pub(crate) mod tests {
                 ..
             })
         ));
-        assert!(ui.composer.is_empty(), "collapse must not become composer text");
-        assert_eq!(ui.app.expanded(), None, "a header cannot open a session peek");
+        assert!(
+            ui.composer.is_empty(),
+            "collapse must not become composer text"
+        );
     }
 
     #[test]
@@ -2277,12 +2370,7 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(Vec::new());
 
         assert!(!ui.app.show_all());
-        assert!(!press_normal_key(
-            &mut ui,
-            &[],
-            'a',
-            KeyModifiers::CONTROL
-        ));
+        assert!(!press_normal_key(&mut ui, &[], 'a', KeyModifiers::CONTROL));
         assert!(ui.app.show_all());
         assert!(ui.composer.is_empty());
     }
@@ -2302,8 +2390,7 @@ pub(crate) mod tests {
                 KeyModifiers::CONTROL
             ));
             assert!(
-                ui.mutations
-                    .in_flight(&format!("claude:s1:{operation}")),
+                ui.mutations.in_flight(&format!("claude:s1:{operation}")),
                 "ctrl+{c} must submit {operation}"
             );
             assert!(ui.composer.is_empty());

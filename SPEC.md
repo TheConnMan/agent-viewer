@@ -150,12 +150,13 @@ to "real session", the same safe direction as the opencode rule, and the same tw
 this from swallowing anything: the viewer-state overlay clears `companion` for sessions the
 viewer itself spawned, and `Ctrl+A` and `Ctrl+F` both surface companion rows.
 
-## Rollout transcripts (for detail view + status tail)
+## Rollout transcripts (reusable readers + status tail)
 
 Path: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. Parse with `serde_json`
 line-by-line (`BufReader`). For the list, read only the **first line** (`session_meta`, has
 `payload.cwd`, `payload.id`, `payload.originator`, `cli_version`) and the **last few lines**
-for the terminal marker. Parse the full file lazily only when a session is opened.
+for the terminal marker. The core also exposes full-file transcript readers for later
+surfaces. The TUI does not consume them.
 
 - Message content: `type:"response_item"`, `payload.role`, `payload.content[].text`
   (assistant text is `content[].type == "output_text"`).
@@ -388,10 +389,9 @@ tested without a daemon):
   absence of a daemon, is a visible failed spawn carrying the daemon's own error. `codex exec`
   is reachable only via `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`. See "No silent exec fallback".
 - **attach:** daemon-hosted plus a reachable daemon -> `codex resume --remote <endpoint> <id>`;
-  a foreign row that is mid-turn with a live pid -> refused, and the refusal is flagged
-  `tail: true` so the TUI opens the row's inline peek (the live read-only transcript) with the
-  reason in the footer; everything else -> plain `codex resume <id>`. A daemon-hosted row whose
-  daemon is gone also takes the plain resume: there is no live turn left to protect.
+  a foreign row that is mid-turn with a live pid -> refused with the reason in the footer;
+  everything else -> plain `codex resume <id>`. A daemon-hosted row whose daemon is gone also
+  takes the plain resume: there is no live turn left to protect.
 - **stop:** daemon-hosted -> `turn/interrupt` (the in-progress turn id is resolved first with
   `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
   a no-op success); else a pid -> SIGTERM as before; else unsupported.
@@ -537,17 +537,16 @@ viewer-local name override is involved, so the list can never disagree with `cla
   around `codex archive`/`unarchive`/`resume`. No UI. Unit-tested.
 - `agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`.
 
-Cargo workspace. Live-refresh the registry every ~1-2s; `notify`-watch the focused session's
-rollout for live tail.
+Cargo workspace. Live-refresh the registry every ~1-2s.
 
 ## TUI behavior
 
-- Left pane: sessions grouped by project, status glyphs (borrow opencode-monitor's vocabulary:
-  spinner=running, green=done, gray=hidden, red=errored). Right pane: focused session tail.
+- Single list: sessions grouped by project or state, with status glyphs based on
+  opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
 - Keys: `Enter` attach/resume when the composer is empty, or spawn a composed task; bare letters
   and numbers type into the composer, including when empty, and `/` composes; `Ctrl+D` hide
-  (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` collapse group; arrows
-  navigate; `Ctrl+F` filters; `Ctrl+C` quit. Keep the set small and obvious.
+  (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` toggles a selected group
+  header; arrows navigate; `Ctrl+F` filters; `Ctrl+C` quit. Keep the set small and obvious.
 
 ### Mouse capture must be escapable (`Ctrl+T`)
 

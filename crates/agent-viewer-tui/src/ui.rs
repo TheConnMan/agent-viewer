@@ -1,13 +1,9 @@
 //! Rendering surface: a flat single-list main view (state- or project-grouped) with a
-//! one-line footer, bottom peek overlay, centered new/rename/help modals, and the
-//! full-screen embedded-PTY attach view. The approved amber palette lives in `theme`.
+//! one-line footer, centered new/rename/help modals, and the full-screen embedded-PTY attach
+//! view. The approved amber palette lives in `theme`.
 
 use crate::app::{App, Composer, Row, Section};
 use crate::logos::LogoMarks;
-use crate::peek::{self, PeekKind};
-// PeekCache moved to `crate::peek_cache`; re-export so `agent_viewer_tui::ui::PeekCache`
-// still resolves for its import sites and for the render functions here.
-pub use crate::peek_cache::PeekCache;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
 use ratatui::Frame;
@@ -177,17 +173,6 @@ fn status_glyph(status: &Status, now_ms: i64) -> (&'static str, ratatui::style::
     }
 }
 
-fn status_word(status: &Status) -> &'static str {
-    match status {
-        Status::Working => "working",
-        Status::NeedsInput { .. } => "needs-input",
-        Status::Idle => "idle",
-        Status::Done => "done",
-        Status::Error => "error",
-        Status::Unknown => "unknown",
-    }
-}
-
 fn section_label(section: Section) -> &'static str {
     match section {
         Section::NeedsInput => "NEEDS INPUT",
@@ -197,7 +182,7 @@ fn section_label(section: Section) -> &'static str {
     }
 }
 
-/// A group header line: a triangle indicator plus its member count. Expanded shows
+/// A group header line: a triangle indicator plus its member count. An open group shows
 /// "▼ <label>  (<count>)"; collapsed shows "▶ <label>  (<count> hidden)".
 fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) -> String {
     if collapsed {
@@ -228,7 +213,7 @@ pub struct ReplyModal {
 }
 
 /// Top-level input mode driving key routing and what the footer shows. The inline spawn
-/// composer, inline rename, and inline peek expansion all live on the Normal list view.
+/// composer and inline rename both live on the Normal list view.
 pub enum Mode {
     Normal,
     Filter,
@@ -257,7 +242,7 @@ pub struct ListHit {
     /// The List widget's final scroll offset (item index of the first visible item).
     offset: usize,
     /// One entry per rendered item line, in draw order: `Some(visible-row index)` for a
-    /// selectable row, `None` for a non-selectable Spacer or an inline peek-expansion line.
+    /// selectable row, `None` for a non-selectable Spacer.
     item_to_row: Vec<Option<usize>>,
     /// A floating overlay (the slash-command popup) that shadows the bottom of the list this
     /// frame, if any. A cell inside it belongs to the overlay, not the row drawn underneath,
@@ -268,8 +253,8 @@ pub struct ListHit {
 impl ListHit {
     /// Reverse a terminal cell `(x, y)` to the selectable `visible()`-row index under it, if
     /// the point falls on a selectable row within the list area. Pure — unit-testable with no
-    /// terminal. Returns `None` outside the area, on a blank spacer, on an expansion line, or
-    /// on a cell shadowed by a floating overlay (the slash-command popup).
+    /// terminal. Returns `None` outside the area, on a blank spacer, or on a cell shadowed by
+    /// a floating overlay (the slash-command popup).
     pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
         let a = self.area;
         if a.width == 0 || a.height == 0 {
@@ -305,12 +290,8 @@ pub struct Draw<'a> {
     pub workspace: &'a Path,
     pub mode: &'a Mode,
     pub notice: &'a str,
-    pub peek: &'a PeekCache,
     pub composer: &'a Composer,
     pub pulses: &'a Pulses,
-    /// The currently inline-expanded row (peek), if any — its transcript tail renders
-    /// indented beneath it.
-    pub expanded: Option<&'a (BackendKind, String)>,
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
     pub pr_status: &'a crate::pr_cache::PrStatusCache,
@@ -369,20 +350,12 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         ])
         .split(frame.area());
 
-    // Inline rename edits the selected row in place; inline peek expands it downward.
+    // Inline rename edits the selected row in place.
     let rename = match d.mode {
         Mode::Rename(m) => Some((m.backend, m.id.as_str(), m.buffer.as_str())),
         _ => None,
     };
-    let expand_lines = match d.expanded {
-        Some(key) => peek_expansion(d.app, d.peek, key, vertical[0].width as usize),
-        None => Vec::new(),
-    };
-    let deco = ListDeco {
-        rename,
-        expanded: d.expanded,
-        expand_lines: &expand_lines,
-    };
+    let deco = ListDeco { rename };
 
     draw_header(frame, d.app, d.workspace, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
@@ -403,8 +376,8 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         hit.blocked = slash_popup_area(d.composer, vertical[3]);
     }
     *d.list_hit.borrow_mut() = hit;
-    // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
-    // force-expanded peek above it); every other mode shows the persistent spawn composer.
+    // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
+    // the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
         let title = d
             .app
@@ -513,70 +486,9 @@ fn draw_suggestion_popup<S: AsRef<str>>(
     frame.render_widget(List::new(items), area);
 }
 
-/// Per-row decorations layered over the list model: an in-place rename edit field and the
-/// inline peek expansion under one row.
+/// Per-row decorations layered over the list model.
 struct ListDeco<'a> {
     rename: Option<(BackendKind, &'a str, &'a str)>,
-    expanded: Option<&'a (BackendKind, String)>,
-    expand_lines: &'a [Line<'static>],
-}
-
-/// The inline peek expansion for the EXPANDED row (resolved by its key, not the selection —
-/// which App keeps in sync but which could momentarily diverge): the last message word-
-/// wrapped to the panel width (peek::build), indented and color-coded per PeekKind. opencode
-/// (no transcript file) falls back to a couple of metadata lines when it has no message.
-fn peek_expansion(
-    app: &App,
-    peek: &PeekCache,
-    key: &(BackendKind, String),
-    width: usize,
-) -> Vec<Line<'static>> {
-    let Some(session) = app.session_for(key) else {
-        return Vec::new();
-    };
-    // Reserve the 6-column indent (matching the rename/expansion gutter).
-    let inner = width.saturating_sub(6);
-    // Metadata fallback for sessions with no transcript file (opencode) when items is empty.
-    let meta = if session.rollout_path.is_none() {
-        vec![
-            format!("status: {}", status_word(&session.status)),
-            format!("cwd: {}", session.cwd.display()),
-        ]
-    } else {
-        Vec::new()
-    };
-    // Surface WHAT a blocked session is waiting on: codex from the parsed pending approval,
-    // claude from its state.json needs (session.summary), opencode has no needs-input signal.
-    let ask: Option<String> = if matches!(session.status, Status::NeedsInput { .. }) {
-        match session.backend {
-            BackendKind::Codex => peek.ask.as_ref().map(|s| format!("Awaiting approval: {s}")),
-            BackendKind::Claude => (!session.summary.is_empty())
-                .then(|| format!("Awaiting input: {}", session.summary)),
-            BackendKind::Opencode => None,
-        }
-    } else {
-        None
-    };
-    let plines = peek::build(
-        ask.as_deref(),
-        &peek.items,
-        peek.error.as_deref(),
-        &meta,
-        inner,
-    );
-    plines
-        .into_iter()
-        .map(|pl| {
-            let style = match pl.kind {
-                PeekKind::Ask => fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-                PeekKind::Role => fg(theme::MUTED),
-                PeekKind::Body => fg(theme::TEXT),
-                PeekKind::Meta => fg(theme::MUTED),
-                PeekKind::Error => fg(theme::WARN),
-            };
-            Line::from(vec![Span::raw("      "), Span::styled(pl.text, style)])
-        })
-        .collect()
 }
 
 /// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
@@ -729,7 +641,8 @@ fn composer_box_height(text: &str, inner_width: u16) -> u16 {
         1usize
     } else {
         let segments = wrap_by_width(text, inner_width as usize, inner_width as usize);
-        segments.len() + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
+        segments.len()
+            + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
     };
     input_lines.clamp(1, COMPOSER_MAX_LINES as usize) as u16 + 3
 }
@@ -854,10 +767,7 @@ fn draw_composer(
 
     frame.render_widget(
         Paragraph::new(Line::from(metadata_spans)),
-        Rect {
-            height: 1,
-            ..inner
-        },
+        Rect { height: 1, ..inner },
     );
 
     let input = Rect {
@@ -1022,15 +932,13 @@ fn draw_list(
     let rows = app.visible();
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     // Parallel to `items`: the backend of each pushed item that is a session row (None for
-    // headers/spacers/rename/expansion lines), so the logo overlay can find its rows by
-    // item index after the List has laid them out.
+    // headers/spacers/rename lines), so the logo overlay can find its rows by item index after
+    // the List has laid them out.
     let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
     // Also parallel to `items`, in lockstep draw order: each rendered line's selectable row
-    // target (Some(visible-row index) for a header/session line, None for a Spacer or an
-    // expansion line). This is the map the mouse handler reverses to pick a row from a cell.
+    // target (Some(visible-row index) for a header/session line, None for a Spacer). This is
+    // the map the mouse handler reverses to pick a row from a cell.
     let mut item_to_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
-    // The selection index only shifts if expansion lines are inserted BEFORE the selected
-    // row; expansion always sits under the (selected) expanded row, so it stays aligned.
     for (row_idx, row) in rows.iter().enumerate() {
         // A Spacer renders a blank line but is never selectable, so it maps to no row.
         let target = if matches!(row, Row::Spacer) {
@@ -1053,18 +961,6 @@ fn draw_list(
                     item_backends.push(Some(*backend));
                 }
                 item_to_row.push(target);
-                // Inline peek expansion: indented muted transcript tail under the row.
-                if let Some((eb, eid)) = deco.expanded
-                    && backend == eb
-                    && id == eid
-                {
-                    for line in deco.expand_lines {
-                        // Lines are already indented + styled by peek_expansion.
-                        items.push(ListItem::new(line.clone()));
-                        item_backends.push(None);
-                        item_to_row.push(None);
-                    }
-                }
             }
             _ => {
                 items.push(row_to_item(row, pulses, now_ms, pr_status, width));
@@ -1078,17 +974,6 @@ fn draw_list(
     if !rows.is_empty() {
         let sel = app.selected_index().min(rows.len() - 1);
         state.select(Some(sel));
-        // The List widget only scrolls the SELECTED item into view — the expansion lines
-        // that follow it can fall below the viewport (under the composer). When expanded,
-        // push the offset up so the selected row plus all its expansion lines are visible.
-        let viewport = area.height as usize;
-        if !deco.expand_lines.is_empty() && viewport > 0 {
-            let last = sel + deco.expand_lines.len(); // item index of the last expansion line
-            if last >= viewport {
-                // Keep the selected row itself visible (never scroll past it).
-                *state.offset_mut() = (last + 1 - viewport).min(sel);
-            }
-        }
     }
     frame.render_stateful_widget(list, area, &mut state);
     // Capture the final scroll offset AFTER render (the widget computes it from the selection),
@@ -1369,7 +1254,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -1460,8 +1345,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Enter", "spawn composed task"),
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
-        ("Space", "expand peek in row"),
-        ("Enter/Space", "collapse group (on a header)"),
+        ("Enter/Space", "toggle group on a header"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
@@ -1582,11 +1466,7 @@ mod tests {
                     &pulses,
                     0,
                     &pr_status,
-                    ListDeco {
-                        rename: None,
-                        expanded: None,
-                        expand_lines: &[],
-                    },
+                    ListDeco { rename: None },
                     None,
                     area,
                 );
@@ -1646,11 +1526,7 @@ mod tests {
                         &pulses,
                         now_ms,
                         &pr_status,
-                        ListDeco {
-                            rename: None,
-                            expanded: None,
-                            expand_lines: &[],
-                        },
+                        ListDeco { rename: None },
                         None,
                         Rect::new(0, 0, 80, 2),
                     );
@@ -1916,12 +1792,7 @@ mod tests {
         (rows, (pos.x, pos.y))
     }
 
-    fn render_viewer(
-        w: u16,
-        h: u16,
-        text: &str,
-        mode: Mode,
-    ) -> (Vec<String>, (u16, u16)) {
+    fn render_viewer(w: u16, h: u16, text: &str, mode: Mode) -> (Vec<String>, (u16, u16)) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1930,7 +1801,6 @@ mod tests {
         for ch in text.chars() {
             composer.push_char(ch);
         }
-        let peek = PeekCache::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -1943,10 +1813,8 @@ mod tests {
                     workspace: Path::new("/tmp"),
                     mode: &mode,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
@@ -2034,7 +1902,6 @@ mod tests {
         for ch in "hello".chars() {
             composer.push_char(ch);
         }
-        let peek = PeekCache::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -2049,10 +1916,8 @@ mod tests {
                     workspace: Path::new("/tmp"),
                     mode: &Mode::Normal,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
@@ -2142,7 +2007,6 @@ mod tests {
         for ch in "typed".chars() {
             composer.push_char(ch);
         }
-        let peek = PeekCache::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -2157,10 +2021,8 @@ mod tests {
                     workspace: Path::new("/tmp"),
                     mode: &Mode::Normal,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,

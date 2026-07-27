@@ -6,7 +6,7 @@ use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{App, Composer};
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::terminal_title::{format_terminal_title, set_terminal_title};
-use agent_viewer_tui::ui::{Draw, ListHit, Mode, PeekCache, Pulses, draw};
+use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, draw};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -34,7 +34,6 @@ fn session(id: &str, status: Status) -> Session {
 
 fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
     let mode = Mode::Normal;
-    let peek = PeekCache::new();
     let composer = Composer::new();
     let pulses = Pulses::new();
     let pr_status = PrStatusCache::new();
@@ -50,10 +49,8 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     workspace,
                     mode: &mode,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
