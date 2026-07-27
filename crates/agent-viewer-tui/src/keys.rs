@@ -196,6 +196,71 @@ pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
     }
 }
 
+/// Route one terminal paste without interpreting embedded newlines as key presses.
+pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
+    match &mut ui.mode {
+        Mode::Normal => ui.composer.push_str(text),
+        Mode::Attached => {
+            ui.pending_reply = None;
+            let Some(fkey) = ui.focused.clone() else {
+                return;
+            };
+            let bracketed_paste = ui
+                .attached
+                .get(&fkey)
+                .is_some_and(|pty| pty.with_screen(|screen| screen.bracketed_paste()));
+            if let Some(tracker) = ui.detach_trackers.get_mut(&fkey) {
+                if bracketed_paste {
+                    for _ in text.chars() {
+                        tracker.on_char();
+                    }
+                } else {
+                    let mut chars = text.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\r' => {
+                                tracker.on_enter();
+                                if chars.peek() == Some(&'\n') {
+                                    chars.next();
+                                }
+                            }
+                            '\n' => tracker.on_enter(),
+                            '\u{8}' | '\u{7f}' => tracker.on_backspace(),
+                            _ => tracker.on_char(),
+                        }
+                    }
+                }
+            }
+            if let Some(pty) = ui.attached.get_mut(&fkey) {
+                if bracketed_paste {
+                    let mut bytes = b"\x1b[200~".to_vec();
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    let _ = pty.write_input(&bytes);
+                } else {
+                    let _ = pty.write_input(text.as_bytes());
+                }
+            }
+        }
+        Mode::Filter => {
+            let mut filter = ui.app.filter().to_string();
+            filter.push_str(&single_line_paste(text));
+            ui.app.set_filter(filter);
+        }
+        Mode::Rename(modal) => modal.buffer.push_str(&single_line_paste(text)),
+        Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
+        Mode::Help => {}
+    }
+}
+
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn single_line_paste(text: &str) -> String {
+    normalize_paste(text).replace('\n', " ")
+}
+
 /// Ctrl+T is the app-wide mouse-capture toggle. Pure predicate so the chord is unit-testable
 /// without a live terminal; a bare `t` must stay composer text.
 fn is_mouse_toggle_chord(key: KeyEvent, ctrl: bool) -> bool {
@@ -504,13 +569,16 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        MouseAction, ensure_completions, handle_mouse_event, handle_rename_key, is_quit_chord,
-        open_filter,
+        MouseAction, ensure_completions, handle_attached_key, handle_mouse_event, handle_paste,
+        handle_rename_key, is_quit_chord, open_filter,
     };
     use crate::{NoticeState, Ui};
+    use agent_viewer_core::pty::{PtySession, PtySpec};
     use agent_viewer_core::{BackendKind, Session, Status};
-    use agent_viewer_tui::app::{App, Composer, GroupKey, GroupMode, Row, Section};
-    use agent_viewer_tui::mutations::MutationRunner;
+    use agent_viewer_tui::app::{
+        App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section,
+    };
+    use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
     use agent_viewer_tui::ui::{Mode, PeekCache, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -532,6 +600,12 @@ pub(crate) mod tests {
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
+            mutation_executor: std::sync::Arc::new(|_| {
+                Ok(MutationOutcome {
+                    notice: String::new(),
+                    spawned: None,
+                })
+            }),
             models: agent_viewer_tui::model_cache::ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
@@ -790,6 +864,321 @@ pub(crate) mod tests {
         open_filter(&mut ui);
         assert!(matches!(ui.mode, Mode::Filter));
         assert_eq!(ui.app.filter(), ""); // opens with a fresh, empty query
+    }
+
+    #[test]
+    fn multiline_paste_updates_the_draft_without_requesting_a_spawn() {
+        let mut ui = test_ui_with(Vec::new());
+
+        handle_paste("first\nsecond", &mut ui);
+
+        assert_eq!(ui.composer.text(), "first\nsecond");
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.notice.text(), "");
+        assert!(ui.pulses.is_empty());
+        assert!(
+            !ui.mutations.in_flight("claude:first\nsecond:spawn"),
+            "paste must not submit the composed task"
+        );
+    }
+
+    #[test]
+    fn attached_multiline_paste_is_bracketed_on_a_real_pty() {
+        use std::time::{Duration, Instant};
+
+        let payload = "one\ntwo";
+        let expected_hex = "1b5b3230307e6f6e650a74776f1b5b3230317e";
+        let script = concat!(
+            "stty raw -echo; ",
+            "printf '\\033[?2004hREADY\\r\\n'; ",
+            "captured=$(dd bs=1 count=19 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); ",
+            "printf '\\033[?2004lCAPTURE:%s\\r\\n' \"$captured\"; ",
+            "sleep 30"
+        );
+        let pty = PtySession::spawn(PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("spawn real pty");
+
+        let mut ui = test_ui_with(Vec::new());
+        let key = (BackendKind::Codex, "attached-session".to_string());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(key.clone());
+        ui.detach_trackers.insert(key.clone(), DetachTracker::new());
+        ui.attached.insert(key.clone(), pty);
+
+        let ready_start = Instant::now();
+        while ready_start.elapsed() < Duration::from_secs(5)
+            && !ui.attached.get(&key).unwrap().with_screen(|screen| {
+                screen.bracketed_paste() && screen.contents().contains("READY")
+            })
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ui.attached.get(&key).unwrap().with_screen(|screen| {
+                screen.bracketed_paste() && screen.contents().contains("READY")
+            }),
+            "child never enabled bracketed paste"
+        );
+
+        handle_paste(payload, &mut ui);
+
+        let capture_start = Instant::now();
+        while capture_start.elapsed() < Duration::from_secs(5)
+            && !ui
+                .attached
+                .get(&key)
+                .unwrap()
+                .with_screen(|screen| screen.contents().contains(expected_hex))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let contents = ui
+            .attached
+            .get(&key)
+            .unwrap()
+            .with_screen(|screen| screen.contents());
+        assert!(
+            contents.contains(&format!("CAPTURE:{expected_hex}")),
+            "child observed unexpected paste bytes: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn attached_raw_multiline_paste_keeps_only_the_final_line_before_left_detaches() {
+        use std::time::{Duration, Instant};
+
+        let script = concat!(
+            "stty raw -echo; ",
+            "printf 'READY\\r\\n'; ",
+            "captured=$(dd bs=1 count=7 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); ",
+            "printf 'CAPTURE:%s\\r\\n' \"$captured\"; ",
+            "sleep 30"
+        );
+        let pty = PtySession::spawn(PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("spawn real pty");
+
+        let mut ui = test_ui_with(Vec::new());
+        let session_key = (BackendKind::Codex, "raw-paste-session".to_string());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(session_key.clone());
+        ui.detach_trackers
+            .insert(session_key.clone(), DetachTracker::new());
+        ui.attached.insert(session_key.clone(), pty);
+
+        let ready_start = Instant::now();
+        while ready_start.elapsed() < Duration::from_secs(5)
+            && !ui
+                .attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| screen.contents().contains("READY"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ui.attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| {
+                    !screen.bracketed_paste() && screen.contents().contains("READY")
+                }),
+            "child unexpectedly enabled bracketed paste"
+        );
+
+        handle_paste("foo\nbar", &mut ui);
+
+        let capture_start = Instant::now();
+        while capture_start.elapsed() < Duration::from_secs(5)
+            && !ui
+                .attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| screen.contents().contains("CAPTURE:666f6f0a626172"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ui.attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| { screen.contents().contains("CAPTURE:666f6f0a626172") })
+        );
+
+        handle_attached_key(key(KeyCode::Backspace, KeyModifiers::NONE), &mut ui);
+        handle_attached_key(key(KeyCode::Backspace, KeyModifiers::NONE), &mut ui);
+        handle_attached_key(key(KeyCode::Left, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(ui.mode, Mode::Attached));
+
+        handle_attached_key(key(KeyCode::Backspace, KeyModifiers::NONE), &mut ui);
+        handle_attached_key(key(KeyCode::Left, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn attached_raw_crlf_paste_submits_once_and_leaves_left_clear_to_detach() {
+        use std::time::{Duration, Instant};
+
+        let script = concat!(
+            "stty raw -echo; ",
+            "printf 'READY\\r\\n'; ",
+            "captured=$(dd bs=1 count=5 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); ",
+            "printf 'CAPTURE:%s\\r\\n' \"$captured\"; ",
+            "sleep 30"
+        );
+        let pty = PtySession::spawn(PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+        })
+        .expect("spawn real pty");
+
+        let mut ui = test_ui_with(Vec::new());
+        let session_key = (BackendKind::Codex, "raw-crlf-session".to_string());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(session_key.clone());
+        ui.detach_trackers
+            .insert(session_key.clone(), DetachTracker::new());
+        ui.attached.insert(session_key.clone(), pty);
+
+        let ready_start = Instant::now();
+        while ready_start.elapsed() < Duration::from_secs(5)
+            && !ui
+                .attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| screen.contents().contains("READY"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ui.attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| {
+                    !screen.bracketed_paste() && screen.contents().contains("READY")
+                }),
+            "child unexpectedly enabled bracketed paste"
+        );
+
+        handle_paste("foo\r\n", &mut ui);
+
+        let capture_start = Instant::now();
+        while capture_start.elapsed() < Duration::from_secs(5)
+            && !ui
+                .attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| screen.contents().contains("CAPTURE:666f6f0d0a"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ui.attached
+                .get(&session_key)
+                .unwrap()
+                .with_screen(|screen| { screen.contents().contains("CAPTURE:666f6f0d0a") })
+        );
+
+        handle_attached_key(key(KeyCode::Left, KeyModifiers::NONE), &mut ui);
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn attached_unicode_paste_requires_matching_backspaces_before_left_can_detach() {
+        let mut ui = test_ui_with(Vec::new());
+        let key = (BackendKind::Codex, "attached-session".to_string());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(key.clone());
+        ui.detach_trackers.insert(key.clone(), DetachTracker::new());
+
+        handle_paste("λ🦀é", &mut ui);
+
+        let tracker = ui.detach_trackers.get_mut(&key).unwrap();
+        tracker.on_backspace();
+        assert!(!tracker.detach_on_left());
+        tracker.on_backspace();
+        assert!(!tracker.detach_on_left());
+        tracker.on_backspace();
+        assert!(tracker.detach_on_left());
+    }
+
+    #[test]
+    fn paste_does_not_leak_into_the_composer_outside_normal_mode() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.push_char('x');
+        ui.mode = Mode::Help;
+
+        handle_paste("first\nsecond", &mut ui);
+
+        assert_eq!(ui.composer.text(), "x");
+        assert!(matches!(ui.mode, Mode::Help));
+    }
+
+    #[test]
+    fn filter_paste_appends_as_one_normalized_line() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.app.set_filter("before ".to_string());
+        ui.mode = Mode::Filter;
+
+        handle_paste("one\r\ntwo\rthree", &mut ui);
+
+        assert_eq!(ui.app.filter(), "before one two three");
+        assert!(matches!(ui.mode, Mode::Filter));
+    }
+
+    #[test]
+    fn rename_paste_appends_as_one_normalized_line() {
+        use agent_viewer_tui::ui::RenameModal;
+
+        let mut ui = test_ui_with(Vec::new());
+        ui.mode = Mode::Rename(RenameModal {
+            backend: BackendKind::Claude,
+            id: "s1".to_string(),
+            buffer: "before ".to_string(),
+        });
+
+        handle_paste("one\r\ntwo\rthree", &mut ui);
+
+        match &ui.mode {
+            Mode::Rename(modal) => assert_eq!(modal.buffer, "before one two three"),
+            _ => panic!("expected rename mode"),
+        }
+    }
+
+    #[test]
+    fn reply_paste_preserves_normalized_line_breaks() {
+        use agent_viewer_tui::ui::ReplyModal;
+
+        let mut ui = test_ui_with(Vec::new());
+        ui.mode = Mode::Reply(ReplyModal {
+            backend: BackendKind::Claude,
+            id: "s1".to_string(),
+            buffer: "before\n".to_string(),
+        });
+
+        handle_paste("one\r\ntwo\rthree", &mut ui);
+
+        match &ui.mode {
+            Mode::Reply(modal) => assert_eq!(modal.buffer, "before\none\ntwo\nthree"),
+            _ => panic!("expected reply mode"),
+        }
     }
 
     /// A bg row: it carries the short id that names its job dir, so rename applies to it.

@@ -5,7 +5,7 @@
 use agent_viewer_core::BackendKind;
 use std::path::{Path, PathBuf};
 
-/// Inline spawn composer (item 8): a persistent one-line input above the footer. Holds
+/// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
 /// the task text plus the target backend, which Tab cycles Claude -> Codex -> Opencode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composer {
@@ -124,6 +124,14 @@ impl Composer {
     pub fn push_char(&mut self, c: char) {
         self.text.push(c);
         // Editing the command word re-opens a dismissed popup and resets the highlight.
+        self.suggest_dismissed = false;
+        self.suggest_idx = 0;
+    }
+
+    /// Append pasted text as one draft, normalizing terminal line endings to `\n`.
+    pub fn push_str(&mut self, text: &str) {
+        self.text
+            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
         self.suggest_dismissed = false;
         self.suggest_idx = 0;
     }

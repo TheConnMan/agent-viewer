@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::Duration;
@@ -17,7 +18,10 @@ use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelectio
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
+};
 use crossterm::execute;
 
 mod actions;
@@ -42,6 +46,22 @@ const SPAWN_ABANDON_MS: i64 = 600_000;
 type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
 type Snapshot = (Vec<Session>, String, usize);
+
+struct BracketedPasteGuard<W: io::Write> {
+    writer: W,
+}
+
+impl<W: io::Write> BracketedPasteGuard<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: io::Write> Drop for BracketedPasteGuard<W> {
+    fn drop(&mut self) {
+        let _ = execute!(&mut self.writer, DisableBracketedPaste);
+    }
+}
 
 /// The refresh worker's handles: newest-listing snapshots in, forced-refresh wakes out.
 struct Refresher {
@@ -143,6 +163,9 @@ struct Ui {
     last_backend_error: String,
     /// Blocking backend mutations run off the render thread.
     mutations: MutationRunner,
+    /// Backend mutation boundary used by composer submission on the runner thread.
+    mutation_executor:
+        Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>,
     /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
     models: ModelCache,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
@@ -280,6 +303,7 @@ fn main() -> io::Result<()> {
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
+        mutation_executor: Arc::new(ops::run_mutation),
         models,
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
@@ -312,8 +336,11 @@ fn main() -> io::Result<()> {
     // universal, so Ctrl+T toggles it off on demand (see `keys::set_mouse_capture`). Starts on
     // to match `ui.mouse_capture`. Best-effort: a terminal that rejects the sequence leaves
     // the keyboard nav.
-    let _ = execute!(io::stdout(), EnableMouseCapture);
-    let result = run(&mut terminal, &action_backends, &refresher, &mut ui);
+    let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let result = {
+        let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
+        run(&mut terminal, &action_backends, &refresher, &mut ui)
+    };
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -433,6 +460,7 @@ fn run(
                 Event::Mouse(me) => {
                     keys::handle_mouse_event(me, backends, ui, terminal)?;
                 }
+                Event::Paste(text) => keys::handle_paste(&text, ui),
                 _ => {}
             }
         }
@@ -669,7 +697,12 @@ mod tests {
     use super::*;
     use agent_viewer_core::SessionOrigin;
     use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
-    use std::path::PathBuf;
+    use std::{
+        io as test_io,
+        panic::{AssertUnwindSafe, catch_unwind},
+        path::PathBuf,
+        sync::{Arc as TestArc, Mutex},
+    };
 
     const CWD: &str = "/tmp";
 
@@ -735,6 +768,7 @@ mod tests {
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
+            mutation_executor: Arc::new(ops::run_mutation),
             models: ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: PrStatusCache::new(),
@@ -945,6 +979,41 @@ mod tests {
         assert!(
             !ui.pulses
                 .contains_key(&(BackendKind::Codex, "new".to_string()))
+        );
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(TestArc<Mutex<Vec<u8>>>);
+
+    impl test_io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> test_io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> test_io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_is_disabled_during_panic_unwinding() {
+        let bytes = TestArc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(TestArc::clone(&bytes));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = BracketedPasteGuard::new(writer);
+            panic!("simulate tui panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            bytes
+                .lock()
+                .unwrap()
+                .windows(b"\x1b[?2004l".len())
+                .any(|bytes| bytes == b"\x1b[?2004l"),
+            "panic cleanup must disable bracketed paste"
         );
     }
 

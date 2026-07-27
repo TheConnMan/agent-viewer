@@ -333,9 +333,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         return;
     }
 
-    // The composer box grows with its wrapped text (empty -> 3 rows; long input wraps and the
-    // box gets taller, up to a cap) so a long task description stays visible instead of
-    // scrolling off to the right. Reply mode sizes the same box to the reply buffer.
+    // The composer box keeps one metadata row above its wrapped input and grows to a cap so
+    // a long task description stays visible. Reply mode sizes its prompt prefixed box to the
+    // reply buffer.
     let inner_w = frame.area().width.saturating_sub(2);
     let composer_h = match &d.mode {
         Mode::Reply(m) => {
@@ -352,10 +352,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             let prefix = format!("↳ reply {title_seg}❯ ");
             input_box_height(display_width(&prefix), &m.buffer, inner_w)
         }
-        _ => {
-            let prefix = composer_prefix(d.app, d.composer);
-            input_box_height(display_width(&prefix), d.composer.text(), inner_w)
-        }
+        _ => composer_box_height(d.composer.text(), inner_w),
     };
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
@@ -599,9 +596,8 @@ fn abbreviate_dir(dir: &Path) -> String {
 const COMPOSER_MAX_LINES: u16 = 10;
 
 /// Split `text` into visual lines by terminal display width: the first line gets `first`
-/// columns, every line after it gets `rest`. Breaks between characters (never mid-char),
-/// honoring wide/zero-width glyphs. Always returns at least one (possibly empty) segment so
-/// the caller can rely on `.last()`.
+/// columns, every line after it gets `rest`. Breaks between characters and at explicit
+/// newlines, honoring wide and zero width glyphs. Always returns at least one segment.
 fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut lines: Vec<String> = Vec::new();
@@ -609,6 +605,12 @@ fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
     let mut cur_w = 0usize;
     let mut budget = first.max(1);
     for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            budget = rest.max(1);
+            continue;
+        }
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + cw > budget && !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
@@ -635,25 +637,15 @@ fn input_box_height(prefix_w: usize, text: &str, inner_width: u16) -> u16 {
     (lines as u16).clamp(1, COMPOSER_MAX_LINES) + 2
 }
 
-/// The composer prompt prefix (`<mark> <backend> [<model> ]<dir> ❯ `) as a plain string, for
-/// measuring its width. Mirrors the colored spans built in `draw_composer`.
-fn composer_prefix(app: &App, composer: &Composer) -> String {
-    let backend = composer.backend();
-    let dir = app
-        .spawn_target()
-        .map(|d| abbreviate_dir(&d))
-        .unwrap_or_default();
-    let model = composer.model();
-    let model_seg = if model == "default" {
-        String::new()
+/// Composer height includes one fixed metadata row, the visible input rows, and both borders.
+fn composer_box_height(text: &str, inner_width: u16) -> u16 {
+    let input_lines = if inner_width == 0 || text.is_empty() {
+        1usize
     } else {
-        format!("{model} ")
+        let segments = wrap_by_width(text, inner_width as usize, inner_width as usize);
+        segments.len() + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
     };
-    format!(
-        "{} {} {model_seg}{dir} ❯ ",
-        backend_mark(backend),
-        backend.name()
-    )
+    input_lines.clamp(1, COMPOSER_MAX_LINES as usize) as u16 + 3
 }
 
 /// The look of an input box: its border color, the colored prompt spans that lead the first
@@ -740,11 +732,8 @@ fn draw_input_box(
     (inner, start == 0)
 }
 
-/// Persistent inline spawn composer inside a rounded, faint-bordered box (Claude Code's
-/// input-box feel): `◆ codex ~/git/foo ❯ <text>`, or a muted placeholder when empty. The
-/// brand mark + backend name are in the backend's color, the target dir muted. Long input
-/// wraps down the (grown) box; when `show_cursor` (list view, Normal mode), the terminal's
-/// native cursor is placed at the end of the typed text so it blinks there.
+/// Persistent inline spawn composer with metadata on the first inner row and full width input
+/// on every following row. Long input keeps its tail visible beneath the fixed metadata.
 fn draw_composer(
     frame: &mut Frame,
     app: &App,
@@ -758,42 +747,81 @@ fn draw_composer(
         .spawn_target()
         .map(|d| abbreviate_dir(&d))
         .unwrap_or_default();
-    // The model shows after the backend name, muted; "default" (codex/opencode) shows nothing.
     let model = composer.model();
     let model_seg = if model == "default" {
         String::new()
     } else {
         format!("{model} ")
     };
-    let mut prefix_spans = vec![Span::styled(
+    let mut metadata_spans = vec![Span::styled(
         format!("{} {} ", backend_mark(backend), backend.name()),
         fg(backend_mark_color(backend)),
     )];
     if !model_seg.is_empty() {
-        prefix_spans.push(Span::styled(model_seg, fg(theme::MUTED)));
+        metadata_spans.push(Span::styled(model_seg, fg(theme::MUTED)));
     }
-    prefix_spans.push(Span::styled(format!("{dir} "), fg(theme::MUTED)));
-    prefix_spans.push(Span::styled("❯ ", fg(theme::ACCENT)));
-    let prefix_w = display_width(&composer_prefix(app, composer));
+    metadata_spans.push(Span::styled(dir, fg(theme::MUTED)));
 
-    let (inner, first_visible) = draw_input_box(
-        frame,
-        area,
-        InputBox {
-            border: theme::FAINT,
-            prefix_spans,
-            prefix_w,
-            placeholder: "describe a task · tab to switch agent",
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(theme::FAINT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(metadata_spans)),
+        Rect {
+            height: 1,
+            ..inner
         },
-        composer.text(),
-        show_cursor,
     );
 
-    // Logo mode: the mark prefix rendered as two blank columns above; overlay the brand image
-    // onto them. Only when the first line (which carries the mark slot) is on screen.
+    let input = Rect {
+        y: inner.y.saturating_add(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    if input.height > 0 {
+        if composer.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "describe a task · tab to switch agent",
+                    fg(theme::FAINT),
+                ))),
+                input,
+            );
+            if show_cursor {
+                frame.set_cursor_position((input.x, input.y));
+            }
+        } else {
+            let width = input.width as usize;
+            let mut segments = wrap_by_width(composer.text(), width, width);
+            if display_width(segments.last().unwrap()) == width {
+                segments.push(String::new());
+            }
+            let start = segments.len().saturating_sub(input.height as usize);
+            let lines = segments[start..]
+                .iter()
+                .map(|segment| Line::from(Span::styled(segment.clone(), fg(theme::TEXT))))
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines), input);
+
+            if show_cursor {
+                let last_width = display_width(segments.last().unwrap()) as u16;
+                let x = input.x + last_width.min(input.width - 1);
+                let y = input.y + (segments.len() - start - 1) as u16;
+                frame.set_cursor_position((x, y));
+            }
+        }
+    }
+
+    // Logo mode: overlay the image on the reserved mark slot in the metadata row.
     if let Some(logos) = logos
         && logo_marks()
-        && first_visible
         && inner.width >= 2
     {
         frame.render_widget(
@@ -1675,6 +1703,199 @@ mod tests {
             .collect();
         let pos = term.get_cursor_position().unwrap();
         (rows, (pos.x, pos.y))
+    }
+
+    fn render_viewer(
+        w: u16,
+        h: u16,
+        text: &str,
+        mode: Mode,
+    ) -> (Vec<String>, (u16, u16)) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = App::new(Vec::new());
+        let mut composer = Composer::new();
+        for ch in text.chars() {
+            composer.push_char(ch);
+        }
+        let peek = PeekCache::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    mode: &mode,
+                    notice: "",
+                    peek: &peek,
+                    composer: &composer,
+                    pulses: &pulses,
+                    expanded: None,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| {
+                let mut continuation_cells = 0;
+                (0..w)
+                    .filter_map(|x| {
+                        if continuation_cells > 0 {
+                            continuation_cells -= 1;
+                            return None;
+                        }
+
+                        let symbol = buf[(x, y)].symbol();
+                        continuation_cells = display_width(symbol).saturating_sub(1);
+                        Some(symbol)
+                    })
+                    .collect()
+            })
+            .collect();
+        let pos = term.get_cursor_position().unwrap();
+        (rows, (pos.x, pos.y))
+    }
+
+    fn composer_bounds(rows: &[String]) -> (usize, usize) {
+        let top = rows
+            .iter()
+            .position(|row| row.starts_with('╭'))
+            .expect("composer top border");
+        let bottom = rows
+            .iter()
+            .enumerate()
+            .skip(top + 1)
+            .find_map(|(index, row)| row.starts_with('╰').then_some(index))
+            .expect("composer bottom border");
+        (top, bottom)
+    }
+
+    #[test]
+    fn composer_renders_metadata_above_a_full_width_input_row() {
+        let target = "/tmp/spawn-dir";
+        let app = App::new(vec![Session {
+            backend: BackendKind::Claude,
+            id: "metadata".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "metadata".into(),
+            cwd: target.into(),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }]);
+        let mut composer = Composer::new();
+        composer.cycle_backend();
+        composer.set_models(
+            vec!["default".into(), "gpt-5.3-codex".into()],
+            BackendKind::Codex,
+        );
+        composer.cycle_model();
+        for ch in "hello".chars() {
+            composer.push_char(ch);
+        }
+        let peek = PeekCache::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(50, 16)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    mode: &Mode::Normal,
+                    notice: "",
+                    peek: &peek,
+                    composer: &composer,
+                    pulses: &pulses,
+                    expanded: None,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..16)
+            .map(|y| (0..50).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let cursor = term.get_cursor_position().unwrap();
+        let (top, bottom) = composer_bounds(&rows);
+
+        assert_eq!(bottom - top + 1, 4);
+        let metadata = &rows[top + 1];
+        assert!(metadata.contains("codex"));
+        assert!(metadata.contains("gpt-5.3-codex"));
+        assert!(metadata.contains(target));
+        assert!(!metadata.contains("hello"));
+        assert_eq!(&rows[top + 2], &format!("│hello{}│", " ".repeat(43)));
+        assert_eq!((cursor.x, cursor.y), (6, (top + 2) as u16));
+    }
+
+    #[test]
+    fn composer_exact_width_input_adds_a_cursor_continuation_row() {
+        let (rows, cursor) = render_viewer(12, 18, "0123456789", Mode::Normal);
+        let (top, bottom) = composer_bounds(&rows);
+
+        assert_eq!(bottom - top + 1, 5);
+        assert_eq!(&rows[top + 2], "│0123456789│");
+        assert_eq!(&rows[top + 3], "│          │");
+        assert_eq!(cursor, (1, (top + 3) as u16));
+    }
+
+    #[test]
+    fn composer_preserves_blank_lines_and_wraps_unicode_at_full_width() {
+        let text = "abcdef界gh\n\nijklmnopqrst";
+        let (rows, cursor) = render_viewer(12, 18, text, Mode::Normal);
+        let (top, bottom) = composer_bounds(&rows);
+
+        assert_eq!(bottom - top + 1, 7);
+        assert!(rows[top + 1].contains("claude"));
+        assert_eq!(&rows[top + 2], "│abcdef界gh│");
+        assert_eq!(&rows[top + 3], "│          │");
+        assert_eq!(&rows[top + 4], "│ijklmnopqr│");
+        assert_eq!(&rows[top + 5], "│st        │");
+        assert_eq!(cursor, (3, (top + 5) as u16));
+    }
+
+    #[test]
+    fn composer_height_cap_keeps_metadata_and_the_input_tail_visible() {
+        let text = (0..15)
+            .map(|index| format!("line{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (rows, cursor) = render_viewer(20, 24, &text, Mode::Normal);
+        let (top, bottom) = composer_bounds(&rows);
+
+        assert_eq!(bottom - top + 1, 13);
+        assert!(rows[top + 1].contains("claude"));
+        assert!(rows[top + 2].contains("line05"));
+        assert!(rows[bottom - 1].contains("line14"));
+        assert_eq!(cursor, (7, (bottom - 1) as u16));
     }
 
     #[test]
