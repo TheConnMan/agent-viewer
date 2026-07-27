@@ -2638,6 +2638,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tab_accepts_theme_suggestion_and_opens_picker() {
+        let mut ui = test_ui_with(Vec::new());
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        for character in "/th".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        assert!(ui.composer.suggestions().contains(&"theme"));
+
+        press_normal_code(&mut ui, &backends, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert!(ui.composer.is_theme_command());
+        assert!(ui.themes.picker_open());
+    }
+
+    #[test]
     fn theme_picker_escape_reverts_and_enter_persists() {
         use agent_viewer_core::state::ViewerDb;
         use agent_viewer_tui::ui::theme::{persist_theme, persisted_theme};
