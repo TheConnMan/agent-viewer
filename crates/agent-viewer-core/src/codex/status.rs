@@ -45,13 +45,13 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         open_rollouts: HashMap::new(),
         attached_threads: HashSet::new(),
     };
-    // The argv backstop is consulted ONLY when the kernel's socket table could not be read at
-    // all. Whenever it can, "holds a listening socket" answers per process and decides alone,
-    // so a session whose PROMPT happens to be "app-server" keeps its own pid.
-    let table = std::fs::read_to_string("/proc/net/unix");
-    let trust_argv = table.is_err();
-    let listening = table
-        .map(|t| listening_socket_inodes(&t))
+    // The two host signals are a UNION, not a fallback chain. Neither is complete on its own:
+    // the socket table misses an app-server on the `stdio://` transport (it holds no socket at
+    // all), and argv misses a host whose command line this crate cannot parse. Either saying
+    // "host" is enough, because the mistake in that direction is recoverable and the other one
+    // SIGTERMs a process hosting other people's threads.
+    let listening = std::fs::read_to_string("/proc/net/unix")
+        .map(|table| listening_socket_inodes(&table))
         .unwrap_or_default();
     for (pid, process) in sys.processes() {
         if !process.name().to_string_lossy().starts_with("codex") {
@@ -90,7 +90,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         }
         let owner = RolloutOwner {
             pid: pid.as_u32(),
-            daemon: holds_a_listening_socket || (trust_argv && is_daemon_process(&args)),
+            daemon: holds_a_listening_socket || is_daemon_process(&args),
         };
         for path in held {
             record_owner(&mut scan.open_rollouts, path, owner);
@@ -108,27 +108,32 @@ fn socket_inode(link_target: &str) -> Option<u64> {
         .ok()
 }
 
-/// PURE: inodes of every LISTENING unix socket, from /proc/net/unix.
+/// PURE: inodes of every unix socket that has called `listen()`, from /proc/net/unix.
 ///
-/// Columns are `Num RefCount Protocol Flags Type St Inode Path`, and `St == 01` is
-/// SS_LISTENING: the accepting end, never a client connection. Intersected against a codex
-/// process's own fds this says "this process is a server", which is what an app-server hosting
-/// other people's threads IS. A `codex exec` session runs its app-server in process and listens
-/// on nothing; an interactive session holds a CONNECTED socket to the daemon (`St == 03`),
-/// which is deliberately not matched.
+/// Columns are `Num RefCount Protocol Flags Type St Inode Path`. The listening marker is
+/// `SO_ACCEPTCON` (0x10000) in FLAGS, not the state: `St` comes from `sock->state`, where 01
+/// is SS_UNCONNECTED (which a plain unbound socket also reports) and 03 is SS_CONNECTED.
+/// Confirmed against the live table on 2026-07-27 - the daemon's accepting socket is
+/// `Flags=00010000 St=01` while a client on the same path is `Flags=00000000 St=03`.
+///
+/// Intersected against a codex process's own fds this says "this process is a server", which
+/// is what an app-server hosting other people's threads IS. A `codex exec` session runs its
+/// app-server in process and listens on nothing; an interactive session holds a CONNECTED
+/// socket to the daemon, which is deliberately not matched.
 ///
 /// Deliberately NOT filtered to the control-socket path. A second app-server on a custom
 /// `--listen` endpoint hosts threads exactly as the managed daemon does, and a path filter
 /// would classify it as an ordinary session, exposing its pid to a SIGTERM that would kill
 /// every thread inside it.
 fn listening_socket_inodes(proc_net_unix: &str) -> HashSet<u64> {
+    const SO_ACCEPTCON: u64 = 0x10000;
     proc_net_unix
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let listening = fields.nth(5)? == "01";
-            let inode = fields.next()?.parse().ok()?;
-            listening.then_some(inode)
+            let mut fields = line.split_whitespace().skip(3);
+            let flags = u64::from_str_radix(fields.next()?, 16).ok()?;
+            let inode = fields.nth(2)?.parse().ok()?;
+            (flags & SO_ACCEPTCON != 0).then_some(inode)
         })
         .collect()
 }
@@ -451,12 +456,16 @@ mod tests {
     #[test]
     fn a_listening_socket_identifies_a_host_and_a_connected_one_does_not() {
         // Real /proc/net/unix shape: Num RefCount Protocol Flags Type St Inode Path.
+        // Live shape captured from this box on 2026-07-27: the accepting socket carries
+        // SO_ACCEPTCON in FLAGS and reports St=01 (SS_UNCONNECTED, NOT a listening state), the
+        // client on the same path carries no flags and St=03.
         let table = "\
 Num       RefCount Protocol Flags    Type St Inode Path
 ffff0001: 00000002 00000000 00010000 0001 01 111111 /home/user/.codex/app-server-control/app-server-control.sock
 ffff0002: 00000003 00000000 00000000 0001 03 222222 /home/user/.codex/app-server-control/app-server-control.sock
 ffff0003: 00000002 00000000 00010000 0001 01 333333 /tmp/second-app-server.sock
 ffff0004: 00000003 00000000 00000000 0001 03 444444
+ffff0005: 00000002 00000000 00000000 0001 01 555555 /tmp/bound-but-never-listening.sock
 ";
         let found = listening_socket_inodes(table);
 
@@ -474,19 +483,24 @@ ffff0004: 00000003 00000000 00000000 0001 03 444444
             "a host on a custom listen endpoint is still a host"
         );
         assert!(!found.contains(&444444), "an unbound client socket is not");
+        // St alone would have matched this: 01 is SS_UNCONNECTED, which a socket that never
+        // called listen() also reports. Only SO_ACCEPTCON in FLAGS means listening.
+        assert!(
+            !found.contains(&555555),
+            "a bound socket that never called listen() is not a host"
+        );
     }
 
-    /// The two signals are not peers. Whenever the socket table can be read it decides ALONE
-    /// and per process, so an ordinary session whose prompt happens to be the word
-    /// `app-server` keeps its own pid. The crude argv test is reached only when the table is
-    /// unreadable, the one situation where being wrong in the safe direction beats silence.
+    /// The two signals are a UNION and each covers the other's blind spot: an app-server on
+    /// the `stdio://` transport holds no socket for the table to see, and argv cannot be
+    /// parsed reliably for a host whose options this crate does not know. Either one saying
+    /// "host" is enough, which is why the argv side is allowed to be crude and over-eager: its
+    /// mistake costs a stop that fails visibly, and the mistake it prevents kills a process
+    /// hosting other people's threads.
     #[test]
-    fn the_argv_backstop_is_deliberately_wrong_where_the_socket_signal_is_right() {
-        assert!(
-            is_daemon_process(&argv(&["codex", "exec", "app-server"])),
-            "the backstop alone reads a PROMPT as a host, which is why it is gated behind an \
-             unreadable /proc/net/unix rather than consulted alongside the socket table"
-        );
+    fn the_argv_signal_still_answers_for_a_host_with_no_socket_to_see() {
+        // The stdio-transport app-server, the case that killed the gated design.
+        assert!(is_daemon_process(&argv(&["codex", "app-server"])));
     }
 
     #[test]

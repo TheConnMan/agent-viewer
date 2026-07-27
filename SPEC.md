@@ -218,36 +218,37 @@ daemon pid (returning `None` plus `daemon_hosted: true`), and `stop` routes a da
 to `turn/interrupt` over the socket, never to a signal. What such a row's fd does NOT do any
 more is decide its status: see the rule table below.
 
-**A host is identified by the LISTENING socket it holds, not by its command line.**
-`/proc/net/unix` carries every unix socket's inode and state, and `St == 01` is SS_LISTENING,
-the accepting end. Intersected against a codex process's own fds (the same `/proc/<pid>/fd`
-sweep that collects rollout fds already sees the `socket:[<inode>]` links, so it costs nothing
-extra) this says "this process is a server", which is what an app-server hosting other
-people's threads IS. A `codex exec` session runs its app-server in process and listens on
-nothing; an interactive session holds a CONNECTED socket to the daemon (`St == 03`), which is
-deliberately not matched. Verified live on 2026-07-27: inode 4441325 listening on the control
-socket, held by pid 2950586, the running daemon, with a connected client on the same path
-correctly excluded.
+**A host is identified by the LISTENING socket it holds, in UNION with the argv test.**
+`/proc/net/unix` carries every unix socket's inode and flags, and `SO_ACCEPTCON` (0x10000) in
+FLAGS is the listening marker. Not the state: `St` comes from `sock->state`, where 01 is
+SS_UNCONNECTED, which a socket that never called `listen()` also reports. Confirmed against
+the live table on 2026-07-27 - the daemon's accepting socket is `Flags=00010000 St=01` (inode
+4441325, pid 2950586) while a client on the same path is `Flags=00000000 St=03`.
 
-Deliberately NOT filtered to the control-socket path. A second app-server on a custom
-`--listen` endpoint hosts threads exactly as the managed daemon does, and a path filter would
-classify it as an ordinary session, exposing its pid to a SIGTERM that kills every thread
-inside it.
+Intersected against a codex process's own fds (the `/proc/<pid>/fd` sweep that collects rollout
+fds already sees the `socket:[<inode>]` links, so it costs nothing extra) this says "this
+process is a server", which is what an app-server hosting other people's threads IS. A
+`codex exec` session runs its app-server in process and listens on nothing; an interactive
+session holds a CONNECTED socket, which is deliberately not matched.
 
-This replaced three rounds of trying to locate `app-server` in argv, each of which traded one
-counterexample for another: a fixed index breaks `codex -c k=v app-server`, scanning for
-prompt-taking subcommands breaks a profile named `exec`, and a uniform option-arity parse
-breaks a boolean flag mixed with a value-taking one. argv cannot say which options take values
-and this crate does not own the CLI, so the guessing had no fixed point. The kernel's socket
-table has no such ambiguity.
+Deliberately NOT filtered to the control-socket path: a second app-server on a custom
+`--listen` endpoint hosts threads exactly as the managed daemon does.
 
-The argv test survives only as a GATED backstop, consulted when `/proc/net/unix` cannot be
-read at all. Whenever it can, the socket signal decides alone and per process, so a session
-whose prompt happens to be the word `app-server` keeps its own pid. The backstop itself is
-deliberately crude and biased: `app-server` anywhere means host, minus the `app-server daemon`
-probes. The asymmetry licenses that. A false negative hands a host's pid to SIGTERM and kills
-every session inside it; a false positive only routes stop through `turn/interrupt`, which
-fails visibly and kills nothing.
+**Neither signal is complete, so they are a union rather than a fallback chain.** The socket
+table cannot see an app-server on the `stdio://` transport, which holds no socket at all (the
+editor-extension shape). argv cannot be parsed reliably, which three rounds of review
+established: a fixed index breaks `codex -c k=v app-server`, scanning for prompt-taking
+subcommands breaks a profile named `exec`, and a uniform option-arity parse breaks a boolean
+flag mixed with a value-taking one. argv does not say which options take values and this crate
+does not own the CLI, so that guessing had no fixed point.
+
+Either signal saying "host" is therefore enough, and the argv side stays deliberately crude and
+over-eager: `app-server` anywhere means host, minus the `app-server daemon` probes. The
+asymmetry licenses it. A false negative hands a host's pid to SIGTERM and kills every session
+inside it; a false positive only routes stop through `turn/interrupt`, which fails visibly and
+kills nothing. The known residual is a session whose task prompt is exactly the word
+`app-server`, which reads as a host and loses its own pid. That is the accepted side of the
+trade.
 
 The predicate previously also treated "holds more than one rollout fd" as proof of the daemon.
 That is measurably false and was removed: a plain
