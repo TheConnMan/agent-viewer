@@ -294,7 +294,12 @@ pub fn try_spawn_thread(
 }
 
 /// IMPURE: `try_spawn_thread` for callers that only need the id or an error (the live test).
-pub fn spawn_thread(daemon: &Daemon, cwd: &Path, task: &str, model: Option<&str>) -> Result<String> {
+pub fn spawn_thread(
+    daemon: &Daemon,
+    cwd: &Path,
+    task: &str,
+    model: Option<&str>,
+) -> Result<String> {
     match try_spawn_thread(daemon, cwd, task, model) {
         SpawnAttempt::Started(thread_id) => Ok(thread_id),
         SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
@@ -410,10 +415,7 @@ impl Drop for Client {
         // connection started running regardless. The write timeout is re-armed short first: the
         // socket still carries whatever deadline `connect` set, and a wedged peer would
         // otherwise stall the drop for all of it.
-        let _ = self
-            .socket
-            .get_ref()
-            .set_write_timeout(Some(CLOSE_TIMEOUT));
+        let _ = self.socket.get_ref().set_write_timeout(Some(CLOSE_TIMEOUT));
         let _ = self.socket.close(None);
         let _ = self.socket.flush();
     }

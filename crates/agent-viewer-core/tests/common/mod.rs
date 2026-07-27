@@ -70,10 +70,7 @@ impl FrameReplay {
     }
 
     /// Pop a frame and correlate a response ID to the supplied request ID.
-    pub fn respond_to(
-        &mut self,
-        request: &serde_json::Value,
-    ) -> Option<serde_json::Value> {
+    pub fn respond_to(&mut self, request: &serde_json::Value) -> Option<serde_json::Value> {
         let mut frame = self.next_frame()?;
         let request_id = request.get("id").cloned();
 
