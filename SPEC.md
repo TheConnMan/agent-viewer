@@ -234,11 +234,14 @@ breaks a boolean flag mixed with a value-taking one. argv cannot say which optio
 and this crate does not own the CLI, so the guessing had no fixed point. The kernel's socket
 table has no such ambiguity.
 
-The argv test survives only as the backstop for an unreadable `/proc/net/unix`, and is
-deliberately crude and biased: `app-server` anywhere means host, minus the `app-server daemon`
-probes. The asymmetry licenses that. A false negative hands a host's pid to SIGTERM and kills
-every session inside it; a false positive only routes stop through `turn/interrupt`, which
-fails visibly and kills nothing.
+The argv test survives only as a GATED backstop, consulted when the socket table named no
+daemon at all: an unreadable `/proc/net/unix`, or a daemon listening outside the control dir
+(`--listen unix:///somewhere/else`). Whenever the exact signal is available it decides alone,
+so a session whose prompt happens to be the word `app-server` keeps its own pid. The backstop
+itself is deliberately crude and biased: `app-server` anywhere means host, minus the
+`app-server daemon` probes. The asymmetry licenses that. A false negative hands a host's pid to
+SIGTERM and kills every session inside it; a false positive only routes stop through
+`turn/interrupt`, which fails visibly and kills nothing.
 
 The predicate previously also treated "holds more than one rollout fd" as proof of the daemon.
 That is measurably false and was removed: a plain
