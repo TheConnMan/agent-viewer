@@ -747,6 +747,7 @@ mod tests {
             logos: None,
             list_hit: RefCell::new(ListHit::default()),
             mouse_capture: true,
+            mouse_press: None,
         }
     }
 
