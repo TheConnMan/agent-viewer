@@ -206,6 +206,7 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
         ("Enter/Space", "toggle group on a header"),
+        ("Ctrl+K", "command palette"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
@@ -233,7 +234,7 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     );
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
