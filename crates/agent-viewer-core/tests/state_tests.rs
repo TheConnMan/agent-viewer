@@ -5,8 +5,11 @@ use agent_viewer_core::state::{
     DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
     apply_viewer_state, match_spawn,
 };
+use base64::Engine;
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 
 fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: Status) -> Session {
     Session {
@@ -34,6 +37,90 @@ fn temp_db_path() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("viewer.db");
     (dir, path)
+}
+
+#[test]
+fn opencode_server_secret_is_stable_random_and_shared_by_concurrent_openers() {
+    let (_dir, path) = temp_db_path();
+    let workers = 12;
+    let barrier = Arc::new(Barrier::new(workers));
+    let handles = (0..workers)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                ViewerDb::open(&path)
+                    .expect("open viewer db")
+                    .opencode_server_secret()
+                    .expect("read or create server secret")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let secrets = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("secret worker"))
+        .collect::<Vec<_>>();
+    assert!(
+        secrets.iter().all(|secret| secret == &secrets[0]),
+        "all concurrent transactions must reread the single committed secret"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&secrets[0])
+        .expect("secret is standard Base64");
+    assert_eq!(decoded.len(), 32, "the stored secret has 256 bits");
+    assert!(
+        decoded.iter().any(|byte| *byte != 0),
+        "the stored secret is not a zero filled placeholder"
+    );
+
+    let conn = rusqlite::Connection::open(&path).expect("inspect viewer db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM settings WHERE key = 'opencode.server_password'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count stored secrets");
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn viewer_db_enforces_private_state_directory_mode() {
+    let root = tempfile::TempDir::new().unwrap();
+    let state_dir = root.path().join("state");
+    std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    ViewerDb::open(&state_dir.join("viewer.db")).expect("open viewer db");
+
+    let mode = std::fs::metadata(&state_dir)
+        .expect("state directory metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn detached_spawn_log_is_private_even_when_preexisting_mode_is_permissive() {
+    let root = tempfile::TempDir::new().unwrap();
+    let log_path = root.path().join("logs").join("opencode-server.log");
+    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    std::fs::write(&log_path, b"existing\n").unwrap();
+    std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "printf started"]);
+
+    agent_viewer_core::spawn::spawn_detached(command, &log_path).expect("spawn writer");
+
+    let mode = std::fs::metadata(&log_path)
+        .expect("log metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[test]
