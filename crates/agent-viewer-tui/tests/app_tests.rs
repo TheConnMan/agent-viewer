@@ -4,7 +4,7 @@ use agent_viewer_tui::app::{
     row_layout,
 };
 use agent_viewer_tui::pr_cache::PrStatusCache;
-use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, draw, theme};
+use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, ThemeState, draw, theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::cell::RefCell;
@@ -91,6 +91,7 @@ fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expect
     let pulses = Pulses::new();
     let pr_status = PrStatusCache::new();
     let list_hit = RefCell::new(ListHit::default());
+    let themes = ThemeState::default();
     let mut terminal = Terminal::new(TestBackend::new(240, 12)).unwrap();
     terminal
         .draw(|frame| {
@@ -108,6 +109,7 @@ fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expect
                     pr_status: &pr_status,
                     logos: None,
                     list_hit: &list_hit,
+                    themes: &themes,
                 },
             );
         })
@@ -914,6 +916,7 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     let pulses = Pulses::new();
     let pr_status = PrStatusCache::new();
     let list_hit = RefCell::new(ListHit::default());
+    let themes = ThemeState::default();
     let width = 76_u16;
     let height = 20_u16;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -934,6 +937,7 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
                     pr_status: &pr_status,
                     logos: None,
                     list_hit: &list_hit,
+                    themes: &themes,
                 },
             );
         })
@@ -977,11 +981,17 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     assert!(done_summary < done_elapsed);
     assert_eq!(needs_status, done_status);
     assert_eq!(needs_status - needs_title - 1, 40);
-    assert_eq!(buffer[(needs_pr, needs_y)].fg, theme::ACCENT);
-    assert_eq!(buffer[(needs_summary, needs_y)].fg, theme::MUTED);
-    assert_eq!(buffer[(needs_elapsed, needs_y)].fg, theme::MUTED);
-    assert_eq!(buffer[(done_summary, done_y)].fg, theme::MUTED);
-    assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::MUTED);
+    assert_eq!(buffer[(needs_pr, needs_y)].fg, theme::amber(false).accent);
+    assert_eq!(
+        buffer[(needs_summary, needs_y)].fg,
+        theme::amber(false).muted
+    );
+    assert_eq!(
+        buffer[(needs_elapsed, needs_y)].fg,
+        theme::amber(false).muted
+    );
+    assert_eq!(buffer[(done_summary, done_y)].fg, theme::amber(false).muted);
+    assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::amber(false).muted);
     assert_eq!(needs_elapsed + 2, width);
     assert_eq!(done_elapsed + 2, width);
 }
@@ -1008,6 +1018,7 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
     let pulses = Pulses::new();
     let pr_status = PrStatusCache::new();
     let list_hit = RefCell::new(ListHit::default());
+    let themes = ThemeState::default();
     let width = 48_u16;
     let height = 20_u16;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1028,6 +1039,7 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
                     pr_status: &pr_status,
                     logos: None,
                     list_hit: &list_hit,
+                    themes: &themes,
                 },
             );
         })
@@ -1055,7 +1067,7 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
     assert!(status < pr);
     assert!(pr < elapsed);
     assert!(status - title - 1 < 30);
-    assert_eq!(buffer[(pr, row)].fg, theme::ACCENT);
+    assert_eq!(buffer[(pr, row)].fg, theme::amber(false).accent);
     assert_eq!(elapsed + 2, width);
 }
 
