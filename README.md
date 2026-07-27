@@ -154,9 +154,9 @@ modal.
 - `h` / `u` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `Ctrl+T` — turn mouse reporting off / back on. Off hands the mouse back to your terminal so
-  you can drag-select and copy text out of the viewer; on restores click/hover row selection
-  and wheel scrolling. Works everywhere, including inside an attach, so the transcript is
-  copyable. A footer notice names the mode you just switched to.
+  you can drag-select and copy text out of the viewer; on restores left click row activation,
+  hover row selection, and wheel scrolling. Works everywhere, including inside an attach, so
+  the transcript is copyable. A footer notice names the mode you just switched to.
 - `?` — key help.
 - `q` — quit.
 

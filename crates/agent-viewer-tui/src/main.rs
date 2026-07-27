@@ -171,6 +171,7 @@ struct Ui {
     /// Whether mouse reporting is currently on (Ctrl+T toggles). Off hands the mouse back to
     /// the terminal so the user can drag-select and copy; `handle_mouse` gates on this.
     mouse_capture: bool,
+    mouse_press: Option<keys::MousePress>,
 }
 
 impl Ui {
@@ -288,6 +289,7 @@ fn main() -> io::Result<()> {
         logos,
         list_hit: RefCell::new(ListHit::default()),
         mouse_capture: true,
+        mouse_press: None,
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
@@ -421,7 +423,9 @@ fn run(
                         let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
                     }
                 }
-                Event::Mouse(me) => keys::handle_mouse(me, ui),
+                Event::Mouse(me) => {
+                    keys::handle_mouse_event(me, backends, ui, terminal)?;
+                }
                 _ => {}
             }
         }
