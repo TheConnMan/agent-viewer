@@ -1195,6 +1195,7 @@ fn row_to_item(
             summary,
             status,
             title,
+            created_at_ms,
             updated_at_ms,
             pr_refs,
             ..
@@ -1210,7 +1211,12 @@ fn row_to_item(
                 Some(g) => (g, theme::ACCENT),
                 None => status_glyph(status, now_ms),
             };
-            let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
+            let started_at_ms = if *created_at_ms > 0 {
+                *created_at_ms
+            } else {
+                *updated_at_ms
+            };
+            let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
             let pr_color = pr_badge_theme_color(pr_status.badge_color(pr_refs));
             let line = session_line(SessionRow {
                 glyph,
@@ -1602,6 +1608,68 @@ mod tests {
         assert_eq!(title.bg, theme::SEL_BG);
         assert_eq!(summary.bg, theme::SEL_BG);
         assert_ne!(title.fg, summary.fg);
+    }
+
+    #[test]
+    fn session_elapsed_uses_creation_time_after_activity_refresh() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let session = |created_at_ms, updated_at_ms| Session {
+            backend: BackendKind::Codex,
+            id: "elapsed".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "elapsed".into(),
+            cwd: "/tmp/agent-viewer-elapsed".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms,
+            updated_at_ms,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+        let render_elapsed = |app: &App, now_ms| {
+            let pulses = Pulses::new();
+            let pr_status = crate::pr_cache::PrStatusCache::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_list(
+                        frame,
+                        app,
+                        &pulses,
+                        now_ms,
+                        &pr_status,
+                        ListDeco {
+                            rename: None,
+                            expanded: None,
+                            expand_lines: &[],
+                        },
+                        None,
+                        Rect::new(0, 0, 80, 2),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..2)
+                .flat_map(|y| (0..80).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+
+        let mut app = App::new(vec![session(1_000, 91_000)]);
+        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+
+        app.set_sessions(vec![session(1_000, 111_000)]);
+        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+
+        let fallback = App::new(vec![session(0, 90_000)]);
+        assert!(render_elapsed(&fallback, 120_000).contains("Working 30s"));
     }
 
     #[test]
