@@ -501,10 +501,10 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
         session.id == session_id && !session.hidden
     })
     .expect("unarchive did not round trip");
-    let message = runtime
+    let last_message = runtime
         .read_last_message(&default_opencode_db(), &session_id)
-        .expect("read server message history")
-        .expect("the test prompt remains in message history");
+        .expect("read the real last server message")
+        .expect("abort persists an assistant message");
 
     let cleanup_result = cleanup.delete();
     let cleanup_ok = cleanup_result.is_ok();
@@ -553,11 +553,8 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
     assert_eq!(renamed.title, format!("{title_marker} renamed"));
     assert!(archived.hidden);
     assert!(!unarchived.hidden);
-    assert!(
-        message.text.contains(&title_marker),
-        "server message history did not retain the submitted prompt: {:?}",
-        message.text
-    );
+    assert_eq!(last_message.role, "assistant");
+    assert_eq!(last_message.text, "Aborted");
     assert!(removed, "cleanup session remained in the server list");
     assert!(
         server_still_healthy,

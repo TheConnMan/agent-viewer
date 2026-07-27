@@ -4,7 +4,7 @@ use crate::error::{AttachRefusal, Error, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::ffi::OsStrExt;
@@ -294,6 +294,13 @@ impl OpencodeRuntime {
 
     fn probe(&self) -> Option<SocketAddr> {
         let mut state = self.state();
+        if let Some(endpoint) = state.endpoint {
+            state.last_failure = self
+                .probe_health(endpoint, self.health_timeout())
+                .err()
+                .map(|error| format!("port {}: {error}", endpoint.port()));
+            return Some(endpoint);
+        }
         let (endpoint, failures) = self.probe_candidates(None);
         state.endpoint = endpoint;
         state.last_failure = endpoint
@@ -304,6 +311,13 @@ impl OpencodeRuntime {
 
     fn ensure_server(&self) -> std::result::Result<SocketAddr, String> {
         let mut state = self.state();
+        if let Some(endpoint) = state.endpoint {
+            state.last_failure = self
+                .probe_health(endpoint, self.health_timeout())
+                .err()
+                .map(|error| format!("port {}: {error}", endpoint.port()));
+            return Ok(endpoint);
+        }
         let deadline = Instant::now() + self.inner.startup_timeout;
         let (endpoint, mut failures) = self.probe_candidates(Some(deadline));
         if let Some(endpoint) = endpoint {
@@ -504,15 +518,38 @@ impl OpencodeBackend {
         let sessions: Vec<ServerSession> =
             self.runtime
                 .request_json(endpoint, "GET", "/session?limit=10000", None, 200)?;
-        let statuses: HashMap<String, ServerStatus> =
-            self.runtime
-                .request_json(endpoint, "GET", "/session/status", None, 200)?;
-        let permissions: Vec<PermissionRequest> =
-            self.runtime
-                .request_json(endpoint, "GET", "/permission", None, 200)?;
-        let questions: Vec<QuestionRequest> =
-            self.runtime
-                .request_json(endpoint, "GET", "/question", None, 200)?;
+        let directories = sessions
+            .iter()
+            .filter(|session| session.is_active_managed())
+            .map(|session| session.directory.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut statuses = HashMap::new();
+        let mut permissions = Vec::new();
+        let mut questions = Vec::new();
+        for directory in directories {
+            let directory = percent_encode(directory.as_bytes());
+            statuses.extend(self.runtime.request_json::<HashMap<String, ServerStatus>>(
+                endpoint,
+                "GET",
+                &format!("/session/status?directory={directory}"),
+                None,
+                200,
+            )?);
+            permissions.extend(self.runtime.request_json::<Vec<PermissionRequest>>(
+                endpoint,
+                "GET",
+                &format!("/permission?directory={directory}"),
+                None,
+                200,
+            )?);
+            questions.extend(self.runtime.request_json::<Vec<QuestionRequest>>(
+                endpoint,
+                "GET",
+                &format!("/question?directory={directory}"),
+                None,
+                200,
+            )?);
+        }
 
         let mut input_reasons = HashMap::new();
         for permission in permissions {
@@ -536,18 +573,22 @@ impl OpencodeBackend {
         let mut listed = sessions
             .into_iter()
             .map(|session| {
-                let status = input_reasons
-                    .get(&session.id)
-                    .cloned()
-                    .map(|reason| Status::NeedsInput {
-                        reason: Some(reason),
-                    })
-                    .unwrap_or_else(|| {
-                        match statuses.get(&session.id).map(|status| status.kind.as_str()) {
-                            Some("busy" | "retry") => Status::Working,
-                            _ => Status::Idle,
-                        }
-                    });
+                let status = if session.is_active_managed() {
+                    input_reasons
+                        .get(&session.id)
+                        .cloned()
+                        .map(|reason| Status::NeedsInput {
+                            reason: Some(reason),
+                        })
+                        .unwrap_or_else(|| {
+                            match statuses.get(&session.id).map(|status| status.kind.as_str()) {
+                                Some("busy" | "retry") => Status::Working,
+                                _ => Status::Idle,
+                            }
+                        })
+                } else {
+                    Status::Idle
+                };
                 Session {
                     backend: BackendKind::Opencode,
                     id: session.id,
@@ -629,7 +670,10 @@ impl Backend for OpencodeBackend {
             .ensure_server()
             .map_err(|error| Error::Command(format!("spawn failed: {error}")))?;
         let directory = percent_encode(dir.as_os_str().as_bytes());
-        let mut create = json!({"title": crate::spawn::truncated_title(task)});
+        let mut create = json!({
+            "title": crate::spawn::truncated_title(task),
+            "metadata": {"agent-viewer": {"background": true}}
+        });
         if let Some(model) = &model {
             create["model"] = json!({"providerID": model.provider, "id": model.id});
         }
@@ -748,7 +792,24 @@ struct ServerSession {
     title: String,
     #[serde(default)]
     permission: Option<Value>,
+    #[serde(default)]
+    metadata: Option<Value>,
     time: ServerSessionTime,
+}
+
+impl ServerSession {
+    fn is_active_managed(&self) -> bool {
+        self.time.archived.unwrap_or(0.0) <= 0.0
+            && self
+                .metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("agent-viewer"))
+                .and_then(Value::as_object)
+                .and_then(|marker| marker.get("background"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    }
 }
 
 #[derive(Deserialize)]

@@ -218,13 +218,7 @@ fn healthy_response() -> ScriptedResponse {
 }
 
 fn empty_server_list_responses() -> Vec<ScriptedResponse> {
-    vec![
-        healthy_response(),
-        ScriptedResponse::json(200, json!([])),
-        ScriptedResponse::json(200, json!({})),
-        ScriptedResponse::json(200, json!([])),
-        ScriptedResponse::json(200, json!([])),
-    ]
+    vec![healthy_response(), ScriptedResponse::json(200, json!([]))]
 }
 
 fn unused_addr() -> SocketAddr {
@@ -312,17 +306,11 @@ fn opencode_runtime_reuses_healthy_primary_before_backup() {
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         primary
-            .wait_for_requests(5)
+            .wait_for_requests(2)
             .iter()
             .map(|request| request.target.as_str())
             .collect::<Vec<_>>(),
-        vec![
-            "/global/health",
-            "/session?limit=10000",
-            "/session/status",
-            "/permission",
-            "/question",
-        ]
+        vec!["/global/health", "/session?limit=10000"]
     );
     assert!(
         backup.requests().is_empty(),
@@ -344,7 +332,7 @@ fn opencode_runtime_reuses_healthy_backup_before_starting_free_primary() {
 
     assert!(backend.list().expect("list from healthy backup").is_empty());
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(backup.wait_for_requests(5)[0].target, "/global/health");
+    assert_eq!(backup.wait_for_requests(2)[0].target, "/global/health");
 }
 
 #[test]
@@ -366,7 +354,7 @@ fn opencode_runtime_skips_unrelated_primary_and_reuses_healthy_backup() {
     assert!(backend.list().expect("list from backup").is_empty());
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
     assert_eq!(primary.wait_for_requests(1)[0].target, "/global/health");
-    assert_eq!(backup.wait_for_requests(5)[0].target, "/global/health");
+    assert_eq!(backup.wait_for_requests(2)[0].target, "/global/health");
 }
 
 #[test]
@@ -630,9 +618,18 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
     rows[3]["permission"] = Value::Null;
     rows[4]["permission"] = Value::Null;
     rows[5]["permission"] = Value::Null;
+    for row in &mut rows[1..5] {
+        row["metadata"] = json!({"agent-viewer": {"background": true}});
+    }
+    let directory = rows[1]["directory"].as_str().unwrap().to_string();
     let permission_id = rows[3]["id"].as_str().unwrap().to_string();
     let question_id = rows[4]["id"].as_str().unwrap().to_string();
-    let status = common::fixture_json("opencode/session_status_idle_busy_retry.json");
+    let external_id = rows[5]["id"].as_str().unwrap().to_string();
+    let mut status = common::fixture_json("opencode/session_status_idle_busy_retry.json");
+    status
+        .as_object_mut()
+        .unwrap()
+        .insert(external_id.clone(), json!({"type": "busy"}));
     let primary = ScriptedServer::spawn(vec![
         healthy_response(),
         ScriptedResponse::json(200, sessions),
@@ -717,6 +714,15 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
             reason: Some("Which deployment target?".to_string())
         }
     );
+    assert_eq!(
+        listed
+            .iter()
+            .find(|session| session.id == external_id)
+            .unwrap()
+            .status,
+        Status::Idle,
+        "unmarked external history must ignore scoped busy status"
+    );
     assert!(
         listed
             .iter()
@@ -728,17 +734,146 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
         primary
             .wait_for_requests(5)
             .iter()
-            .map(|request| request.target.as_str())
+            .map(|request| request.target.clone())
             .collect::<Vec<_>>(),
         vec![
-            "/global/health",
-            "/session?limit=10000",
-            "/session/status",
-            "/permission",
-            "/question",
+            "/global/health".to_string(),
+            "/session?limit=10000".to_string(),
+            format!(
+                "/session/status?directory={}",
+                encoded_component(&directory)
+            ),
+            format!("/permission?directory={}", encoded_component(&directory)),
+            format!("/question?directory={}", encoded_component(&directory)),
         ],
-        "listing uses one bulk call per server resource"
+        "listing scopes one metadata triplet to the marked directory"
     );
+}
+
+#[test]
+fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
+    let first_directory = "/tmp/project one";
+    let second_directory = "/tmp/雪?project/two";
+    let sessions = json!([
+        {
+            "id": "ses_first_busy",
+            "parentID": null,
+            "directory": first_directory,
+            "title": "first busy",
+            "permission": null,
+            "metadata": {"agent-viewer": {"background": true}},
+            "time": {"created": 10, "updated": 50}
+        },
+        {
+            "id": "ses_first_idle",
+            "parentID": null,
+            "directory": first_directory,
+            "title": "first idle",
+            "permission": null,
+            "metadata": {"agent-viewer": {"background": true}},
+            "time": {"created": 10, "updated": 40}
+        },
+        {
+            "id": "ses_second_retry",
+            "parentID": null,
+            "directory": second_directory,
+            "title": "second retry",
+            "permission": null,
+            "metadata": {"agent-viewer": {"background": true}},
+            "time": {"created": 10, "updated": 30}
+        },
+        {
+            "id": "ses_external_history",
+            "parentID": null,
+            "directory": "/historical/do not probe",
+            "title": "external",
+            "permission": null,
+            "time": {"created": 10, "updated": 20}
+        },
+        {
+            "id": "ses_archived_marked",
+            "parentID": null,
+            "directory": "/archived/do not probe",
+            "title": "archived",
+            "permission": null,
+            "metadata": {"agent-viewer": {"background": true}},
+            "time": {"created": 10, "updated": 10, "archived": 11}
+        }
+    ]);
+    let server = ScriptedServer::spawn(vec![
+        healthy_response(),
+        ScriptedResponse::json(200, sessions),
+        ScriptedResponse::json(
+            200,
+            json!({
+                "ses_first_busy": {"type": "busy"},
+                "ses_first_idle": {"type": "idle"}
+            }),
+        ),
+        ScriptedResponse::json(200, json!([])),
+        ScriptedResponse::json(200, json!([])),
+        ScriptedResponse::json(
+            200,
+            json!({
+                "ses_second_retry": {
+                    "type": "retry",
+                    "attempt": 2,
+                    "message": "temporary provider failure",
+                    "next": 100
+                }
+            }),
+        ),
+        ScriptedResponse::json(200, json!([])),
+        ScriptedResponse::json(200, json!([])),
+    ]);
+    let launcher_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = no_launch_runtime(
+        [server.addr, unused_addr()],
+        Duration::from_millis(250),
+        Arc::clone(&launcher_calls),
+    );
+    let mut backend = backend_with_runtime(runtime);
+
+    let listed = backend.list().expect("directory scoped server list");
+    let status = |id: &str| {
+        listed
+            .iter()
+            .find(|session| session.id == id)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(status("ses_first_busy"), Status::Working);
+    assert_eq!(status("ses_first_idle"), Status::Idle);
+    assert_eq!(status("ses_second_retry"), Status::Working);
+    assert_eq!(status("ses_external_history"), Status::Idle);
+
+    let first = encoded_component(first_directory);
+    let second = encoded_component(second_directory);
+    assert_eq!(
+        server
+            .wait_for_requests(8)
+            .iter()
+            .map(|request| request.target.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "/global/health".to_string(),
+            "/session?limit=10000".to_string(),
+            format!("/session/status?directory={first}"),
+            format!("/permission?directory={first}"),
+            format!("/question?directory={first}"),
+            format!("/session/status?directory={second}"),
+            format!("/permission?directory={second}"),
+            format!("/question?directory={second}"),
+        ],
+        "two marked rows in one directory share one metadata triplet"
+    );
+    assert_eq!(
+        server.requests().len(),
+        8,
+        "metadata calls must scale with unique marked directories, not rows"
+    );
+    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1088,6 +1223,7 @@ fn opencode_spawn_create_then_prompt_returns_exact_id_and_model_shapes() {
         requests[1].json_body(),
         json!({
             "title": task.chars().take(40).collect::<String>(),
+            "metadata": {"agent-viewer": {"background": true}},
             "model": {"providerID": "openai", "id": "gpt-5.6-sol"}
         })
     );
@@ -1215,6 +1351,7 @@ fn opencode_shared_runtime_connects_spawn_and_fresh_listing_instances() {
                             "directory": "/tmp",
                             "title": "shared",
                             "permission": null,
+                            "metadata": {"agent-viewer": {"background": true}},
                             "time": {"created": 1, "updated": 2}
                         }]),
                     ),
@@ -1433,26 +1570,38 @@ fn opencode_server_message_peek_selects_newest_nonblank_ordered_text() {
 }
 
 #[test]
-fn opencode_server_message_peek_surfaces_assistant_error_message_only() {
+fn opencode_server_message_peek_prefers_newer_abort_over_older_user_text() {
     let server = ScriptedServer::spawn(vec![
         healthy_response(),
         ScriptedResponse::json(
             200,
-            json!([{
-                "info": {
-                    "id": "msg_error",
-                    "role": "assistant",
-                    "time": {"created": 500},
-                    "error": {
-                        "name": "ProviderError",
-                        "data": {
-                            "message": "model unavailable",
-                            "responseBody": "secret provider payload"
-                        }
-                    }
+            json!([
+                {
+                    "info": {
+                        "id": "msg_user",
+                        "role": "user",
+                        "time": {"created": 400}
+                    },
+                    "parts": [
+                        {"type": "text", "text": "OLDER USER PROMPT MARKER"}
+                    ]
                 },
-                "parts": []
-            }]),
+                {
+                    "info": {
+                        "id": "msg_error",
+                        "role": "assistant",
+                        "time": {"created": 500},
+                        "error": {
+                            "name": "MessageAbortedError",
+                            "data": {
+                                "message": "Aborted",
+                                "responseBody": "unrelated provider payload"
+                            }
+                        }
+                    },
+                    "parts": []
+                }
+            ]),
         ),
     ]);
     let launcher_calls = Arc::new(AtomicUsize::new(0));
@@ -1468,12 +1617,7 @@ fn opencode_server_message_peek_surfaces_assistant_error_message_only() {
         .expect("assistant error is parseable")
         .expect("assistant error is visible");
     assert_eq!(item.role, "assistant");
-    assert!(item.text.contains("model unavailable"), "{}", item.text);
-    assert!(
-        !item.text.contains("secret provider payload"),
-        "{}",
-        item.text
-    );
+    assert_eq!(item.text, "Aborted");
 }
 
 // --- run-mode companions: `opencode run` sessions are one-shots, not fleet members ---
