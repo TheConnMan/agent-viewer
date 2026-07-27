@@ -500,9 +500,10 @@ rollout for live tail.
 
 - Left pane: sessions grouped by project, status glyphs (borrow opencode-monitor's vocabulary:
   spinner=running, green=done, gray=hidden, red=errored). Right pane: focused session tail.
-- Keys: `Enter` attach/resume; `n` new session (prompt dir + task, spawn detached);
-  `h` hide (archive); `u` unhide; `a` toggle show-hidden; `space` collapse group;
-  `/` filter; `j/k` + arrows navigate; `q` quit. Keep the set small and obvious.
+- Keys: `Enter` attach/resume when the composer is empty, or spawn a composed task; bare letters
+  and numbers type into the composer, including when empty, and `/` composes; `Ctrl+D` hide
+  (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` collapse group; arrows
+  navigate; `Ctrl+F` filters; `Ctrl+C` quit. Keep the set small and obvious.
 
 ### Mouse capture must be escapable (`Ctrl+T`)
 
@@ -543,10 +544,11 @@ screen is simply uncopyable.
 1. `cargo build --workspace` and `cargo clippy --workspace` are clean; `cargo test --workspace` passes.
 2. The TUI launches on this box and lists real sessions from `state_*.sqlite`, grouped by project,
    with correct hidden/visible split.
-3. Pressing `n` spawns a background `codex exec` that appears in the list within ~2s.
+3. Composing a task and pressing `Enter` spawns a background `codex exec` that appears in the
+   list within ~2s.
 4. That spawned session shows **running** (proving the `/proc/fd` correlation works live), then
    **done** after it finishes — demonstrated with actual output, not asserted in prose.
-5. `h`/`u` archive/unarchive a session and it moves between visible and hidden views.
+5. `Ctrl+D`/`Ctrl+U` archive/unarchive a session and it moves between visible and hidden views.
 6. README documents how to build and run.
 
 Report at completion with: the exact commands run and their output for done-when items 1, 3, and 4

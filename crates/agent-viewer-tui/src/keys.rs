@@ -53,7 +53,7 @@ pub(crate) fn handle_key(
     // be stopped without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as
     // copy and never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
     if is_quit_chord(key, ctrl, &ui.mode) {
-        ui.attached.clear(); // drop = kill owned children, same teardown as `q`
+        ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
     }
     // Ctrl+T flips mouse capture, which is the only way to get the terminal's own text
@@ -324,6 +324,9 @@ fn handle_normal_key(
     // Ctrl-chords always act, regardless of composer state.
     if ctrl {
         match key.code {
+            KeyCode::Char('a') => ui.app.toggle_show_all(),
+            KeyCode::Char('d') => hide_selected(backends, ui, true),
+            KeyCode::Char('u') => hide_selected(backends, ui, false),
             KeyCode::Char('s') => ui.app.toggle_group_mode(),
             KeyCode::Char('r') => open_rename(backends, ui),
             KeyCode::Char('e') => open_reply(backends, ui),
@@ -381,16 +384,9 @@ fn handle_normal_key(
         }
         KeyCode::Char(c) => {
             if ui.composer.is_empty() {
-                // Empty composer: the command hotkeys still fire; any other printable
-                // starts a task (n included — it just types).
+                // Empty composer: punctuation hotkeys still fire; every bare letter and
+                // number starts a task.
                 match c {
-                    'q' => {
-                        ui.attached.clear(); // drop = kill owned children
-                        return Ok(true);
-                    }
-                    'a' => ui.app.toggle_show_all(),
-                    'h' => hide_selected(backends, ui, true),
-                    'u' => hide_selected(backends, ui, false),
                     '?' => ui.mode = Mode::Help,
                     // On a header, Space collapses/expands the group (and persists), never
                     // typing a space; on a session it toggles the inline peek; otherwise it
@@ -570,7 +566,7 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 pub(crate) mod tests {
     use super::{
         MouseAction, ensure_completions, handle_attached_key, handle_mouse_event, handle_paste,
-        handle_rename_key, is_quit_chord, open_filter,
+        handle_normal_key, handle_rename_key, is_quit_chord, open_filter,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec};
@@ -587,6 +583,41 @@ pub(crate) mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    fn press_normal_key(
+        ui: &mut Ui,
+        backends: &[Box<dyn agent_viewer_core::Backend>],
+        c: char,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        ui.models.seed(
+            BackendKind::Claude,
+            vec![ui.composer.model().to_string()],
+            true,
+        );
+        let (_snapshot_tx, snapshots) =
+            std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
+        let (wake, _wake_rx) = std::sync::mpsc::channel();
+        let refresher = crate::Refresher { snapshots, wake };
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("fixed terminal");
+
+        handle_normal_key(
+            key(KeyCode::Char(c), modifiers),
+            modifiers.contains(KeyModifiers::CONTROL),
+            backends,
+            &refresher,
+            ui,
+            &mut terminal,
+        )
+        .expect("normal key routing")
     }
 
     pub(crate) fn test_ui_with(sessions: Vec<Session>) -> Ui {
@@ -1248,6 +1279,37 @@ pub(crate) mod tests {
             _session: &Session,
         ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
             unreachable!("attach is not exercised by the rename key tests")
+        }
+    }
+
+    struct ArchivingBackend;
+
+    impl agent_viewer_core::Backend for ArchivingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                archive: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by the archive key tests")
+        }
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawn is not exercised by the archive key tests")
+        }
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by the archive key tests")
         }
     }
 
@@ -2124,6 +2186,125 @@ pub(crate) mod tests {
         // Attached, Ctrl+C must reach the child as an interrupt, not tear down the viewer.
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(!is_quit_chord(ctrl_c, true, &Mode::Attached));
+    }
+
+    #[test]
+    fn bare_letters_and_digits_start_composer_text() {
+        for c in ('a'..='z').chain('A'..='Z').chain('0'..='9') {
+            let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-keys", 100)]);
+            select_session_row(&mut ui, "s1");
+
+            assert!(
+                !press_normal_key(&mut ui, &[], c, KeyModifiers::NONE),
+                "{c:?} must not quit"
+            );
+            assert_eq!(ui.composer.text(), c.to_string(), "{c:?} must compose");
+            assert!(!ui.app.show_all(), "{c:?} must not change list scope");
+            assert!(
+                !ui.mutations.in_flight("claude:s1:hide")
+                    && !ui.mutations.in_flight("claude:s1:unhide"),
+                "{c:?} must not submit a mutation"
+            );
+            assert_eq!(
+                ui.app.selected().map(|session| session.id.as_str()),
+                Some("s1"),
+                "{c:?} must not move the selection"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_question_mark_opens_help() {
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-help", 100)]);
+        select_session_row(&mut ui, "s1");
+
+        assert!(!press_normal_key(&mut ui, &[], '?', KeyModifiers::NONE));
+        assert!(matches!(ui.mode, Mode::Help));
+        assert!(ui.composer.is_empty(), "help must not become composer text");
+    }
+
+    #[test]
+    fn bare_space_on_a_session_toggles_its_inline_peek() {
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-peek", 100)]);
+        select_session_row(&mut ui, "s1");
+
+        assert!(!press_normal_key(&mut ui, &[], ' ', KeyModifiers::NONE));
+        assert_eq!(
+            ui.app.expanded(),
+            Some(&(BackendKind::Claude, "s1".to_string()))
+        );
+        assert!(ui.composer.is_empty(), "peek must not become composer text");
+    }
+
+    #[test]
+    fn bare_space_on_a_group_header_collapses_the_group() {
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-group", 100)]);
+        let header = ui
+            .app
+            .visible()
+            .iter()
+            .position(|row| matches!(row, agent_viewer_tui::app::Row::ProjectHeader { .. }))
+            .expect("project header present");
+        assert!(ui.app.select_visible_index(header));
+
+        assert!(!press_normal_key(&mut ui, &[], ' ', KeyModifiers::NONE));
+        assert!(matches!(
+            ui.app.visible().get(ui.app.selected_index()),
+            Some(agent_viewer_tui::app::Row::ProjectHeader {
+                collapsed: true,
+                ..
+            })
+        ));
+        assert!(ui.composer.is_empty(), "collapse must not become composer text");
+        assert_eq!(ui.app.expanded(), None, "a header cannot open a session peek");
+    }
+
+    #[test]
+    fn bare_slash_starts_composer_input() {
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-slash", 100)]);
+        select_session_row(&mut ui, "s1");
+
+        assert!(!press_normal_key(&mut ui, &[], '/', KeyModifiers::NONE));
+        assert_eq!(ui.composer.text(), "/");
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn ctrl_a_toggles_show_all() {
+        let mut ui = test_ui_with(Vec::new());
+
+        assert!(!ui.app.show_all());
+        assert!(!press_normal_key(
+            &mut ui,
+            &[],
+            'a',
+            KeyModifiers::CONTROL
+        ));
+        assert!(ui.app.show_all());
+        assert!(ui.composer.is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_submit_their_archive_operations() {
+        for (c, operation) in [('d', "hide"), ('u', "unhide")] {
+            let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-archive", 100)]);
+            select_session_row(&mut ui, "s1");
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+                vec![Box::new(ArchivingBackend)];
+
+            assert!(!press_normal_key(
+                &mut ui,
+                &backends,
+                c,
+                KeyModifiers::CONTROL
+            ));
+            assert!(
+                ui.mutations
+                    .in_flight(&format!("claude:s1:{operation}")),
+                "ctrl+{c} must submit {operation}"
+            );
+            assert!(ui.composer.is_empty());
+        }
     }
 
     #[test]
