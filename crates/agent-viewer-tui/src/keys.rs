@@ -717,7 +717,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
-        ) -> agent_viewer_core::Result<Option<u32>> {
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by mouse activation")
         }
 
