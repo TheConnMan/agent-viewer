@@ -50,6 +50,11 @@ pub fn scan_codex_processes() -> CodexProcessScan {
             listening_socket_inodes(&table, &crate::default_codex_home().join(CONTROL_DIR))
         })
         .unwrap_or_default();
+    // The argv backstop is consulted ONLY when the socket table named no daemon at all: an
+    // unreadable /proc/net/unix, or a daemon listening somewhere other than the control dir
+    // (`--listen unix:///somewhere/else`). Whenever the exact signal is available it decides
+    // alone, so a session whose PROMPT happens to be "app-server" keeps its own pid.
+    let trust_argv = listening.is_empty();
     for (pid, process) in sys.processes() {
         if !process.name().to_string_lossy().starts_with("codex") {
             continue;
@@ -87,7 +92,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         }
         let owner = RolloutOwner {
             pid: pid.as_u32(),
-            daemon: holds_the_control_socket || is_daemon_process(&args),
+            daemon: holds_the_control_socket || (trust_argv && is_daemon_process(&args)),
         };
         for path in held {
             record_owner(&mut scan.open_rollouts, path, owner);
@@ -155,31 +160,13 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, RolloutOwner> {
     scan_codex_processes().open_rollouts
 }
 
-/// PURE: is this codex process an app-server hosting other people's threads? Decided from
-/// ARGV ALONE, because this single predicate is what keeps `stop` from SIGTERMing the daemon
-/// and every session inside it.
+/// PURE: is this codex process an app-server hosting other people's threads, as far as its
+/// COMMAND LINE can say? The deciding signal is the listening control socket
+/// (`scan_codex_processes`); this is the backstop for when the socket table names no daemon,
+/// and `is_app_server` documents why it is deliberately crude.
 ///
-/// The rule is `app-server` anywhere after argv[0], MINUS the two shapes where that word is
-/// not the subcommand. The live daemon's cmdline is `codex app-server --listen unix://`
-/// (captured from /proc/<pid>/cmdline).
-///
-/// The asymmetry decides every judgement call here. A FALSE NEGATIVE means Ctrl+X SIGTERMs a
-/// process hosting other people's threads, killing all of them. A false positive only routes
-/// stop through `turn/interrupt`, which fails visibly and kills nothing. So the default is
-/// "this is a host", and only shapes proven otherwise are carved out:
-///
-///   1. `app-server daemon ...` - the short-lived `daemon version` / `daemon start` probes,
-///      which host nothing.
-///   2. the word appearing AFTER `exec` or `resume` - those are the two subcommands that take
-///      a free-text positional, so `codex exec ... "app-server"` is a user's task prompt, and
-///      reading it as the daemon would strip that session's real pid.
-///
-/// Deliberately NOT a fixed argv index: `codex -c key=value app-server --listen` is a real
-/// host whose subcommand is not argv[1], and requiring the index would hand its pid to SIGTERM.
-/// Anything unrecognised keeps the safe answer.
-///
-/// This USED to also treat "holds more than one rollout fd" as proof of the daemon. That is
-/// measurably false and was removed: a plain
+/// The predicate USED to also treat "holds more than one rollout fd" as proof of the daemon.
+/// That is measurably false and was removed: a plain
 /// `codex exec --json -C ... --dangerously-bypass-approvals-and-sandbox` (pid 2910115, live on
 /// 2026-07-27) held TWO rollouts, its own plus a subagent thread it spawned (registry source
 /// `{"subagent":{"thread_spawn":...}}`). Misclassifying an exec session as the daemon routes
@@ -486,6 +473,35 @@ ffff0004: 00000002 00000000 00010000 0001 01 444444
         assert!(
             !found.contains(&444444),
             "an unbound socket has no path to match"
+        );
+    }
+
+    /// The two signals are not peers. Whenever the socket table names a daemon, it decides
+    /// ALONE, so an ordinary session whose prompt happens to be the word `app-server` keeps
+    /// its own pid; the crude argv test is reached only when nothing was named, which is the
+    /// only situation where being wrong in the safe direction beats being silent.
+    #[test]
+    fn the_argv_backstop_is_reached_only_when_no_daemon_was_named() {
+        let control = Path::new("/home/user/.codex/app-server-control");
+        let with_daemon = "\
+ffff0001: 00000002 00000000 00010000 0001 01 111111 /home/user/.codex/app-server-control/app-server-control.sock
+";
+        let without = "\
+ffff0003: 00000002 00000000 00010000 0001 01 333333 /run/user/1000/other.sock
+";
+        assert!(
+            !listening_socket_inodes(with_daemon, control).is_empty(),
+            "a named daemon must switch the argv backstop OFF"
+        );
+        assert!(
+            listening_socket_inodes(without, control).is_empty(),
+            "no named daemon must leave the argv backstop ON"
+        );
+        // And the row the gate protects: a prompt that is exactly the subcommand name. The
+        // backstop says daemon (safe bias); the socket signal must be allowed to overrule it.
+        assert!(
+            is_daemon_process(&argv(&["codex", "exec", "app-server"])),
+            "the backstop alone is deliberately wrong here, which is why it is gated"
         );
     }
 
