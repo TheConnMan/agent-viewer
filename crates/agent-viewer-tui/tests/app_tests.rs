@@ -474,49 +474,6 @@ fn rename_resolves_target_by_key_after_reorder() {
 }
 
 #[test]
-fn expansion_collapses_when_selection_leaves_the_expanded_row() {
-    let sessions = vec![
-        sess(
-            BackendKind::Codex,
-            "a",
-            "/synthetic/one",
-            300,
-            Status::Working,
-        ),
-        sess(
-            BackendKind::Codex,
-            "b",
-            "/synthetic/two",
-            200,
-            Status::Working,
-        ),
-    ];
-    let mut app = App::new(sessions);
-    let key_a = (BackendKind::Codex, "a".to_string());
-
-    // Toggle expands the selected row; toggle again collapses it.
-    select(&mut app, "a");
-    app.toggle_expanded();
-    assert_eq!(app.expanded(), Some(&key_a));
-    app.toggle_expanded();
-    assert_eq!(app.expanded(), None);
-
-    // Moving the selection off the expanded row collapses it (never renders b's peek under a).
-    select(&mut app, "a");
-    app.toggle_expanded();
-    assert_eq!(app.expanded(), Some(&key_a));
-    select(&mut app, "b");
-    assert_eq!(app.expanded(), None);
-
-    // A filter that drops the expanded row also collapses it (selection can't stay on a).
-    select(&mut app, "a");
-    app.toggle_expanded();
-    assert_eq!(app.expanded(), Some(&key_a));
-    app.set_filter("two".to_string()); // only b's cwd matches
-    assert_eq!(app.expanded(), None);
-}
-
-#[test]
 fn show_all_covers_companions_and_archived() {
     let mut companion = sess(BackendKind::Codex, "comp", "/p", 300, Status::Idle);
     companion.companion = true;
@@ -677,8 +634,9 @@ fn format_elapsed_buckets() {
 }
 
 #[test]
-fn rows_carry_summary_and_updated() {
+fn rows_carry_summary_created_and_updated() {
     let mut s = sess(BackendKind::Codex, "sx", "/p", 12_345, Status::Working);
+    s.created_at_ms = 1_000;
     s.summary = "one-line preview".to_string();
     let app = App::new(vec![s]);
     let rows = app.visible();
@@ -690,10 +648,12 @@ fn rows_carry_summary_and_updated() {
     match row {
         Row::Session {
             summary,
+            created_at_ms,
             updated_at_ms,
             ..
         } => {
             assert_eq!(summary, "one-line preview");
+            assert_eq!(*created_at_ms, 1_000);
             assert_eq!(*updated_at_ms, 12_345);
         }
         _ => unreachable!(),
@@ -739,10 +699,7 @@ fn composer_edit_and_backend_cycle() {
 fn composer_bulk_append_keeps_one_multiline_draft_and_picker_state() {
     let mut c = Composer::new();
     c.cycle_backend();
-    c.set_models(
-        vec!["default".into(), "chosen".into()],
-        BackendKind::Codex,
-    );
+    c.set_models(vec!["default".into(), "chosen".into()], BackendKind::Codex);
     c.cycle_model();
     for ch in "/implement ".chars() {
         c.push_char(ch);
@@ -1238,7 +1195,7 @@ fn collapse_hides_group_rows_and_marks_header() {
     assert!(!has_session(&app, "a1"));
     assert!(has_session(&app, "b1"));
 
-    // Header a now reports collapsed; header b is still expanded.
+    // Header a now reports collapsed; header b is still open.
     assert!(app.visible().iter().any(|r| matches!(
         r,
         Row::ProjectHeader { root, collapsed, .. } if root == &root_a && *collapsed

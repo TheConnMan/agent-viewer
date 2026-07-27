@@ -1,18 +1,12 @@
 use std::cell::RefCell;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-use agent_viewer_core::opencode::OpencodeRuntime;
 use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{App, Composer};
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::terminal_title::{format_terminal_title, set_terminal_title};
-use agent_viewer_tui::ui::{Draw, ListHit, Mode, PeekCache, Pulses, draw};
+use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, draw};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -38,13 +32,7 @@ fn session(id: &str, status: Status) -> Session {
     }
 }
 
-fn render_with_peek(
-    app: &App,
-    workspace: &Path,
-    width: u16,
-    peek: &PeekCache,
-    expanded: Option<&(BackendKind, String)>,
-) -> Vec<String> {
+fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
     let mode = Mode::Normal;
     let composer = Composer::new();
     let pulses = Pulses::new();
@@ -61,10 +49,8 @@ fn render_with_peek(
                     workspace,
                     mode: &mode,
                     notice: "",
-                    peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
@@ -82,102 +68,6 @@ fn render_with_peek(
             row.trim_end().to_string()
         })
         .collect()
-}
-
-fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
-    render_with_peek(app, workspace, width, &PeekCache::new(), None)
-}
-
-struct PeekServer {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl PeekServer {
-    fn spawn() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let thread = std::thread::spawn(move || {
-            let responses = [
-                (Duration::ZERO, "{\"healthy\":true,\"version\":\"1.17.20\"}"),
-                (
-                    Duration::from_millis(220),
-                    "[{\"info\":{\"role\":\"assistant\",\"time\":{\"created\":1}},\"parts\":[{\"type\":\"text\",\"text\":\"STALE SERVER MESSAGE\"}]}]",
-                ),
-                (Duration::ZERO, "{\"healthy\":true,\"version\":\"1.17.20\"}"),
-                (
-                    Duration::ZERO,
-                    "[{\"info\":{\"role\":\"assistant\",\"time\":{\"created\":2}},\"parts\":[{\"type\":\"text\",\"text\":\"FRESH SERVER MESSAGE\"}]}]",
-                ),
-            ];
-            let mut next = 0;
-            while !stop_for_thread.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut request = Vec::new();
-                        let mut buffer = [0_u8; 512];
-                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            match stream.read(&mut buffer) {
-                                Ok(0) | Err(_) => break,
-                                Ok(read) => request.extend_from_slice(&buffer[..read]),
-                            }
-                        }
-                        let (delay, body) = responses
-                            .get(next)
-                            .copied()
-                            .unwrap_or((Duration::ZERO, "{}"));
-                        next += 1;
-                        std::thread::sleep(delay);
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.flush();
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        Self {
-            addr,
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for PeekServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn unused_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
-}
-
-fn opencode_session(id: &str, updated_at_ms: i64, status: Status) -> Session {
-    let mut session = session(id, status);
-    session.backend = BackendKind::Opencode;
-    session.updated_at_ms = updated_at_ms;
-    session.daemon_hosted = true;
-    session
 }
 
 #[test]
@@ -273,67 +163,6 @@ fn refreshed_counts_ignore_row_visibility() {
             app.completed_count()
         ),
         (2, 2, 2)
-    );
-}
-
-#[test]
-fn opencode_peek_is_nonblocking_rejects_stale_results_and_renders_input_reason() {
-    let server = PeekServer::spawn();
-    let runtime = OpencodeRuntime::for_test(
-        [server.addr, unused_addr()],
-        Duration::from_millis(250),
-        PathBuf::from("/"),
-        |_| Err(io::Error::other("peek must never launch a server")),
-    );
-    let mut peek = PeekCache::with_opencode_runtime(runtime);
-    let stale = opencode_session("ses_stale", 1, Status::Idle);
-    let fresh = opencode_session(
-        "ses_fresh",
-        2,
-        Status::NeedsInput {
-            reason: Some("Choose the deployment target".to_string()),
-        },
-    );
-
-    let refresh_started = Instant::now();
-    peek.refresh(Some(&stale));
-    assert!(
-        refresh_started.elapsed() < Duration::from_millis(75),
-        "refresh waited for the delayed HTTP response"
-    );
-    peek.refresh(Some(&fresh));
-
-    let app = App::new(vec![fresh.clone()]);
-    let expanded = (BackendKind::Opencode, fresh.id.clone());
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut rendered = String::new();
-    while Instant::now() < deadline {
-        peek.refresh(Some(&fresh));
-        rendered = render_with_peek(
-            &app,
-            Path::new("/sessions/project"),
-            100,
-            &peek,
-            Some(&expanded),
-        )
-        .join("\n");
-        assert!(
-            !rendered.contains("STALE SERVER MESSAGE"),
-            "a completed response for the old selection flashed on the new row"
-        );
-        if rendered.contains("FRESH SERVER MESSAGE") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    assert!(
-        rendered.contains("FRESH SERVER MESSAGE"),
-        "the matching completed server response never rendered"
-    );
-    assert!(
-        rendered.contains("Awaiting input: Choose the deployment target"),
-        "{rendered}"
     );
 }
 

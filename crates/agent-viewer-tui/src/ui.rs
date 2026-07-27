@@ -1,13 +1,9 @@
 //! Rendering surface: a flat single-list main view (state- or project-grouped) with a
-//! one-line footer, bottom peek overlay, centered new/rename/help modals, and the
-//! full-screen embedded-PTY attach view. The approved amber palette lives in `theme`.
+//! one-line footer, centered new/rename/help modals, and the full-screen embedded-PTY attach
+//! view. The approved amber palette lives in `theme`.
 
 use crate::app::{App, Composer, Row, Section};
 use crate::logos::LogoMarks;
-use crate::peek::{self, PeekKind};
-// PeekCache moved to `crate::peek_cache`; re-export so `agent_viewer_tui::ui::PeekCache`
-// still resolves for its import sites and for the render functions here.
-pub use crate::peek_cache::PeekCache;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
 use ratatui::Frame;
@@ -15,7 +11,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui_image::Image;
 use std::cell::RefCell;
@@ -177,17 +173,6 @@ fn status_glyph(status: &Status, now_ms: i64) -> (&'static str, ratatui::style::
     }
 }
 
-fn status_word(status: &Status) -> &'static str {
-    match status {
-        Status::Working => "working",
-        Status::NeedsInput { .. } => "needs-input",
-        Status::Idle => "idle",
-        Status::Done => "done",
-        Status::Error => "error",
-        Status::Unknown => "unknown",
-    }
-}
-
 fn section_label(section: Section) -> &'static str {
     match section {
         Section::NeedsInput => "NEEDS INPUT",
@@ -197,7 +182,7 @@ fn section_label(section: Section) -> &'static str {
     }
 }
 
-/// A group header line: a triangle indicator plus its member count. Expanded shows
+/// A group header line: a triangle indicator plus its member count. An open group shows
 /// "▼ <label>  (<count>)"; collapsed shows "▶ <label>  (<count> hidden)".
 fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) -> String {
     if collapsed {
@@ -228,7 +213,7 @@ pub struct ReplyModal {
 }
 
 /// Top-level input mode driving key routing and what the footer shows. The inline spawn
-/// composer, inline rename, and inline peek expansion all live on the Normal list view.
+/// composer and inline rename both live on the Normal list view.
 pub enum Mode {
     Normal,
     Filter,
@@ -257,7 +242,7 @@ pub struct ListHit {
     /// The List widget's final scroll offset (item index of the first visible item).
     offset: usize,
     /// One entry per rendered item line, in draw order: `Some(visible-row index)` for a
-    /// selectable row, `None` for a non-selectable Spacer or an inline peek-expansion line.
+    /// selectable row, `None` for a non-selectable Spacer.
     item_to_row: Vec<Option<usize>>,
     /// A floating overlay (the slash-command popup) that shadows the bottom of the list this
     /// frame, if any. A cell inside it belongs to the overlay, not the row drawn underneath,
@@ -268,8 +253,8 @@ pub struct ListHit {
 impl ListHit {
     /// Reverse a terminal cell `(x, y)` to the selectable `visible()`-row index under it, if
     /// the point falls on a selectable row within the list area. Pure — unit-testable with no
-    /// terminal. Returns `None` outside the area, on a blank spacer, on an expansion line, or
-    /// on a cell shadowed by a floating overlay (the slash-command popup).
+    /// terminal. Returns `None` outside the area, on a blank spacer, or on a cell shadowed by
+    /// a floating overlay (the slash-command popup).
     pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
         let a = self.area;
         if a.width == 0 || a.height == 0 {
@@ -305,12 +290,8 @@ pub struct Draw<'a> {
     pub workspace: &'a Path,
     pub mode: &'a Mode,
     pub notice: &'a str,
-    pub peek: &'a PeekCache,
     pub composer: &'a Composer,
     pub pulses: &'a Pulses,
-    /// The currently inline-expanded row (peek), if any — its transcript tail renders
-    /// indented beneath it.
-    pub expanded: Option<&'a (BackendKind, String)>,
     pub now_ms: i64,
     pub attach: Option<AttachView<'a>>,
     pub pr_status: &'a crate::pr_cache::PrStatusCache,
@@ -337,7 +318,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // The composer box keeps one metadata row above its wrapped input and grows to a cap so
     // a long task description stays visible. Reply mode sizes its prompt prefixed box to the
     // reply buffer.
-    let inner_w = frame.area().width.saturating_sub(2);
+    let inner_w = input_inner_width(frame.area().width);
     let composer_h = match &d.mode {
         Mode::Reply(m) => {
             let title = d
@@ -369,20 +350,12 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         ])
         .split(frame.area());
 
-    // Inline rename edits the selected row in place; inline peek expands it downward.
+    // Inline rename edits the selected row in place.
     let rename = match d.mode {
         Mode::Rename(m) => Some((m.backend, m.id.as_str(), m.buffer.as_str())),
         _ => None,
     };
-    let expand_lines = match d.expanded {
-        Some(key) => peek_expansion(d.app, d.peek, key, vertical[0].width as usize),
-        None => Vec::new(),
-    };
-    let deco = ListDeco {
-        rename,
-        expanded: d.expanded,
-        expand_lines: &expand_lines,
-    };
+    let deco = ListDeco { rename };
 
     draw_header(frame, d.app, d.workspace, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
@@ -403,8 +376,8 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         hit.blocked = slash_popup_area(d.composer, vertical[3]);
     }
     *d.list_hit.borrow_mut() = hit;
-    // Reply mode replaces the spawn composer with a small reply input (the ask sits in the
-    // force-expanded peek above it); every other mode shows the persistent spawn composer.
+    // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
+    // the persistent spawn composer.
     if let Mode::Reply(m) = d.mode {
         let title = d
             .app
@@ -513,70 +486,9 @@ fn draw_suggestion_popup<S: AsRef<str>>(
     frame.render_widget(List::new(items), area);
 }
 
-/// Per-row decorations layered over the list model: an in-place rename edit field and the
-/// inline peek expansion under one row.
+/// Per-row decorations layered over the list model.
 struct ListDeco<'a> {
     rename: Option<(BackendKind, &'a str, &'a str)>,
-    expanded: Option<&'a (BackendKind, String)>,
-    expand_lines: &'a [Line<'static>],
-}
-
-/// The inline peek expansion for the EXPANDED row (resolved by its key, not the selection —
-/// which App keeps in sync but which could momentarily diverge): the last message word-
-/// wrapped to the panel width (peek::build), indented and color-coded per PeekKind. opencode
-/// (no transcript file) falls back to a couple of metadata lines when it has no message.
-fn peek_expansion(
-    app: &App,
-    peek: &PeekCache,
-    key: &(BackendKind, String),
-    width: usize,
-) -> Vec<Line<'static>> {
-    let Some(session) = app.session_for(key) else {
-        return Vec::new();
-    };
-    // Reserve the 6-column indent (matching the rename/expansion gutter).
-    let inner = width.saturating_sub(6);
-    // Metadata fallback for sessions with no transcript file (opencode) when items is empty.
-    let meta = if session.rollout_path.is_none() {
-        vec![
-            format!("status: {}", status_word(&session.status)),
-            format!("cwd: {}", session.cwd.display()),
-        ]
-    } else {
-        Vec::new()
-    };
-    // Surface WHAT a blocked session is waiting on: codex from the parsed pending approval,
-    // claude from its state.json needs, and OpenCode from the server input reason.
-    let ask: Option<String> = if matches!(session.status, Status::NeedsInput { .. }) {
-        match session.backend {
-            BackendKind::Codex => peek.ask.as_ref().map(|s| format!("Awaiting approval: {s}")),
-            BackendKind::Claude => (!session.summary.is_empty())
-                .then(|| format!("Awaiting input: {}", session.summary)),
-            BackendKind::Opencode => peek.ask.as_ref().map(|s| format!("Awaiting input: {s}")),
-        }
-    } else {
-        None
-    };
-    let plines = peek::build(
-        ask.as_deref(),
-        &peek.items,
-        peek.error.as_deref(),
-        &meta,
-        inner,
-    );
-    plines
-        .into_iter()
-        .map(|pl| {
-            let style = match pl.kind {
-                PeekKind::Ask => fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-                PeekKind::Role => fg(theme::MUTED),
-                PeekKind::Body => fg(theme::TEXT),
-                PeekKind::Meta => fg(theme::MUTED),
-                PeekKind::Error => fg(theme::WARN),
-            };
-            Line::from(vec![Span::raw("      "), Span::styled(pl.text, style)])
-        })
-        .collect()
 }
 
 /// Abbreviate a spawn-target dir with a leading `~` for $HOME (display only).
@@ -596,33 +508,118 @@ fn abbreviate_dir(dir: &Path) -> String {
 /// whole screen while still showing a generous multi-line task description.
 const COMPOSER_MAX_LINES: u16 = 10;
 
-/// Split `text` into visual lines by terminal display width: the first line gets `first`
-/// columns, every line after it gets `rest`. Breaks between characters and at explicit
-/// newlines, honoring wide and zero width glyphs. Always returns at least one segment.
-fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
+/// Breathing room inside an input box, one column each side of the border. It also lines the
+/// box's contents up with the list rows above, whose backend mark starts two columns in
+/// (border 1 + pad 1 == status glyph + its trailing space), so the composer's own mark and
+/// its input text sit in the same column as every row's mark.
+const INPUT_PAD_X: u16 = 1;
+
+/// The block every input box is drawn in: rounded `border`ed, padded by `INPUT_PAD_X`.
+fn input_block(border: ratatui::style::Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(border))
+        .padding(Padding::horizontal(INPUT_PAD_X))
+}
+
+/// The text width an input box has left inside `frame_width` once both borders and both pads
+/// are taken out — what the height math must wrap against so it agrees with the render.
+fn input_inner_width(frame_width: u16) -> u16 {
+    frame_width.saturating_sub(2 + 2 * INPUT_PAD_X)
+}
+
+/// Display width of a single character, floored at zero for combining marks.
+fn char_width(ch: char) -> usize {
     use unicode_width::UnicodeWidthChar;
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+/// Split `text` into visual lines by terminal display width: the first line gets `first`
+/// columns, every line after it gets `rest`. Breaks at explicit newlines and, within a line,
+/// at the last space that still fits, so words stay whole the way a text editor wraps them.
+/// The run of spaces a break is taken at is dropped, so a wrapped line never opens with the
+/// space that ended the previous one; a single word too long for a whole line still breaks
+/// mid-word. Wide and zero width glyphs are measured, not counted. Always returns at least
+/// one segment.
+fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
+    let rest = rest.max(1);
+    for para in text.split('\n') {
+        let budget = if lines.is_empty() { first.max(1) } else { rest };
+        wrap_paragraph(para, budget, rest, &mut lines);
+    }
+    lines
+}
+
+/// Wrap one newline-free paragraph into `out`, always pushing at least one segment (an empty
+/// paragraph is a blank line, which the composer must keep).
+fn wrap_paragraph(para: &str, first: usize, rest: usize, out: &mut Vec<String>) {
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    let mut budget = first.max(1);
-    for ch in text.chars() {
-        if ch == '\n' {
-            lines.push(std::mem::take(&mut cur));
+    let mut budget = first;
+    // Spaces seen since the last word, held back so a break can drop them instead of
+    // starting the next line with them.
+    let mut gap = String::new();
+    let mut gap_w = 0usize;
+
+    // Push `cur` as a finished line and reopen an empty one at the continuation budget.
+    macro_rules! break_line {
+        () => {{
+            out.push(std::mem::take(&mut cur));
             cur_w = 0;
-            budget = rest.max(1);
+            budget = rest;
+        }};
+    }
+
+    let mut chars = para.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            gap.push(ch);
+            gap_w += char_width(ch);
             continue;
         }
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cur_w + cw > budget && !cur.is_empty() {
-            lines.push(std::mem::take(&mut cur));
-            cur_w = 0;
-            budget = rest.max(1);
+        // The next word: a run of non-space characters, measured whole so the break decision
+        // can be made before any of it is committed to the current line.
+        let mut word = String::new();
+        let mut word_w = 0usize;
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            word.push(c);
+            word_w += char_width(c);
         }
-        cur.push(ch);
+        if !cur.is_empty() && cur_w + gap_w + word_w > budget {
+            // The word does not fit after the gap, so the line ends here and the gap is eaten.
+            break_line!();
+        } else {
+            cur.push_str(&gap);
+            cur_w += gap_w;
+        }
+        gap.clear();
+        gap_w = 0;
+        for c in word.chars() {
+            let cw = char_width(c);
+            if cur_w + cw > budget && !cur.is_empty() {
+                break_line!();
+            }
+            cur.push(c);
+            cur_w += cw;
+        }
+    }
+    // Trailing spaces are kept: the user typed them and the cursor sits after them.
+    for c in gap.chars() {
+        let cw = char_width(c);
+        if cur_w + cw > budget && !cur.is_empty() {
+            break_line!();
+        }
+        cur.push(c);
         cur_w += cw;
     }
-    lines.push(cur);
-    lines
+    out.push(cur);
 }
 
 /// The full box height (including both borders) an input box needs to show `text` wrapped to
@@ -678,10 +675,7 @@ fn draw_input_box(
         prefix_w,
         placeholder,
     } = style;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(fg(border));
+    let block = input_block(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -764,10 +758,7 @@ fn draw_composer(
     }
     metadata_spans.push(Span::styled(dir, fg(theme::MUTED)));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(fg(theme::FAINT));
+    let block = input_block(theme::FAINT);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -941,15 +932,13 @@ fn draw_list(
     let rows = app.visible();
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     // Parallel to `items`: the backend of each pushed item that is a session row (None for
-    // headers/spacers/rename/expansion lines), so the logo overlay can find its rows by
-    // item index after the List has laid them out.
+    // headers/spacers/rename lines), so the logo overlay can find its rows by item index after
+    // the List has laid them out.
     let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
     // Also parallel to `items`, in lockstep draw order: each rendered line's selectable row
-    // target (Some(visible-row index) for a header/session line, None for a Spacer or an
-    // expansion line). This is the map the mouse handler reverses to pick a row from a cell.
+    // target (Some(visible-row index) for a header/session line, None for a Spacer). This is
+    // the map the mouse handler reverses to pick a row from a cell.
     let mut item_to_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
-    // The selection index only shifts if expansion lines are inserted BEFORE the selected
-    // row; expansion always sits under the (selected) expanded row, so it stays aligned.
     for (row_idx, row) in rows.iter().enumerate() {
         // A Spacer renders a blank line but is never selectable, so it maps to no row.
         let target = if matches!(row, Row::Spacer) {
@@ -972,18 +961,6 @@ fn draw_list(
                     item_backends.push(Some(*backend));
                 }
                 item_to_row.push(target);
-                // Inline peek expansion: indented muted transcript tail under the row.
-                if let Some((eb, eid)) = deco.expanded
-                    && backend == eb
-                    && id == eid
-                {
-                    for line in deco.expand_lines {
-                        // Lines are already indented + styled by peek_expansion.
-                        items.push(ListItem::new(line.clone()));
-                        item_backends.push(None);
-                        item_to_row.push(None);
-                    }
-                }
             }
             _ => {
                 items.push(row_to_item(row, pulses, now_ms, pr_status, width));
@@ -997,17 +974,6 @@ fn draw_list(
     if !rows.is_empty() {
         let sel = app.selected_index().min(rows.len() - 1);
         state.select(Some(sel));
-        // The List widget only scrolls the SELECTED item into view — the expansion lines
-        // that follow it can fall below the viewport (under the composer). When expanded,
-        // push the offset up so the selected row plus all its expansion lines are visible.
-        let viewport = area.height as usize;
-        if !deco.expand_lines.is_empty() && viewport > 0 {
-            let last = sel + deco.expand_lines.len(); // item index of the last expansion line
-            if last >= viewport {
-                // Keep the selected row itself visible (never scroll past it).
-                *state.offset_mut() = (last + 1 - viewport).min(sel);
-            }
-        }
     }
     frame.render_stateful_widget(list, area, &mut state);
     // Capture the final scroll offset AFTER render (the widget computes it from the selection),
@@ -1114,6 +1080,7 @@ fn row_to_item(
             summary,
             status,
             title,
+            created_at_ms,
             updated_at_ms,
             pr_refs,
             ..
@@ -1129,7 +1096,12 @@ fn row_to_item(
                 Some(g) => (g, theme::ACCENT),
                 None => status_glyph(status, now_ms),
             };
-            let elapsed = crate::app::format_elapsed(now_ms - *updated_at_ms);
+            let started_at_ms = if *created_at_ms > 0 {
+                *created_at_ms
+            } else {
+                *updated_at_ms
+            };
+            let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
             let pr_color = pr_badge_theme_color(pr_status.badge_color(pr_refs));
             let line = session_line(SessionRow {
                 glyph,
@@ -1282,7 +1254,7 @@ fn draw_footer(frame: &mut Frame, app: &App, mode: &Mode, notice: &str, now_ms: 
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · space peek · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme::MUTED),
                 ))
@@ -1373,8 +1345,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Enter", "spawn composed task"),
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
-        ("Space", "expand peek in row"),
-        ("Enter/Space", "collapse group (on a header)"),
+        ("Enter/Space", "toggle group on a header"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
@@ -1495,11 +1466,7 @@ mod tests {
                     &pulses,
                     0,
                     &pr_status,
-                    ListDeco {
-                        rename: None,
-                        expanded: None,
-                        expand_lines: &[],
-                    },
+                    ListDeco { rename: None },
                     None,
                     area,
                 );
@@ -1521,6 +1488,64 @@ mod tests {
         assert_eq!(title.bg, theme::SEL_BG);
         assert_eq!(summary.bg, theme::SEL_BG);
         assert_ne!(title.fg, summary.fg);
+    }
+
+    #[test]
+    fn session_elapsed_uses_creation_time_after_activity_refresh() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let session = |created_at_ms, updated_at_ms| Session {
+            backend: BackendKind::Codex,
+            id: "elapsed".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "elapsed".into(),
+            cwd: "/tmp/agent-viewer-elapsed".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms,
+            updated_at_ms,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+        let render_elapsed = |app: &App, now_ms| {
+            let pulses = Pulses::new();
+            let pr_status = crate::pr_cache::PrStatusCache::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_list(
+                        frame,
+                        app,
+                        &pulses,
+                        now_ms,
+                        &pr_status,
+                        ListDeco { rename: None },
+                        None,
+                        Rect::new(0, 0, 80, 2),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..2)
+                .flat_map(|y| (0..80).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>()
+        };
+
+        let mut app = App::new(vec![session(1_000, 91_000)]);
+        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+
+        app.set_sessions(vec![session(1_000, 111_000)]);
+        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+
+        let fallback = App::new(vec![session(0, 90_000)]);
+        assert!(render_elapsed(&fallback, 120_000).contains("Working 30s"));
     }
 
     #[test]
@@ -1649,7 +1674,8 @@ mod tests {
 
     #[test]
     fn wrap_by_width_splits_first_line_shorter_than_the_rest() {
-        // First line budget 4, rest budget 6: "abcdefghij" -> "abcd" | "efghij".
+        // First line budget 4, rest budget 6. One unbroken word has no space to break at, so
+        // it still hard splits: "abcdefghij" -> "abcd" | "efghij".
         assert_eq!(wrap_by_width("abcdefghij", 4, 6), vec!["abcd", "efghij"]);
         // Fits on one line -> one segment.
         assert_eq!(wrap_by_width("abc", 10, 10), vec!["abc"]);
@@ -1661,6 +1687,58 @@ mod tests {
     fn wrap_by_width_counts_wide_glyphs_by_display_width() {
         // Each CJK glyph is two columns wide, so only two fit in a 5-wide budget.
         assert_eq!(wrap_by_width("一二三", 5, 5), vec!["一二", "三"]);
+    }
+
+    #[test]
+    fn wrap_by_width_breaks_between_words_not_mid_word() {
+        // "hello world" in 8 columns breaks at the space rather than after "hello wo".
+        assert_eq!(wrap_by_width("hello world", 8, 8), vec!["hello", "world"]);
+        // Several short words pack greedily up to the budget.
+        assert_eq!(
+            wrap_by_width("the quick brown fox", 10, 10),
+            vec!["the quick", "brown fox"]
+        );
+        // A word that fits exactly still takes the whole line, with the next word below it.
+        assert_eq!(wrap_by_width("abcde fg", 5, 5), vec!["abcde", "fg"]);
+    }
+
+    #[test]
+    fn wrap_by_width_drops_the_space_a_line_breaks_at() {
+        // The space between the words is eaten by the break: no wrapped line opens with it.
+        for segment in wrap_by_width("alpha beta gamma delta", 11, 11) {
+            assert!(
+                !segment.starts_with(' '),
+                "wrapped line opens with a space: {segment:?}"
+            );
+        }
+        // A whole run of spaces at the break point is dropped, not just one.
+        assert_eq!(wrap_by_width("alpha     beta", 7, 7), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn wrap_by_width_hard_breaks_a_word_longer_than_a_line() {
+        // No break opportunity inside the long word, so it splits at the budget and the
+        // short word that follows still wraps whole.
+        assert_eq!(
+            wrap_by_width("ab supercalifragilistic cd", 6, 6),
+            vec!["ab", "superc", "alifra", "gilist", "ic cd"]
+        );
+    }
+
+    #[test]
+    fn wrap_by_width_keeps_leading_and_trailing_spaces_the_user_typed() {
+        // Indentation at the start of a line is content, not a break artifact.
+        assert_eq!(wrap_by_width("  indented", 12, 12), vec!["  indented"]);
+        // A trailing space stays on the line so the cursor sits after it.
+        assert_eq!(wrap_by_width("hi ", 12, 12), vec!["hi "]);
+    }
+
+    #[test]
+    fn wrap_by_width_preserves_explicit_newlines_and_blank_lines() {
+        assert_eq!(
+            wrap_by_width("one\n\ntwo three", 9, 9),
+            vec!["one", "", "two three"]
+        );
     }
 
     #[test]
@@ -1723,7 +1801,6 @@ mod tests {
         for ch in text.chars() {
             composer.push_char(ch);
         }
-        let peek = PeekCache::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -1736,10 +1813,8 @@ mod tests {
                     workspace: Path::new("/tmp"),
                     mode: &mode,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
@@ -1827,7 +1902,6 @@ mod tests {
         for ch in "hello".chars() {
             composer.push_char(ch);
         }
-        let peek = PeekCache::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -1842,10 +1916,8 @@ mod tests {
                     workspace: Path::new("/tmp"),
                     mode: &Mode::Normal,
                     notice: "",
-                    peek: &peek,
                     composer: &composer,
                     pulses: &pulses,
-                    expanded: None,
                     now_ms: 0,
                     attach: None,
                     pr_status: &pr_status,
@@ -1868,19 +1940,25 @@ mod tests {
         assert!(metadata.contains("gpt-5.3-codex"));
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
-        assert_eq!(&rows[top + 2], &format!("│hello{}│", " ".repeat(43)));
-        assert_eq!((cursor.x, cursor.y), (6, (top + 2) as u16));
+        // Border + one pad column, so the input text opens at column 2 (the mark column the
+        // list rows above use), not hard against the border.
+        assert_eq!(&rows[top + 2], &format!("│ hello{}│", " ".repeat(42)));
+        // One pad column between the border and the metadata mark.
+        assert_eq!(metadata.chars().nth(1), Some(' '));
+        assert_eq!((cursor.x, cursor.y), (7, (top + 2) as u16));
     }
 
     #[test]
     fn composer_exact_width_input_adds_a_cursor_continuation_row() {
-        let (rows, cursor) = render_viewer(12, 18, "0123456789", Mode::Normal);
+        // A 12-wide frame leaves 8 input columns (2 borders + 2 pads), so 8 chars fill the
+        // row exactly and the cursor needs a continuation row below it.
+        let (rows, cursor) = render_viewer(12, 18, "01234567", Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "│0123456789│");
+        assert_eq!(&rows[top + 2], "│ 01234567 │");
         assert_eq!(&rows[top + 3], "│          │");
-        assert_eq!(cursor, (1, (top + 3) as u16));
+        assert_eq!(cursor, (2, (top + 3) as u16));
     }
 
     #[test]
@@ -1889,13 +1967,99 @@ mod tests {
         let (rows, cursor) = render_viewer(12, 18, text, Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
-        assert_eq!(bottom - top + 1, 7);
-        assert!(rows[top + 1].contains("claude"));
-        assert_eq!(&rows[top + 2], "│abcdef界gh│");
-        assert_eq!(&rows[top + 3], "│          │");
-        assert_eq!(&rows[top + 4], "│ijklmnopqr│");
-        assert_eq!(&rows[top + 5], "│st        │");
-        assert_eq!(cursor, (3, (top + 5) as u16));
+        // 8 input columns: "abcdef界" fills them, so "gh" wraps; the blank line survives.
+        assert_eq!(bottom - top + 1, 8);
+        assert_eq!(&rows[top + 2], "│ abcdef界 │");
+        assert_eq!(&rows[top + 3], "│ gh       │");
+        assert_eq!(&rows[top + 4], "│          │");
+        assert_eq!(&rows[top + 5], "│ ijklmnop │");
+        assert_eq!(&rows[top + 6], "│ qrst     │");
+        assert_eq!(cursor, (6, (top + 6) as u16));
+    }
+
+    #[test]
+    fn composer_input_column_matches_the_list_row_mark_column() {
+        // A list row is `<status glyph><space><backend mark>`, so its mark slot opens at
+        // column 2. The composer's pad column puts its own mark and its input text in that
+        // same column; without the pad they would sit at column 1, one short of the rows
+        // above. Marks themselves are a process-global mode (another test flips the logo
+        // OnceLock), so this asserts columns, never glyphs.
+        let app = App::new(vec![Session {
+            backend: BackendKind::Claude,
+            id: "aligned".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "aligned-session".into(),
+            cwd: "/tmp/aligned".into(),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }]);
+        let mut composer = Composer::new();
+        for ch in "typed".chars() {
+            composer.push_char(ch);
+        }
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..20)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let (top, _) = composer_bounds(&rows);
+
+        let list_row = rows
+            .iter()
+            .find(|row| row.contains("aligned-session"))
+            .expect("session row");
+        // Column 0 is the status glyph, column 1 its separator space, column 2 the mark slot.
+        assert_ne!(list_row.chars().next(), Some(' '));
+        assert_eq!(list_row.chars().nth(1), Some(' '));
+        // The composer's metadata row and its input row both open at that same column 2.
+        assert_eq!(rows[top + 1].chars().nth(1), Some(' '));
+        assert_eq!(rows[top + 2].chars().nth(1), Some(' '));
+        assert_eq!(rows[top + 2].chars().nth(2), Some('t'));
+    }
+
+    #[test]
+    fn composer_wraps_the_input_at_word_boundaries() {
+        // 20-wide frame -> 16 input columns. The text breaks after "wrap" rather than
+        // splitting "boundaries", and no wrapped row opens with the eaten space.
+        let (rows, _) = render_viewer(20, 24, "wrap at word boundaries here", Mode::Normal);
+        let (top, _) = composer_bounds(&rows);
+
+        assert_eq!(&rows[top + 2], "│ wrap at word     │");
+        assert_eq!(&rows[top + 3], "│ boundaries here  │");
     }
 
     #[test]
@@ -1911,29 +2075,29 @@ mod tests {
         assert!(rows[top + 1].contains("claude"));
         assert!(rows[top + 2].contains("line05"));
         assert!(rows[bottom - 1].contains("line14"));
-        assert_eq!(cursor, (7, (bottom - 1) as u16));
+        assert_eq!(cursor, (8, (bottom - 1) as u16));
     }
 
     #[test]
     fn input_box_wraps_long_text_down_the_rows_with_cursor_on_the_last() {
-        // Inner width 6 (8 - 2 borders), prompt "> " (width 2): first budget 4, rest 6.
-        // "abcdefgh" -> "abcd" | "efgh" across the two inner rows.
-        let (rows, cursor) = render_input_box(8, 4, "> ", 2, "abcdefgh");
+        // Inner width 6 (10 - 2 borders - 2 pads), prompt "> " (width 2): first budget 4,
+        // rest 6. "abcdefgh" has no space to break at, so it hard splits "abcd" | "efgh".
+        let (rows, cursor) = render_input_box(10, 4, "> ", 2, "abcdefgh");
         assert!(rows[0].starts_with('╭'), "top border: {:?}", rows[0]);
         assert!(rows[3].starts_with('╰'), "bottom border: {:?}", rows[3]);
-        // Row 1: border + prompt + first 4 chars. Row 2: border + next 4 chars (no prompt).
-        assert_eq!(&rows[1], "│> abcd│");
-        assert_eq!(&rows[2], "│efgh  │");
+        // Row 1: border + pad + prompt + first 4 chars. Row 2: next 4 chars (no prompt).
+        assert_eq!(&rows[1], "│ > abcd │");
+        assert_eq!(&rows[2], "│ efgh   │");
         // Cursor sits at the end of the text on the second inner row (y == 2), not off-screen
-        // to the right, which was the bug: inner.x (1) + 4 typed chars = col 5.
-        assert_eq!(cursor, (5, 2));
+        // to the right: inner.x (2) + 4 typed chars = col 6.
+        assert_eq!(cursor, (6, 2));
     }
 
     #[test]
     fn input_box_short_text_stays_on_one_row() {
         // Short text does not wrap: single inner row, cursor right after it on row 1.
         let (rows, cursor) = render_input_box(12, 3, "> ", 2, "hi");
-        assert_eq!(&rows[1], "│> hi      │");
-        assert_eq!(cursor, (5, 1));
+        assert_eq!(&rows[1], "│ > hi     │");
+        assert_eq!(cursor, (6, 1));
     }
 }
