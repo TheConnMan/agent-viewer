@@ -106,7 +106,12 @@ impl Backend for OpencodeBackend {
             })
             .clone()
     }
-    fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
+    fn spawn(
+        &self,
+        dir: &std::path::Path,
+        task: &str,
+        model: Option<&str>,
+    ) -> Result<crate::backend::SpawnResult> {
         let title = crate::spawn::truncated_title(task);
         let mut cmd = std::process::Command::new("opencode");
         cmd.arg("run")
@@ -121,7 +126,10 @@ impl Backend for OpencodeBackend {
         // Viewer-owned log dir; we do NOT write under ~/.local/share/opencode/.
         let log_path = crate::spawn::viewer_log_path("opencode");
         let pid = crate::spawn::spawn_detached(cmd, &log_path)?;
-        Ok(Some(pid))
+        Ok(crate::backend::SpawnResult {
+            pid: Some(pid),
+            session_id: None,
+        })
     }
     fn stop(&self, session: &Session) -> Result<()> {
         // Only viewer-spawned opencode sessions carry a pid (filled by the overlay).

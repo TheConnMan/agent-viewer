@@ -41,6 +41,7 @@ pub struct Thread {
 
 pub struct Registry {
     conn: rusqlite::Connection,
+    session_index_path: std::path::PathBuf,
 }
 
 impl Registry {
@@ -49,6 +50,10 @@ impl Registry {
     pub fn open(db_path: &std::path::Path) -> Result<Registry> {
         Ok(Registry {
             conn: crate::open_readonly(db_path)?,
+            session_index_path: db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .join("session_index.jsonl"),
         })
     }
 
@@ -63,7 +68,7 @@ impl Registry {
              FROM threads \
              ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC",
         )?;
-        let threads = stmt
+        let mut threads = stmt
             .query_map([], |row| {
                 Ok(Thread {
                     id: row.get(0)?,
@@ -79,6 +84,12 @@ impl Registry {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let names = read_thread_names(&self.session_index_path);
+        for thread in &mut threads {
+            if let Some(name) = names.get(&thread.id) {
+                thread.title.clone_from(name);
+            }
+        }
         Ok(threads)
     }
 
@@ -94,4 +105,27 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(models)
     }
+}
+
+fn read_thread_names(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return std::collections::HashMap::new();
+    };
+    let mut names = std::collections::HashMap::new();
+    for line in contents.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
+            continue;
+        };
+        let Some(id) = crate::json_str(&value, "id") else {
+            continue;
+        };
+        let Some(name) = crate::json_str(&value, "thread_name") else {
+            continue;
+        };
+        if id.trim().is_empty() || name.trim().is_empty() {
+            continue;
+        }
+        names.insert(id.to_string(), name.to_string());
+    }
+    names
 }

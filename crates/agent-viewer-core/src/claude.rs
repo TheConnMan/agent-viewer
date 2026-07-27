@@ -178,7 +178,12 @@ impl Backend for ClaudeBackend {
             })
             .clone()
     }
-    fn spawn(&self, dir: &std::path::Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
+    fn spawn(
+        &self,
+        dir: &std::path::Path,
+        task: &str,
+        model: Option<&str>,
+    ) -> Result<crate::backend::SpawnResult> {
         // Detach like the other backends so the TUI key handler returns immediately
         // (`claude --bg` still self-detaches; setsid + no wait keeps it off this thread).
         let cmd = claude_spawn_command(&self.binary, dir, task, model);
@@ -186,7 +191,7 @@ impl Backend for ClaudeBackend {
         crate::spawn::spawn_detached(cmd, &log_path)?;
         // The forked pid is the dispatcher CLI, not the worker; claude rows are never
         // companions so spawn pinning is unnecessary.
-        Ok(None)
+        Ok(crate::backend::SpawnResult::default())
     }
     /// Rename a daemon-backed bg job the way claude itself does: a read-modify-write of
     /// `name`/`nameSource` in that job's `state.json`. Verified against the 2.1.220 bundle,

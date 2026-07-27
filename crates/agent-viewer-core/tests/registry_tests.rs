@@ -10,6 +10,23 @@ const INSERT_COLS: &str = "INSERT INTO threads \
      sandbox_policy, approval_mode, archived, model, git_branch, first_user_message, \
      preview, created_at_ms, updated_at_ms) VALUES ";
 
+fn thread_insert(id: &str, title: &str, updated_at_ms: i64) -> String {
+    format!(
+        "{INSERT_COLS}\
+         ('{id}','/home/user/proj/sessions/{id}.jsonl',1,1,'cli','openai',\
+          '/home/user/proj','{title}','workspace-write','on-request',0,\
+          'gpt-5',NULL,'first message','preview',1000,{updated_at_ms})"
+    )
+}
+
+fn copy_session_index(dir: &tempfile::TempDir) {
+    std::fs::copy(
+        common::fixture_path("codex_session_index_names.jsonl"),
+        dir.path().join("session_index.jsonl"),
+    )
+    .expect("copy session index fixture");
+}
+
 #[test]
 fn find_state_db_picks_highest_numeric() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -90,6 +107,93 @@ fn threads_maps_rows_and_orders_by_recency() {
     // NULL *_ms columns fall back through COALESCE to *_at * 1000.
     assert_eq!(vscode.updated_at_ms, 1000);
     assert_eq!(vscode.created_at_ms, 1000);
+}
+
+#[test]
+fn threads_overlay_uses_the_latest_valid_duplicate_name() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_duplicate", "SQLite Original Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+    copy_session_index(&dir);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query threads");
+
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].id, "fixture_thread_duplicate");
+    assert_eq!(
+        threads[0].title, "Latest Index Name",
+        "later empty and nonstring duplicate names must not erase the last valid index name"
+    );
+}
+
+#[test]
+fn threads_overlay_isolates_a_malformed_line_from_valid_neighbors() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let ordinary = thread_insert("fixture_thread_ordinary", "Ordinary SQLite Name", 2000);
+    let duplicate = thread_insert("fixture_thread_duplicate", "Duplicate SQLite Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[ordinary.as_str(), duplicate.as_str()]);
+    copy_session_index(&dir);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query threads");
+    let ordinary = threads
+        .iter()
+        .find(|thread| thread.id == "fixture_thread_ordinary")
+        .expect("ordinary fixture thread");
+    let duplicate = threads
+        .iter()
+        .find(|thread| thread.id == "fixture_thread_duplicate")
+        .expect("duplicate fixture thread");
+
+    assert_eq!(
+        ordinary.title, "Ordinary Index Name",
+        "a valid entry before the malformed line must survive"
+    );
+    assert_eq!(
+        duplicate.title, "Latest Index Name",
+        "a valid entry after the malformed line must still be read"
+    );
+}
+
+#[test]
+fn threads_overlay_ignores_names_for_unknown_ids() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_sqlite_only", "SQLite Only Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+    copy_session_index(&dir);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query threads");
+
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].id, "fixture_thread_sqlite_only");
+    assert_eq!(
+        threads[0].title, "SQLite Only Name",
+        "an index name for another id must not affect this row"
+    );
+}
+
+#[test]
+fn threads_without_a_session_index_keep_the_sqlite_title() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_duplicate", "SQLite Fallback Name", 3000);
+    let (_dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query threads without an index");
+
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].id, "fixture_thread_duplicate");
+    assert_eq!(threads[0].title, "SQLite Fallback Name");
 }
 
 #[test]
