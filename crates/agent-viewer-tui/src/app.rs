@@ -231,6 +231,22 @@ impl App {
             .count()
     }
 
+    /// Sessions that have finished, whether successfully or with an error.
+    pub fn completed_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|session| match &session.status {
+                Status::Done | Status::Error => true,
+                Status::Working
+                | Status::NeedsInput { .. }
+                | Status::Idle
+                | Status::Unknown => {
+                    false
+                }
+            })
+            .count()
+    }
+
     /// key Ctrl+S — toggle ByState / ByProject grouping.
     pub fn toggle_group_mode(&mut self) {
         self.group_mode = match self.group_mode {

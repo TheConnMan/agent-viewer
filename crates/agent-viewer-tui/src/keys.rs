@@ -580,6 +580,7 @@ pub(crate) mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -623,6 +624,7 @@ pub(crate) mod tests {
     pub(crate) fn test_ui_with(sessions: Vec<Session>) -> Ui {
         Ui {
             app: App::new(sessions),
+            workspace: PathBuf::from("/tmp"),
             mode: Mode::Normal,
             notice: NoticeState::default(),
             db: None,
@@ -671,6 +673,7 @@ pub(crate) mod tests {
                     frame,
                     agent_viewer_tui::ui::Draw {
                         app: &ui.app,
+                        workspace: &ui.workspace,
                         mode: &ui.mode,
                         notice: ui.notice.text(),
                         peek: &ui.peek,
