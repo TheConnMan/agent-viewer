@@ -51,10 +51,12 @@ Every session resolves to one of six states, each with its own glyph in the list
 
 Each row is prefixed by its backend's mark in the backend's color — by default the textual
 tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) — followed by
-the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Error`,
-`Unknown`) and a muted one-line summary. The status word and time sit right-aligned; Claude
-jobs with associated pull requests show a badge just left of the time — `#315` for one PR,
-`2 PRs` for several. The badge is colored by the PR's live GitHub status: yellow when checks
+the title. Titles share a visible column sized to the widest title, capped at 40 terminal
+columns. The state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`,
+`Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
+summary and any Claude pull request badge. Elapsed time alone sits flush right. Claude jobs
+with associated pull requests show `#315` for one PR or `2 PRs` for several. The badge is
+colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or
 unresolvable.
