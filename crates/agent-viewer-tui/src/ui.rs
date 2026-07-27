@@ -924,6 +924,53 @@ fn draw_list(
 ) -> ListHit {
     let width = area.width as usize;
     let rows = app.visible();
+    let desired_title_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session { title, .. } => Some(display_width(title)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    // Resolve narrow viewport degradation once for the whole visible list. The smallest
+    // viable row width becomes the shared width, so individual summaries cannot move status.
+    let title_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session {
+                backend,
+                title,
+                summary,
+                status,
+                created_at_ms,
+                updated_at_ms,
+                pr_refs,
+                ..
+            } => {
+                let started_at_ms = if *created_at_ms > 0 {
+                    *created_at_ms
+                } else {
+                    *updated_at_ms
+                };
+                let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
+                let pr = pr_badge(pr_refs);
+                let (visible_title, _, _, _, _) = crate::app::row_layout(
+                    width,
+                    mark_width(backend_mark(*backend)),
+                    title,
+                    desired_title_width,
+                    status_display_word(status),
+                    &pr,
+                    summary,
+                    display_width(&elapsed),
+                );
+                Some(display_width(&visible_title))
+            }
+            _ => None,
+        })
+        .min()
+        .unwrap_or(desired_title_width);
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     // Parallel to `items`: the backend of each pushed session row (None for headers/spacers).
     // Renamed sessions retain their backend so the logo overlay can find its rows by item index
@@ -957,13 +1004,27 @@ fn draw_list(
                     ));
                     item_backends.push(Some(*backend));
                 } else {
-                    items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                    items.push(row_to_item(
+                        row,
+                        pulses,
+                        now_ms,
+                        pr_status,
+                        width,
+                        title_width,
+                    ));
                     item_backends.push(Some(*backend));
                 }
                 item_to_row.push(target);
             }
             _ => {
-                items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                items.push(row_to_item(
+                    row,
+                    pulses,
+                    now_ms,
+                    pr_status,
+                    width,
+                    title_width,
+                ));
                 item_backends.push(None);
                 item_to_row.push(target);
             }
@@ -1076,6 +1137,7 @@ fn row_to_item(
     now_ms: i64,
     pr_status: &crate::pr_cache::PrStatusCache,
     width: usize,
+    title_width: usize,
 ) -> ListItem<'static> {
     match row {
         Row::Spacer => ListItem::new(Line::from("")),
@@ -1136,6 +1198,7 @@ fn row_to_item(
                 pr_color,
                 elapsed: &elapsed,
                 width,
+                title_width,
             });
             if bloom.is_some() {
                 ListItem::new(line).style(Style::default().bg(theme::SEL_BG))
@@ -1203,45 +1266,46 @@ struct SessionRow<'a> {
     pr_color: ratatui::style::Color,
     elapsed: &'a str,
     width: usize,
+    title_width: usize,
 }
 
-/// `glyphmarkname  summary <pad> <pr> <status word> <time>`, flush-left (glyph in column
-/// 0). The animated glyph + brand mark + title sit left with a muted summary; the right
-/// cluster (Claude Code style) is a right-aligned `<pr> <status word> <time>` — PR badge
-/// accent, status word in its state color, elapsed muted. The title truncates first when
-/// width is tight; the right cluster is never clipped.
+/// `glyphmarktitle status  summary PR <pad> elapsed`, flush-left (glyph in column 0). The
+/// title and status share columns across visible rows. PR badges remain complete and colored,
+/// while summary and elapsed time use the muted style.
 fn session_line(r: SessionRow) -> Line<'static> {
     let word = status_display_word(r.status);
-    // The right cluster as one reserved unit: [pr ]word elapsed.
-    let right = if r.pr.is_empty() {
-        format!("{word} {}", r.elapsed)
-    } else {
-        format!("{} {word} {}", r.pr, r.elapsed)
-    };
-    let (name_out, summary_out, pad) = crate::app::row_layout(
+    let (title_out, status_out, pr_out, summary_out, pad) = crate::app::row_layout(
         r.width,
         mark_width(r.mark),
         r.name,
+        r.title_width,
+        word,
+        r.pr,
         r.summary,
-        right.chars().count(),
+        display_width(r.elapsed),
     );
     let mut spans = vec![
         Span::styled(r.glyph.to_string(), fg(r.gcolor)),
         Span::styled(r.mark.to_string(), fg(r.mark_color)),
-        Span::styled(name_out, fg(theme::TEXT)),
+        Span::styled(title_out, fg(theme::TEXT)),
+        Span::raw(" "),
+        Span::styled(status_out, fg(status_color(r.status))),
     ];
-    if !summary_out.is_empty() {
+    let has_pr = !pr_out.is_empty();
+    let has_summary = !summary_out.is_empty();
+    if has_pr || has_summary {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(summary_out, fg(theme::MUTED)));
+        if has_summary {
+            spans.push(Span::styled(summary_out, fg(theme::MUTED)));
+        }
+        if has_pr && has_summary {
+            spans.push(Span::raw(" "));
+        }
+        if has_pr {
+            spans.push(Span::styled(pr_out, fg(r.pr_color)));
+        }
     }
     spans.push(Span::raw(" ".repeat(pad)));
-    // Right cluster: <pr> <status word> <time>.
-    if !r.pr.is_empty() {
-        spans.push(Span::styled(r.pr.to_string(), fg(r.pr_color)));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(word.to_string(), fg(status_color(r.status))));
-    spans.push(Span::raw(" "));
     spans.push(Span::styled(r.elapsed.to_string(), fg(theme::MUTED)));
     Line::from(spans)
 }
@@ -1633,13 +1697,22 @@ mod tests {
         };
 
         let mut app = App::new(vec![session(1_000, 91_000)]);
-        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+        let rendered = render_elapsed(&app, 121_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("2m"));
+        assert!(rendered.find("Working") < rendered.rfind("2m"));
 
         app.set_sessions(vec![session(1_000, 111_000)]);
-        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+        let rendered = render_elapsed(&app, 121_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("2m"));
+        assert!(rendered.find("Working") < rendered.rfind("2m"));
 
         let fallback = App::new(vec![session(0, 90_000)]);
-        assert!(render_elapsed(&fallback, 120_000).contains("Working 30s"));
+        let rendered = render_elapsed(&fallback, 120_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("30s"));
+        assert!(rendered.find("Working") < rendered.rfind("30s"));
     }
 
     #[test]
