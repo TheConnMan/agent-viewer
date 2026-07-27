@@ -106,6 +106,50 @@ is deliberate and matches how the Codex reader depends on its columns directly; 
 `backend.list()` error is already contained to a footer notice over the previous snapshot, so
 the failure mode on an old schema is a visible notice, not a crash.
 
+## Enumeration — claude, and the nested `claude -p` companion rule
+
+Rows come from `claude agents --json --all`. A non-zero exit or a missing binary is a quiet
+empty backend, never an error. Each row is enriched from `<jobs root>/<short>/state.json` for
+summary, transcript path, PR refs, and `updated_at`.
+
+**Companions.** Every live claude process registers itself at `~/.claude/sessions/<pid>.json`,
+and the agents list returns all of them. That includes a nested `claude -p`, the Agent SDK's
+headless entrypoint, which another session shelled out to from a Bash call: a skill, a hook, an
+`/implement` planning pass. It is a real process but not a fleet member anyone started, and
+because it has no `jobId` it never gets a name the user chose, so claude derives one from the
+cwd as `<dir-basename>-<n>`. Those rows read as mystery sessions in the default view and vanish
+on their own when the child exits, since the pid file is removed on exit.
+
+The discriminator is `entrypoint`, matched on the `sdk-` prefix so the whole SDK family
+(`sdk-cli`, `sdk-ts`, `sdk-py`) is one rule. Two alternatives were rejected because a genuine
+interactive terminal session is indistinguishable from a nested `claude -p` under both:
+`kind == "interactive"` is what a real terminal session reports too, and the absence of
+`id`/`jobId` is equally true of one. A `--bg` job and an interactive session BOTH report
+`entrypoint: "cli"`, which is what makes the `sdk-` prefix the safe cut.
+
+**`entrypoint` is not in the agents output.** Verified live on this box 2026-07-27, claude
+2.1.220: `claude agents --json --all` projects only
+`cwd, id, kind, name, sessionId, startedAt, state` plus `pid` on live rows. Reading
+`entrypoint` off an agents row always yields nothing, so the rule needs a second read of the
+per-process registry, keyed by the row's `pid`:
+
+```
+$ claude agents --json --all | jq '[.[] | .entrypoint] | unique'
+[null]
+
+$ cat ~/.claude/sessions/2054075.json
+{"pid":2054075, "cwd":".../agent-viewer/.worktrees/claude-companion-filter",
+ "kind":"interactive", "entrypoint":"sdk-cli",
+ "name":"claude-companion-filter-61", "nameSource":"derived"}
+```
+
+Rows with no `pid` are skipped without touching the disk: a pid is absent exactly for finished
+background jobs, which are real fleet members. The sessions root follows the same
+`$CLAUDE_CONFIG_DIR` precedence as the jobs root. A missing or unreadable registry file parses
+to "real session", the same safe direction as the opencode rule, and the same two escapes keep
+this from swallowing anything: the viewer-state overlay clears `companion` for sessions the
+viewer itself spawned, and `Ctrl+A` and `Ctrl+F` both surface companion rows.
+
 ## Rollout transcripts (for detail view + status tail)
 
 Path: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. Parse with `serde_json`
