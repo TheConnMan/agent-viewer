@@ -456,7 +456,13 @@ pub fn apply_viewer_state(sessions: &mut [Session], state: &ViewerState) {
         }
         // A terminal row's recorded pid may already have been recycled by an unrelated
         // process, so never hand it out: a later stop would signal the wrong process.
+        //
+        // A daemon-hosted row is skipped outright. Its pid is None BY DESIGN (the fd holder is
+        // the app-server, whose pid belongs to every other thread it hosts), and "no pid, not
+        // finished" is that row's permanent shape - exactly the hole this overlay would fill,
+        // putting a signalable pid back on the one row that must never be signalled.
         if session.pid.is_none()
+            && !session.daemon_hosted
             && !session.status.is_finished()
             && let Some(pid) = state.spawn_pids.get(&key)
         {

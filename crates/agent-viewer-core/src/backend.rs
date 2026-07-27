@@ -144,6 +144,11 @@ pub struct Session {
     /// Associated PR references (claude jobs `state.json` children where kind=="pr");
     /// rendered as a right-aligned badge. Empty for codex/opencode.
     pub pr_refs: Vec<PrRef>,
+    /// codex only: this thread lives inside the shared `codex app-server` daemon, which holds
+    /// its rollout fd. Such a row carries no `pid` by design (the daemon's pid belongs to every
+    /// other thread it hosts too), is joined with `codex resume --remote`, and is stopped with
+    /// `turn/interrupt` rather than a signal. Always false for the other backends.
+    pub daemon_hosted: bool,
 }
 
 /// A push notification from a backend that supports `subscribe`: either one session's status

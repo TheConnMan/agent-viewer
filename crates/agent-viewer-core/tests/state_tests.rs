@@ -26,6 +26,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: S
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 
@@ -296,6 +297,37 @@ fn viewer_db_open_drops_legacy_tables_and_keeps_supported_data() {
     assert!(
         tables.iter().any(|name| name == "collapsed_groups"),
         "{tables:?}"
+    );
+}
+
+/// A daemon-hosted codex row must come out of the overlay with `pid: None`. Its pid is None by
+/// design (the app-server holds the fd, and its pid belongs to every other thread it hosts) and
+/// it is never "finished" while the daemon keeps hosting it, so it matches this overlay's
+/// fill-the-hole condition exactly. Filling it would hand `stop`/`remove` a pid that SIGTERMs
+/// the daemon and every session in it.
+#[test]
+fn apply_viewer_state_never_puts_a_pid_back_on_a_daemon_hosted_row() {
+    let mut hosted = sess(BackendKind::Codex, "hosted", "/p", 10, Status::Working);
+    hosted.daemon_hosted = true;
+    let ordinary = sess(BackendKind::Codex, "ordinary", "/p", 20, Status::Working);
+    let mut sessions = vec![hosted, ordinary];
+
+    let spawn_pids = HashMap::from([
+        ((BackendKind::Codex, "hosted".to_string()), 9999),
+        ((BackendKind::Codex, "ordinary".to_string()), 4242),
+    ]);
+    let state = ViewerState {
+        pinned: HashSet::new(),
+        spawn_pids,
+    };
+
+    apply_viewer_state(&mut sessions, &state);
+
+    assert_eq!(sessions[0].pid, None, "daemon-hosted row must stay pidless");
+    assert_eq!(
+        sessions[1].pid,
+        Some(4242),
+        "an ordinary viewer-spawned row still gets its pid back"
     );
 }
 

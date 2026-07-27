@@ -116,12 +116,19 @@ build clean with clippy and tests passing.
   `SQLITE_OPEN_READ_ONLY`. Codex writes it concurrently; never write it yourself.
 - **Never hardcode the state file version.** Glob `state_*.sqlite` and pick the highest version
   number. Same for any versioned Codex path.
-- **Mutations delegate to CLI subcommands, never the DB.** Create/archive/unarchive/resume go
-  through `codex ...` (and the Claude/opencode equivalents), never a direct DB write. One
-  documented exception: Claude rename writes `name`/`nameSource` into
-  `~/.claude/jobs/<short>/state.json`, because Claude ships no `rename` subcommand and that
-  file is its own store of record for the name. Read `SPEC.md` "Claude mutations" before
-  touching it - the channel it does NOT use was verified the expensive way.
+- **Mutations delegate to CLI subcommands or the app-server, never the DB.**
+  Archive/unarchive/resume go through `codex ...` (and the Claude/opencode equivalents), never a
+  direct DB write. Two documented exceptions:
+  - Codex spawn and stop speak JSON-RPC to the `codex app-server` daemon (`thread/start` plus
+    `turn/start`, and `turn/interrupt`), because a `codex exec` spawn hosts its app-server in
+    process and produces a thread nobody can ever join, and because the daemon holds the
+    rollout fd of every thread it hosts so a signal is not a safe stop. agent-viewer MAY start
+    a daemon and NEVER stops or restarts one. Read `SPEC.md` "Codex attach/resume" before
+    touching spawn, attach, or stop - the fabricated-interrupt behavior was measured live.
+  - Claude rename writes `name`/`nameSource` into `~/.claude/jobs/<short>/state.json`, because
+    Claude ships no `rename` subcommand and that file is its own store of record for the name.
+    Read `SPEC.md` "Claude mutations" before touching it - the channel it does NOT use was
+    verified the expensive way.
 - **`source` is a serialized enum, not a flat string.** Parse `cli`/`exec`/`vscode` prefixes;
   treat anything else (JSON blobs, subagent objects) as a subagent. Keep this defensive.
 - **Capabilities are backend-advertised.** An unsupported action is a no-op with a footer

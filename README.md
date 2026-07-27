@@ -14,8 +14,10 @@ no data or whose CLI is not installed simply list empty — they never error the
 
 - **Codex** — full support. Reads the global registry (`~/.codex/state_*.sqlite`, table
   `threads`) plus the rollout transcripts under `~/.codex/sessions/`, resolves live
-  running/done/errored status, spawns detached `codex exec` jobs, attaches via
-  `codex resume`, and archives/unarchives.
+  running/done/errored status, spawns into the shared `codex app-server` daemon (starting one if
+  none is running, and falling back to a detached `codex exec` if the daemon cannot be reached),
+  attaches by joining that daemon (`codex resume --remote`), stops a hosted session by
+  interrupting its turn, and archives/unarchives.
 - **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), remove (`claude rm`),
   and rename background sessions. Rename writes `name`/`nameSource` into that job's
   `~/.claude/jobs/<short>/state.json`, which is what Claude's own fleet view does and the only
@@ -32,7 +34,11 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✽` working (blinks) — the agent is actively running.
 - `◐` needs-input — waiting on you. Best-effort for Codex (inferred from the transcript
   tail), so treat it as a hint rather than a guarantee.
-- `∙` idle — live but not doing anything.
+- `∙` idle — live but not doing anything. A Codex session hosted by the app-server daemon reads
+  idle rather than done while this viewer still has an embedded terminal open on it, since that
+  terminal is a live client sitting in the session. `Ctrl+]` only leaves the view: the terminal
+  stays alive for instant re-attach, so the row settles on done once that terminal is closed
+  (quitting the viewer, or `Ctrl+X` twice on the row).
 - `●` done — finished cleanly.
 - `✗` error — exited with an error.
 - `?` unknown — the backend cannot say; never shown as a false idle.
@@ -77,7 +83,9 @@ companion.
 The list view carries a persistent composer in a rounded box between the list and the
 footer: `[cc] claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab`
 cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model,
-and `Enter` spawns it detached with that model. The models are discovered from each agent's
+and `Enter` spawns it detached with that model. A Codex spawn goes into the shared
+`codex app-server` daemon so the new session can be joined live later; the viewer starts that
+daemon if none is running and never stops one. The models are discovered from each agent's
 CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
 opencode: `opencode models`), default first. Discovery runs in the background and is cached
 for a day, so the picker is populated from the first keystroke rather than waiting on a probe
@@ -93,7 +101,9 @@ model for the target agent, floating above the box. `↑`/`↓` move the highlig
 `Enter` picks the model (and clears the composer), `Esc` closes it.
 
 **Spawned sessions run unsandboxed.** Codex jobs are started with
-`--dangerously-bypass-approvals-and-sandbox`, so they can write files, use the network, and
+`--dangerously-bypass-approvals-and-sandbox` on the exec path, and with the same posture
+(`sandbox: danger-full-access`, `approvalPolicy: never`) on the daemon path, so they can write
+files, use the network, and
 drive git (fetch, branch, worktree, commit) without prompting. This is deliberate: codex's
 `workspace-write` sandbox mounts `.git` read-only and blocks the network, which made every
 git-shaped task a silent no-op — the session would burn a turn and report back that it could
@@ -134,7 +144,10 @@ modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
   Claude row, which has no job dir) is a no-op with a footer notice.
-- `Ctrl+X` — stop the selected session; press again within 2s to remove it.
+- `Ctrl+X` — stop the selected session; press again within 2s to remove it. A Codex session
+  hosted by the app-server daemon is stopped by interrupting its current turn, never by
+  signalling a process: the daemon runs every session it hosts, so a signal would take all of
+  them down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `a` — show all (companions + archived + deleted-dir rows).
 - `h` / `u` — archive / unarchive (Codex only).
@@ -152,12 +165,21 @@ never freezes the list; a `…` notice shows while the action is in flight.
 ## Embedded attach
 
 `→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
-full-screen embedded terminal. Codex runs `codex resume`; opencode runs `opencode -s`;
+full-screen embedded terminal. Codex joins the `codex app-server` daemon that hosts the session
+(`codex resume --remote unix://<socket>`) when it hosts one, and otherwise runs a plain
+`codex resume`; opencode runs `opencode -s`;
 Claude runs `claude attach`, which resumes the same thread for both a running background
 job and a finished one (waking it in place); a row with no background-job id falls back to
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
+
+**A Codex session that is live in another process is refused rather than opened.** Attaching to
+a mid-turn session that the viewer does not host would not join it: the new `codex resume`
+process replays the transcript, finds it ends mid-turn, and writes a synthesized interruption
+into the running session's transcript, which then renders as "Conversation interrupted". The
+footer says so instead, and the session is left alone. Sessions the viewer spawned are hosted by
+the daemon, so they are always joinable live.
 
 Peek and reply are deliberately out of scope for this rebuild (a divergence from Fleet View,
 which binds `space` to reply — noted here so it is not mistaken for an oversight; see the
@@ -198,8 +220,8 @@ automatically when their CLIs and data exist and silently list empty otherwise.
 cargo test --workspace
 ```
 
-The live end-to-end tests are `#[ignore]` by default because they spawn a real
-`codex exec` and need Codex auth plus network:
+The live end-to-end tests are `#[ignore]` by default because they spawn real Codex sessions
+(through the app-server daemon and through `codex exec`) and need Codex auth plus network:
 
 ```
 cargo test -p agent-viewer-core --test e2e_live -- --ignored --nocapture

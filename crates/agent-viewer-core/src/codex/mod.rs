@@ -1,18 +1,105 @@
+pub mod app_server;
 pub mod cli;
 pub mod registry;
 pub mod rollout;
 pub mod source;
 pub mod status;
 
-use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin};
+use crate::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin, Status};
 use crate::error::{AttachRefusal, Result};
 use registry::Registry;
 use status::StatusResolver;
 use std::path::Path;
 
-// NOTE: the experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`,
-// `thread/list`, `command/exec/terminate`) is the eventual "clean" backend and the v2
-// upgrade path. v1 reads the same SQLite + rollout files directly.
+// Enumeration still reads the SQLite registry + rollout files directly; the `codex app-server`
+// daemon is used for the two things files cannot express: spawning a thread that stays
+// joinable, and joining or interrupting one. See `app_server` and SPEC.md
+// "Codex attach/resume".
+
+/// Which spawn path a new session takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnRoute {
+    Daemon,
+    Exec,
+}
+
+/// PURE: the daemon wins whenever one is reachable. `codex exec` runs its app-server IN
+/// PROCESS, so an exec-spawned thread can never be joined from outside no matter what attach
+/// does later; with no daemon, exec is still better than not spawning at all.
+pub fn spawn_route(daemon: Option<&app_server::Daemon>) -> SpawnRoute {
+    match daemon {
+        Some(_) => SpawnRoute::Daemon,
+        None => SpawnRoute::Exec,
+    }
+}
+
+/// How a row is attached: a true join through the hosting daemon, a plain local resume, or a
+/// refusal carrying the reason to show verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachRoute {
+    Remote(String),
+    Local,
+    Refuse(&'static str),
+}
+
+/// Shown verbatim in the footer when attach is refused. It names the interrupt because that is
+/// the damage being avoided: a plain resume of a live thread appends a synthesized
+/// `TurnAborted{Interrupted}` to the rollout of a session that is still running.
+const LIVE_TURN_REFUSAL: &str =
+    "session is live in another codex process; attaching would fabricate an interrupt";
+
+/// PURE attach routing:
+///   daemon-hosted + a reachable daemon                -> Remote (a real live join)
+///   foreign + mid-turn (Working|NeedsInput) + a pid    -> Refuse (a resume would corrupt it)
+///   everything else                                    -> Local
+///
+/// A daemon-hosted row whose daemon is gone falls to Local: there is no live thread left to
+/// join and none to interrupt either, so opening the transcript beats refusing the row.
+pub fn attach_route(session: &Session, daemon: Option<&app_server::Daemon>) -> AttachRoute {
+    if session.daemon_hosted {
+        return match daemon {
+            Some(daemon) => AttachRoute::Remote(app_server::remote_endpoint(daemon)),
+            None => AttachRoute::Local,
+        };
+    }
+    let mid_turn = matches!(session.status, Status::Working | Status::NeedsInput { .. });
+    if mid_turn && session.pid.is_some() {
+        return AttachRoute::Refuse(LIVE_TURN_REFUSAL);
+    }
+    AttachRoute::Local
+}
+
+/// How a row is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRoute {
+    Interrupt,
+    Signal(u32),
+    Unsupported,
+}
+
+/// PURE: the reason to show for a spawn attempt that did not start a turn.
+fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
+    match attempt {
+        app_server::SpawnAttempt::Started(thread_id) => format!("thread {thread_id} started"),
+        app_server::SpawnAttempt::TurnFailed { thread_id, error } => {
+            format!("thread {thread_id} exists but its first turn failed: {error}")
+        }
+        app_server::SpawnAttempt::NotCreated(error) => error.to_string(),
+    }
+}
+
+/// PURE stop routing. `daemon_hosted` outranks any pid on the row: the daemon holds the
+/// rollout fd of every thread it hosts, so a pid that rode along on such a row is the DAEMON's
+/// pid, and signalling it would kill the daemon and every other session inside it.
+pub fn stop_route(session: &Session) -> StopRoute {
+    if session.daemon_hosted {
+        return StopRoute::Interrupt;
+    }
+    match session.pid {
+        Some(pid) => StopRoute::Signal(pid),
+        None => StopRoute::Unsupported,
+    }
+}
 
 /// Sandbox args passed to `codex exec` for viewer-spawned sessions.
 ///
@@ -162,18 +249,28 @@ impl Backend for CodexBackend {
         // cannot keep, and a capability that is advertised and then fails at press time is
         // worse than one advertised as unsupported. Keep the gate; the table is the
         // coarser statement.
-        capabilities.stop = session.pid.is_some();
+        //
+        // A daemon-hosted row carries no pid BY DESIGN (the fd holder is the daemon, whose pid
+        // must never be signalled), and it is stopped with `turn/interrupt` over the socket
+        // instead. Gating on the pid alone would gray Ctrl+C out on exactly the rows that are
+        // interruptible.
+        capabilities.stop = session.pid.is_some() || session.daemon_hosted;
         capabilities
     }
 
     fn list(&mut self) -> Result<Vec<Session>> {
         let threads = self.query_threads()?;
-        let open = status::open_rollout_paths();
+        // ONE process sweep per tick, giving both the open-rollout map and the set of threads a
+        // client is sitting in (the liveness signal a daemon-held fd cannot provide).
+        let scan = status::scan_codex_processes();
         let mut sessions = Vec::with_capacity(threads.len());
         for thread in threads {
             // The resolver canonicalizes once (cached) and returns the owning pid from the
             // same open map, so no per-tick canonicalize is needed here.
-            let (status, pid) = self.resolver.resolve(&thread.rollout_path, &open);
+            let attached = scan.attached_threads.contains(&thread.id);
+            let (status, pid, daemon_hosted) =
+                self.resolver
+                    .resolve(&thread.rollout_path, &scan.open_rollouts, attached);
             let companion = thread.source.is_companion();
             let origin = if matches!(thread.source, source::Source::Exec) {
                 SessionOrigin::Exec
@@ -197,6 +294,7 @@ impl Backend for CodexBackend {
                 pid,
                 rollout_path: Some(thread.rollout_path),
                 pr_refs: Vec::new(),
+                daemon_hosted,
             });
         }
         Ok(sessions)
@@ -218,6 +316,33 @@ impl Backend for CodexBackend {
     }
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
+        // Prefer the shared daemon: a thread it hosts is the only kind that can be joined
+        // later, and it may be started here (never stopped, never restarted).
+        let daemon = app_server::ensure_daemon();
+        if let (SpawnRoute::Daemon, Some(daemon)) = (spawn_route(daemon.as_ref()), daemon.as_ref()) {
+            let attempt = app_server::try_spawn_thread(daemon, dir, task, model);
+            match attempt {
+                // No pid to return: the daemon owns the thread, and its pid must never be
+                // handed back as a killable one (it is every other hosted thread's pid too).
+                // The costs of that are real but small: `record_spawn` is pid-keyed, so a
+                // daemon-hosted row gets no viewer spawn record, which means no pin (it does
+                // not need one - a `vscode`-source row is not a companion) and no first-sight
+                // bloom. Stop goes through turn/interrupt instead of a signal. Same shape as
+                // the claude backend, which also self-detaches and returns None.
+                app_server::SpawnAttempt::Started(_) => return Ok(None),
+                // The thread EXISTS and is already in the listing; only its first turn failed.
+                // Falling back here would run the user's task a second time (two rows, two
+                // agents, one Enter), so surface it against the thread that is there.
+                attempt if !app_server::may_fall_back(&attempt) => {
+                    return Err(crate::error::Error::Command(format!(
+                        "codex app-server spawn incomplete: {}",
+                        spawn_failure_reason(&attempt)
+                    )));
+                }
+                // Nothing was created, so the exec path below is still safe.
+                _ => {}
+            }
+        }
         let cmd = codex_spawn_command(dir, task, model);
         let log_path = crate::default_codex_home()
             .join("bg-logs")
@@ -235,9 +360,19 @@ impl Backend for CodexBackend {
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
-        match session.pid {
-            Some(pid) => crate::spawn::terminate(pid, "codex"),
-            None => Err(crate::error::Error::Unsupported(self.kind().name())),
+        match stop_route(session) {
+            StopRoute::Interrupt => {
+                // Probe only, never start: if no daemon answers, this thread is not hosted by
+                // one any more, so there is no turn left to interrupt.
+                let daemon = app_server::probe_daemon().ok_or_else(|| {
+                    crate::error::Error::Command(
+                        "no codex app-server daemon is listening to interrupt".into(),
+                    )
+                })?;
+                app_server::interrupt_thread(&daemon, &session.id)
+            }
+            StopRoute::Signal(pid) => crate::spawn::terminate(pid, "codex"),
+            StopRoute::Unsupported => Err(crate::error::Error::Unsupported(self.kind().name())),
         }
     }
 
@@ -253,7 +388,17 @@ impl Backend for CodexBackend {
         &self,
         session: &Session,
     ) -> std::result::Result<std::process::Command, AttachRefusal> {
-        let mut cmd = cli::resume_command(&session.id);
+        // Probe only, never start, and only for a row that claims a daemon host: the probe is
+        // a shell-out and this runs on the attach keypress, so a Local or Refuse row must not
+        // pay for it.
+        let daemon = session.daemon_hosted.then(app_server::probe_daemon).flatten();
+        let mut cmd = match attach_route(session, daemon.as_ref()) {
+            // A real live join: `thread/resume` inside the hosting process returns the history
+            // and atomically subscribes to live updates.
+            AttachRoute::Remote(endpoint) => cli::resume_remote_command(&endpoint, &session.id),
+            AttachRoute::Local => cli::resume_command(&session.id),
+            AttachRoute::Refuse(reason) => return Err(AttachRefusal::new(reason)),
+        };
         // `codex resume` inherits the viewer's cwd and otherwise prompts "Choose working
         // directory" on attach. Pin it to the session's own cwd when that directory still
         // exists; leave it unset when the dir was deleted so the spawn cannot fail on it.

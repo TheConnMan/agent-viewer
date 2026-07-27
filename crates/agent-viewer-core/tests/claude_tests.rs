@@ -302,6 +302,7 @@ fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 

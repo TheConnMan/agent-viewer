@@ -88,7 +88,13 @@ pub fn tail_state(path: &std::path::Path) -> Result<TailState> {
             .get("payload")
             .and_then(|p| crate::json_str(p, "type"))
         {
-            Some("task_complete") => last_complete = Some(idx),
+            // `turn_aborted` is terminal exactly like `task_complete`: a turn stopped by
+            // `turn/interrupt` (or Esc in a TUI) writes NEITHER a task_complete NOR a later
+            // task_started, so without this the tail stays MidTurn and the row reads Working
+            // forever - a stop would look like it did nothing. Captured live from an
+            // interrupted daemon-hosted thread: {"type":"event_msg","payload":
+            // {"type":"turn_aborted","turn_id":...,"reason":"interrupted",...}}.
+            Some("task_complete") | Some("turn_aborted") => last_complete = Some(idx),
             Some("task_started") => last_started = Some(idx),
             Some(t) if t.ends_with("_approval_request") => last_approval = Some(idx),
             _ => {}
@@ -184,7 +190,9 @@ pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval
             continue;
         };
         match crate::json_str(payload, "type") {
-            Some("task_complete") => last_complete = Some(idx),
+            // Same terminal pair as `tail_state`: an aborted turn clears a pending approval,
+            // otherwise the peek header keeps asking about a turn that is over.
+            Some("task_complete") | Some("turn_aborted") => last_complete = Some(idx),
             Some("task_started") => last_started = Some(idx),
             Some("exec_approval_request") => {
                 let command = payload

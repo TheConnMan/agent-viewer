@@ -20,6 +20,7 @@ fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 

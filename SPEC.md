@@ -173,10 +173,123 @@ All verified present in `codex --help` (0.144.1):
   sandbox, no approval prompts. This matches how the sessions are actually used (the user's
   own machine, the user's own repos, unattended) and is asserted by
   `codex_spawn_command_runs_unsandboxed` in `crates/agent-viewer-core/src/codex/mod.rs`.
+  **Superseded for viewer-spawned sessions (kept for the record).** A `codex exec` spawn runs
+  its app-server IN PROCESS, so the thread it creates can never be joined from another
+  process. Spawn now goes through the shared `codex app-server` daemon (`thread/start` plus
+  `turn/start`) and the `codex exec` shape above is the fallback for when no daemon can be
+  reached. The sandbox posture is unchanged and carried onto the new path: `thread/start` pins
+  `sandbox: danger-full-access` and `approvalPolicy: never` for exactly the evidence above.
+  See "Codex attach/resume" below.
 - **Hide (req 3):** `codex archive <id>`; **unhide:** `codex unarchive <id>`;
   hard-delete (optional, guard behind a confirm): `codex delete <id>`.
-- **Attach/resume:** `codex resume <id>` (or `codex exec resume <id>`), exec'd into the
-  user's terminal from the TUI.
+- **Attach/resume (superseded, kept for the record):** `codex resume <id>` (or
+  `codex exec resume <id>`), exec'd into the user's terminal from the TUI. This is still the
+  command for a session with no live turn, but it is NOT how a live session is joined; see
+  "Codex attach/resume" below for what replaced it and why.
+
+## Codex attach/resume - what is implemented, and the measurements behind it
+
+**`codex resume <id>` on a running session does not join it.** The new process gets its own
+ThreadManager, replays the rollout, sees that it ends mid-turn, and appends a synthesized
+`TurnAborted{reason: Interrupted}`, which the TUI renders as "Conversation interrupted - tell
+the model what to do differently". Measured live against codex-cli 0.145.0 on this box: a
+foreign resume of a live thread reported `status: idle` with turn statuses `["interrupted"]`
+while the real session kept running untouched, both processes then holding the same rollout
+path. That is a destructive read, so agent-viewer refuses it (see below) rather than showing a
+false interruption.
+
+**A real join exists only inside the ONE app-server process that hosts the thread.** There,
+`thread/resume` returns the history and atomically subscribes the caller to live updates: two
+clients on one app-server received byte-identical live streams with no interrupt marker. The
+TUI reaches that with `codex resume --remote unix://<socketPath> <id>`.
+
+**A daemon-hosted turn survives its client disconnecting.** A turn started with `thread/start`
+plus `turn/start` kept running after the initiating client closed the socket: the rollout grew
+3778 bytes post-disconnect, thread status stayed "active" and the turn "inProgress". So a spawn
+is exactly connect, start thread, start turn, disconnect. `turn/start` answers immediately with
+the new turn (`status: inProgress`), so waiting for that response confirms acceptance without
+waiting for the work.
+
+**THE GUARD: the daemon holds the rollout fd of every thread it hosts** (verified by reading
+`/proc/<daemon pid>/fd`). The `/proc/fd` scan therefore reports the DAEMON's pid as the owning
+pid of every daemon-hosted row, and a SIGTERM there would kill the daemon and every session
+inside it. The scanner now returns a `RolloutOwner { pid, daemon }`, the resolver withholds a
+daemon pid (returning `None` plus `daemon_hosted: true`), and `stop` routes a daemon-hosted row
+to `turn/interrupt` over the socket, never to a signal. What such a row's fd does NOT do any
+more is decide its status: see the rule table below.
+
+**Daemon-created threads are recorded with `source = vscode`,** because the daemon runs with
+the default `--session-source vscode`. Viewer-spawned rows therefore enumerate as
+interactive-origin. That is accepted, not worked around.
+
+**Consequence, and the second status rule set it forces.** The daemon keeps the rollout fd open
+long after the turn completes (observed still held 20+ minutes later), so for a daemon-hosted row
+the open fd carries NO liveness information. Applying the fd rules there stranded every finished
+background task at Idle forever, which makes working and finished indistinguishable for exactly
+the sessions the viewer spawns. `status_from` therefore takes `daemon` and `attached` alongside
+`open` and the tail, and a daemon-hosted row is resolved from the TAIL:
+
+| daemon-hosted row, tail | status |
+| --- | --- |
+| MidTurn, or unreadable/empty (spawn race) | Working |
+| AwaitingApproval | NeedsInput |
+| Complete, a client attached | Idle |
+| Complete | Done |
+
+Rows the daemon does not host keep the fd rules unchanged, and `attached` never touches them.
+
+**"A client is attached" is read from argv in the same process sweep.** A TUI that joined a
+daemon-hosted thread runs `codex resume --remote unix://<sock> <thread-id>`, so the thread id
+appears in a codex process's argv. `scan_codex_processes` returns both the open-rollout map and
+that set of thread ids from ONE sysinfo pass, because this runs every refresh tick over thousands
+of threads: no second sweep, and no per-row daemon query on the render path. Detection is
+shape-based (a 36-char UUID token), and a false positive costs one tick of Idle instead of Done.
+
+The precise meaning of "attached" is therefore "a `codex resume` process for this thread still
+exists", which is NOT the same as "the user is looking at it". `Ctrl+]` detaches the view but
+the viewer deliberately keeps the PTY child alive so re-attaching is instant, so the row stays
+Idle until that child actually goes away (quitting the viewer, `Ctrl+X` twice, or the child
+exiting on its own). Documented rather than fixed: the alternative is asking the daemon per row
+on the render path.
+
+**Known gap, deliberately not addressed: stale-daemon attach targeting.** `attach_route` points
+a daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
+it is the same process that holds the row's fd. If a daemon were restarted (the viewer never
+restarts one) the endpoint could name a daemon that does not host that thread. Matching the fd
+holder's pid to the answering daemon is the fix and is out of scope here.
+
+Two facts make the tail trustworthy here: the daemon writes the same `task_complete` event_msg
+the exec path does (verified on a daemon-created rollout), and the Working-to-Done flip is
+observable end to end on the daemon path (`codex_spawn_running_then_done` and
+`embedded_attach_live` both pass against a daemon spawn).
+
+Implemented routing (all three seams are pure functions in `codex/mod.rs`, so they are unit
+tested without a daemon):
+- **spawn:** `ensure_daemon()`, then `thread/start` + `turn/start` on it; the thread id comes
+  back from `result.thread.id` and no pid is returned (the spawn record still resolves the new
+  row by cwd plus time window). A daemon RPC failure falls back to the `codex exec` path rather
+  than failing the user's spawn.
+- **attach:** daemon-hosted plus a reachable daemon -> `codex resume --remote <endpoint> <id>`;
+  a foreign row that is mid-turn with a live pid -> refused with the reason shown verbatim in
+  the footer; everything else -> plain `codex resume <id>`. A daemon-hosted row whose daemon is
+  gone also takes the plain resume: there is no live turn left to protect.
+- **stop:** daemon-hosted -> `turn/interrupt` (the in-progress turn id is resolved first with
+  `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
+  a no-op success); else a pid -> SIGTERM as before; else unsupported.
+
+Transport: the control socket is a Unix socket that upgrades to RFC6455 WebSocket at `/rpc`
+(handshake URL `ws://localhost/rpc`), driven by blocking `tungstenite` over
+`std::os::unix::net::UnixStream` since this crate is synchronous. A client offering
+`permessage-deflate` is rejected ("Missing, duplicated or incorrect header
+sec-websocket-extensions") and dropped, so no compression may be advertised.
+
+`codex app-server daemon version` is the availability gate and the socket discovery
+(`"status":"running"` plus a non-empty `socketPath`); it exits non-zero with "failed to connect
+to ..." when nothing is listening. agent-viewer MAY start a daemon (`codex app-server daemon
+start`, idempotent, 0.5s on this box, and it prints `"status":"started"` so availability is
+confirmed by re-probing) and NEVER stops or restarts one - other clients and every other hosted
+thread live in that process. `attach` and `stop` probe only, since a daemon that is not up
+cannot be hosting anything.
 
 **Superseded (original v1 note, kept for the record).** This spec previously read: "Note the
 experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`, `thread/list`,
@@ -191,7 +304,8 @@ shows a single LISTEN holder, and three simultaneous client connections all init
 served different requests concurrently, reproduced independently with a stdlib WebSocket client
 while other clients were already connected. Concurrent app-server clients are safe. The residual
 risk is semantic (two clients steering one live thread), and D-004 forecloses that by never
-calling `thread/resume`.
+calling `thread/resume` from the viewer's own client: the join happens in the `codex resume
+--remote` TUI the viewer execs into, which is the user's single steering client.
 
 **Current design: agent-viewer binds to the app-server for Codex metadata.** Enumeration comes
 from `thread/list` with an explicit `sourceKinds` filter and `useStateDbOnly: true` (D-005),
@@ -212,8 +326,13 @@ $ codex app-server daemon version
 
 The other half of the original caution still stands: the API is marked `[experimental]` with
 shallow versioning, so deserialize permissively and fall back to read-only `state_*.sqlite`
-enumeration when `status` is not `running` or the handshake fails. agent-viewer never starts,
-stops, or restarts a daemon.
+enumeration when `status` is not `running` or the handshake fails.
+
+**Correction (daemon lifecycle).** This previously read "agent-viewer never starts, stops, or
+restarts a daemon". It now MAY start one, because a spawn that lands on no daemon produces a
+session nobody can ever join (`codex exec` hosts its app-server in process). It still NEVER
+stops and NEVER restarts one: other clients, and every other thread the daemon hosts, live in
+that process. Only spawn may start; attach and stop probe. See "Codex attach/resume".
 
 ## Model discovery: probe off-thread, cache on disk
 

@@ -6,6 +6,10 @@
 use agent_viewer_core::backend::{Backend, Status, all_backends};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::codex::app_server::{
+    ensure_daemon, interrupt_thread, probe_daemon, remote_endpoint, spawn_thread,
+};
+use agent_viewer_core::codex::status::open_rollout_paths;
 use agent_viewer_core::default_codex_home;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use std::path::PathBuf;
@@ -380,4 +384,138 @@ fn claude_live_rename_round_trips_through_the_agents_listing() {
         snapshot,
         "the state file must be byte-identical to how the test found it"
     );
+}
+
+/// Live proof of the daemon spawn-and-join path, and of the guard that keeps it safe.
+///
+/// `codex exec` runs its app-server IN PROCESS, so an exec-spawned thread can never be joined
+/// from outside: a foreign `codex resume` replays the rollout, finds it ends mid-turn, and
+/// appends a synthesized `TurnAborted{Interrupted}` while the real session keeps running. Only
+/// a thread hosted by the shared daemon can be joined, which is why spawn goes through it.
+///
+/// Asserts the four things that make that path safe, none of which can be checked without a
+/// real daemon: the spawned thread shows up in `list()` and reaches Working; its row is
+/// `daemon_hosted` with NO pid (the fd holder is the daemon, and a SIGTERM there would kill
+/// every session it hosts); attach routes to `codex resume --remote unix://<sock>`; and
+/// `interrupt_thread` leaves the daemon process alive. Skips cleanly when no daemon answers.
+#[test]
+#[ignore = "live: needs a reachable codex app-server daemon (auth + network)"]
+fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
+    let Some(daemon) = ensure_daemon() else {
+        eprintln!("[skip] no codex app-server daemon reachable on this box");
+        return;
+    };
+    println!("[daemon] socket {}", daemon.socket_path.display());
+
+    // 1. Temp git repo (codex expects one).
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo)
+            .status()
+            .expect("run git init")
+            .success(),
+        "git init failed"
+    );
+
+    // 2. Spawn a thread ON THE DAEMON. The task is deliberately slow enough that the turn is
+    //    still in progress while the assertions below run.
+    let thread_id = spawn_thread(
+        &daemon,
+        &repo,
+        "Count from 1 to 40, printing one number per line, and nothing else.",
+        None,
+    )
+    .expect("spawn a thread through the daemon");
+    println!("[daemon] thread {thread_id}");
+
+    // 3. The row appears in the ordinary listing and reaches Working.
+    let mut backend = CodexBackend::new(default_codex_home());
+    let session = poll_session(&mut backend, Duration::from_secs(30), |s| {
+        s.id == thread_id && s.status == Status::Working
+    })
+    .expect("daemon-spawned thread never reached Working in list()");
+
+    // 4. THE GUARD: the daemon holds this rollout's fd, so the row must carry no pid at all.
+    assert!(
+        session.daemon_hosted,
+        "a thread spawned on the daemon must be flagged daemon_hosted"
+    );
+    assert_eq!(
+        session.pid, None,
+        "the daemon's pid must never be handed back as the session's killable pid"
+    );
+
+    // 5. The daemon's own pid, straight from the fd scan for this rollout.
+    let rollout = session
+        .rollout_path
+        .clone()
+        .expect("codex rows carry a rollout path");
+    let canonical = std::fs::canonicalize(&rollout).unwrap_or(rollout);
+    let owner = open_rollout_paths()
+        .get(&canonical)
+        .copied()
+        .expect("something holds the live rollout fd");
+    assert!(
+        owner.daemon,
+        "the fd holder for a daemon-hosted thread must be recognized as the app-server"
+    );
+    println!("[daemon] rollout fd held by app-server pid {}", owner.pid);
+
+    // 6. Attach joins through this daemon's socket instead of a plain resume.
+    let command = backend
+        .attach_command(&session)
+        .expect("a daemon-hosted row is attachable");
+    let args: Vec<String> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        args.iter().any(|a| a == "--remote"),
+        "attach must join the daemon, not fork a foreign resume: {args:?}"
+    );
+    assert!(
+        args.iter().any(|a| *a == remote_endpoint(&daemon)),
+        "attach must point at this daemon's unix:// socket: {args:?}"
+    );
+
+    // 7. Interrupt the turn (this is `stop` for a daemon-hosted row), then prove the daemon
+    //    itself survived it. Killing the daemon here would take down every hosted session.
+    interrupt_thread(&daemon, &thread_id).expect("interrupt the daemon-hosted turn");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        std::path::Path::new(&format!("/proc/{}", owner.pid)).exists(),
+        "interrupt killed the app-server daemon (pid {}) - stop must never signal a \
+         daemon-held pid",
+        owner.pid
+    );
+    assert!(
+        probe_daemon().is_some(),
+        "the daemon must still answer its version probe after an interrupt"
+    );
+    println!(
+        "[daemon] app-server pid {} survived the interrupt",
+        owner.pid
+    );
+
+    // 8. The row must LEAVE Working. An interrupted turn writes neither `task_complete` nor a
+    //    new `task_started`, so a tail rule that only knows those two markers leaves the row
+    //    Working forever and the stop looks like it did nothing to the user.
+    let stopped = poll_session(&mut backend, Duration::from_secs(30), |s| {
+        s.id == thread_id && s.status != Status::Working
+    })
+    .expect("interrupted daemon-hosted row never left Working");
+    println!(
+        "[daemon] row settled at {:?} after the interrupt (daemon_hosted={}, pid={:?})",
+        stopped.status, stopped.daemon_hosted, stopped.pid
+    );
+    assert!(
+        stopped.daemon_hosted && stopped.pid.is_none(),
+        "the stopped row is still daemon-hosted and still pidless"
+    );
+
+    // Tidy: keep the box's session list clean.
+    let _ = backend.hide(&thread_id);
 }
