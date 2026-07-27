@@ -394,21 +394,23 @@ pub(crate) fn spawn_from_composer(
         Some(m) => format!("spawned on {} {m}", backend_kind.name()),
         None => format!("spawned on {}", backend_kind.name()),
     };
-    match backend.spawn(&target, &task, model) {
-        Ok(Some(pid)) => {
-            // Record the spawn so the overlay can pin (and later stop) the session.
-            if let Some(db) = &ui.db {
-                let _ = db.record_spawn(backend_kind, &target, pid, now_ms());
-            }
-            ui.set_notice(notice);
-        }
-        Ok(None) => ui.set_notice(notice),
-        Err(e) => {
-            // Keep the composer text so the user can retry.
-            ui.set_notice(format!("spawn failed: {e}"));
-            return;
-        }
+    // On the mutation runner, not here. A codex spawn now dials the app-server daemon (and may
+    // start one), so running it inline froze the composer for as long as that took. The dedup
+    // key is backend+task, so a double Enter cannot spawn the same task twice while the first
+    // is still in flight, while a different task still goes straight through.
+    let key = format!("{}:{}:spawn", backend_kind.name(), task);
+    let mutation = Mutation::Spawn {
+        backend: backend_kind,
+        dir: target,
+        task: task.clone(),
+        model: model.map(str::to_string),
+        spawned_at_ms: now_ms(),
+        notice,
+    };
+    if !ui.mutations.submit(key, move || run_mutation(mutation)) {
+        return;
     }
+    ui.set_notice(format!("spawning… on {}", backend_kind.name()));
     ui.composer.clear();
     // Hasten the next listing so the spawned row (and its bloom) appears promptly; the
     // notice survives until the 1s clear cadence since apply_snapshot preserves it.

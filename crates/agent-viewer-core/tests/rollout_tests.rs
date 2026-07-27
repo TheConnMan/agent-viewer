@@ -131,6 +131,49 @@ fn tail_state_stale_complete_then_started() {
     assert_eq!(tail_state(&path).expect("tail_state"), TailState::MidTurn);
 }
 
+/// A turn stopped with `turn/interrupt` (this is what Ctrl+X does to a daemon-hosted row)
+/// writes a `turn_aborted` event and nothing else: no task_complete, no new task_started. That
+/// has to read as terminal, or the row it belongs to reads Working forever and the stop looks
+/// like it did nothing. The appended line is the live capture's shape.
+#[test]
+fn tail_state_turn_aborted_is_terminal() {
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
+    assert_eq!(
+        tail_state(&path).expect("tail_state"),
+        TailState::MidTurn,
+        "the fixture starts mid-turn"
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"019fa12c-c9c8-7f53-a0b8-babf4e947d6e","reason":"interrupted","started_at":1785115494,"completed_at":1785115500}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::Complete);
+}
+
+/// An approval that was never answered, on a turn that then got interrupted, is over: the tail
+/// must not keep reporting AwaitingApproval once the turn is aborted.
+#[test]
+fn tail_state_turn_aborted_after_an_approval_is_terminal() {
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_approval.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted","completed_at":1785115500}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    assert_eq!(tail_state(&path).expect("tail_state"), TailState::Complete);
+}
+
 #[test]
 fn tail_state_awaiting_approval() {
     // task_started then an *_approval_request, no task_complete after -> AwaitingApproval.

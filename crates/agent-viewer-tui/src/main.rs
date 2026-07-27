@@ -290,9 +290,12 @@ fn main() -> io::Result<()> {
         mouse_capture: true,
     };
 
-    // Hand the listing backends to the refresh worker; the UI keeps a separate cheap set
-    // (stateless builders) for the non-list calls: attach_command, spawn, capabilities,
-    // and the mutation closures. Only the worker set ever calls the slow list().
+    // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
+    // non-list calls: attach_command and capabilities. Only the worker set ever calls the slow
+    // list(). These are no longer all cheap stateless builders: `attach_command` shells out to
+    // `codex app-server daemon version` for a daemon-hosted row (about 34ms, and only for
+    // those rows). Spawn used to be here too and is now a `Mutation::Spawn` on the runner,
+    // because a codex spawn dials the daemon and may start one.
     let refresher = spawn_refresh_worker(list_backends);
     let action_backends = all_backends();
 

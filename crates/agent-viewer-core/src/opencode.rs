@@ -91,6 +91,7 @@ impl Backend for OpencodeBackend {
                 pid: None,
                 rollout_path: None,
                 pr_refs: Vec::new(),
+                daemon_hosted: false,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

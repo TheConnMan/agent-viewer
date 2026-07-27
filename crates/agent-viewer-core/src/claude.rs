@@ -402,6 +402,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             pid,
             rollout_path: None,
             pr_refs: Vec::new(),
+            daemon_hosted: false,
         });
     }
     Ok(sessions)

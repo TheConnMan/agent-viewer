@@ -230,6 +230,7 @@ fn session_with_pid(pid: Option<u32>) -> Session {
         pid,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 

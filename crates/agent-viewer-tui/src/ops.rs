@@ -14,6 +14,17 @@ pub(crate) enum Mutation {
     Rename(Session, String),
     Hide(Session),
     Unhide(Session),
+    /// Spawn a new session. On the runner, not the key path: a codex spawn now talks to the
+    /// app-server daemon and may start one, so it is a multi-second blocking call on a bad day
+    /// and would freeze the composer if it ran inline like it used to.
+    Spawn {
+        backend: BackendKind,
+        dir: std::path::PathBuf,
+        task: String,
+        model: Option<String>,
+        spawned_at_ms: i64,
+        notice: String,
+    },
 }
 
 /// A fresh backend instance for a worker thread. The mutating methods (stop/remove/
@@ -48,7 +59,11 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<String, String> {
             // so the two race; killing here guarantees ordering within the remove op and makes
             // a concurrent `stop` harmless. Terminate is idempotent (ESRCH/gone -> Ok) and
             // pid guarded by comm prefix, so it never signals a recycled pid.
-            if let Some(pid) = s.pid {
+            //
+            // NEVER for a daemon-hosted row: the pid on such a row could only be the codex
+            // app-server's, and SIGTERMing it would kill the daemon and every session inside
+            // it. `stop` interrupts those over the socket; remove just archives.
+            if let Some(pid) = s.pid.filter(|_| !s.daemon_hosted) {
                 let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
             }
             match backend.remove(&s) {
@@ -71,6 +86,28 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<String, String> {
             .hide(&s.id)
             .map(|()| format!("archived: {}", s.title))
             .map_err(|e| format!("{}: {e}", s.backend.name())),
+        Mutation::Spawn {
+            backend,
+            dir,
+            task,
+            model,
+            spawned_at_ms,
+            notice,
+        } => match fresh_backend(backend).spawn(&dir, &task, model.as_deref()) {
+            // A pid means the viewer forked the worker itself, so record the spawn for the
+            // pin/stop overlay - against a fresh connection, like every other viewer-DB
+            // follow-up here. `Ok(None)` is the self-detaching shape (claude --bg, and a
+            // codex thread the app-server daemon owns), which has no pid to record.
+            Ok(pid) => {
+                if let Some(pid) = pid
+                    && let Ok(db) = agent_viewer_core::state::ViewerDb::open_default()
+                {
+                    let _ = db.record_spawn(backend, &dir, pid, spawned_at_ms);
+                }
+                Ok(notice)
+            }
+            Err(e) => Err(format!("spawn failed: {e}")),
+        },
         Mutation::Unhide(s) => fresh_backend(s.backend)
             .unhide(&s.id)
             .map(|()| format!("unarchived: {}", s.title))
@@ -119,6 +156,7 @@ mod tests {
             pid: Some(pid),
             rollout_path: None,
             pr_refs: Vec::new(),
+            daemon_hosted: false,
         }
     }
 

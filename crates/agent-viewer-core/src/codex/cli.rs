@@ -26,6 +26,15 @@ pub fn resume_command(id: &str) -> std::process::Command {
     cmd
 }
 
+/// Build (do not run) `codex resume --remote <endpoint> <id>`: the TUI joins the app-server
+/// that HOSTS the thread instead of starting its own ThreadManager, which is what makes the
+/// join live rather than a replay that fabricates an interrupt.
+pub fn resume_remote_command(endpoint: &str, id: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("codex");
+    cmd.arg("resume").arg("--remote").arg(endpoint).arg(id);
+    cmd
+}
+
 /// PURE builder (unit-tested): one JSON-RPC 2.0 request line for
 /// `thread/name/set` {threadId, name}, serialized via serde_json (no hand-built
 /// strings — names with quotes/newlines must survive).

@@ -1,28 +1,51 @@
 mod common;
 
 use agent_viewer_core::backend::Status;
-use agent_viewer_core::codex::status::{StatusResolver, resolve_status};
+use agent_viewer_core::codex::status::{RolloutOwner, StatusResolver, resolve_status};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-fn empty_map() -> HashMap<PathBuf, u32> {
+fn empty_map() -> HashMap<PathBuf, RolloutOwner> {
     HashMap::new()
 }
 
-/// An open map holding the canonical form of `path` mapped to an arbitrary owning PID.
-fn open_with(path: &std::path::Path) -> HashMap<PathBuf, u32> {
+/// An open map holding the canonical form of `path` mapped to an owner, keyed the way the
+/// live `/proc/fd` scan keys it.
+fn open_owned_by(path: &std::path::Path, owner: RolloutOwner) -> HashMap<PathBuf, RolloutOwner> {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut map = HashMap::new();
-    map.insert(canon, 4242);
+    map.insert(canon, owner);
     map
+}
+
+/// The fd is held by the session's OWN codex process: an ordinary killable pid.
+fn open_with(path: &std::path::Path) -> HashMap<PathBuf, RolloutOwner> {
+    open_owned_by(
+        path,
+        RolloutOwner {
+            pid: 4242,
+            daemon: false,
+        },
+    )
+}
+
+/// The fd is held by the shared `codex app-server` daemon.
+fn open_with_daemon(path: &std::path::Path) -> HashMap<PathBuf, RolloutOwner> {
+    open_owned_by(
+        path,
+        RolloutOwner {
+            pid: 9999,
+            daemon: true,
+        },
+    )
 }
 
 #[test]
 fn needs_input_when_open_and_awaiting() {
     let path = common::fixture_path("rollout_approval.jsonl");
     assert_eq!(
-        resolve_status(&path, &open_with(&path)),
+        resolve_status(&path, &open_with(&path), false),
         Status::NeedsInput {
             reason: Some("awaiting approval".to_string())
         }
@@ -32,33 +55,39 @@ fn needs_input_when_open_and_awaiting() {
 #[test]
 fn working_when_open_and_midturn() {
     let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, &open_with(&path)), Status::Working);
+    assert_eq!(
+        resolve_status(&path, &open_with(&path), false),
+        Status::Working
+    );
 }
 
 #[test]
 fn idle_when_open_and_complete() {
     // Live session between turns: held open + tail Complete -> Idle.
     let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(resolve_status(&path, &open_with(&path)), Status::Idle);
+    assert_eq!(
+        resolve_status(&path, &open_with(&path), false),
+        Status::Idle
+    );
 }
 
 #[test]
 fn done_when_closed_and_complete() {
     let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map()), Status::Done);
+    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Done);
 }
 
 #[test]
 fn failed_when_closed_and_midturn() {
     let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map()), Status::Error);
+    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Error);
 }
 
 #[test]
 fn failed_when_file_missing() {
     // Missing file, empty map: Failed, never panics.
     let path = PathBuf::from("/nonexistent/rollout-does-not-exist.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map()), Status::Error);
+    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Error);
 }
 
 #[test]
@@ -69,8 +98,8 @@ fn resolver_reresolves_when_session_closes_without_file_change() {
     let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
     let mut resolver = StatusResolver::new();
     let open = open_with(&path);
-    assert_eq!(resolver.resolve(&path, &open).0, Status::Idle);
-    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Done);
+    assert_eq!(resolver.resolve(&path, &open, false).0, Status::Idle);
+    assert_eq!(resolver.resolve(&path, &empty_map(), false).0, Status::Done);
 }
 
 #[test]
@@ -82,15 +111,18 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     let mut resolver = StatusResolver::new();
     for p in [&complete, &midturn, &missing] {
         assert_eq!(
-            resolver.resolve(p, &empty_map()).0,
-            resolve_status(p, &empty_map())
+            resolver.resolve(p, &empty_map(), false).0,
+            resolve_status(p, &empty_map(), false)
         );
     }
 
     // ...and invalidates its (mtime, len) cache when the file changes.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
-    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Error);
+    assert_eq!(
+        resolver.resolve(&path, &empty_map(), false).0,
+        Status::Error
+    );
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -101,5 +133,160 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     )
     .unwrap();
     drop(f);
-    assert_eq!(resolver.resolve(&path, &empty_map()).0, Status::Done);
+    assert_eq!(resolver.resolve(&path, &empty_map(), false).0, Status::Done);
+}
+
+// --- who holds the fd: the session's own process, or the shared app-server daemon ---
+
+#[test]
+fn resolver_returns_the_pid_when_the_sessions_own_process_holds_the_fd() {
+    let path = common::fixture_path("rollout_midturn.jsonl");
+    let mut resolver = StatusResolver::new();
+    assert_eq!(
+        resolver.resolve(&path, &open_with(&path), false),
+        (Status::Working, Some(4242), false)
+    );
+}
+
+/// THE GUARD plus the daemon rule table. The `codex app-server` daemon holds the rollout fd for
+/// every thread it hosts, so the /proc/<pid>/fd scan reports the DAEMON's pid for those rows.
+/// Returning it as the session's pid would let `stop` SIGTERM the daemon and take down every
+/// other session it hosts, so the resolver must return None and say daemon_hosted instead.
+///
+/// The tail rules for those rows are NOT the fd rules, because the daemon never closes the fd
+/// (observed still held 20+ minutes past completion), so the fd carries no liveness at all:
+///   MidTurn or unreadable -> Working, AwaitingApproval -> NeedsInput,
+///   Complete -> Done (Idle only while a client is attached; covered by the next test).
+#[test]
+fn resolver_withholds_the_daemon_pid_and_flags_the_row_daemon_hosted() {
+    let cases = [
+        ("rollout_midturn.jsonl", Status::Working),
+        ("rollout_complete.jsonl", Status::Done),
+        (
+            "rollout_approval.jsonl",
+            Status::NeedsInput {
+                reason: Some("awaiting approval".to_string()),
+            },
+        ),
+    ];
+    for (fixture, expected) in cases {
+        let path = common::fixture_path(fixture);
+        let mut resolver = StatusResolver::new();
+        assert_eq!(
+            resolver.resolve(&path, &open_with_daemon(&path), false),
+            (expected.clone(), None, true),
+            "{fixture} under a daemon-held fd"
+        );
+        // The pure entry point sees the same status; only the pid/host answer is new.
+        assert_eq!(
+            resolve_status(&path, &open_with_daemon(&path), false),
+            expected,
+            "{fixture} via resolve_status"
+        );
+    }
+}
+
+/// The regression this table exists for: a finished background task must reach Done. Under the
+/// fd rule a daemon-hosted row sat at Idle forever, because the daemon holds every hosted
+/// thread's rollout open indefinitely, so "working" and "finished" became indistinguishable for
+/// exactly the sessions the viewer spawns. A test that only checked the non-daemon rules would
+/// pass with the daemon branch deleted; this one fails.
+#[test]
+fn a_finished_daemon_hosted_row_reaches_done_even_though_the_fd_is_still_open() {
+    let path = common::fixture_path("rollout_complete.jsonl");
+    let mut resolver = StatusResolver::new();
+    assert_eq!(
+        resolver.resolve(&path, &open_with_daemon(&path), false),
+        (Status::Done, None, true)
+    );
+    // The same file under the session's OWN process is still Idle: that fd does mean "alive".
+    assert_eq!(
+        resolver.resolve(&path, &open_with(&path), false),
+        (Status::Idle, Some(4242), false)
+    );
+}
+
+/// The refinement: a human sitting in the thread (a `codex resume --remote ... <id>` client)
+/// must not be reported as finished. Only the Complete case moves; a live turn stays Working
+/// and an approval stays NeedsInput whether or not somebody is watching.
+#[test]
+fn an_attached_client_holds_a_daemon_hosted_row_at_idle_instead_of_done() {
+    let complete = common::fixture_path("rollout_complete.jsonl");
+    let mut resolver = StatusResolver::new();
+    assert_eq!(
+        resolver.resolve(&complete, &open_with_daemon(&complete), true),
+        (Status::Idle, None, true)
+    );
+
+    let midturn = common::fixture_path("rollout_midturn.jsonl");
+    let approval = common::fixture_path("rollout_approval.jsonl");
+    assert_eq!(
+        resolver.resolve(&midturn, &open_with_daemon(&midturn), true),
+        (Status::Working, None, true)
+    );
+    assert_eq!(
+        resolver.resolve(&approval, &open_with_daemon(&approval), true),
+        (
+            Status::NeedsInput {
+                reason: Some("awaiting approval".to_string())
+            },
+            None,
+            true
+        )
+    );
+}
+
+/// The spawn race is preserved on the daemon path: the registry row can appear before the
+/// rollout has any parsable tail, and that must read Working, not Error or Done.
+#[test]
+fn a_daemon_hosted_row_with_no_readable_tail_is_working() {
+    let path = PathBuf::from("/nonexistent/rollout-not-written-yet.jsonl");
+    let mut resolver = StatusResolver::new();
+    for attached in [false, true] {
+        assert_eq!(
+            resolver.resolve(&path, &open_with_daemon(&path), attached),
+            (Status::Working, None, true),
+            "attached={attached}"
+        );
+    }
+}
+
+/// Rows the daemon does not host keep TODAY's rules exactly, and `attached` never touches them:
+/// their fd is their own process's, so it is still the liveness signal.
+#[test]
+fn the_attached_flag_changes_nothing_for_a_row_the_daemon_does_not_host() {
+    let complete = common::fixture_path("rollout_complete.jsonl");
+    let midturn = common::fixture_path("rollout_midturn.jsonl");
+    let approval = common::fixture_path("rollout_approval.jsonl");
+    let awaiting = Status::NeedsInput {
+        reason: Some("awaiting approval".to_string()),
+    };
+    let cases = [
+        (&complete, true, Status::Idle),
+        (&complete, false, Status::Done),
+        (&midturn, true, Status::Working),
+        (&midturn, false, Status::Error),
+        (&approval, true, awaiting.clone()),
+        (&approval, false, Status::Error),
+    ];
+    for (path, open, expected) in cases {
+        let held = if open { open_with(path) } else { empty_map() };
+        for attached in [false, true] {
+            assert_eq!(
+                resolve_status(path, &held, attached),
+                expected,
+                "{path:?} open={open} attached={attached}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resolver_reports_no_pid_and_no_daemon_host_when_the_fd_is_closed() {
+    let path = common::fixture_path("rollout_complete.jsonl");
+    let mut resolver = StatusResolver::new();
+    assert_eq!(
+        resolver.resolve(&path, &empty_map(), false),
+        (Status::Done, None, false)
+    );
 }

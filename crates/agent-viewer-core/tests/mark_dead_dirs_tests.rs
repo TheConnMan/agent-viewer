@@ -24,6 +24,7 @@ fn sess(cwd: PathBuf, companion: bool) -> Session {
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 

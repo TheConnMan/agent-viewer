@@ -31,6 +31,7 @@ fn claude_session(
         pid,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 
@@ -52,6 +53,7 @@ fn opencode_session(cwd: PathBuf) -> Session {
         pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
+        daemon_hosted: false,
     }
 }
 
