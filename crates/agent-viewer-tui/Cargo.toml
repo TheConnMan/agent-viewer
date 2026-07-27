@@ -23,6 +23,7 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 resvg = "0.45"
 termina = "0.3.3"
 tui-term = "0.3.4"
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 
 [dev-dependencies]

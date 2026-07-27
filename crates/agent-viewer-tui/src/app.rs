@@ -2,6 +2,8 @@ use agent_viewer_core::group::project_root;
 use agent_viewer_core::{BackendKind, PrRef, Session, Status};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // The composer, DetachTracker, and command-scan helpers moved to `crate::composer`; re-export
 // them here so `agent_viewer_tui::app::{Composer, DetachTracker, subdir_names, file_stems}`
@@ -709,51 +711,115 @@ fn section_of(status: &Status) -> Section {
     }
 }
 
-/// Truncate `s` to at most `width` chars (char-, not byte-bounded). NOTE: at `width == 0`
-/// this yields the EMPTY string — deliberately unlike `ui::truncate`, which returns the full
-/// string at width 0. The row-layout math here needs "no room -> show nothing"; do not merge
-/// the two helpers without preserving each caller's zero-width behavior.
+/// Truncate `s` to at most `width` terminal columns. At `width == 0` this yields the empty
+/// string, unlike `ui::truncate`, which treats zero as unconstrained.
 fn truncate_to(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
+    if UnicodeWidthStr::width(s) <= width {
         return s.to_string();
     }
-    s.chars().take(width).collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used + grapheme_width > width {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme_width;
+    }
+    out
 }
 
 /// Width math for one session row, kept pure so it is unit-testable.
 ///
-/// The row is `<glyph><mark><name>[<2sp><detail>]<pad><right cluster>`,
-/// flush-left (glyph in column 0). `mark_width` is the measured display width of the brand
-/// mark (some marks are ambiguous-width — the caller measures, never assumes 1). `right_len`
-/// is the measured width of the whole right-aligned cluster (`<pr> <status word> <time>`),
-/// reserved FIRST plus a one-space minimum gap, so a long title truncates instead of
-/// clipping the cluster off the line. `detail` is the left muted summary; any room left
-/// after the name (and a two-space gap) goes to a truncated `detail`. Returns the visible
-/// name, the visible detail, and the pad width.
+/// The row is
+/// `<glyph><mark><title><space><status><2sp><summary><space><pr><pad><elapsed>`.
+/// The title keeps the supplied shared width whenever that column fits. Narrow rows may
+/// reduce it enough to retain complete secondary fields. The PR badge is always atomic.
+#[allow(clippy::too_many_arguments)]
 pub fn row_layout(
     width: usize,
     mark_width: usize,
-    name: &str,
-    detail: &str,
-    right_len: usize,
-) -> (String, String, usize) {
-    // Fixed left decorations before the name: glyph + mark (flush, no indent).
+    title: &str,
+    title_width: usize,
+    status: &str,
+    pr: &str,
+    summary: &str,
+    elapsed_width: usize,
+) -> (String, String, String, String, usize) {
+    // Fixed left decorations before the title: glyph + mark.
     let left_fixed = 1 + mark_width;
-    // Reserve the right cluster plus at least one space of separation.
-    let content = width.saturating_sub(left_fixed + right_len + 1);
+    let status_width = UnicodeWidthStr::width(status);
+    let pr_width = UnicodeWidthStr::width(pr);
+    let summary_min_width = summary
+        .graphemes(true)
+        .next()
+        .map(UnicodeWidthStr::width)
+        .unwrap_or(0);
+    // One space separates title from status and one always separates elapsed when it fits.
+    let required_without_secondary = left_fixed + 1 + status_width + 1 + elapsed_width;
+    let unconstrained_title_capacity =
+        title_width.min(width.saturating_sub(required_without_secondary));
 
-    let name_out = truncate_to(name, content);
-    let name_len = name_out.chars().count();
-
-    let mut detail_out = String::new();
-    if !detail.is_empty() && content > name_len + 2 {
-        detail_out = truncate_to(detail, content - name_len - 2);
+    // Keep the full shared column whenever it fits. If the viewport itself forces that
+    // column narrower, also reserve a complete PR and one summary grapheme where possible.
+    let mut title_capacity = unconstrained_title_capacity;
+    if !pr.is_empty() || !summary.is_empty() {
+        let available_for_secondary = width.saturating_sub(required_without_secondary);
+        let pr_minimum = usize::from(!pr.is_empty()) * (2 + pr_width);
+        let summary_minimum = usize::from(!summary.is_empty()) * (2 + summary_min_width);
+        let combined_minimum =
+            2 + pr_width + usize::from(!pr.is_empty() && !summary.is_empty()) + summary_min_width;
+        let minimum_secondary =
+            if !pr.is_empty() && !summary.is_empty() && combined_minimum <= available_for_secondary
+            {
+                combined_minimum
+            } else if !pr.is_empty() && pr_minimum <= available_for_secondary {
+                pr_minimum
+            } else if !summary.is_empty() && summary_minimum <= available_for_secondary {
+                summary_minimum
+            } else {
+                0
+            };
+        title_capacity = title_capacity
+            .min(width.saturating_sub(required_without_secondary + minimum_secondary));
     }
-    let detail_len = detail_out.chars().count();
 
-    let used = left_fixed + name_len + if detail_len > 0 { 2 + detail_len } else { 0 };
-    let pad = width.saturating_sub(used + right_len).max(1);
-    (name_out, detail_out, pad)
+    let mut title_out = truncate_to(title, title_capacity);
+    title_out.push_str(
+        &" ".repeat(title_capacity.saturating_sub(UnicodeWidthStr::width(title_out.as_str()))),
+    );
+
+    let mut secondary_capacity = width.saturating_sub(required_without_secondary + title_capacity);
+    let mut pr_out = String::new();
+    let mut summary_out = String::new();
+    if secondary_capacity >= 2 {
+        secondary_capacity -= 2;
+        if !pr.is_empty() && pr_width <= secondary_capacity {
+            pr_out = pr.to_string();
+            secondary_capacity -= pr_width;
+        }
+        if !summary.is_empty() {
+            if !pr_out.is_empty() {
+                secondary_capacity = secondary_capacity.saturating_sub(1);
+            }
+            summary_out = truncate_to(summary, secondary_capacity);
+        }
+    }
+
+    let rendered_secondary_gap = usize::from(!pr_out.is_empty() || !summary_out.is_empty()) * 2;
+    let pr_summary_gap = usize::from(!pr_out.is_empty() && !summary_out.is_empty());
+    let used = left_fixed
+        + title_capacity
+        + 1
+        + status_width
+        + rendered_secondary_gap
+        + UnicodeWidthStr::width(pr_out.as_str())
+        + pr_summary_gap
+        + UnicodeWidthStr::width(summary_out.as_str())
+        + elapsed_width;
+    let pad = width.saturating_sub(used);
+    (title_out, status.to_string(), pr_out, summary_out, pad)
 }
 
 /// How a typed codex approval reply maps to a decision. Approve auto-sends the stable `y`
