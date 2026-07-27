@@ -217,6 +217,7 @@ struct Ui {
     db: Option<ViewerDb>,
     /// Inline spawn composer (persistent on the list view).
     composer: Composer,
+    themes: ui::ThemeState,
     /// Per-PTY left-arrow detach gate, keyed like `attached`. Reset only when a new PTY is
     /// spawned; a re-attach reuses the previous pending count (the child's input line may
     /// still hold text). Pruned alongside its PTY.
@@ -351,7 +352,8 @@ fn capture_terminal_palette() -> Option<TerminalPalette> {
 
 fn main() -> io::Result<()> {
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
-    ui::set_glyph_marks(std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1"));
+    let glyph_marks = std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1");
+    ui::set_glyph_marks(glyph_marks);
 
     let workspace = std::env::current_dir().unwrap_or_default();
     let terminal_palette = capture_terminal_palette();
@@ -370,6 +372,12 @@ fn main() -> io::Result<()> {
     let opencode_runtime = OpencodeRuntime::new();
     let mut list_backends = all_backends_with_opencode(opencode_runtime.clone());
     let db = ViewerDb::open_default().ok();
+    let persisted_theme = db.as_ref().and_then(ui::theme::persisted_theme);
+    let (themes, theme_notices) = ui::ThemeState::load(
+        ui::glyph_marks(),
+        persisted_theme.as_deref(),
+        &ui::theme::theme_directory(),
+    );
 
     // Startup refresh BEFORE entering the alt screen so the first paint is not empty. If
     // every backend fails to list, print the errors to stderr and exit without a UI.
@@ -390,6 +398,9 @@ fn main() -> io::Result<()> {
     let mut startup_notice = NoticeState::new();
     if !notice.is_empty() {
         startup_notice.set(notice, now_ms());
+    }
+    if !theme_notices.is_empty() {
+        startup_notice.set(theme_notices.join(" · "), now_ms());
     }
     // Build the app, then seed the collapsed set from the DB so a group the user collapsed
     // last run renders collapsed from the first paint.
@@ -438,6 +449,7 @@ fn main() -> io::Result<()> {
         notice: startup_notice,
         db,
         composer: Composer::new(),
+        themes,
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
@@ -574,6 +586,7 @@ fn run(
                     pr_status: &ui.pr_status,
                     logos: ui.logos.as_ref(),
                     list_hit: &ui.list_hit,
+                    themes: &ui.themes,
                 },
             );
         })?;
@@ -604,6 +617,9 @@ fn run(
 /// live spawn bloom. The attach view owns the screen, so it never fast-ticks.
 fn wants_fast_ticks(ui: &Ui) -> bool {
     if matches!(ui.mode, Mode::Attached) {
+        return false;
+    }
+    if !ui.themes.active().animation {
         return false;
     }
     if !ui.pulses.is_empty() {
@@ -643,6 +659,9 @@ fn apply_snapshot(refresher: &Refresher, ui: &mut Ui) {
     let Some((mut sessions, notice, _ok)) = refresher.latest() else {
         return;
     };
+    if let Some(notice) = ui.themes.reload_active() {
+        ui.set_notice(notice);
+    }
     if let Some(db) = &ui.db {
         // Newly-resolved viewer spawns kick off a one-shot bloom on their fresh row.
         let resolved = overlay(db, &mut sessions);
@@ -898,6 +917,7 @@ mod tests {
             notice: NoticeState::new(),
             db: None,
             composer: Composer::new(),
+            themes: ui::ThemeState::default(),
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
