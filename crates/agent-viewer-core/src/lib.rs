@@ -10,8 +10,8 @@ pub mod spawn;
 pub mod state;
 
 pub use backend::{
-    Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status, StatusEvent,
-    StatusSink, Subscription,
+    Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, SpawnResult, Status,
+    StatusEvent, StatusSink, Subscription,
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use pr_status::PrBadgeColor;
