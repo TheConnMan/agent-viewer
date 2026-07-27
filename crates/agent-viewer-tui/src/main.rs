@@ -1,13 +1,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_viewer_core::backend::{Backend, BackendKind, all_backends};
-use agent_viewer_core::pty::PtySession;
+use agent_viewer_core::pty::{PtySession, TerminalPalette};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{SpawnRecord, ViewerDb, apply_viewer_state, match_spawn};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
@@ -23,6 +23,8 @@ use crossterm::event::{
     Event, KeyEventKind,
 };
 use crossterm::execute;
+use termina::escape::osc::{ColorOrQuery, DynamicColorNumber, Osc};
+use termina::{Event as TerminaEvent, PlatformTerminal, Terminal as _};
 
 mod actions;
 mod keys;
@@ -42,6 +44,7 @@ const FAST_POLL: Duration = Duration::from_millis(120);
 const PULSE_MS: i64 = 400;
 /// Abandoned spawn records (no matching session after this long) are deleted.
 const SPAWN_ABANDON_MS: i64 = 600_000;
+const PALETTE_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
 
 type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
@@ -181,6 +184,8 @@ struct Ui {
     /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
     /// on quit — conversation state persists in each backend's own store.
     attached: HashMap<Key, PtySession>,
+    /// The host terminal colors captured once before alternate screen entry.
+    terminal_palette: Option<TerminalPalette>,
     /// The focused session while in `Mode::Attached` (input target + header snapshot).
     focused: Option<Key>,
     focused_session: Option<Session>,
@@ -216,9 +221,80 @@ impl Ui {
     }
 }
 
+fn is_palette_response(event: &TerminaEvent) -> bool {
+    let TerminaEvent::Osc(Osc::ChangeDynamicColors(slot, colors)) = event else {
+        return false;
+    };
+    matches!(
+        slot,
+        DynamicColorNumber::TextForegroundColor | DynamicColorNumber::TextBackgroundColor
+    ) && matches!(colors.as_slice(), [ColorOrQuery::Color(_)])
+}
+
+fn capture_terminal_palette() -> Option<TerminalPalette> {
+    let mut terminal = PlatformTerminal::new().ok()?;
+    if terminal.enter_raw_mode().is_err() {
+        let _ = terminal.enter_cooked_mode();
+        return None;
+    }
+    let captured = (|| -> io::Result<Option<TerminalPalette>> {
+        write!(
+            terminal,
+            "{}{}",
+            Osc::ChangeDynamicColors(
+                DynamicColorNumber::TextForegroundColor,
+                vec![ColorOrQuery::Query],
+            ),
+            Osc::ChangeDynamicColors(
+                DynamicColorNumber::TextBackgroundColor,
+                vec![ColorOrQuery::Query],
+            ),
+        )?;
+        terminal.flush()?;
+
+        let deadline = Instant::now() + PALETTE_QUERY_TIMEOUT;
+        let mut foreground = None;
+        let mut background = None;
+        while foreground.is_none() || background.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() || !terminal.poll(is_palette_response, Some(remaining))? {
+                break;
+            }
+            let TerminaEvent::Osc(Osc::ChangeDynamicColors(slot, colors)) =
+                terminal.read(is_palette_response)?
+            else {
+                continue;
+            };
+            let [ColorOrQuery::Color(color)] = colors.as_slice() else {
+                continue;
+            };
+            let rgb = [color.red, color.green, color.blue];
+            match slot {
+                DynamicColorNumber::TextForegroundColor => foreground = Some(rgb),
+                DynamicColorNumber::TextBackgroundColor => background = Some(rgb),
+                _ => {}
+            }
+        }
+
+        Ok(match (foreground, background) {
+            (Some(foreground), Some(background)) => Some(TerminalPalette {
+                foreground,
+                background,
+            }),
+            _ => None,
+        })
+    })();
+    let _ = terminal.enter_cooked_mode();
+    captured.ok().flatten()
+}
+
 fn main() -> io::Result<()> {
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
     ui::set_glyph_marks(std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1"));
+
+    let terminal_palette = capture_terminal_palette();
 
     // Inline brand-logo images are always attempted. The probe queries the terminal (stdin
     // raw-mode toggle) so it runs BEFORE ratatui::init() takes the alt screen; on a non-tty or
@@ -310,6 +386,7 @@ fn main() -> io::Result<()> {
         pending_spawn: None,
         pending_reply: None,
         attached: HashMap::new(),
+        terminal_palette,
         focused: None,
         focused_session: None,
         focused_exited: false,
@@ -782,6 +859,7 @@ mod tests {
             list_hit: RefCell::new(ListHit::default()),
             mouse_capture: true,
             mouse_press: None,
+            terminal_palette: None,
         }
     }
 
