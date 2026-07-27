@@ -123,7 +123,10 @@ impl ViewerDb {
     /// tests: temp path.
     pub fn open(path: &std::path::Path) -> Result<ViewerDb> {
         if let Some(parent) = path.parent() {
+            use std::os::unix::fs::PermissionsExt;
+
             std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let db = match ViewerDb::try_open(path) {
             Ok(db) => db,
@@ -417,6 +420,44 @@ impl ViewerDb {
                 rusqlite::params!["opencode.server_url"],
             )?;
             Ok(())
+        }
+    }
+
+    pub fn opencode_server_secret(&self) -> Result<String> {
+        use base64::Engine;
+        use std::io::Read;
+
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let existing = transaction.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params!["opencode.server_password"],
+            |row| row.get::<_, String>(0),
+        );
+        match existing {
+            Ok(secret) => {
+                transaction.commit()?;
+                Ok(secret)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let mut random = [0u8; 32];
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+                let candidate = base64::engine::general_purpose::STANDARD.encode(random);
+                transaction.execute(
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+                    rusqlite::params!["opencode.server_password", candidate],
+                )?;
+                let secret = transaction.query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    rusqlite::params!["opencode.server_password"],
+                    |row| row.get::<_, String>(0),
+                )?;
+                transaction.commit()?;
+                Ok(secret)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 

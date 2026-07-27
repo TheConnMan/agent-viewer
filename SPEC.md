@@ -51,60 +51,54 @@ only. For each id, the latest valid entry with a nonempty name wins. Use the SQL
 the index is missing, unreadable, malformed, invalid, or has no matching entry. The index never
 supplies rows, status, or any field other than the name.
 
-## Enumeration — opencode, and the run-mode companion rule
+## Enumeration and runtime: opencode
 
-opencode keeps its own registry at `~/.local/share/opencode/opencode.db`. Same discipline as
-the Codex registry: open read-only, never write it, and treat a missing file as a quiet empty
-backend rather than an error.
+The primary OpenCode authority is a secured loopback server. The viewer probes fixed candidates
+`127.0.0.1:4096`, then `127.0.0.1:4097`. It never stops or restarts a server. Spawn alone may
+start `opencode serve --hostname 127.0.0.1 --port <port>`, always from the user home directory.
+The child inherits the normal environment and overrides only `OPENCODE_SERVER_USERNAME` and
+`OPENCODE_SERVER_PASSWORD`.
 
-- Table `session`, load-bearing columns: `id`, `parent_id`, `directory`, `title`,
-  `time_created`, `time_updated`, `time_archived`, `permission`. Order by `time_updated DESC`.
-  The live table carries ~27 drizzle-managed columns; the reader depends only on these eight,
-  and the test fixture enforces that by construction.
-- `time_archived IS NOT NULL` is the hidden set. Grouping key = `directory`.
-- opencode exposes no per-session process signal, so status is a three-tier recency heuristic
-  over one `live_opencode_proc()` check per `list()` call, never `NeedsInput` or `Error`.
+Credentials use nonempty environment overrides when supplied, otherwise a generated stable
+secret in viewer SQLite. The viewer stores no OpenCode jobs there. `~/.local/share/opencode/opencode.db`
+is opened read only as compatibility enumeration when no secure server is available.
+That fallback retains parent and run mode companion classification through the stored `permission`
+field.
 
-**Companions.** A session is a companion when `parent_id` is non-NULL (a sub-session of
-another session) **or** when it was started as a one-shot `opencode run` rather than by a
-human at the TUI. The second half is the opencode analogue of the Codex `exec`/subagent rule
-above: a run fired off by a script (an `/implement` review pass, a CI job) is a step inside
-somebody else's job, not a fleet member anyone would attach to. `parent_id` alone does not
-catch it, because `opencode run` creates a top-level session with no parent.
+Before any credential bearing request, a fresh stream is connected without writing. The viewer
+verifies the listener owner is the pinned process, sends unauthenticated `GET /global/health`
+with keep alive, and requires `401` on a reusable connection. It finds the accepted connection
+inode for that exact local ephemeral tuple and verifies pid, start time, effective uid, exact
+argv, listener inode, and runtime generation. It revalidates after the test hook, then writes
+the authorized request with close on that same `TcpStream`; it never reconnects for auth. This
+same stream requirement is load bearing because Linux `TCP_DEFER_ACCEPT` delayed acceptance
+until the initial health write.
 
-The discriminator is the `session.permission` column. `opencode run` denies the interactive
-`question` tool when it creates the session; the TUI writes no session override at all.
-Verified live on this box 2026-07-26, both on opencode 1.17.20, which rules out a version
-confound in the stored history (every 1.17.20 row observed had the column set, every 1.17.17
-row had it empty):
+The pin contains pid, start time, listener inode, effective uid, and exact argv. Runtime state
+contains a generation, pin, healthy state, and managed ids. A short state lock protects state;
+a separate startup mutex serializes starts. An occupied listener that returns `200` to unauthenticated
+health is insecure and rejected, never stopped or restarted. Spawn may use `4097` if it is free.
 
-```
-$ opencode run --title "AV probe run mode" "..."     -> permission =
-    [{"permission":"question","pattern":"*","action":"deny"},
-     {"permission":"plan_enter","pattern":"*","action":"deny"},
-     {"permission":"plan_exit","pattern":"*","action":"deny"}]
+The HTTP client is bounded HTTP/1.1 over `TcpStream`, with strict content framing, bodyless
+`204` handling, no redirects, and bounded headers, body, and timeouts.
 
-$ opencode  (TUI, driven through a pty, one message sent)  -> permission = NULL
-```
+Global listing is `GET /experimental/session?limit=10000&archived=true`, following
+`X-Next-Cursor`. Repeated or malformed cursors, or a full page without a cursor, are errors.
+The only managed marker is the exact permission rule
+`{"permission":"agent-viewer.background","pattern":"*","action":"allow"}`. Metadata is
+not a valid marker.
 
-Corroborated in the shipped binary: that array literal is constructed inside the `run`
-command handler, immediately after its "You must provide a message or a command" and
-"--fork requires --continue or --session" validations.
+Only exact marked rows are managed. Only they receive `daemon_hosted`, live status, pending input,
+managed capabilities, and server mutations. The managed id cache includes archived marked rows
+so archive and unarchive work, but archived marked rows are not status polled. Status, permission,
+and question are fetched once per unique active managed directory. A failure affects only that
+directory's rows, including external rows, which become `Unknown`. Otherwise external server
+enumerated rows use compatibility `Idle` status.
 
-Match **semantically** — a `question` entry with `action: "deny"` anywhere in the array — not
-by string equality. The stored key order is not the source order, and the github-action path
-writes the `question` deny without the `plan_enter`/`plan_exit` pair. Anything that is not a
-JSON array of objects parses to "interactive", the safe direction: a shown row one keypress
-from hidden beats a hidden row the user cannot find.
-
-Two existing behaviors keep this from swallowing anything: sessions the viewer itself spawned
-are pinned by the viewer-state overlay, which clears `companion`, and `Ctrl+F` searches hidden
-rows, so a run-mode session is always reachable by name.
-
-Selecting `permission` makes the reader depend on a column older opencode schemas lack. That
-is deliberate and matches how the Codex reader depends on its columns directly; a
-`backend.list()` error is already contained to a footer notice over the previous snapshot, so
-the failure mode on an old schema is a visible notice, not a crash.
+Server mutations apply only to exact managed rows. Managed sessions attach through the authenticated
+server with `opencode attach http://<endpoint> -s <session_id>` and username and password environment
+values. External rows use `opencode -s <session_id>`. External deletion remains local
+`opencode session delete <id>`. `read_last_message` remains a core live proof.
 
 ## Enumeration — claude, and the nested `claude -p` companion rule
 

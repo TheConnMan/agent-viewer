@@ -229,8 +229,7 @@ pub trait Backend: Send {
     /// Sessions are returned recency-sorted (updated_at_ms DESC).
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
     /// Returns the direct child PID when the viewer forked it and the exact backend session
-    /// identity when the spawn protocol provides one. The TUI records a PID in the viewer DB
-    /// for spawn pinning and stop, while an exact session id can select the new row directly.
+    /// identity when the spawn protocol provides one.
     /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
     /// None uses the backend's own default.
     fn spawn(
@@ -252,7 +251,6 @@ pub trait Backend: Send {
         let _ = id;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
-    /// SIGTERM the live session process (session.pid required; runtime-gated).
     fn stop(&self, session: &Session) -> crate::error::Result<()> {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))

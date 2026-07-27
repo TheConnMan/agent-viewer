@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 struct RecordedRequest {
+    connection_id: usize,
     method: String,
     target: String,
     headers: BTreeMap<String, String>,
@@ -42,6 +43,7 @@ struct ScriptedResponse {
     delay: Duration,
     headers: Vec<(String, String)>,
     framing: ResponseFraming,
+    close_connection: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +62,7 @@ impl ScriptedResponse {
             delay: Duration::ZERO,
             headers: Vec::new(),
             framing: ResponseFraming::ContentLength,
+            close_connection: true,
         }
     }
 
@@ -71,6 +74,7 @@ impl ScriptedResponse {
             delay: Duration::ZERO,
             headers: Vec::new(),
             framing: ResponseFraming::ContentLength,
+            close_connection: true,
         }
     }
 
@@ -90,6 +94,11 @@ impl ScriptedResponse {
 
     fn without_framing(mut self) -> Self {
         self.framing = ResponseFraming::None;
+        self
+    }
+
+    fn keep_alive(mut self) -> Self {
+        self.close_connection = false;
         self
     }
 }
@@ -120,6 +129,63 @@ impl ScriptedServer {
         .expect("bind verified scripted server")
     }
 
+    fn spawn_verified_deferred(responses: Vec<ScriptedResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind deferred scripted server");
+        enable_deferred_accept(&listener).expect("enable deferred accept");
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let process = Some(Arc::new(ProcFixture::new_in(
+            new_proc_root(),
+            51002,
+            &listener,
+            addr,
+        )));
+        let process_for_thread = process.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let mut responses: VecDeque<_> = responses.into();
+        let thread = std::thread::spawn(move || {
+            let mut connection_id = 0;
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        connection_id += 1;
+                        if let Some(process) = &process_for_thread {
+                            process.record_connection(&stream);
+                        }
+                        while let Ok(request) = read_http_request(&mut stream, connection_id) {
+                            requests_for_thread.lock().unwrap().push(request);
+                            let response = responses.pop_front().unwrap_or_else(|| {
+                                ScriptedResponse::raw(500, "text/plain", "unexpected request")
+                            });
+                            if !response.delay.is_zero() {
+                                std::thread::sleep(response.delay);
+                            }
+                            let close = response.close_connection;
+                            let _ = write_http_response(&mut stream, &response);
+                            if close {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            requests,
+            stop,
+            thread: Some(thread),
+            process,
+        }
+    }
+
     fn spawn_on_verified_in(
         addr: SocketAddr,
         responses: Vec<ScriptedResponse>,
@@ -127,6 +193,61 @@ impl ScriptedServer {
         pid: u32,
     ) -> io::Result<Self> {
         Self::spawn_on_with_process(addr, responses, Some((proc_root, pid)))
+    }
+
+    fn spawn_on_verified_routed_in(
+        addr: SocketAddr,
+        proc_root: Arc<tempfile::TempDir>,
+        pid: u32,
+        route: impl Fn(&RecordedRequest) -> ScriptedResponse + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let process = Some(Arc::new(ProcFixture::new_in(
+            proc_root, pid, &listener, addr,
+        )));
+        let process_for_thread = process.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut connection_id = 0;
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        connection_id += 1;
+                        if let Some(process) = &process_for_thread {
+                            process.record_connection(&stream);
+                        }
+                        while let Ok(request) = read_http_request(&mut stream, connection_id) {
+                            let response = route(&request);
+                            requests_for_thread.lock().unwrap().push(request);
+                            if !response.delay.is_zero() {
+                                std::thread::sleep(response.delay);
+                            }
+                            let close = response.close_connection;
+                            let _ = write_http_response(&mut stream, &response);
+                            if close {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            addr,
+            requests,
+            stop,
+            thread: Some(thread),
+            process,
+        })
     }
 
     fn spawn_on_with_process(
@@ -146,23 +267,28 @@ impl ScriptedServer {
         let stop_for_thread = Arc::clone(&stop);
         let mut responses: VecDeque<_> = responses.into();
         let thread = std::thread::spawn(move || {
+            let mut connection_id = 0;
             while !stop_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        connection_id += 1;
                         if let Some(process) = &process_for_thread {
                             process.record_connection(&stream);
                         }
-                        let request = read_http_request(&mut stream);
-                        if let Ok(request) = request {
+                        while let Ok(request) = read_http_request(&mut stream, connection_id) {
                             requests_for_thread.lock().unwrap().push(request);
+                            let response = responses.pop_front().unwrap_or_else(|| {
+                                ScriptedResponse::raw(500, "text/plain", "unexpected request")
+                            });
+                            if !response.delay.is_zero() {
+                                std::thread::sleep(response.delay);
+                            }
+                            let close = response.close_connection;
+                            let _ = write_http_response(&mut stream, &response);
+                            if close {
+                                break;
+                            }
                         }
-                        let response = responses.pop_front().unwrap_or_else(|| {
-                            ScriptedResponse::raw(500, "text/plain", "unexpected request")
-                        });
-                        if !response.delay.is_zero() {
-                            std::thread::sleep(response.delay);
-                        }
-                        let _ = write_http_response(&mut stream, &response);
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -318,17 +444,37 @@ fn socket_inode(fd: i32) -> u64 {
         .ino()
 }
 
+fn enable_deferred_accept(listener: &TcpListener) -> io::Result<()> {
+    let seconds: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            (&seconds as *const libc::c_int).cast(),
+            std::mem::size_of_val(&seconds) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 impl Drop for ScriptedServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
+        if let Ok(mut stream) = TcpStream::connect(self.addr) {
+            let _ = stream.write_all(b"GET /shutdown HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
+fn read_http_request(stream: &mut TcpStream, connection_id: usize) -> io::Result<RecordedRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -369,6 +515,7 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<RecordedRequest> {
         bytes.extend_from_slice(&chunk[..read]);
     }
     Ok(RecordedRequest {
+        connection_id,
         method,
         target,
         headers,
@@ -404,7 +551,12 @@ fn write_http_response(stream: &mut TcpStream, response: &ScriptedResponse) -> i
         }
         ResponseFraming::None => {}
     }
-    write!(stream, "Connection: close\r\n\r\n")?;
+    let connection = if response.close_connection {
+        "close"
+    } else {
+        "keep-alive"
+    };
+    write!(stream, "Connection: {connection}\r\n\r\n")?;
     match response.framing {
         ResponseFraming::Chunked => {
             write!(
@@ -490,11 +642,32 @@ fn unauthorized_health() -> ScriptedResponse {
     ScriptedResponse::json(401, json!({"error": "Unauthorized"}))
 }
 
+fn secure_responses(actual: Vec<ScriptedResponse>) -> Vec<ScriptedResponse> {
+    actual
+        .into_iter()
+        .flat_map(|response| [unauthorized_health().keep_alive(), response])
+        .collect()
+}
+
+fn assert_test_secret_pairs(requests: &[RecordedRequest]) {
+    assert_eq!(requests.len() % 2, 0);
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(b"agent-viewer:test-secret")
+    );
+    for pair in requests.chunks_exact(2) {
+        assert_eq!(pair[0].connection_id, pair[1].connection_id);
+        assert_eq!(pair[0].method, "GET");
+        assert_eq!(pair[0].target, "/global/health");
+        assert!(!pair[0].headers.contains_key("authorization"));
+        assert!(pair[0].body.is_empty());
+        assert_eq!(pair[1].headers.get("authorization"), Some(&expected));
+    }
+}
+
 fn managed_permission() -> Value {
     json!([
-        {"permission": "question", "pattern": "*", "action": "deny"},
-        {"permission": "plan_enter", "pattern": "*", "action": "deny"},
-        {"permission": "plan_exit", "pattern": "*", "action": "deny"}
+        {"permission": "agent-viewer.background", "pattern": "*", "action": "allow"}
     ])
 }
 
@@ -562,7 +735,10 @@ fn opencode_runtime_reuses_healthy_primary_before_backup() {
             .iter()
             .map(|request| request.target.as_str())
             .collect::<Vec<_>>(),
-        vec!["/global/health", "/experimental/session?limit=10000"]
+        vec![
+            "/global/health",
+            "/experimental/session?limit=10000&archived=true",
+        ]
     );
     assert!(
         backup.requests().is_empty(),
@@ -863,25 +1039,30 @@ fn opencode_missing_db_lists_empty() {
 fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
     let mut sessions = common::fixture_json("opencode/session_list_with_archived_row.json");
     let rows = sessions.as_array_mut().unwrap();
+    let archived_id = rows[0]["id"].as_str().unwrap().to_string();
+    let busy_id = rows[1]["id"].as_str().unwrap().to_string();
+    let run_mode_id = rows[2]["id"].as_str().unwrap().to_string();
+    let permission_id = rows[3]["id"].as_str().unwrap().to_string();
+    let question_id = rows[4]["id"].as_str().unwrap().to_string();
+    let external_ids = rows[5..]
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
     rows[0]["permission"] = Value::Null;
     let parent_id = rows[0]["id"].clone();
     rows[1]["parentID"] = parent_id;
-    rows[1]["permission"] = Value::Null;
-    rows[3]["permission"] = Value::Null;
-    rows[4]["permission"] = Value::Null;
-    rows[5]["permission"] = Value::Null;
-    for row in &mut rows[1..5] {
-        row["permission"] = managed_permission();
+    for index in [1, 3, 4] {
+        rows[index]["permission"] = managed_permission();
+    }
+    for row in &mut rows[5..] {
+        row["permission"] = Value::Null;
     }
     let directory = rows[1]["directory"].as_str().unwrap().to_string();
-    let permission_id = rows[3]["id"].as_str().unwrap().to_string();
-    let question_id = rows[4]["id"].as_str().unwrap().to_string();
-    let external_id = rows[5]["id"].as_str().unwrap().to_string();
     let mut status = common::fixture_json("opencode/session_status_idle_busy_retry.json");
     status
         .as_object_mut()
         .unwrap()
-        .insert(external_id.clone(), json!({"type": "busy"}));
+        .insert(external_ids[0].clone(), json!({"type": "busy"}));
     let primary = ScriptedServer::spawn(vec![
         healthy_response(),
         ScriptedResponse::json(200, sessions),
@@ -892,8 +1073,7 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
                 "id": "per_1",
                 "sessionID": permission_id,
                 "permission": "bash",
-                "patterns": ["git status", "git diff"],
-                "metadata": {"ignored": "not a reason"}
+                "patterns": ["git status", "git diff"]
             }]),
         ),
         ScriptedResponse::json(
@@ -933,20 +1113,31 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
         },
         "server rows remain newest first"
     );
-    assert_eq!(listed[0].status, Status::Idle);
-    assert!(listed[0].hidden);
-    assert_eq!(listed[1].status, Status::Working);
-    assert!(listed[1].companion, "parentID marks a companion");
-    assert_eq!(listed[2].status, Status::Working, "retry is active work");
-    assert!(
-        listed[2].companion,
-        "the captured denied question permission marks a run row"
-    );
+    let row = |id: &str| listed.iter().find(|session| session.id == id).unwrap();
+    let archived = row(&archived_id);
+    assert_eq!(archived.status, Status::Idle);
+    assert!(archived.hidden);
+    assert!(!archived.daemon_hosted);
 
-    let permission = listed
-        .iter()
-        .find(|session| session.id == permission_id)
-        .unwrap();
+    let busy = row(&busy_id);
+    assert_eq!(busy.status, Status::Working);
+    assert!(busy.companion, "parentID independently marks a companion");
+    assert!(busy.daemon_hosted);
+    assert_eq!(busy.pid, None);
+
+    let run_mode = row(&run_mode_id);
+    assert_eq!(
+        run_mode.status,
+        Status::Idle,
+        "external run mode history ignores scoped retry status"
+    );
+    assert!(
+        run_mode.companion,
+        "the captured denied question permission independently marks a run row"
+    );
+    assert!(!run_mode.daemon_hosted);
+
+    let permission = row(&permission_id);
     let Status::NeedsInput {
         reason: Some(reason),
     } = &permission.status
@@ -955,32 +1146,28 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
     };
     assert!(reason.contains("bash"), "{reason}");
     assert!(reason.contains("git status"), "{reason}");
+    assert!(permission.daemon_hosted);
+    assert_eq!(permission.pid, None);
 
-    let question = listed
-        .iter()
-        .find(|session| session.id == question_id)
-        .unwrap();
+    let question = row(&question_id);
     assert_eq!(
         question.status,
         Status::NeedsInput {
             reason: Some("Which deployment target?".to_string())
         }
     );
-    assert_eq!(
-        listed
-            .iter()
-            .find(|session| session.id == external_id)
-            .unwrap()
-            .status,
-        Status::Idle,
-        "unmarked external history must ignore scoped busy status"
-    );
-    assert!(
-        listed
-            .iter()
-            .all(|session| session.daemon_hosted && session.pid.is_none()),
-        "every server row is shared runtime hosted and never signalable"
-    );
+    assert!(question.daemon_hosted);
+    assert_eq!(question.pid, None);
+
+    for external_id in &external_ids {
+        let external = row(external_id);
+        assert_eq!(
+            external.status,
+            Status::Idle,
+            "unmarked external history ignores scoped server status"
+        );
+        assert!(!external.daemon_hosted);
+    }
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         primary
@@ -990,7 +1177,7 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
             .collect::<Vec<_>>(),
         vec![
             "/global/health".to_string(),
-            "/experimental/session?limit=10000".to_string(),
+            "/experimental/session?limit=10000&archived=true".to_string(),
             format!(
                 "/session/status?directory={}",
                 encoded_component(&directory)
@@ -998,12 +1185,12 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
             format!("/permission?directory={}", encoded_component(&directory)),
             format!("/question?directory={}", encoded_component(&directory)),
         ],
-        "listing scopes one metadata triplet to the marked directory"
+        "listing scopes one directory snapshot triplet to the managed directory"
     );
 }
 
 #[test]
-fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
+fn opencode_server_directory_snapshots_are_once_per_unique_managed_directory() {
     let first_directory = "/tmp/project one";
     let second_directory = "/tmp/雪?project/two";
     let sessions = json!([
@@ -1012,7 +1199,6 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             "parentID": null,
             "directory": first_directory,
             "title": "first busy",
-            "permission": null,
             "permission": managed_permission(),
             "time": {"created": 10, "updated": 50}
         },
@@ -1021,7 +1207,6 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             "parentID": null,
             "directory": first_directory,
             "title": "first idle",
-            "permission": null,
             "permission": managed_permission(),
             "time": {"created": 10, "updated": 40}
         },
@@ -1030,7 +1215,6 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             "parentID": null,
             "directory": second_directory,
             "title": "second retry",
-            "permission": null,
             "permission": managed_permission(),
             "time": {"created": 10, "updated": 30}
         },
@@ -1047,7 +1231,6 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             "parentID": null,
             "directory": "/archived/do not probe",
             "title": "archived",
-            "permission": null,
             "permission": managed_permission(),
             "time": {"created": 10, "updated": 10, "archived": 11}
         }
@@ -1110,7 +1293,7 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             .collect::<Vec<_>>(),
         vec![
             "/global/health".to_string(),
-            "/experimental/session?limit=10000".to_string(),
+            "/experimental/session?limit=10000&archived=true".to_string(),
             format!("/session/status?directory={first}"),
             format!("/permission?directory={first}"),
             format!("/question?directory={first}"),
@@ -1118,12 +1301,12 @@ fn opencode_server_metadata_requests_are_once_per_unique_marked_directory() {
             format!("/permission?directory={second}"),
             format!("/question?directory={second}"),
         ],
-        "two marked rows in one directory share one metadata triplet"
+        "two managed rows in one directory share one directory snapshot triplet"
     );
     assert_eq!(
         server.requests().len(),
         8,
-        "metadata calls must scale with unique marked directories, not rows"
+        "directory snapshot calls scale with unique managed directories, not rows"
     );
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
 }
@@ -1701,7 +1884,7 @@ fn opencode_stop_aborts_only_the_percent_encoded_session() {
 }
 
 #[test]
-fn opencode_server_metadata_mutations_use_exact_paths_and_json() {
+fn opencode_server_session_mutations_use_exact_paths_and_json() {
     let id = "ses/\"雪?../../target#fragment";
     let encoded = encoded_component(id);
     let server = ScriptedServer::spawn(vec![
@@ -1957,12 +2140,11 @@ fn opencode_run_mode_permission_marker_shapes() {
 
 #[test]
 fn secure_transport_verifies_before_auth_and_accepts_bodyless_204() {
-    let server = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": "ses_secure"})),
         ScriptedResponse::empty(204).without_framing(),
-    ]);
+    ]));
     let runtime = secure_runtime_for(
         &server,
         [server.addr, unused_addr()],
@@ -1976,39 +2158,123 @@ fn secure_transport_verifies_before_auth_and_accepts_bodyless_204() {
         .expect("secure spawn");
     assert_eq!(spawned.session_id.as_deref(), Some("ses_secure"));
 
-    let requests = server.wait_for_requests(4);
-    assert_eq!(requests.len(), 4);
-    assert!(
-        !requests[0].headers.contains_key("authorization"),
-        "the first health request is deliberately unauthenticated"
-    );
-    let expected = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(b"agent-viewer:test-secret")
-    );
-    assert!(
-        requests[1..]
-            .iter()
-            .all(|request| request.headers.get("authorization") == Some(&expected))
-    );
+    let requests = server.wait_for_requests(6);
+    assert_eq!(requests.len(), 6);
+    assert_test_secret_pairs(&requests);
     assert_eq!(
-        requests[2].json_body().get("permission"),
+        requests[3].json_body().get("permission"),
         Some(&managed_permission()),
         "spawn writes the exact durable permission marker"
     );
     assert!(
-        requests[2].json_body().get("metadata").is_none(),
+        requests[3].json_body().get("metadata").is_none(),
         "metadata is not a supported create field"
     );
 }
 
 #[test]
+fn secure_health_uses_startup_budget_for_delayed_authenticated_response() {
+    let mut delayed_health = healthy_response();
+    delayed_health.delay = Duration::from_millis(300);
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        delayed_health,
+        ScriptedResponse::json(200, json!({"id": "ses_slow_health"})),
+        ScriptedResponse::empty(204).without_framing(),
+    ]));
+    let runtime = secure_runtime_for(
+        &server,
+        [server.addr, unused_addr()],
+        Duration::from_secs(1),
+        |_| Err(io::Error::other("launcher was not expected")),
+    );
+    let backend = backend_with_runtime(runtime);
+
+    let spawned = backend
+        .spawn(
+            PathBuf::from("/tmp/slow_health").as_path(),
+            "slow health",
+            None,
+        )
+        .expect("300 ms authenticated health fits one second startup budget");
+    assert_eq!(spawned.session_id.as_deref(), Some("ses_slow_health"));
+
+    let requests = server.wait_for_requests(6);
+    assert_eq!(requests.len(), 6);
+    assert_test_secret_pairs(&requests);
+}
+
+#[test]
+fn deferred_accept_preflights_then_authenticates_on_the_same_connection() {
+    let server = ScriptedServer::spawn_verified_deferred(vec![
+        unauthorized_health().keep_alive(),
+        healthy_response(),
+        unauthorized_health().keep_alive(),
+        ScriptedResponse::json(200, json!({"id": "ses_deferred"})),
+        unauthorized_health().keep_alive(),
+        ScriptedResponse::empty(204).without_framing(),
+    ]);
+    let runtime = secure_runtime_for(
+        &server,
+        [server.addr, unused_addr()],
+        Duration::from_millis(500),
+        |_| Err(io::Error::other("launcher was not expected")),
+    );
+    let backend = backend_with_runtime(runtime);
+
+    let spawned = backend
+        .spawn(
+            PathBuf::from("/tmp/deferred").as_path(),
+            "deferred body",
+            None,
+        )
+        .expect("deferred accept spawn");
+    assert_eq!(spawned.session_id.as_deref(), Some("ses_deferred"));
+
+    let requests = server.wait_for_requests(6);
+    assert_eq!(requests.len(), 6);
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(b"agent-viewer:test-secret")
+    );
+    for pair in requests.chunks_exact(2) {
+        assert_eq!(pair[0].connection_id, pair[1].connection_id);
+        assert_eq!(pair[0].method, "GET");
+        assert_eq!(pair[0].target, "/global/health");
+        assert!(!pair[0].headers.contains_key("authorization"));
+        assert!(pair[0].body.is_empty());
+        assert_eq!(pair[1].headers.get("authorization"), Some(&expected));
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.connection_id)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 2, 2, 3, 3]
+    );
+    assert_eq!(requests[2].target, "/global/health");
+    assert!(requests[3].target.starts_with("/session?directory="));
+    assert_eq!(
+        requests[3].json_body().get("permission"),
+        Some(&managed_permission())
+    );
+    assert_eq!(requests[4].target, "/global/health");
+    assert!(
+        requests[5]
+            .target
+            .starts_with("/session/ses_deferred/prompt_async?directory=")
+    );
+    assert_eq!(
+        requests[5].json_body(),
+        json!({"parts": [{"type": "text", "text": "deferred body"}]})
+    );
+}
+
+#[test]
 fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_headers() {
-    let chunked = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let chunked = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!([])).chunked(),
-    ]);
+    ]));
     let mut backend = backend_with_runtime(secure_runtime_for(
         &chunked,
         [chunked.addr, unused_addr()],
@@ -2016,6 +2282,7 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
         |_| Err(io::Error::other("launcher was not expected")),
     ));
     assert!(backend.list().expect("chunked global list").is_empty());
+    assert_test_secret_pairs(&chunked.wait_for_requests(4));
 
     for response in [
         ScriptedResponse::json(200, json!([])).without_framing(),
@@ -2023,11 +2290,8 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
         ScriptedResponse::json(200, json!([])).header("X-Oversized", &"x".repeat(70_000)),
         ScriptedResponse::raw(200, "application/json", "x".repeat(20_000_000)),
     ] {
-        let server = ScriptedServer::spawn_verified(vec![
-            unauthorized_health(),
-            healthy_response(),
-            response,
-        ]);
+        let server =
+            ScriptedServer::spawn_verified(secure_responses(vec![healthy_response(), response]));
         let mut backend = backend_with_runtime(secure_runtime_for(
             &server,
             [server.addr, unused_addr()],
@@ -2035,6 +2299,7 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
             |_| Err(io::Error::other("launcher was not expected")),
         ));
         let error = backend.list().expect_err("unsafe HTTP response must fail");
+        assert_test_secret_pairs(&server.wait_for_requests(4));
         let message = error.to_string().to_ascii_lowercase();
         assert!(
             message.contains("framing")
@@ -2049,7 +2314,8 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
 
 #[test]
 fn process_identity_mismatches_send_no_http_bytes() {
-    let cases: Vec<Box<dyn Fn(&ProcFixture)>> = vec![
+    type ProcMutation = Box<dyn Fn(&ProcFixture)>;
+    let cases: Vec<ProcMutation> = vec![
         Box::new(|process| process.write_identity(1000, unsafe { libc::geteuid() } + 1, None)),
         Box::new(|process| {
             process.write_identity(
@@ -2083,7 +2349,7 @@ fn process_identity_mismatches_send_no_http_bytes() {
 
 #[test]
 fn replacement_between_connect_and_authorized_write_sends_no_credential_or_task() {
-    let server = ScriptedServer::spawn_verified(vec![unauthorized_health()]);
+    let server = ScriptedServer::spawn_verified(vec![unauthorized_health().keep_alive()]);
     let process = server.process();
     let runtime = secure_runtime_with_hook(
         &server,
@@ -2110,7 +2376,7 @@ fn startup_credentials_are_env_only_and_errors_are_sanitized() {
     let candidates = unused_addrs();
     let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
         candidates,
-        startup_timeout: Duration::from_millis(80),
+        startup_timeout: Duration::from_millis(500),
         durable_cwd: PathBuf::from("/"),
         launcher: Arc::new(move |command| {
             launched_for_callback.lock().unwrap().push(command);
@@ -2131,52 +2397,62 @@ fn startup_credentials_are_env_only_and_errors_are_sanitized() {
     let message = error.to_string();
     assert!(!message.contains("test-secret"), "{message}");
     assert!(!message.contains("YWdlbnQtdmlld2Vy"), "{message}");
+    assert!(
+        message.contains(&candidates[0].port().to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains(&candidates[1].port().to_string()),
+        "{message}"
+    );
 
     let launched = launched.lock().unwrap();
-    assert_eq!(launched.len(), 1);
-    let command = &launched[0];
-    let args = command_args(command);
-    assert_eq!(
-        args,
-        vec![
-            "serve".to_string(),
-            "--hostname".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            candidates[0].port().to_string(),
-        ]
-    );
-    assert!(!args.iter().any(|arg| arg.contains("test-secret")));
-    let env = command
-        .get_envs()
-        .map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.map(|value| value.to_string_lossy().into_owned()),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        env.get("OPENCODE_SERVER_USERNAME"),
-        Some(&Some("agent-viewer".to_string()))
-    );
-    assert_eq!(
-        env.get("OPENCODE_SERVER_PASSWORD"),
-        Some(&Some("test-secret".to_string()))
-    );
+    assert_eq!(launched.len(), 2);
+    for (index, command) in launched.iter().enumerate() {
+        let args = command_args(command);
+        assert_eq!(
+            args,
+            vec![
+                "serve".to_string(),
+                "--hostname".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                candidates[index].port().to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("test-secret")));
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get("OPENCODE_SERVER_USERNAME"),
+            Some(&Some("agent-viewer".to_string()))
+        );
+        assert_eq!(
+            env.get("OPENCODE_SERVER_PASSWORD"),
+            Some(&Some("test-secret".to_string()))
+        );
+    }
 }
 
 #[test]
 fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
     let exact = managed_permission();
     let near = json!([
+        {"permission": "agent-viewer.background", "pattern": "*", "action": "deny"}
+    ]);
+    let run_mode_compatibility = json!([
         {"permission": "question", "pattern": "*", "action": "deny"},
         {"permission": "plan_enter", "pattern": "*", "action": "deny"},
-        {"permission": "plan_exit", "pattern": "*", "action": "deny"},
-        {"permission": "read", "pattern": "*", "action": "allow"}
+        {"permission": "plan_exit", "pattern": "*", "action": "deny"}
     ]);
-    let server = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(
             200,
@@ -2195,6 +2471,14 @@ fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
                     "directory": "/external",
                     "title": "near marker",
                     "permission": near,
+                    "time": {"created": 1, "updated": 4}
+                },
+                {
+                    "id": "ses_run_compatibility",
+                    "parentID": null,
+                    "directory": "/run_compatibility",
+                    "title": "run mode compatibility",
+                    "permission": run_mode_compatibility,
                     "time": {"created": 1, "updated": 4}
                 }
             ]),
@@ -2233,7 +2517,7 @@ fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
         ScriptedResponse::json(200, json!({"id": "ses_archived"})),
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": "ses_good"})),
-    ]);
+    ]));
     let runtime = secure_runtime_for(
         &server,
         [server.addr, unused_addr()],
@@ -2247,42 +2531,43 @@ fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
     assert_eq!(row("ses_good").status, Status::Working);
     assert_eq!(row("ses_bad").status, Status::Unknown);
     assert_eq!(row("ses_external").status, Status::Idle);
+    assert_eq!(row("ses_run_compatibility").status, Status::Idle);
     assert!(row("ses_good").daemon_hosted);
     assert!(row("ses_bad").daemon_hosted);
     assert!(row("ses_archived").daemon_hosted);
     assert!(!row("ses_external").daemon_hosted);
+    assert!(!row("ses_run_compatibility").daemon_hosted);
     assert!(row("ses_archived").hidden);
 
-    let requests = server.wait_for_requests(10);
+    let requests = server.wait_for_requests(18);
+    assert_test_secret_pairs(&requests);
     let targets = requests
-        .iter()
-        .map(|request| request.target.as_str())
+        .chunks_exact(2)
+        .map(|pair| pair[1].target.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
-        targets[2], "/experimental/session?limit=10000",
+        targets[1], "/experimental/session?limit=10000&archived=true",
         "listing starts at the global experimental route"
     );
     assert_eq!(
-        targets[3],
-        "/experimental/session?limit=10000&cursor=page%20two"
+        targets[2],
+        "/experimental/session?limit=10000&archived=true&cursor=page%20two"
     );
-    assert!(
-        targets
-            .iter()
-            .any(|target| *target == "/session/status?directory=%2Fbad")
-    );
-    assert!(
-        targets
-            .iter()
-            .any(|target| *target == "/session/status?directory=%2Fgood")
-    );
+    assert!(targets.contains(&"/session/status?directory=%2Fbad"));
+    assert!(targets.contains(&"/session/status?directory=%2Fgood"));
     assert!(
         targets.iter().all(|target| !target.contains("%2Farchived")),
-        "archived managed ids remain cached without active metadata probes"
+        "archived managed ids remain cached without active directory snapshot probes"
     );
     assert!(
         targets.iter().all(|target| !target.contains("%2Fexternal")),
         "near marker rows remain external"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|target| !target.contains("%2Frun_compatibility")),
+        "run mode compatibility rows remain external"
     );
 
     let archived_row = row("ses_archived").clone();
@@ -2296,8 +2581,9 @@ fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
     backend
         .rename(&good_row, "managed renamed")
         .expect("cached managed row remains rename authorized");
-    let mutation_requests = server
-        .wait_for_requests(16)
+    let all_requests = server.wait_for_requests(30);
+    assert_test_secret_pairs(&all_requests);
+    let mutation_requests = all_requests
         .into_iter()
         .filter(|request| {
             request.method == "PATCH"
@@ -2343,6 +2629,39 @@ fn global_pagination_exact_marker_archived_cache_and_directory_isolation() {
 }
 
 #[test]
+fn global_pagination_requests_archived_sessions_on_every_page() {
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(200, json!([])).header("x-next-cursor", "page two"),
+        ScriptedResponse::json(200, json!([])),
+    ]));
+    let runtime = secure_runtime_for(
+        &server,
+        [server.addr, unused_addr()],
+        Duration::from_millis(400),
+        |_| Err(io::Error::other("launcher was not expected")),
+    );
+    let mut backend = backend_with_runtime(runtime);
+
+    assert!(backend.list().expect("global archived list").is_empty());
+
+    let requests = server.wait_for_requests(6);
+    assert_test_secret_pairs(&requests);
+    let targets = requests
+        .chunks_exact(2)
+        .map(|pair| pair[1].target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets[1],
+        "/experimental/session?limit=10000&archived=true"
+    );
+    assert_eq!(
+        targets[2],
+        "/experimental/session?limit=10000&archived=true&cursor=page%20two"
+    );
+}
+
+#[test]
 fn pagination_rejects_repeated_or_malformed_cursor_and_full_page_without_cursor() {
     for responses in [
         vec![
@@ -2368,9 +2687,9 @@ fn pagination_rejects_repeated_or_malformed_cursor_and_full_page_without_cursor(
             ),
         )],
     ] {
-        let mut script = vec![unauthorized_health(), healthy_response()];
-        script.extend(responses);
-        let server = ScriptedServer::spawn_verified(script);
+        let mut actual = vec![healthy_response()];
+        actual.extend(responses);
+        let server = ScriptedServer::spawn_verified(secure_responses(actual));
         let mut backend = backend_with_runtime(secure_runtime_for(
             &server,
             [server.addr, unused_addr()],
@@ -2379,6 +2698,7 @@ fn pagination_rejects_repeated_or_malformed_cursor_and_full_page_without_cursor(
         ));
 
         let error = backend.list().expect_err("invalid pagination must fail");
+        assert_test_secret_pairs(&server.requests());
         assert!(
             error.to_string().to_ascii_lowercase().contains("cursor"),
             "{error}"
@@ -2388,12 +2708,11 @@ fn pagination_rejects_repeated_or_malformed_cursor_and_full_page_without_cursor(
 
 #[test]
 fn same_pinned_identity_with_failed_health_stays_pinned_and_does_not_start() {
-    let server = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!([])),
         ScriptedResponse::raw(500, "text/plain", "temporarily unhealthy"),
-    ]);
+    ]));
     let launches = Arc::new(AtomicUsize::new(0));
     let launches_for_callback = Arc::clone(&launches);
     let runtime = secure_runtime_for(
@@ -2411,16 +2730,17 @@ fn same_pinned_identity_with_failed_health_stays_pinned_and_does_not_start() {
     let _ = backend.list();
 
     assert_eq!(launches.load(Ordering::SeqCst), 0);
-    assert_eq!(server.wait_for_requests(4).len(), 4);
+    let requests = server.wait_for_requests(6);
+    assert_eq!(requests.len(), 6);
+    assert_test_secret_pairs(&requests);
 }
 
 #[test]
 fn changed_pinned_identity_is_cleared_without_sending_replacement_credentials() {
-    let server = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!([])),
-    ]);
+    ]));
     let runtime = secure_runtime_for(
         &server,
         [server.addr, unused_addr()],
@@ -2437,15 +2757,17 @@ fn changed_pinned_identity_is_cleared_without_sending_replacement_credentials() 
 
     assert_eq!(
         server.requests().len(),
-        3,
+        4,
         "a changed pin is rejected from process state before opening another HTTP request"
     );
+    assert_test_secret_pairs(&server.requests());
 }
 
 #[test]
 fn capabilities_do_not_wait_for_blocked_health_or_startup() {
     let mut delayed = unauthorized_health();
     delayed.delay = Duration::from_millis(350);
+    delayed = delayed.keep_alive();
     let server = ScriptedServer::spawn_verified(vec![delayed]);
     let runtime = secure_runtime_for(
         &server,
@@ -2465,13 +2787,17 @@ fn capabilities_do_not_wait_for_blocked_health_or_startup() {
     );
     assert!(!capabilities.live_status);
     let _ = worker.join().expect("listing thread");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].headers.contains_key("authorization"));
 }
 
 #[test]
 fn stale_health_completion_cannot_publish_over_a_changed_process_generation() {
     let mut delayed_health = healthy_response();
     delayed_health.delay = Duration::from_millis(180);
-    let server = ScriptedServer::spawn_verified(vec![unauthorized_health(), delayed_health]);
+    let server =
+        ScriptedServer::spawn_verified(vec![unauthorized_health().keep_alive(), delayed_health]);
     let runtime = secure_runtime_for(
         &server,
         [server.addr, unused_addr()],
@@ -2486,6 +2812,7 @@ fn stale_health_completion_cannot_publish_over_a_changed_process_generation() {
         .write_identity(2000, unsafe { libc::geteuid() }, None);
 
     let _ = worker.join().expect("listing worker");
+    assert_test_secret_pairs(&server.requests());
 
     assert!(
         !backend_with_runtime(runtime.clone())
@@ -2509,12 +2836,14 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
     let primary = unused_addr();
     let backup = ScriptedServer::spawn(vec![]);
     let launch_gate = Arc::new((Mutex::new((0_usize, false)), std::sync::Condvar::new()));
+    let launch_attempts = Arc::new(AtomicUsize::new(0));
     let successful_launches = Arc::new(AtomicUsize::new(0));
     let launched_server = Arc::new(Mutex::new(None::<ScriptedServer>));
     let launched_pid = 62001;
     let make_runtime = || {
         let proc_root_for_launcher = Arc::clone(&proc_root);
         let gate = Arc::clone(&launch_gate);
+        let attempts = Arc::clone(&launch_attempts);
         let successes = Arc::clone(&successful_launches);
         let server_slot = Arc::clone(&launched_server);
         OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
@@ -2522,6 +2851,7 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
             startup_timeout: Duration::from_secs(2),
             durable_cwd: PathBuf::from("/"),
             launcher: Arc::new(move |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
                 let (lock, ready) = &*gate;
                 let mut state = lock.lock().unwrap();
                 state.0 += 1;
@@ -2530,18 +2860,36 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
                     .wait_timeout_while(state, Duration::from_millis(500), |state| !state.1)
                     .unwrap();
                 drop(state);
-                match ScriptedServer::spawn_on_verified_in(
+                let created = Arc::new(AtomicUsize::new(0));
+                let created_for_route = Arc::clone(&created);
+                match ScriptedServer::spawn_on_verified_routed_in(
                     primary,
-                    vec![
-                        unauthorized_health(),
-                        healthy_response(),
-                        ScriptedResponse::json(200, json!([])),
-                        unauthorized_health(),
-                        healthy_response(),
-                        ScriptedResponse::json(200, json!([])),
-                    ],
                     Arc::clone(&proc_root_for_launcher),
                     launched_pid,
+                    move |request| {
+                        let authorized = request.headers.contains_key("authorization");
+                        match (request.method.as_str(), request.target.as_str(), authorized) {
+                            ("GET", "/global/health", false) => unauthorized_health().keep_alive(),
+                            ("GET", "/global/health", true) => healthy_response(),
+                            ("POST", target, true) if target.starts_with("/session?directory=") => {
+                                let index = created_for_route.fetch_add(1, Ordering::SeqCst);
+                                match index {
+                                    0 => ScriptedResponse::json(200, json!({"id": "ses_race_one"})),
+                                    1 => ScriptedResponse::json(200, json!({"id": "ses_race_two"})),
+                                    _ => {
+                                        ScriptedResponse::raw(500, "text/plain", "duplicate create")
+                                    }
+                                }
+                            }
+                            ("POST", target, true)
+                                if target.contains("/prompt_async?directory=") =>
+                            {
+                                ScriptedResponse::empty(204).without_framing()
+                            }
+                            (_, _, false) => unauthorized_health().keep_alive(),
+                            _ => ScriptedResponse::raw(500, "text/plain", "unexpected request"),
+                        }
+                    },
                 ) {
                     Ok(server) => {
                         successes.fetch_add(1, Ordering::SeqCst);
@@ -2551,12 +2899,7 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
                     Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                         let started = Instant::now();
                         while started.elapsed() < Duration::from_secs(1) {
-                            let request_count = server_slot
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .map_or(0, |server| server.requests().len());
-                            if request_count >= 3 {
+                            if server_slot.lock().unwrap().is_some() {
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(2));
@@ -2574,8 +2917,20 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
     };
     let first = make_runtime();
     let second = make_runtime();
-    let first_worker = std::thread::spawn(move || backend_with_runtime(first).list());
-    let second_worker = std::thread::spawn(move || backend_with_runtime(second).list());
+    let first_worker = std::thread::spawn(move || {
+        backend_with_runtime(first).spawn(
+            PathBuf::from("/race_one").as_path(),
+            "run sleep 20",
+            None,
+        )
+    });
+    let second_worker = std::thread::spawn(move || {
+        backend_with_runtime(second).spawn(
+            PathBuf::from("/race_two").as_path(),
+            "run sleep 20",
+            None,
+        )
+    });
     let (lock, ready) = &*launch_gate;
     let state = lock.lock().unwrap();
     let (mut state, _) = ready
@@ -2586,18 +2941,53 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
     ready.notify_all();
     drop(state);
 
-    assert!(first_worker.join().unwrap().unwrap().is_empty());
-    assert!(second_worker.join().unwrap().unwrap().is_empty());
+    let first_spawn = first_worker.join().unwrap().expect("first exact spawn");
+    let second_spawn = second_worker.join().unwrap().expect("second exact spawn");
+    let spawn_ids = [
+        first_spawn.session_id.expect("first session id"),
+        second_spawn.session_id.expect("second session id"),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
 
+    assert_eq!(launch_attempts.load(Ordering::SeqCst), 2);
     assert_eq!(successful_launches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        spawn_ids,
+        ["ses_race_one".to_string(), "ses_race_two".to_string()]
+            .into_iter()
+            .collect()
+    );
     let server_guard = launched_server.lock().unwrap();
     let server = server_guard.as_ref().expect("one verified launch winner");
-    let requests = server.wait_for_requests(6);
+    let requests = server.wait_for_requests(12);
+    for pair in requests.chunks_exact(2) {
+        assert_eq!(pair[0].connection_id, pair[1].connection_id);
+        assert_eq!(pair[0].method, "GET");
+        assert_eq!(pair[0].target, "/global/health");
+        assert!(!pair[0].headers.contains_key("authorization"));
+        assert!(pair[1].headers.contains_key("authorization"));
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST"
+                && request.target.starts_with("/session?directory="))
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.target.contains("/prompt_async?directory="))
+            .count(),
+        2
+    );
     let authorized = requests
         .iter()
         .filter_map(|request| request.headers.get("authorization"))
         .collect::<Vec<_>>();
-    assert_eq!(authorized.len(), 4);
+    assert_eq!(authorized.len(), 6);
     assert!(authorized.iter().all(|value| *value == authorized[0]));
 }
 
@@ -2627,9 +3017,15 @@ fn readiness_rejects_a_server_not_owned_by_the_exact_launched_pid() {
         password_override: Some("test-secret".to_string()),
         before_authorized_write: None,
     });
-    let mut backend = backend_with_runtime(runtime);
+    let backend = backend_with_runtime(runtime);
 
-    let _ = backend.list();
+    backend
+        .spawn(
+            PathBuf::from("/wrong_pid").as_path(),
+            "must not submit",
+            None,
+        )
+        .expect_err("readiness rejects the wrong launched pid");
 
     let guard = launched_server.lock().unwrap();
     let server = guard.as_ref().expect("fake server started");
@@ -2645,11 +3041,10 @@ fn occupied_insecure_primary_is_untouched_while_verified_backup_is_reused() {
         200,
         json!({"healthy": true, "version": "insecure"}),
     )]);
-    let backup = ScriptedServer::spawn_verified(vec![
-        unauthorized_health(),
+    let backup = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!([])),
-    ]);
+    ]));
     let runtime = secure_runtime_for(
         &backup,
         [primary.addr, backup.addr],
@@ -2664,7 +3059,9 @@ fn occupied_insecure_primary_is_untouched_while_verified_backup_is_reused() {
         primary.requests().is_empty(),
         "the unrelated primary receives neither a health request nor a credential"
     );
-    assert_eq!(backup.wait_for_requests(3).len(), 3);
+    let requests = backup.wait_for_requests(4);
+    assert_eq!(requests.len(), 4);
+    assert_test_secret_pairs(&requests);
 }
 
 #[test]

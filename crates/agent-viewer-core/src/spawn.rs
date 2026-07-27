@@ -188,6 +188,7 @@ fn describe(cmd: &std::process::Command) -> String {
 /// stdout+stderr appended to log_path (parent dir created if missing); do NOT wait.
 /// Returns the child PID.
 pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path) -> Result<u32> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
 
     if let Some(parent) = log_path.parent() {
@@ -196,7 +197,9 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(log_path)?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let log_err = log.try_clone()?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
