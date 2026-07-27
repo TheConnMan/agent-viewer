@@ -5,6 +5,16 @@ pub enum BackendKind {
     Opencode,
 }
 
+/// Identities produced by a successful backend spawn.
+///
+/// `pid` belongs only to a direct viewer child that may be recorded for pinning and stop.
+/// `session_id` is the backend's exact identity when the spawn protocol returns one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpawnResult {
+    pub pid: Option<u32>,
+    pub session_id: Option<String>,
+}
+
 impl BackendKind {
     /// "codex" | "claude" | "opencode"
     pub fn name(self) -> &'static str {
@@ -218,9 +228,9 @@ pub trait Backend: Send {
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
     /// Sessions are returned recency-sorted (updated_at_ms DESC).
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
-    /// Returns the direct child PID when the viewer forked it (codex, opencode);
-    /// None when the tool self-detaches its real worker (claude --bg).
-    /// The TUI records Some(pid) in the viewer DB (spawn pinning + stop).
+    /// Returns the direct child PID when the viewer forked it and the exact backend session
+    /// identity when the spawn protocol provides one. The TUI records a PID in the viewer DB
+    /// for spawn pinning and stop, while an exact session id can select the new row directly.
     /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
     /// None uses the backend's own default.
     fn spawn(
@@ -228,7 +238,7 @@ pub trait Backend: Send {
         dir: &std::path::Path,
         task: &str,
         model: Option<&str>,
-    ) -> crate::error::Result<Option<u32>>;
+    ) -> crate::error::Result<SpawnResult>;
     /// Candidate models for the composer's model picker, DEFAULT-FIRST and deduped.
     /// Discovery is best-effort and cached; a failing probe degrades to just the default.
     fn available_models(&self) -> Vec<String> {
@@ -349,8 +359,8 @@ mod tests {
                 _dir: &std::path::Path,
                 _task: &str,
                 _model: Option<&str>,
-            ) -> crate::error::Result<Option<u32>> {
-                Ok(None)
+            ) -> crate::error::Result<SpawnResult> {
+                Ok(SpawnResult::default())
             }
             fn attach_command(
                 &self,

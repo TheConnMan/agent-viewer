@@ -1,0 +1,7 @@
+{"id":"fixture_thread_duplicate","thread_name":"Earlier Index Name","updated_at":"2026-07-27T00:00:00Z"}
+{"id":"fixture_thread_ordinary","thread_name":"Ordinary Index Name","updated_at":"2026-07-27T00:00:01Z"}
+{malformed fixture line
+{"id":"fixture_thread_duplicate","thread_name":"Latest Index Name","updated_at":"2026-07-27T00:00:02Z"}
+{"id":"fixture_thread_unknown","thread_name":"Unknown Index Name","updated_at":"2026-07-27T00:00:03Z"}
+{"id":"fixture_thread_duplicate","thread_name":"","updated_at":"2026-07-27T00:00:04Z"}
+{"id":"fixture_thread_duplicate","thread_name":42,"updated_at":"2026-07-27T00:00:05Z"}

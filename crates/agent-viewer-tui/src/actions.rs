@@ -434,14 +434,15 @@ pub(crate) fn spawn_from_composer(
     // key is backend+task, so a double Enter cannot spawn the same task twice while the first
     // is still in flight, while a different task still goes straight through.
     let key = format!("{}:{}:spawn", backend_kind.name(), task);
-    let mutation = Mutation::Spawn {
-        backend: backend_kind,
-        dir: target,
-        task: task.clone(),
-        model: model.map(str::to_string),
-        spawned_at_ms: now_ms(),
+    let mutation = Mutation::spawn(
+        &ui.app,
+        backend_kind,
+        target,
+        task.clone(),
+        model.map(str::to_string),
+        now_ms(),
         notice,
-    };
+    );
     if !ui.mutations.submit(key, move || run_mutation(mutation)) {
         return;
     }
