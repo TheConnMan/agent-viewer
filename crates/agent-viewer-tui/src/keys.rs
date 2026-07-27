@@ -39,12 +39,12 @@ pub(crate) struct MousePress {
 }
 
 /// Returns `true` when the app should quit.
-pub(crate) fn handle_key(
+pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     key: KeyEvent,
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<bool> {
     ui.mouse_press = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -267,19 +267,23 @@ fn is_mouse_toggle_chord(key: KeyEvent, ctrl: bool) -> bool {
     ctrl && matches!(key.code, KeyCode::Char('t'))
 }
 
-/// Turn mouse reporting on or off, pushing the matching terminal mode change and telling the
-/// user which mode they are in. Off hands the mouse back to the terminal so drag-select and
-/// copy work natively; on restores click/hover row selection and wheel forwarding to an
-/// attached child. Best-effort: a terminal that rejects the sequence still gets the flag flip,
-/// which is what gates `handle_mouse`.
+/// Record the requested mouse reporting state and tell the user which mode they are in. The
+/// run loop writes the matching terminal mode sequence after the input action returns; keeping
+/// this state-only makes the shared attach and detach paths safe to exercise in unit tests.
 pub(crate) fn set_mouse_capture(ui: &mut Ui, on: bool) {
-    use crossterm::execute;
     apply_mouse_capture_state(ui, on);
-    let _ = if on {
-        execute!(io::stdout(), crossterm::event::EnableMouseCapture)
+}
+
+/// Write one mouse-reporting mode sequence. This stays separate from state changes so tests
+/// can use an in-memory writer rather than changing the invoking terminal.
+pub(crate) fn write_mouse_capture<W: io::Write>(writer: &mut W, on: bool) -> io::Result<()> {
+    use crossterm::execute;
+
+    if on {
+        execute!(writer, crossterm::event::EnableMouseCapture)
     } else {
-        execute!(io::stdout(), crossterm::event::DisableMouseCapture)
-    };
+        execute!(writer, crossterm::event::DisableMouseCapture)
+    }
 }
 
 /// The state half of `set_mouse_capture`: flip the flag and set the footer notice, with no
@@ -306,13 +310,13 @@ fn is_quit_chord(key: KeyEvent, ctrl: bool, mode: &Mode) -> bool {
     ctrl && matches!(key.code, KeyCode::Char('c')) && !matches!(mode, Mode::Attached)
 }
 
-fn handle_normal_key(
+fn handle_normal_key<B: ratatui::backend::Backend>(
     key: KeyEvent,
     ctrl: bool,
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<bool> {
     // Refresh the slash-command list up front (keyed on backend+target, so a no-op unless
     // they changed) BEFORE anything reads `suggestions_active` — otherwise a Ctrl+S regroup
@@ -418,7 +422,7 @@ fn handle_normal_key(
 fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let Some(fkey) = ui.focused.clone() else {
-        ui.mode = Mode::Normal;
+        detach_to_list(ui);
         return;
     };
 
@@ -480,6 +484,7 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
 fn detach_to_list(ui: &mut Ui) {
     ui.mode = Mode::Normal;
     ui.focused = None;
+    set_mouse_capture(ui, true);
 }
 
 fn handle_filter_key(code: KeyCode, ui: &mut Ui) {
@@ -523,11 +528,11 @@ fn handle_rename_key(code: KeyCode, ui: &mut Ui) {
 
 /// Reply-compose key handling: Enter delivers (and attaches); every other key edits the
 /// buffer or cancels. Enter is split out because delivery needs the terminal + backends.
-fn handle_reply_key(
+fn handle_reply_key<B: ratatui::backend::Backend>(
     code: KeyCode,
     backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     match code {
         KeyCode::Enter => {
@@ -831,6 +836,43 @@ pub(crate) mod tests {
         }
     }
 
+    struct AnyAttachingBackend(BackendKind);
+
+    impl agent_viewer_core::Backend for AnyAttachingBackend {
+        fn kind(&self) -> BackendKind {
+            self.0
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                attach: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by attach selection")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawn is not exercised by attach selection")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            Ok(command)
+        }
+    }
+
     #[test]
     fn ensure_models_fills_the_picker_from_the_cached_catalog() {
         // A catalog seeded from the viewer DB must reach the `/model` picker on the key path,
@@ -1079,6 +1121,7 @@ pub(crate) mod tests {
         .expect("spawn real pty");
 
         let mut ui = test_ui_with(Vec::new());
+        ui.mouse_capture = false;
         let session_key = (BackendKind::Codex, "raw-crlf-session".to_string());
         ui.mode = Mode::Attached;
         ui.focused = Some(session_key.clone());
@@ -1127,6 +1170,10 @@ pub(crate) mod tests {
 
         handle_attached_key(key(KeyCode::Left, KeyModifiers::NONE), &mut ui);
         assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            ui.mouse_capture,
+            "an empty Left detach must restore list mouse capture"
+        );
     }
 
     #[test]
@@ -1408,6 +1455,70 @@ pub(crate) mod tests {
         assert!(
             on.contains("ctrl+t"),
             "notice must name the way back: {on:?}"
+        );
+    }
+
+    #[test]
+    fn every_backend_attach_starts_in_terminal_text_selection_mode() {
+        for backend in [
+            BackendKind::Codex,
+            BackendKind::Claude,
+            BackendKind::Opencode,
+        ] {
+            let mut session = sess("shared-attach", "/tmp/agentviewer-shared-attach", 100);
+            session.backend = backend;
+            // Avoid Claude's real trust preflight; this fake backend only exercises the shared
+            // attach success transition after its command is accepted.
+            session.short_id = Some("short".to_string());
+            let mut ui = test_ui_with(vec![session]);
+            select_session_row(&mut ui, "shared-attach");
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+                vec![Box::new(AnyAttachingBackend(backend))];
+            let mut terminal = test_terminal();
+
+            crate::actions::attach_selected(&backends, &mut ui, &mut terminal)
+                .expect("attach selected session");
+
+            assert!(matches!(ui.mode, Mode::Attached), "{backend:?} must attach");
+            assert!(
+                !ui.mouse_capture,
+                "{backend:?} attach must hand drag selection to the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_bracket_and_missing_focused_pty_restore_list_mouse_capture() {
+        let mut ctrl_detach = test_ui_with(Vec::new());
+        ctrl_detach.mode = Mode::Attached;
+        ctrl_detach.focused = Some((BackendKind::Codex, "ctrl-detach".to_string()));
+        ctrl_detach.mouse_capture = false;
+
+        handle_attached_key(
+            key(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &mut ctrl_detach,
+        );
+
+        assert!(matches!(ctrl_detach.mode, Mode::Normal));
+        assert!(
+            ctrl_detach.mouse_capture,
+            "Ctrl+] must restore list mouse capture"
+        );
+
+        let mut missing_pty = test_ui_with(Vec::new());
+        missing_pty.mode = Mode::Attached;
+        missing_pty.focused = Some((BackendKind::Codex, "missing-pty".to_string()));
+        missing_pty.mouse_capture = false;
+
+        handle_attached_key(
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut missing_pty,
+        );
+
+        assert!(matches!(missing_pty.mode, Mode::Normal));
+        assert!(
+            missing_pty.mouse_capture,
+            "a missing focused PTY must restore list mouse capture"
         );
     }
 

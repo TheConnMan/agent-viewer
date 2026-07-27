@@ -57,10 +57,12 @@ Every session resolves to one of six states, each with its own glyph in the list
 
 Each row is prefixed by its backend's mark in the backend's color — by default the textual
 tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) — followed by
-the state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`, `Error`,
-`Unknown`) and a muted one-line summary. The status word and time sit right-aligned; Claude
-jobs with associated pull requests show a badge just left of the time — `#315` for one PR,
-`2 PRs` for several. The badge is colored by the PR's live GitHub status: yellow when checks
+the title. Titles share a visible column sized to the widest title, capped at 40 terminal
+columns. The state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`,
+`Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
+summary and any Claude pull request badge. Elapsed time alone sits flush right. Claude jobs
+with associated pull requests show `#315` for one PR or `2 PRs` for several. The badge is
+colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or
 unresolvable.
@@ -171,10 +173,9 @@ its SQLite title still shows the prompt.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
-- `Ctrl+T` — turn mouse reporting off / back on. Off hands the mouse back to your terminal so
-  you can drag-select and copy text out of the viewer; on restores left click row activation,
-  hover row selection, and wheel scrolling. Works everywhere, including inside an attach, so
-  the transcript is copyable. A footer notice names the mode you just switched to.
+- `Ctrl+T` — toggle mouse reporting. Off hands the mouse back to your terminal so you can
+  drag-select and copy text; on restores left click row activation, hover row selection, and
+  wheel scrolling. A footer notice names the mode you just switched to.
 - `?` — key help.
 - `Ctrl+C` — quit.
 
@@ -193,6 +194,9 @@ job and a finished one (waking it in place); a row with no background-job id fal
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
+Mouse reporting starts off for every attached backend, so Codex, Claude, and opencode
+transcripts are selectable immediately. Returning to the list restores its mouse behavior;
+`Ctrl+T` toggles either mode manually.
 
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
@@ -215,7 +219,7 @@ for an oversight; see the constitution's Additional Constraints.
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
 If a child exits while you are attached, its final screen stays visible and any key
-returns you to the list.
+except `Ctrl+T` returns you to the list; `Ctrl+T` toggles the mouse instead.
 
 Viewer-local state (archive flags, stop markers, spawn records, and the generated OpenCode server
 secret) is kept in a SQLite database at `~/.local/state/agent-viewer/viewer.db`, separate from

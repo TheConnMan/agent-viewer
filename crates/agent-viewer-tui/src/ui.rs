@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui_image::Image;
 use std::cell::RefCell;
@@ -508,25 +508,19 @@ fn abbreviate_dir(dir: &Path) -> String {
 /// whole screen while still showing a generous multi-line task description.
 const COMPOSER_MAX_LINES: u16 = 10;
 
-/// Breathing room inside an input box, one column each side of the border. It also lines the
-/// box's contents up with the list rows above, whose backend mark starts two columns in
-/// (border 1 + pad 1 == status glyph + its trailing space), so the composer's own mark and
-/// its input text sit in the same column as every row's mark.
-const INPUT_PAD_X: u16 = 1;
-
-/// The block every input box is drawn in: rounded `border`ed, padded by `INPUT_PAD_X`.
+/// The block every input box is drawn in: rounded and bordered, with content immediately
+/// inside the side borders.
 fn input_block(border: ratatui::style::Color) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(fg(border))
-        .padding(Padding::horizontal(INPUT_PAD_X))
 }
 
-/// The text width an input box has left inside `frame_width` once both borders and both pads
-/// are taken out — what the height math must wrap against so it agrees with the render.
+/// The text width an input box has left inside `frame_width` once both borders are taken out.
+/// The height math wraps against that width so it agrees with the render.
 fn input_inner_width(frame_width: u16) -> u16 {
-    frame_width.saturating_sub(2 + 2 * INPUT_PAD_X)
+    frame_width.saturating_sub(2)
 }
 
 /// Display width of a single character, floored at zero for combining marks.
@@ -750,7 +744,7 @@ fn draw_composer(
         format!("{model} ")
     };
     let mut metadata_spans = vec![Span::styled(
-        format!("{} {} ", backend_mark(backend), backend.name()),
+        format!("{}{} ", backend_mark(backend), backend.name()),
         fg(backend_mark_color(backend)),
     )];
     if !model_seg.is_empty() {
@@ -930,15 +924,65 @@ fn draw_list(
 ) -> ListHit {
     let width = area.width as usize;
     let rows = app.visible();
+    let desired_title_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session { title, .. } => Some(display_width(title)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    // Resolve narrow viewport degradation once for the whole visible list. The smallest
+    // viable row width becomes the shared width, so individual summaries cannot move status.
+    let title_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session {
+                backend,
+                title,
+                summary,
+                status,
+                created_at_ms,
+                updated_at_ms,
+                pr_refs,
+                ..
+            } => {
+                let started_at_ms = if *created_at_ms > 0 {
+                    *created_at_ms
+                } else {
+                    *updated_at_ms
+                };
+                let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
+                let pr = pr_badge(pr_refs);
+                let (visible_title, _, _, _, _) = crate::app::row_layout(
+                    width,
+                    mark_width(backend_mark(*backend)),
+                    title,
+                    desired_title_width,
+                    status_display_word(status),
+                    &pr,
+                    summary,
+                    display_width(&elapsed),
+                );
+                Some(display_width(&visible_title))
+            }
+            _ => None,
+        })
+        .min()
+        .unwrap_or(desired_title_width);
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
-    // Parallel to `items`: the backend of each pushed item that is a session row (None for
-    // headers/spacers/rename lines), so the logo overlay can find its rows by item index after
-    // the List has laid them out.
+    // Parallel to `items`: the backend of each pushed session row (None for headers/spacers).
+    // Renamed sessions retain their backend so the logo overlay can find its rows by item index
+    // after the List has laid them out.
     let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
     // Also parallel to `items`, in lockstep draw order: each rendered line's selectable row
     // target (Some(visible-row index) for a header/session line, None for a Spacer). This is
     // the map the mouse handler reverses to pick a row from a cell.
     let mut item_to_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
+    let rename_shown = deco
+        .rename
+        .map(|(backend, _, buffer)| rename_buffer(backend, buffer, width));
     for (row_idx, row) in rows.iter().enumerate() {
         // A Spacer renders a blank line but is never selectable, so it maps to no row.
         let target = if matches!(row, Row::Spacer) {
@@ -948,22 +992,39 @@ fn draw_list(
         };
         match row {
             Row::Session { backend, id, .. } => {
-                // In-place rename edit field replaces the row while renaming it. The rename row
-                // has no logo (its layout differs), so it carries no backend in the overlay vec.
-                if let Some((rb, rid, buf)) = deco.rename
+                // In-place rename edit field replaces the row while renaming it. Its compact
+                // prefix uses the normal mark slot, so logo mode overlays that slot as usual.
+                if let Some((rb, rid, _)) = deco.rename
                     && *backend == rb
                     && id == rid
                 {
-                    items.push(rename_row_item(*backend, buf, width));
-                    item_backends.push(None);
+                    items.push(rename_row_item(
+                        *backend,
+                        rename_shown.as_deref().unwrap_or_default(),
+                    ));
+                    item_backends.push(Some(*backend));
                 } else {
-                    items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                    items.push(row_to_item(
+                        row,
+                        pulses,
+                        now_ms,
+                        pr_status,
+                        width,
+                        title_width,
+                    ));
                     item_backends.push(Some(*backend));
                 }
                 item_to_row.push(target);
             }
             _ => {
-                items.push(row_to_item(row, pulses, now_ms, pr_status, width));
+                items.push(row_to_item(
+                    row,
+                    pulses,
+                    now_ms,
+                    pr_status,
+                    width,
+                    title_width,
+                ));
                 item_backends.push(None);
                 item_to_row.push(target);
             }
@@ -987,7 +1048,7 @@ fn draw_list(
     };
 
     // Logo overlay: for each on-screen session item, draw its brand image over the two blank
-    // mark columns (x+2 = after the status glyph + its trailing space). Only the visible
+    // mark columns (x+1 = immediately after the status glyph). Only the visible
     // window [offset, offset+height) is drawn; y is clamped inside the list area.
     if let Some(logos) = logos
         && logo_marks()
@@ -1000,13 +1061,13 @@ fn draw_list(
                 continue;
             }
             let y = area.y + (j - offset) as u16;
-            if y >= area.y + area.height || area.width < 4 {
+            if y >= area.y + area.height || area.width < 3 {
                 continue;
             }
             frame.render_widget(
                 Image::new(logos.image(*backend)),
                 Rect {
-                    x: area.x + 2,
+                    x: area.x + 1,
                     y,
                     width: 2,
                     height: 1,
@@ -1016,8 +1077,8 @@ fn draw_list(
     }
 
     // Place the terminal's native cursor at the end of the inline rename buffer (its row is
-    // the selection, so it is always on screen). Prefix is `✎ `(2) + `<mark> `(mark_width+1).
-    if let Some((rb, rid, buf)) = deco.rename
+    // the selection, so it is always on screen). Prefix is `✎` + `<mark>`.
+    if let Some((rb, rid, _)) = deco.rename
         && let Some(idx) = rows.iter().position(
             |r| matches!(r, Row::Session { backend, id, .. } if *backend == rb && *id == rid),
         )
@@ -1025,8 +1086,9 @@ fn draw_list(
         let offset = state.offset();
         let y = area.y + idx.saturating_sub(offset) as u16;
         if idx >= offset && y < area.y + area.height {
-            let shown = truncate(buf, width.saturating_sub(6));
-            let col = 2 + mark_width(backend_mark(rb)) + 1 + display_width(&shown);
+            let prefix_width = display_width("✎") + mark_width(backend_mark(rb));
+            let shown = rename_shown.as_deref().unwrap_or_default();
+            let col = prefix_width + display_width(shown);
             let x = area.x + (col as u16).min(area.width.saturating_sub(1));
             frame.set_cursor_position((x, y));
         }
@@ -1035,18 +1097,38 @@ fn draw_list(
     hit
 }
 
-/// The selected row rendered as an inline rename edit field: `✎ <mark> buffer`, the mark in
+/// The selected row rendered as an inline rename edit field: `✎<mark>buffer`, the mark in
 /// the backend's brand color and the edited title in accent. The blinking cursor at the end
 /// of the buffer is the terminal's native cursor, placed by `draw_list`.
-fn rename_row_item(backend: BackendKind, buffer: &str, width: usize) -> ListItem<'static> {
+fn rename_row_item(backend: BackendKind, shown: &str) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
-        Span::styled("✎ ", fg(theme::ACCENT)),
+        Span::styled("✎", fg(theme::ACCENT)),
         Span::styled(
-            format!("{} ", backend_mark(backend)),
+            backend_mark(backend).to_string(),
             fg(backend_mark_color(backend)),
         ),
-        Span::styled(truncate(buffer, width.saturating_sub(6)), fg(theme::ACCENT)),
+        Span::styled(shown.to_string(), fg(theme::ACCENT)),
     ]))
+}
+
+/// Keep one terminal cell open after the displayed edit buffer for the native cursor.
+fn rename_buffer(backend: BackendKind, buffer: &str, width: usize) -> String {
+    let prefix_width = display_width("✎") + mark_width(backend_mark(backend));
+    let buffer_width = width.saturating_sub(prefix_width.saturating_add(1));
+    truncate_display_width(buffer, buffer_width)
+}
+
+/// Truncate a string without exceeding its terminal display width.
+fn truncate_display_width(s: &str, width: usize) -> String {
+    let mut end = 0;
+    for (index, character) in s.char_indices() {
+        let next = index + character.len_utf8();
+        if display_width(&s[..next]) > width {
+            break;
+        }
+        end = next;
+    }
+    s[..end].to_string()
 }
 
 fn row_to_item(
@@ -1055,6 +1137,7 @@ fn row_to_item(
     now_ms: i64,
     pr_status: &crate::pr_cache::PrStatusCache,
     width: usize,
+    title_width: usize,
 ) -> ListItem<'static> {
     match row {
         Row::Spacer => ListItem::new(Line::from("")),
@@ -1115,6 +1198,7 @@ fn row_to_item(
                 pr_color,
                 elapsed: &elapsed,
                 width,
+                title_width,
             });
             if bloom.is_some() {
                 ListItem::new(line).style(Style::default().bg(theme::SEL_BG))
@@ -1182,47 +1266,46 @@ struct SessionRow<'a> {
     pr_color: ratatui::style::Color,
     elapsed: &'a str,
     width: usize,
+    title_width: usize,
 }
 
-/// `glyph mark name  summary <pad> <pr> <status word> <time>`, flush-left (glyph in column
-/// 0). The animated glyph + brand mark + title sit left with a muted summary; the right
-/// cluster (Claude Code style) is a right-aligned `<pr> <status word> <time>` — PR badge
-/// accent, status word in its state color, elapsed muted. The title truncates first when
-/// width is tight; the right cluster is never clipped.
+/// `glyphmarktitle status  summary PR <pad> elapsed`, flush-left (glyph in column 0). The
+/// title and status share columns across visible rows. PR badges remain complete and colored,
+/// while summary and elapsed time use the muted style.
 fn session_line(r: SessionRow) -> Line<'static> {
     let word = status_display_word(r.status);
-    // The right cluster as one reserved unit: [pr ]word elapsed.
-    let right = if r.pr.is_empty() {
-        format!("{word} {}", r.elapsed)
-    } else {
-        format!("{} {word} {}", r.pr, r.elapsed)
-    };
-    let (name_out, summary_out, pad) = crate::app::row_layout(
+    let (title_out, status_out, pr_out, summary_out, pad) = crate::app::row_layout(
         r.width,
         mark_width(r.mark),
         r.name,
+        r.title_width,
+        word,
+        r.pr,
         r.summary,
-        right.chars().count(),
+        display_width(r.elapsed),
     );
     let mut spans = vec![
         Span::styled(r.glyph.to_string(), fg(r.gcolor)),
-        Span::raw(" "),
         Span::styled(r.mark.to_string(), fg(r.mark_color)),
+        Span::styled(title_out, fg(theme::TEXT)),
         Span::raw(" "),
-        Span::styled(name_out, fg(theme::TEXT)),
+        Span::styled(status_out, fg(status_color(r.status))),
     ];
-    if !summary_out.is_empty() {
+    let has_pr = !pr_out.is_empty();
+    let has_summary = !summary_out.is_empty();
+    if has_pr || has_summary {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(summary_out, fg(theme::MUTED)));
+        if has_summary {
+            spans.push(Span::styled(summary_out, fg(theme::MUTED)));
+        }
+        if has_pr && has_summary {
+            spans.push(Span::raw(" "));
+        }
+        if has_pr {
+            spans.push(Span::styled(pr_out, fg(r.pr_color)));
+        }
     }
     spans.push(Span::raw(" ".repeat(pad)));
-    // Right cluster: <pr> <status word> <time>.
-    if !r.pr.is_empty() {
-        spans.push(Span::styled(r.pr.to_string(), fg(r.pr_color)));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(word.to_string(), fg(status_color(r.status))));
-    spans.push(Span::raw(" "));
     spans.push(Span::styled(r.elapsed.to_string(), fg(theme::MUTED)));
     Line::from(spans)
 }
@@ -1424,6 +1507,81 @@ mod tests {
         }
     }
 
+    fn draw_rename(
+        buffer: &str,
+        width: u16,
+        logos: Option<&LogoMarks>,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let backend = BackendKind::Codex;
+        let id = "rename";
+        let app = App::new(vec![Session {
+            backend,
+            id: id.into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "original title".into(),
+            cwd: "/tmp/agent-viewer-rename".into(),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }]);
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    &app,
+                    &pulses,
+                    0,
+                    &pr_status,
+                    ListDeco {
+                        rename: Some((backend, id, buffer)),
+                    },
+                    logos,
+                    Rect::new(0, 0, width, 1),
+                );
+            })
+            .unwrap();
+        terminal
+    }
+
+    #[test]
+    fn rename_truncates_wide_input_by_display_width() {
+        set_logo_marks(true);
+        let mut terminal = draw_rename("a界bc", 8, None);
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(3, 0)].symbol(), "a");
+        assert_eq!(buffer[(4, 0)].symbol(), "界");
+        assert_eq!(buffer[(6, 0)].symbol(), "b");
+        assert_eq!(buffer[(7, 0)].symbol(), " ");
+        terminal.backend_mut().assert_cursor_position((7, 0));
+    }
+
+    #[test]
+    fn rename_logo_overlay_uses_compact_mark_slot() {
+        set_logo_marks(true);
+        let logos = LogoMarks::halfblocks_for_test().unwrap();
+        let terminal = draw_rename("abcde", 8, Some(&logos));
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(0, 0)].symbol(), "✎");
+        assert_ne!(buffer[(1, 0)].symbol(), " ");
+        assert_ne!(buffer[(2, 0)].symbol(), " ");
+        assert_eq!(buffer[(3, 0)].symbol(), "a");
+    }
+
     #[test]
     fn selected_row_keeps_title_and_summary_contrast() {
         use ratatui::Terminal;
@@ -1539,13 +1697,22 @@ mod tests {
         };
 
         let mut app = App::new(vec![session(1_000, 91_000)]);
-        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+        let rendered = render_elapsed(&app, 121_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("2m"));
+        assert!(rendered.find("Working") < rendered.rfind("2m"));
 
         app.set_sessions(vec![session(1_000, 111_000)]);
-        assert!(render_elapsed(&app, 121_000).contains("Working 2m"));
+        let rendered = render_elapsed(&app, 121_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("2m"));
+        assert!(rendered.find("Working") < rendered.rfind("2m"));
 
         let fallback = App::new(vec![session(0, 90_000)]);
-        assert!(render_elapsed(&fallback, 120_000).contains("Working 30s"));
+        let rendered = render_elapsed(&fallback, 120_000);
+        assert!(rendered.contains("Working"));
+        assert!(rendered.trim_end().ends_with("30s"));
+        assert!(rendered.find("Working") < rendered.rfind("30s"));
     }
 
     #[test]
@@ -1940,25 +2107,26 @@ mod tests {
         assert!(metadata.contains("gpt-5.3-codex"));
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
-        // Border + one pad column, so the input text opens at column 2 (the mark column the
-        // list rows above use), not hard against the border.
-        assert_eq!(&rows[top + 2], &format!("│ hello{}│", " ".repeat(42)));
-        // One pad column between the border and the metadata mark.
-        assert_eq!(metadata.chars().nth(1), Some(' '));
-        assert_eq!((cursor.x, cursor.y), (7, (top + 2) as u16));
+        assert!(
+            metadata.starts_with(&format!("│{}codex", backend_mark(BackendKind::Codex))),
+            "compact metadata: {metadata:?}"
+        );
+        // The input begins immediately inside the border, leaving no horizontal padding.
+        assert_eq!(&rows[top + 2], &format!("│hello{}│", " ".repeat(43)));
+        assert_eq!((cursor.x, cursor.y), (6, (top + 2) as u16));
     }
 
     #[test]
     fn composer_exact_width_input_adds_a_cursor_continuation_row() {
-        // A 12-wide frame leaves 8 input columns (2 borders + 2 pads), so 8 chars fill the
+        // A 12 column frame leaves 10 input columns after the borders, so 10 chars fill the
         // row exactly and the cursor needs a continuation row below it.
-        let (rows, cursor) = render_viewer(12, 18, "01234567", Mode::Normal);
+        let (rows, cursor) = render_viewer(12, 18, "0123456789", Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "│ 01234567 │");
+        assert_eq!(&rows[top + 2], "│0123456789│");
         assert_eq!(&rows[top + 3], "│          │");
-        assert_eq!(cursor, (2, (top + 3) as u16));
+        assert_eq!(cursor, (1, (top + 3) as u16));
     }
 
     #[test]
@@ -1967,23 +2135,20 @@ mod tests {
         let (rows, cursor) = render_viewer(12, 18, text, Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
-        // 8 input columns: "abcdef界" fills them, so "gh" wraps; the blank line survives.
-        assert_eq!(bottom - top + 1, 8);
-        assert_eq!(&rows[top + 2], "│ abcdef界 │");
-        assert_eq!(&rows[top + 3], "│ gh       │");
-        assert_eq!(&rows[top + 4], "│          │");
-        assert_eq!(&rows[top + 5], "│ ijklmnop │");
-        assert_eq!(&rows[top + 6], "│ qrst     │");
-        assert_eq!(cursor, (6, (top + 6) as u16));
+        // 10 input columns: "abcdef界gh" fills the first row, and the blank line survives.
+        assert_eq!(bottom - top + 1, 7);
+        assert_eq!(&rows[top + 2], "│abcdef界gh│");
+        assert_eq!(&rows[top + 3], "│          │");
+        assert_eq!(&rows[top + 4], "│ijklmnopqr│");
+        assert_eq!(&rows[top + 5], "│st        │");
+        assert_eq!(cursor, (3, (top + 5) as u16));
     }
 
     #[test]
-    fn composer_input_column_matches_the_list_row_mark_column() {
-        // A list row is `<status glyph><space><backend mark>`, so its mark slot opens at
-        // column 2. The composer's pad column puts its own mark and its input text in that
-        // same column; without the pad they would sit at column 1, one short of the rows
-        // above. Marks themselves are a process-global mode (another test flips the logo
-        // OnceLock), so this asserts columns, never glyphs.
+    fn composer_content_starts_in_the_compact_list_mark_column() {
+        // A list row is `<status glyph><backend mark><title>`, so the mark slot opens at
+        // column 1. Composer metadata and input use that same column immediately inside their
+        // border. Marks are process-global mode, so this asserts measured columns, not glyphs.
         let app = App::new(vec![Session {
             backend: BackendKind::Claude,
             id: "aligned".into(),
@@ -2038,28 +2203,29 @@ mod tests {
             .collect();
         let (top, _) = composer_bounds(&rows);
 
-        let list_row = rows
+        let list_y = rows
             .iter()
-            .find(|row| row.contains("aligned-session"))
+            .position(|row| row.contains("aligned-session"))
             .expect("session row");
-        // Column 0 is the status glyph, column 1 its separator space, column 2 the mark slot.
-        assert_ne!(list_row.chars().next(), Some(' '));
-        assert_eq!(list_row.chars().nth(1), Some(' '));
-        // The composer's metadata row and its input row both open at that same column 2.
-        assert_eq!(rows[top + 1].chars().nth(1), Some(' '));
-        assert_eq!(rows[top + 2].chars().nth(1), Some(' '));
-        assert_eq!(rows[top + 2].chars().nth(2), Some('t'));
+        let mark_width = mark_width(backend_mark(BackendKind::Claude)) as u16;
+        // The list title begins directly after the status glyph and complete mark slot.
+        assert_ne!(buf[(0, list_y as u16)].symbol(), " ");
+        assert_eq!(buf[(1 + mark_width, list_y as u16)].symbol(), "a");
+        // Metadata begins with the mark in column 1 and its backend name follows the mark.
+        assert_eq!(buf[(1 + mark_width, (top + 1) as u16)].symbol(), "c");
+        // The task input also starts at column 1, directly inside its border.
+        assert_eq!(buf[(1, (top + 2) as u16)].symbol(), "t");
     }
 
     #[test]
     fn composer_wraps_the_input_at_word_boundaries() {
-        // 20-wide frame -> 16 input columns. The text breaks after "wrap" rather than
+        // A 20 column frame leaves 18 input columns. The text breaks after "wrap" rather than
         // splitting "boundaries", and no wrapped row opens with the eaten space.
         let (rows, _) = render_viewer(20, 24, "wrap at word boundaries here", Mode::Normal);
         let (top, _) = composer_bounds(&rows);
 
-        assert_eq!(&rows[top + 2], "│ wrap at word     │");
-        assert_eq!(&rows[top + 3], "│ boundaries here  │");
+        assert_eq!(&rows[top + 2], "│wrap at word      │");
+        assert_eq!(&rows[top + 3], "│boundaries here   │");
     }
 
     #[test]
@@ -2075,29 +2241,30 @@ mod tests {
         assert!(rows[top + 1].contains("claude"));
         assert!(rows[top + 2].contains("line05"));
         assert!(rows[bottom - 1].contains("line14"));
-        assert_eq!(cursor, (8, (bottom - 1) as u16));
+        assert_eq!(cursor, (7, (bottom - 1) as u16));
     }
 
     #[test]
     fn input_box_wraps_long_text_down_the_rows_with_cursor_on_the_last() {
-        // Inner width 6 (10 - 2 borders - 2 pads), prompt "> " (width 2): first budget 4,
-        // rest 6. "abcdefgh" has no space to break at, so it hard splits "abcd" | "efgh".
+        // Inner width 8 (10 - 2 borders), prompt "> " (width 2): first budget 6, rest 8.
+        // "abcdefgh" has no space to break at, so it hard splits "abcdef" | "gh".
         let (rows, cursor) = render_input_box(10, 4, "> ", 2, "abcdefgh");
         assert!(rows[0].starts_with('╭'), "top border: {:?}", rows[0]);
         assert!(rows[3].starts_with('╰'), "bottom border: {:?}", rows[3]);
-        // Row 1: border + pad + prompt + first 4 chars. Row 2: next 4 chars (no prompt).
-        assert_eq!(&rows[1], "│ > abcd │");
-        assert_eq!(&rows[2], "│ efgh   │");
+        // Row 1 begins at the border followed by the prompt and first 6 chars. Row 2 has no
+        // prompt and retains the full available inner width.
+        assert_eq!(&rows[1], "│> abcdef│");
+        assert_eq!(&rows[2], "│gh      │");
         // Cursor sits at the end of the text on the second inner row (y == 2), not off-screen
-        // to the right: inner.x (2) + 4 typed chars = col 6.
-        assert_eq!(cursor, (6, 2));
+        // to the right: inner.x (1) + 2 typed chars = col 3.
+        assert_eq!(cursor, (3, 2));
     }
 
     #[test]
     fn input_box_short_text_stays_on_one_row() {
         // Short text does not wrap: single inner row, cursor right after it on row 1.
         let (rows, cursor) = render_input_box(12, 3, "> ", 2, "hi");
-        assert_eq!(&rows[1], "│ > hi     │");
-        assert_eq!(cursor, (6, 1));
+        assert_eq!(&rows[1], "│> hi      │");
+        assert_eq!(cursor, (5, 1));
     }
 }
