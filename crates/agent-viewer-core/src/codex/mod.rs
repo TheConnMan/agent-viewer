@@ -341,6 +341,17 @@ impl Backend for CodexBackend {
         Ok(sessions)
     }
 
+    fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
+        let Some(path) = session
+            .rollout_path
+            .as_deref()
+            .filter(|path| path.is_file())
+        else {
+            return Ok(Vec::new());
+        };
+        rollout::read_turn_activity(path, window)
+    }
+
     fn available_models(&self) -> Vec<String> {
         // default first, then the CLI catalog, falling back to the registry's used models.
         self.models_cache

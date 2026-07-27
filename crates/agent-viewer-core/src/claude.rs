@@ -183,6 +183,16 @@ impl Backend for ClaudeBackend {
         });
         Ok(sessions)
     }
+    fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
+        let Some(path) = session
+            .rollout_path
+            .as_deref()
+            .filter(|path| path.is_file())
+        else {
+            return Ok(Vec::new());
+        };
+        read_claude_turn_activity(path, window)
+    }
     fn available_models(&self) -> Vec<String> {
         // opus[1m] (the non-pinned alias) first, then whatever ~/.claude.json advertises.
         self.models_cache
@@ -831,6 +841,50 @@ pub fn read_claude_transcript(
         items = items.split_off(items.len() - max_items);
     }
     Ok(items)
+}
+
+/// Read turn timestamps from the final 64 KiB of a Claude transcript.
+fn read_claude_turn_activity(
+    path: &std::path::Path,
+    window: std::time::Duration,
+) -> Result<Vec<i64>> {
+    let text = crate::codex::rollout::tail_window(path)?;
+    let (cutoff, now) = crate::activity_window(window);
+    let mut timestamps = Vec::new();
+    for line in text.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
+            continue;
+        };
+        if !matches!(
+            crate::json_str(&value, "type"),
+            Some("user") | Some("assistant")
+        ) {
+            continue;
+        }
+        let has_text = match value
+            .get("message")
+            .and_then(|message| message.get("content"))
+        {
+            Some(serde_json::Value::String(text)) => !text.is_empty(),
+            Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|block| {
+                crate::json_str(block, "type") == Some("text")
+                    && crate::json_str(block, "text").is_some_and(|text| !text.is_empty())
+            }),
+            _ => false,
+        };
+        if !has_text {
+            continue;
+        }
+        let Some(timestamp) = crate::json_str(&value, "timestamp")
+            .and_then(crate::rfc3339_millis)
+            .filter(|timestamp| (*timestamp >= cutoff) && (*timestamp <= now))
+        else {
+            continue;
+        };
+        timestamps.push(timestamp);
+    }
+    timestamps.sort_unstable();
+    Ok(timestamps)
 }
 
 #[cfg(test)]

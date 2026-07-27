@@ -228,6 +228,16 @@ pub trait Backend: Send {
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
     /// Sessions are returned recency-sorted (updated_at_ms DESC).
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
+    /// Epoch millisecond timestamps of turn events for `session` within the last
+    /// `window`, oldest first. Empty when the backend cannot say.
+    fn turn_activity(
+        &self,
+        session: &Session,
+        window: std::time::Duration,
+    ) -> crate::error::Result<Vec<i64>> {
+        let _ = (session, window);
+        Ok(Vec::new())
+    }
     /// Returns the direct child PID when the viewer forked it and the exact backend session
     /// identity when the spawn protocol provides one.
     /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
