@@ -1,64 +1,52 @@
-# Contract: opencode server (optional, opportunistic)
+# Contract: opencode server runtime
 
-Bound only when `opencode.server_url` is configured and reachable (D-013). Unset or unreachable
-means the backend behaves exactly as today: CLI plus read-only SQLite.
+OpenCode server use is automatic and loopback only. The fixed candidates are `127.0.0.1:4097`, then `127.0.0.1:4098`. SQLite is read only compatibility enumeration only when no secure server is available. It is not job authority.
 
-## Lifecycle
+## Lifecycle and credentials
 
-- agent-viewer **MUST NOT** start a server. `opencode serve` is strictly manual, and starting one
-  is a user-visible side effect.
-- agent-viewer **MUST NOT** guess a port. There is no pidfile, port file or registry; the plain
-  `opencode` TUI opens no listening socket at all (it embeds its server in-process).
-- Reachability MUST be probed, and failure MUST degrade silently to the no-server tier rather
-  than erroring. Capabilities are recomputed from the live tier.
-- The server is unsecured by default (`OPENCODE_SERVER_PASSWORD` unset). Basic auth credentials
-  are supported by `opencode attach` via `-p`/`-u` and MUST be passed through when configured.
+The viewer never stops or restarts a server. Spawn is the only operation that may start one. It starts `opencode serve --hostname 127.0.0.1 --port <port>` from the user home directory, preserving the normal environment and overriding only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`. Task shells receive neither credential.
+
+Basic authentication uses nonempty `OPENCODE_SERVER_PASSWORD` and optional nonempty `OPENCODE_SERVER_USERNAME` overrides, or a generated stable secret in owner only credential files. SQLite holds only viewer presentation state. The preexisting unused `opencode.server_url` setting remains unchanged.
+
+An occupied candidate is accepted only when it is the exact pinned OpenCode server process and requires authentication. A listener that returns `200` to unauthenticated `GET /global/health` is rejected as insecure. It is never stopped or restarted. Spawn may then use `4098` when that port is free.
+
+Runtime state contains a generation, the pinned identity, health, and the managed session ids. The identity includes pid, start time, listener inode, effective uid, and exact argv. Process shared ownership uses only `flock`; each viewer process serializes its own work locally.
+
+## Request authentication
+
+Before every credential bearing request, the viewer connects without writing and verifies that the listener owner is the exact pinned process. It sends unauthenticated `GET /global/health` with keep alive and requires `401` while retaining a reusable connection. It resolves the reverse accepted connection inode for that exact local ephemeral tuple and verifies the same pinned pid, start time, effective uid, exact argv, and generation. It repeats this validation after the test hook, then sends the authorized request on that same `TcpStream` with `Connection: close`. It never reconnects for authorization.
+
+The client is bounded HTTP/1.1 over `TcpStream`. It accepts strict content framing, including bodyless `204`, has bounded headers, body, and timeouts, and follows no redirects.
+
+## Enumeration and management
+
+Global enumeration is `GET /experimental/session?limit=10000&archived=true`, with `X-Next-Cursor` pagination. Repeated or malformed cursors, or a full page with no cursor, are errors.
+
+The exact managed marker is this permission rule:
+
+```json
+{"permission":"agent-viewer.background","pattern":"*","action":"allow"}
+```
+
+A metadata marker is invalid. Only exact marked rows are managed. Only they receive `daemon_hosted`, live status, pending input, managed capabilities, and server mutations. The managed id cache includes archived marked rows so archive and unarchive remain available. Archived marked rows are not status polled.
+
+For each unique active managed directory, the viewer fetches status, permission, and question once. A failure marks every row in that directory, including external rows, `Unknown`. Otherwise external server enumerated rows use compatibility `Idle` status.
+
+Server mutations apply only to exact managed rows. Managed attach is refused because it would expose credentials. External rows run `opencode -s <session_id>`. External deletion remains local `opencode session delete <id>`.
 
 ## Endpoints used
 
-Deliberately four, not the ~190 the spec declares. The API is visibly mid-migration - parallel
-`/session` and `/api/session` families, `experimental/` paths, `V2`/`Next` event names - so the
-binding stays narrow.
-
 | Call | Use |
-|---|---|
-| `GET /session` | enumeration |
-| `GET /session/status` | per-session `idle` / `busy` / `retry{attempt,message,next}` |
-| `PATCH /session/{id}` with `{"title":"..."}` | rename |
-| `PATCH /session/{id}` with `{"time":{"archived":<ms>}}` | archive |
+| --- | --- |
+| `GET /global/health` | unauthenticated authentication challenge and authenticated health |
+| `GET /experimental/session?limit=10000&archived=true` | global enumeration |
+| `GET /session/status?directory=...` | one active managed directory status |
+| `GET /permission?directory=...` | one active managed directory permissions |
+| `GET /question?directory=...` | one active managed directory questions |
+| `POST /session?directory=...` | managed spawn |
+| `POST /session/{id}/prompt_async?directory=...` | managed prompt, `204` expected |
+| `PATCH /session/{id}` | managed rename and archive |
+| `POST /session/{id}/abort` | managed stop |
+| `DELETE /session/{id}` | managed delete |
 
-Two encoded caveats:
-
-1. **`GET /session` does not filter archived sessions.** Only `/experimental/session` does
-   (`?archived=true` returned 298; `false` or default returned 297). Archived filtering must
-   therefore be applied by the caller on the stable endpoint.
-2. **Unarchive is `archived: 0`.** Sending `{"time":{}}` is a silent no-op.
-
-The OpenAPI document is at `GET /doc` (467 KB). `/openapi.json`, `/swagger` and `/docs` are SPA
-fallbacks, not the spec.
-
-## Attach
-
-```
-opencode attach <url> -s <session_id>
-```
-
-Native client, no renderer on our side (D-001). Verified: session count was 250 before, during
-and after, with `new_ids=[]`, and the TUI replayed existing conversation history.
-
-`--fork` MUST never be passed.
-
-## Events
-
-SSE at `GET /event`. Consumed: `session.status` (per-session payloads), `session.updated`,
-`message.updated`. `server.heartbeat` is the liveness signal. The declared catalogue also
-includes `EventPermissionAsked`, `EventQuestionAsked` and `EventSessionIdle`.
-
-As everywhere else, the 2s poll backstop (FR-009) is what guarantees the bound; SSE is an
-optimization (D-007).
-
-## Not available
-
-PR association. There are zero `pull` matches in the API spec; `GET /vcs` returns only
-`{"branch":"main","default_branch":"main"}`. `pr_refs` MUST be advertised unsupported on this
-backend in both tiers.
+PR association is unsupported.

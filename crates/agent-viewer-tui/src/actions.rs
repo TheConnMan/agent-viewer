@@ -13,7 +13,7 @@ use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
 use crate::keys::set_mouse_capture;
-use crate::ops::{Mutation, run_mutation};
+use crate::ops::Mutation;
 use crate::{Key, Refresher, Ui};
 
 /// Enter/Space on a header toggles and persists the collapse. Returns true when a header was
@@ -183,7 +183,8 @@ pub(crate) fn apply_rename(ui: &mut Ui) {
     };
     let key = format!("{}:{}:rename", backend_kind.name(), id);
     let mutation = Mutation::Rename(session, name.clone());
-    if ui.mutations.submit(key, move || run_mutation(mutation)) {
+    let executor = ui.mutation_executor.clone();
+    if ui.mutations.submit(key, move || executor(mutation)) {
         ui.set_notice(format!("renaming… {name}"));
     }
 }
@@ -248,7 +249,9 @@ pub(crate) fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bo
     let Some(session) = ui.app.selected().cloned() else {
         return;
     };
-    let caps = caps_of(backends, session.backend);
+    let caps = backend_of(backends, session.backend)
+        .map(|backend| backend.capabilities_for(&session))
+        .unwrap_or_else(Capabilities::none);
     if !caps.archive {
         ui.set_notice(format!("{} does not support hide", session.backend.name()));
         return;
@@ -276,7 +279,8 @@ pub(crate) fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bo
 /// immediate "<verb>… <title>" notice (a duplicate keypress while pending is a no-op).
 fn submit_mutation(ui: &mut Ui, session: &Session, op: &str, verb: &str, mutation: Mutation) {
     let key = format!("{}:{}:{}", session.backend.name(), session.id, op);
-    if ui.mutations.submit(key, move || run_mutation(mutation)) {
+    let executor = ui.mutation_executor.clone();
+    if ui.mutations.submit(key, move || executor(mutation)) {
         ui.set_notice(format!("{verb}… {}", session.title));
     }
 }
@@ -287,13 +291,6 @@ fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn B
         .iter()
         .find(|b| b.kind() == kind)
         .map(|b| b.as_ref())
-}
-
-/// Capabilities for a backend kind from the live slice (falls back to none if absent).
-fn caps_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Capabilities {
-    backend_of(backends, kind)
-        .map(|b| b.capabilities())
-        .unwrap_or_else(Capabilities::none)
 }
 
 pub(crate) fn attach_selected<B: ratatui::backend::Backend>(
