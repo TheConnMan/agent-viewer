@@ -212,12 +212,22 @@ impl Composer {
             return Vec::new();
         };
         let word = word.to_lowercase();
-        self.commands
-            .iter()
-            .filter(|c| c.to_lowercase().starts_with(&word))
-            .map(String::as_str)
-            .take(8)
-            .collect()
+        let include_theme = !word.is_empty() && "theme".starts_with(word.as_str());
+        let mut suggestions = Vec::with_capacity(8);
+        if include_theme {
+            suggestions.push("theme");
+        }
+        suggestions.extend(
+            self.commands
+                .iter()
+                .filter(|command| {
+                    (!include_theme || !command.eq_ignore_ascii_case("theme"))
+                        && command.to_lowercase().starts_with(&word)
+                })
+                .map(String::as_str)
+                .take(8 - suggestions.len()),
+        );
+        suggestions
     }
 
     pub fn suggestions_active(&self) -> bool {
@@ -354,5 +364,41 @@ impl DetachTracker {
     /// Left detaches only when there is no pending input.
     pub fn detach_on_left(&self) -> bool {
         self.pending == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_is_suggested_for_matching_prefix_on_every_backend() {
+        for backend in [
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Opencode,
+        ] {
+            let mut composer = Composer::new();
+            while composer.backend() != backend {
+                composer.cycle_backend();
+            }
+            composer.set_commands(Vec::new(), (backend, Some(PathBuf::from("/tmp/project"))));
+            composer.push_str("/th");
+
+            assert!(
+                composer.suggestions().contains(&"theme"),
+                "/theme missing for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_accepts_theme_suggestion_as_theme_command() {
+        let mut composer = Composer::new();
+        composer.set_commands(Vec::new(), (BackendKind::Claude, None));
+        composer.push_str("/th");
+
+        assert!(composer.accept_suggestion());
+        assert!(composer.is_theme_command());
     }
 }
