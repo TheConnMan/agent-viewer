@@ -1,10 +1,16 @@
-use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
+use agent_viewer_core::{BackendKind, PrRef, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{
     App, Composer, DetachTracker, GroupKey, GroupMode, KillStage, Row, Section, format_elapsed,
     row_layout,
 };
+use agent_viewer_tui::pr_cache::PrStatusCache;
+use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, draw, theme};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthStr;
 
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd
 /// (no filesystem, no subprocess).
@@ -582,46 +588,364 @@ fn selection_clamps_when_selected_session_vanishes() {
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("a"));
 }
 
-// --- Row layout reserves the elapsed slot (finding 3) ---
+// Main row layout
 
 #[test]
-fn row_layout_reserves_right_cluster_for_long_titles() {
-    let width = 40;
+fn row_layout_pads_titles_so_every_status_starts_in_the_same_column() {
+    let width = 80;
     let mark_width = 1;
-    let right_len = 10; // e.g. "Working 3h"
-    let long = "this-is-an-extremely-long-session-title-that-overflows-the-row";
-    let (name, detail, pad) = row_layout(width, mark_width, long, "", right_len);
-    // The title is truncated rather than clipping the right-aligned cluster.
-    assert!(name.chars().count() < long.chars().count());
-    assert!(detail.is_empty());
-    // The whole row (flush left + name + pad + right cluster) fits exactly in width, so the
-    // status word + time cluster is never pushed off the line.
+    let title_width = 14;
+    let elapsed_width = 2;
+    let (short_title, short_status, short_pr, short_summary, short_pad) = row_layout(
+        width,
+        mark_width,
+        "ship",
+        title_width,
+        "Working",
+        "",
+        "build package",
+        elapsed_width,
+    );
+    let (long_title, long_status, long_pr, long_summary, long_pad) = row_layout(
+        width,
+        mark_width,
+        "release notes",
+        title_width,
+        "Needs input",
+        "",
+        "approve release",
+        elapsed_width,
+    );
+
+    assert_eq!(UnicodeWidthStr::width(short_title.as_str()), title_width);
+    assert_eq!(UnicodeWidthStr::width(long_title.as_str()), title_width);
+    assert_eq!(short_status, "Working");
+    assert_eq!(long_status, "Needs input");
+    assert!(short_pr.is_empty());
+    assert!(long_pr.is_empty());
+    assert_eq!(short_summary, "build package");
+    assert_eq!(long_summary, "approve release");
+
     let left_fixed = 3 + mark_width;
-    assert_eq!(left_fixed + name.chars().count() + pad + right_len, width);
+    let status_start_after_short_title =
+        left_fixed + UnicodeWidthStr::width(short_title.as_str()) + 1;
+    let status_start_after_long_title =
+        left_fixed + UnicodeWidthStr::width(long_title.as_str()) + 1;
+    assert_eq!(
+        status_start_after_short_title,
+        status_start_after_long_title
+    );
+
+    let short_used = status_start_after_short_title
+        + UnicodeWidthStr::width(short_status.as_str())
+        + 2
+        + UnicodeWidthStr::width(short_summary.as_str())
+        + short_pad
+        + elapsed_width;
+    let long_used = status_start_after_long_title
+        + UnicodeWidthStr::width(long_status.as_str())
+        + 2
+        + UnicodeWidthStr::width(long_summary.as_str())
+        + long_pad
+        + elapsed_width;
+    assert_eq!(short_used, width);
+    assert_eq!(long_used, width);
 }
 
 #[test]
-fn row_layout_fits_name_and_summary_with_flush_right_cluster() {
-    let width = 60;
+fn row_layout_keeps_pr_with_secondary_and_elapsed_flush_right_at_narrow_width() {
     let mark_width = 1;
-    let right_len = 12; // "#315 Done 2h"
-    let (name, detail, pad) = row_layout(width, mark_width, "sess", "a short summary", right_len);
-    assert_eq!(name, "sess");
-    assert_eq!(detail, "a short summary");
-    let used = (3 + mark_width) + name.chars().count() + 2 + detail.chars().count();
-    assert_eq!(used + pad + right_len, width);
+    let width = 34;
+    let elapsed_width = 2;
+    let (title, status, pr, summary, pad) = row_layout(
+        width,
+        mark_width,
+        "a title that must shrink",
+        40,
+        "Done",
+        "#315",
+        "concise summary",
+        elapsed_width,
+    );
+
+    assert_eq!(status, "Done");
+    assert_eq!(pr, "#315");
+    assert!(!summary.is_empty());
+    assert!(UnicodeWidthStr::width(title.as_str()) < 40);
+
+    let used = (3 + mark_width)
+        + UnicodeWidthStr::width(title.as_str())
+        + 1
+        + UnicodeWidthStr::width(status.as_str())
+        + 2
+        + UnicodeWidthStr::width(pr.as_str())
+        + 1
+        + UnicodeWidthStr::width(summary.as_str())
+        + pad
+        + elapsed_width;
+    assert_eq!(used, width);
 }
 
 #[test]
-fn row_layout_drops_summary_when_no_room() {
-    // Width fits the name and the reserved right cluster but leaves nothing for a summary.
+fn row_layout_keeps_status_start_fixed_when_secondary_lengths_differ() {
+    let width = 50;
     let mark_width = 1;
-    let right_len = 8;
-    let width = (3 + mark_width) + 4 + 1 + right_len; // left_fixed + name(4) + gap + cluster
-    let (name, detail, pad) = row_layout(width, mark_width, "sess", "wont fit", right_len);
-    assert_eq!(name, "sess");
-    assert!(detail.is_empty());
+    let title_width = 14;
+    let elapsed_width = 2;
+    let (with_summary_title, _, _, _, _) = row_layout(
+        width,
+        mark_width,
+        "ship",
+        title_width,
+        "Done",
+        "",
+        "a secondary message much wider than the available space",
+        elapsed_width,
+    );
+    let (without_summary_title, _, _, _, _) = row_layout(
+        width,
+        mark_width,
+        "release notes",
+        title_width,
+        "Needs input",
+        "",
+        "",
+        elapsed_width,
+    );
+
+    assert_eq!(
+        UnicodeWidthStr::width(with_summary_title.as_str()),
+        title_width
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(without_summary_title.as_str()),
+        title_width
+    );
+}
+
+#[test]
+fn row_layout_shrinks_title_to_keep_one_complete_summary_grapheme() {
+    let first_grapheme = "e\u{301}";
+    let (title, status, pr, summary, pad) = row_layout(
+        32,
+        1,
+        "abcdefghijklmnopqrst",
+        20,
+        "Done",
+        "",
+        &format!("{first_grapheme}clair"),
+        2,
+    );
+
+    assert_eq!(status, "Done");
+    assert!(pr.is_empty());
+    assert!(UnicodeWidthStr::width(title.as_str()) < 20);
+    assert!(summary.starts_with(first_grapheme));
     assert!(pad >= 1);
+}
+
+#[test]
+fn row_layout_never_renders_part_of_a_pr_badge() {
+    let (_, _, pr, _, _) = row_layout(19, 1, "task", 4, "Done", "#315", "", 2);
+
+    assert_eq!(pr, "#315");
+}
+
+#[test]
+fn row_layout_truncates_titles_at_grapheme_boundaries() {
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    let title = format!("{family} deploy");
+    let (visible_title, _, _, _, _) = row_layout(20, 1, &title, 2, "Working", "", "", 2);
+
+    assert_eq!(visible_title.trim_end(), family);
+}
+
+#[test]
+fn row_layout_always_separates_elapsed_from_preceding_content() {
+    let (title, status, pr, summary, pad) =
+        row_layout(30, 1, "release", 7, "Done", "#9", "ready", 2);
+    let secondary = format!("{pr} {summary}");
+    let rendered = format!("{title} {status}  {secondary}{}3m", " ".repeat(pad));
+
+    assert!(rendered.ends_with(" 3m"));
+}
+
+#[test]
+fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
+    let long_title = "1234567890".repeat(5);
+    let mut needs = sess(
+        BackendKind::Codex,
+        "needs",
+        "/synthetic/shared",
+        2_800_000,
+        Status::needs_input(),
+    );
+    needs.title = long_title.clone();
+    needs.summary = "review".to_string();
+    needs.pr_refs = vec![PrRef {
+        id: "315".to_string(),
+        href: None,
+    }];
+
+    let mut done = sess(
+        BackendKind::Claude,
+        "done",
+        "/synthetic/shared",
+        9_820_000,
+        Status::Done,
+    );
+    done.title = "Deploy".to_string();
+    done.summary = "finished".to_string();
+
+    let app = App::new(vec![needs, done]);
+    let mode = Mode::Normal;
+    let composer = Composer::new();
+    let pulses = Pulses::new();
+    let pr_status = PrStatusCache::new();
+    let list_hit = RefCell::new(ListHit::default());
+    let width = 76_u16;
+    let height = 20_u16;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/synthetic/shared"),
+                    mode: &mode,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 10_000_000,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let column = |y: u16, needle: &str| -> Option<u16> {
+        let expected: Vec<char> = needle.chars().collect();
+        (0..=width.saturating_sub(expected.len() as u16)).find(|start| {
+            expected
+                .iter()
+                .enumerate()
+                .all(|(offset, ch)| buffer[(*start + offset as u16, y)].symbol() == ch.to_string())
+        })
+    };
+    let row = |needle: &str| -> u16 {
+        (0..height)
+            .find(|y| column(*y, needle).is_some())
+            .expect("rendered session row")
+    };
+
+    let visible_long_title = &long_title[..40];
+    let needs_y = row(visible_long_title);
+    let done_y = row("Deploy");
+    let needs_title = column(needs_y, visible_long_title).unwrap();
+    let needs_status = column(needs_y, "Needs input").unwrap();
+    let needs_pr = column(needs_y, "#315").unwrap();
+    let needs_summary = column(needs_y, "review").unwrap();
+    let needs_elapsed = column(needs_y, "2h").unwrap();
+    let done_title = column(done_y, "Deploy").unwrap();
+    let done_status = column(done_y, "Done").unwrap();
+    let done_summary = column(done_y, "finished").unwrap();
+    let done_elapsed = column(done_y, "3m").unwrap();
+
+    assert!(needs_title < needs_status);
+    assert!(needs_status < needs_summary);
+    assert!(needs_summary < needs_pr);
+    assert!(needs_pr < needs_elapsed);
+    assert!(done_title < done_status);
+    assert!(done_status < done_summary);
+    assert!(done_summary < done_elapsed);
+    assert_eq!(needs_status, done_status);
+    assert_eq!(needs_status - needs_title - 1, 40);
+    assert_eq!(buffer[(needs_pr, needs_y)].fg, theme::ACCENT);
+    assert_eq!(buffer[(needs_summary, needs_y)].fg, theme::MUTED);
+    assert_eq!(buffer[(needs_elapsed, needs_y)].fg, theme::MUTED);
+    assert_eq!(buffer[(done_summary, done_y)].fg, theme::MUTED);
+    assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::MUTED);
+    assert_eq!(needs_elapsed + 2, width);
+    assert_eq!(done_elapsed + 2, width);
+}
+
+#[test]
+fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
+    let long_title = "T".repeat(30);
+    let mut session = sess(
+        BackendKind::Codex,
+        "pr",
+        "/synthetic/shared",
+        2_800_000,
+        Status::Done,
+    );
+    session.title = long_title;
+    session.pr_refs = vec![PrRef {
+        id: "315".to_string(),
+        href: None,
+    }];
+
+    let app = App::new(vec![session]);
+    let mode = Mode::Normal;
+    let composer = Composer::new();
+    let pulses = Pulses::new();
+    let pr_status = PrStatusCache::new();
+    let list_hit = RefCell::new(ListHit::default());
+    let width = 50_u16;
+    let height = 20_u16;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/synthetic/shared"),
+                    mode: &mode,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 10_000_000,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let column = |y: u16, needle: &str| -> Option<u16> {
+        let expected: Vec<char> = needle.chars().collect();
+        (0..=width.saturating_sub(expected.len() as u16)).find(|start| {
+            expected
+                .iter()
+                .enumerate()
+                .all(|(offset, ch)| buffer[(*start + offset as u16, y)].symbol() == ch.to_string())
+        })
+    };
+    let row = (0..height)
+        .find(|y| column(*y, "#315").is_some())
+        .expect("complete PR badge");
+    let title = column(row, "TTTTTTTTTT").unwrap();
+    let status = column(row, "Done").unwrap();
+    let pr = column(row, "#315").unwrap();
+    let elapsed = column(row, "2h").unwrap();
+
+    assert!(title < status);
+    assert!(status < pr);
+    assert!(pr < elapsed);
+    assert!(status - title - 1 < 30);
+    assert_eq!(buffer[(pr, row)].fg, theme::ACCENT);
+    assert_eq!(elapsed + 2, width);
 }
 
 #[test]
