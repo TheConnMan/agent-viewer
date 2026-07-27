@@ -159,10 +159,9 @@ its SQLite title still shows the prompt.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
-- `Ctrl+T` — turn mouse reporting off / back on. Off hands the mouse back to your terminal so
-  you can drag-select and copy text out of the viewer; on restores left click row activation,
-  hover row selection, and wheel scrolling. Works everywhere, including inside an attach, so
-  the transcript is copyable. A footer notice names the mode you just switched to.
+- `Ctrl+T` — toggle mouse reporting. Off hands the mouse back to your terminal so you can
+  drag-select and copy text; on restores left click row activation, hover row selection, and
+  wheel scrolling. A footer notice names the mode you just switched to.
 - `?` — key help.
 - `Ctrl+C` — quit.
 
@@ -180,6 +179,9 @@ job and a finished one (waking it in place); a row with no background-job id fal
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
+Mouse reporting starts off for every attached backend, so Codex, Claude, and opencode
+transcripts are selectable immediately. Returning to the list restores its mouse behavior;
+`Ctrl+T` toggles either mode manually.
 
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
@@ -202,7 +204,7 @@ for an oversight; see the constitution's Additional Constraints.
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
 If a child exits while you are attached, its final screen stays visible and any key
-returns you to the list.
+except `Ctrl+T` returns you to the list; `Ctrl+T` toggles the mouse instead.
 
 Viewer-local state (archive flags, stop markers, spawn records) is kept in a
 SQLite database at `~/.local/state/agent-viewer/viewer.db`, separate from every backend's
