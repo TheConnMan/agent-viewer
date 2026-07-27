@@ -684,14 +684,20 @@ mod tests {
         assert!(!ui.mouse_capture);
         let off = ui.notice.text().to_string();
         assert!(off.contains("drag to select"), "notice was {off:?}");
-        assert!(off.contains("ctrl+t"), "notice must name the way back: {off:?}");
+        assert!(
+            off.contains("ctrl+t"),
+            "notice must name the way back: {off:?}"
+        );
 
         // Back on: flag restored, and the notice again names the escape hatch.
         set_capture(&mut ui, true);
         assert!(ui.mouse_capture);
         let on = ui.notice.text().to_string();
         assert!(on.contains("click/hover"), "notice was {on:?}");
-        assert!(on.contains("ctrl+t"), "notice must name the way back: {on:?}");
+        assert!(
+            on.contains("ctrl+t"),
+            "notice must name the way back: {on:?}"
+        );
     }
 
     #[test]
@@ -716,7 +722,10 @@ mod tests {
         ui.mouse_capture = true;
         handle_mouse(wheel, &mut ui);
         let moved = ui.app.selected_index();
-        assert_ne!(moved, start, "with capture on the wheel must move selection");
+        assert_ne!(
+            moved, start,
+            "with capture on the wheel must move selection"
+        );
 
         // Capture off (text-select mode): the same wheel event changes nothing. While the
         // terminal owns the mouse, a stray report must not steer the selection.

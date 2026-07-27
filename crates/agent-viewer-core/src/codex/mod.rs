@@ -319,7 +319,8 @@ impl Backend for CodexBackend {
         // Prefer the shared daemon: a thread it hosts is the only kind that can be joined
         // later, and it may be started here (never stopped, never restarted).
         let daemon = app_server::ensure_daemon();
-        if let (SpawnRoute::Daemon, Some(daemon)) = (spawn_route(daemon.as_ref()), daemon.as_ref()) {
+        if let (SpawnRoute::Daemon, Some(daemon)) = (spawn_route(daemon.as_ref()), daemon.as_ref())
+        {
             let attempt = app_server::try_spawn_thread(daemon, dir, task, model);
             match attempt {
                 // No pid to return: the daemon owns the thread, and its pid must never be
@@ -391,7 +392,10 @@ impl Backend for CodexBackend {
         // Probe only, never start, and only for a row that claims a daemon host: the probe is
         // a shell-out and this runs on the attach keypress, so a Local or Refuse row must not
         // pay for it.
-        let daemon = session.daemon_hosted.then(app_server::probe_daemon).flatten();
+        let daemon = session
+            .daemon_hosted
+            .then(app_server::probe_daemon)
+            .flatten();
         let mut cmd = match attach_route(session, daemon.as_ref()) {
             // A real live join: `thread/resume` inside the hosting process returns the history
             // and atomically subscribes to live updates.
