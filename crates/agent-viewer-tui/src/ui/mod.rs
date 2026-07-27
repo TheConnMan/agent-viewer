@@ -5,6 +5,7 @@ mod composer;
 mod header;
 mod list;
 mod overlay;
+mod sprite;
 pub mod theme;
 
 use crate::app::{App, Composer, Row};
@@ -331,10 +332,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
     // (grows with wrapped input) · footer.
+    let header_height = header::height(frame.area(), composer_h);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(header_height),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(composer_h),
@@ -349,7 +351,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     };
     let deco = ListDeco { rename };
 
-    header::draw(frame, d.app, d.workspace, theme, vertical[0]);
+    header::draw(frame, d.app, d.workspace, d.now_ms, theme, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
