@@ -1488,6 +1488,95 @@ fn opencode_last_message_missing_db_is_none() {
     );
 }
 
+fn opencode_activity_session(id: &str) -> Session {
+    Session {
+        backend: BackendKind::Opencode,
+        id: id.to_string(),
+        short_id: None,
+        origin: SessionOrigin::Interactive,
+        title: "Activity session".to_string(),
+        cwd: PathBuf::from("/home/user/project"),
+        git_branch: None,
+        status: Status::Done,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+        daemon_hosted: false,
+    }
+}
+
+#[test]
+fn opencode_turn_activity_normalizes_filters_and_missing_is_empty() {
+    let schema = common::read_fixture("opencode_message_schema.sql");
+    let now = agent_viewer_core::spawn::now_ms();
+    let user = now - 2_000;
+    let assistant = now - 1_000;
+    let old = now - 60_000;
+    let inserts = [
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('ses_activity',NULL,'/home/user/project','Activity',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_old','ses_activity',{old},{old},'{{\"role\":\"user\"}}')"
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_user','ses_activity',{user},{user},'{{\"role\":\"user\"}}')"
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_assistant','ses_activity',{assistant},{assistant},'{{\"role\":\"assistant\"}}')"
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_tool','ses_activity',{now},{now},'{{\"role\":\"tool\"}}')"
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_bad','ses_activity','not-a-timestamp',{now},'{{\"role\":\"assistant\"}}')"
+        ),
+    ];
+    let insert_refs = inserts.iter().map(String::as_str).collect::<Vec<_>>();
+    let (_dir, path) = common::temp_db(&schema, &insert_refs);
+    let backend = OpencodeBackend::with_db(path);
+    assert_eq!(
+        backend
+            .turn_activity(
+                &opencode_activity_session("ses_activity"),
+                Duration::from_secs(10)
+            )
+            .expect("activity"),
+        vec![user, assistant]
+    );
+    assert!(
+        backend
+            .turn_activity(
+                &opencode_activity_session("missing"),
+                Duration::from_secs(10)
+            )
+            .expect("missing session")
+            .is_empty()
+    );
+
+    let missing_backend = OpencodeBackend::with_db(PathBuf::from("/missing/opencode/activity.db"));
+    assert!(
+        missing_backend
+            .turn_activity(
+                &opencode_activity_session("ses_activity"),
+                Duration::from_secs(10)
+            )
+            .expect("missing database")
+            .is_empty()
+    );
+}
+
 // --- v2: `opencode models` stdout parse ---
 
 #[test]
