@@ -218,15 +218,29 @@ daemon pid (returning `None` plus `daemon_hosted: true`), and `stop` routes a da
 to `turn/interrupt` over the socket, never to a signal. What such a row's fd does NOT do any
 more is decide its status: see the rule table below.
 
-**The daemon is identified from ARGV ALONE: `app-server` present, the `daemon` subcommand
-absent.** The live daemon's cmdline is `codex app-server --listen unix://`; the short-lived
-`codex app-server daemon version` / `daemon start` probes carry `daemon` and host nothing.
-Matching on `app-server` rather than on `--listen` errs deliberately toward calling a host a
-host, because the costly mistake here is the false negative (SIGTERM on a process hosting other
-people's threads) while a false positive only routes stop through `turn/interrupt`, which fails
-visibly instead of killing anything.
+**The daemon is identified by the LISTENING control socket it holds, not by its command line.**
+`/proc/net/unix` gives the inode of every unix socket with its state, so the accepting end
+(`St == 01`) bound under `<codex home>/app-server-control/` names the daemon exactly; the same
+`/proc/<pid>/fd` sweep that collects rollout fds already sees `socket:[<inode>]` links, so
+matching them costs nothing extra. A process merely CONNECTED to that path (`St == 03`, any
+client including this viewer) is deliberately not matched. Verified live on 2026-07-27: inode
+4441325 listening on the control socket, held by pid 2950586, the running daemon, with a
+connected client on the same path correctly excluded.
 
-This predicate previously also treated "holds more than one rollout fd" as proof of the daemon.
+This replaced three rounds of trying to locate `app-server` in argv, each of which traded one
+counterexample for another: a fixed index breaks `codex -c k=v app-server`, scanning for
+prompt-taking subcommands breaks a profile named `exec`, and a uniform option-arity parse
+breaks a boolean flag mixed with a value-taking one. argv cannot say which options take values
+and this crate does not own the CLI, so the guessing had no fixed point. The kernel's socket
+table has no such ambiguity.
+
+The argv test survives only as the backstop for an unreadable `/proc/net/unix`, and is
+deliberately crude and biased: `app-server` anywhere means host, minus the `app-server daemon`
+probes. The asymmetry licenses that. A false negative hands a host's pid to SIGTERM and kills
+every session inside it; a false positive only routes stop through `turn/interrupt`, which
+fails visibly and kills nothing.
+
+The predicate previously also treated "holds more than one rollout fd" as proof of the daemon.
 That is measurably false and was removed: a plain
 `codex exec --json -C ... --dangerously-bypass-approvals-and-sandbox` (pid 2910115, live on
 2026-07-27) held TWO rollouts, its own plus a subagent thread it spawned (registry `source`
@@ -293,11 +307,13 @@ Idle until that child actually goes away (quitting the viewer, `Ctrl+X` twice, o
 exiting on its own). Documented rather than fixed: the alternative is asking the daemon per row
 on the render path.
 
-**Known gap, deliberately not addressed: stale-daemon attach targeting.** `attach_route` points
-a daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
+**Known gap, narrowed but not closed: stale-daemon attach targeting.** `attach_route` points a
+daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
 it is the same process that holds the row's fd. If a daemon were restarted (the viewer never
-restarts one) the endpoint could name a daemon that does not host that thread. Matching the fd
-holder's pid to the answering daemon is the fix and is out of scope here.
+restarts one) the endpoint could name a daemon that does not host that thread. The socket-inode
+signal above now makes the fix cheap, since the scan already knows which pid holds the listening
+socket: carrying that pid on the row and comparing it to the answering daemon is all that is
+left. Still out of scope, and now a small change rather than a design one.
 
 Two facts make the tail trustworthy here: the daemon writes the same `task_complete` event_msg
 the exec path does (verified on a daemon-created rollout), and the Working-to-Done flip is
