@@ -59,7 +59,11 @@ pub(crate) fn run_with_timeout(
 /// How long a failed command's stderr may take to arrive once the child is gone. The pipe is
 /// at EOF by then, so this is slack for the reader thread to finish, not a real wait; a
 /// descendant still holding the pipe open must cost the caller this and no more.
-const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Ceiling on captured stderr. The output becomes one footer notice, so more than this is
+/// never shown and only serves to let a chatty descendant grow the buffer unboundedly.
+const STDERR_CAP: usize = 8 * 1024;
 
 /// `run_with_timeout` for callers that must TELL THE USER why it failed, returning the
 /// failure as a one-line diagnostic naming the command.
@@ -99,23 +103,45 @@ pub(crate) fn run_reporting_failure(
     // writes more than the pipe buffer (64KB) blocks on write until someone reads, and a
     // descendant that inherited the pipe can hold it open past the parent's exit. Draining it
     // inline after the wait would turn either case into a hang past the deadline.
-    let (etx, erx) = std::sync::mpsc::channel();
+    //
+    // It accumulates into SHARED memory rather than sending one message at EOF, because the
+    // descendant case is exactly when the diagnostic matters and exactly when EOF never
+    // comes: the parent's own error message is already in the buffer, and a channel that only
+    // fires on EOF would throw it away and report a bare exit code.
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer = std::sync::Arc::clone(&collected);
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        let _ = etx.send(String::from_utf8_lossy(&buf).trim().to_string());
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut buf) = writer.lock() {
+                // Cap it: this is a one-line diagnostic for a footer, not a log sink, and a
+                // chatty descendant must not grow the buffer without bound.
+                if buf.len() < STDERR_CAP {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
     });
+    let stderr_so_far = move || {
+        collected
+            .lock()
+            .map(|buf| String::from_utf8_lossy(&buf).trim().to_string())
+            .unwrap_or_default()
+    };
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    // Bounded: the reason is worth waiting a moment for, never forever.
-                    let why = erx
-                        .recv_timeout(STDERR_DRAIN_GRACE)
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    // The child is gone, so its own output is written; the grace is only slack
+                    // for the reader thread to move the last chunk across. Whatever arrived is
+                    // used either way, so a descendant holding the pipe open costs the wait
+                    // but never the message.
+                    std::thread::sleep(STDERR_DRAIN_GRACE);
+                    let why = stderr_so_far();
                     let why = if why.is_empty() {
                         String::new()
                     } else {
@@ -288,15 +314,21 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5), "took too long");
     }
 
-    /// A descendant that inherited stderr can hold the pipe open after the parent exits.
-    /// The reason is worth a moment, never an unbounded wait.
+    /// A descendant that inherited stderr holds the pipe open after the parent exits, so EOF
+    /// never comes. The parent's OWN diagnostic is already in the buffer by then, and that is
+    /// the whole point of the capture: waiting for EOF would discard it and report a bare
+    /// exit code, and waiting at all must stay bounded.
     #[test]
-    fn run_reporting_failure_gives_up_on_stderr_a_grandchild_still_holds() {
+    fn run_reporting_failure_keeps_stderr_a_grandchild_never_closes() {
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sh -c 'sleep 30' & exit 5");
+        cmd.arg("-c")
+            .arg("echo 'the real reason' >&2; sh -c 'sleep 30' & exit 5");
         let start = Instant::now();
         let err = run_reporting_failure(cmd, Duration::from_secs(30)).unwrap_err();
-        assert!(err.contains("exited"), "got {err:?}");
+        assert!(
+            err.contains("the real reason"),
+            "the parent's own diagnostic must survive a pipe that never reaches EOF, got {err:?}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "a held-open stderr pipe must not stall the caller, took {:?}",

@@ -147,24 +147,49 @@ fn is_daemon_process(args: &[std::borrow::Cow<'_, str>]) -> bool {
     is_app_server(args)
 }
 
-/// The codex subcommands that take a free-text positional, so a word after one of them may be
-/// a user's prompt or a thread id rather than a subcommand of its own.
-const PROMPT_BEARING_SUBCOMMANDS: [&str; 2] = ["exec", "resume"];
-
-/// PURE: the argv test above, kept as its own name because it is what the rule reads as.
+/// PURE: is `app-server` this command line's SUBCOMMAND?
+///
+/// The hard part is that the subcommand's index is not knowable from argv alone: global
+/// options come first and we cannot know which of them take a separate value, so
+/// `codex --profile exec app-server` and `codex --search app-server` disagree about what the
+/// first positional is. Rather than guess, both readings are computed and the answer is the
+/// SAFE union: a host under either parse is treated as a host. Disagreement therefore always
+/// resolves toward "do not signal this pid", which is the only direction whose mistake is
+/// recoverable.
+///
+/// That also removes the need to know which subcommands carry a free-text prompt: under both
+/// readings `codex exec ... "app-server"` has `exec` as its subcommand, so the prompt can
+/// never be mistaken for one, and the same holds for `resume`, `review`, `fork`, or anything
+/// codex adds later.
 fn is_app_server(args: &[std::borrow::Cow<'_, str>]) -> bool {
-    // Start at 1: argv[0] is the binary path, and a codex installed at .../app-server/codex
-    // must not match on its own path.
-    let Some(at) = args.iter().skip(1).position(|arg| arg == "app-server") else {
-        return false;
-    };
-    let at = at + 1;
-    if args.get(at + 1).is_some_and(|arg| arg == "daemon") {
-        return false;
+    // argv[0] is the binary path; a codex installed under .../app-server/ is not a daemon.
+    let rest = args.get(1..).unwrap_or_default();
+    [true, false]
+        .into_iter()
+        .filter_map(|options_take_a_value| subcommand_of(rest, options_take_a_value))
+        // `app-server daemon version|start` is a short-lived probe that hosts nothing.
+        .any(|(name, next)| name == "app-server" && next != Some("daemon"))
+}
+
+/// PURE: the first token that is a subcommand under this reading, plus the token after it.
+/// `--opt=value` is always self-contained; `options_take_a_value` decides whether a bare
+/// `-x` / `--opt` also consumes the token that follows.
+fn subcommand_of<'a>(
+    args: &'a [std::borrow::Cow<'a, str>],
+    options_take_a_value: bool,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let mut i = 0;
+    while let Some(arg) = args.get(i).map(|arg| arg.as_ref()) {
+        if !arg.starts_with('-') {
+            return Some((arg, args.get(i + 1).map(|arg| arg.as_ref())));
+        }
+        i += if options_take_a_value && !arg.contains('=') {
+            2
+        } else {
+            1
+        };
     }
-    !args[1..at]
-        .iter()
-        .any(|arg| PROMPT_BEARING_SUBCOMMANDS.contains(&arg.as_ref()))
+    None
 }
 
 /// PURE: does this argv token have the shape of a codex thread id (a 36-char UUID)? Shape-based
@@ -359,16 +384,19 @@ mod tests {
         // a host, because the costly mistake is the false negative (SIGTERM on a process that
         // hosts other people's threads).
         assert!(is_daemon_process(&argv(&["codex", "app-server"])));
-        // Same reason: a host started with a global option before the subcommand is still a
-        // host. Requiring `app-server` at a fixed index would hand its pid to SIGTERM.
-        assert!(is_daemon_process(&argv(&[
-            "codex",
-            "-c",
-            "model=gpt-5",
-            "app-server",
-            "--listen",
-            "unix://",
-        ])));
+        // Same reason: a host started with global options before the subcommand is still a
+        // host, whatever shape those options take. Requiring `app-server` at a fixed index
+        // would hand the daemon's pid to SIGTERM.
+        for hosts in [
+            argv(&["codex", "-c", "model=gpt-5", "app-server", "--listen"]),
+            argv(&["codex", "--config=model=gpt-5", "app-server", "--listen"]),
+            // A profile whose NAME is a subcommand: the option value must not be read as one.
+            argv(&["codex", "--profile", "exec", "app-server", "--listen"]),
+            // A boolean flag directly before the subcommand: nothing may swallow it.
+            argv(&["codex", "--search", "app-server", "--listen"]),
+        ] {
+            assert!(is_daemon_process(&hosts), "must read as a host: {hosts:?}");
+        }
 
         let not_daemons = [
             argv(&["codex", "exec", "--json", "-C", "/tmp", "do a thing"]),
@@ -406,6 +434,10 @@ mod tests {
                 "019fa125-fa8e-7133-9aab-820742609be3",
                 "app-server",
             ]),
+            // The same for any other prompt-taking subcommand, present or future: the rule
+            // never needs to know their names.
+            argv(&["codex", "review", "app-server"]),
+            argv(&["codex", "fork", "app-server"]),
             // argv[0] alone is the binary path, never evidence of anything.
             argv(&["/opt/app-server/codex", "exec", "do a thing"]),
             // sysinfo returns an empty argv for a process it could not read.
