@@ -5,12 +5,17 @@ use crate::app::{App, Composer};
 use crate::logos::LogoMarks;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui_image::Image;
 use std::path::Path;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LINES: u16 = 10;
+const INPUT_GUTTER: usize = 5;
+pub(super) const COMPOSER_HINT: &str = "⇥ agent · ⇧⇥ model · ⏎ spawn";
 
 pub(super) fn input_inner_width(frame_width: u16) -> u16 {
     frame_width.saturating_sub(2)
@@ -23,9 +28,8 @@ fn input_block(border: ratatui::style::Color) -> Block<'static> {
         .border_style(fg(border))
 }
 
-fn char_width(character: char) -> usize {
-    use unicode_width::UnicodeWidthChar;
-    UnicodeWidthChar::width(character).unwrap_or(0)
+fn grapheme_width(grapheme: &str) -> usize {
+    UnicodeWidthStr::width(grapheme)
 }
 
 pub(super) fn wrap_by_width(text: &str, first: usize, rest: usize) -> Vec<String> {
@@ -53,23 +57,23 @@ fn wrap_paragraph(paragraph: &str, first: usize, rest: usize, output: &mut Vec<S
         }};
     }
 
-    let mut characters = paragraph.chars().peekable();
-    while let Some(&character) = characters.peek() {
-        if character.is_whitespace() {
-            characters.next();
-            gap.push(character);
-            gap_width += char_width(character);
+    let mut graphemes = UnicodeSegmentation::graphemes(paragraph, true).peekable();
+    while let Some(&grapheme) = graphemes.peek() {
+        if grapheme.chars().all(char::is_whitespace) {
+            graphemes.next();
+            gap.push_str(grapheme);
+            gap_width += grapheme_width(grapheme);
             continue;
         }
         let mut word = String::new();
         let mut word_width = 0usize;
-        while let Some(&character) = characters.peek() {
-            if character.is_whitespace() {
+        while let Some(&grapheme) = graphemes.peek() {
+            if grapheme.chars().all(char::is_whitespace) {
                 break;
             }
-            characters.next();
-            word.push(character);
-            word_width += char_width(character);
+            graphemes.next();
+            word.push_str(grapheme);
+            word_width += grapheme_width(grapheme);
         }
         if !current.is_empty() && current_width + gap_width + word_width > budget {
             break_line!();
@@ -79,21 +83,21 @@ fn wrap_paragraph(paragraph: &str, first: usize, rest: usize, output: &mut Vec<S
         }
         gap.clear();
         gap_width = 0;
-        for character in word.chars() {
-            let width = char_width(character);
+        for grapheme in UnicodeSegmentation::graphemes(word.as_str(), true) {
+            let width = grapheme_width(grapheme);
             if current_width + width > budget && !current.is_empty() {
                 break_line!();
             }
-            current.push(character);
+            current.push_str(grapheme);
             current_width += width;
         }
     }
-    for character in gap.chars() {
-        let width = char_width(character);
+    for grapheme in UnicodeSegmentation::graphemes(gap.as_str(), true) {
+        let width = grapheme_width(grapheme);
         if current_width + width > budget && !current.is_empty() {
             break_line!();
         }
-        current.push(character);
+        current.push_str(grapheme);
         current_width += width;
     }
     output.push(current);
@@ -109,15 +113,86 @@ pub(super) fn input_box_height(prefix_width: usize, text: &str, inner_width: u16
     (lines as u16).clamp(1, MAX_LINES) + 2
 }
 
-pub(super) fn box_height(text: &str, inner_width: u16) -> u16 {
+pub(super) fn box_height_for_viewport(text: &str, inner_width: u16, viewport_height: u16) -> u16 {
     let input_lines = if inner_width == 0 || text.is_empty() {
         1usize
     } else {
-        let segments = wrap_by_width(text, inner_width as usize, inner_width as usize);
-        segments.len()
-            + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
+        let width = inner_width as usize;
+        let first = width.saturating_sub(INPUT_GUTTER);
+        let segments = wrap_by_width(text, first, width);
+        let final_budget = if segments.len() == 1 {
+            first.max(1)
+        } else {
+            width.max(1)
+        };
+        segments.len() + usize::from(display_width(segments.last().unwrap()) == final_budget)
     };
-    input_lines.clamp(1, MAX_LINES as usize) as u16 + 3
+    let desired = input_lines.max(1) as u16 + 3;
+    let cap = (viewport_height / 3).max(4);
+    desired.min(cap)
+}
+
+pub(super) fn caret_visible(now_ms: i64, animation: bool) -> bool {
+    !animation || now_ms.rem_euclid(1_100) < 550
+}
+
+struct MetadataLayout {
+    folder: String,
+    hint: Option<String>,
+}
+
+fn metadata_layout(
+    mark: &str,
+    agent: &str,
+    model: &str,
+    folder: &str,
+    width: usize,
+) -> MetadataLayout {
+    let fixed_width = display_width(mark).max(INPUT_GUTTER)
+        + display_width(agent)
+        + display_width(" · ")
+        + display_width(model)
+        + display_width(" · ");
+    let folder_width = display_width(folder);
+    let hint_width = display_width(COMPOSER_HINT);
+    let hint =
+        (fixed_width + folder_width + hint_width <= width).then(|| COMPOSER_HINT.to_string());
+    let folder = if hint.is_some() {
+        folder.to_string()
+    } else {
+        truncate_from_left(folder, width.saturating_sub(fixed_width))
+    };
+    MetadataLayout { folder, hint }
+}
+
+fn truncate_from_left(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let mut tail = Vec::new();
+    let mut tail_width = 0;
+    for grapheme in UnicodeSegmentation::graphemes(text, true).rev() {
+        let grapheme_width = grapheme_width(grapheme);
+        if tail_width + grapheme_width > width - 1 {
+            break;
+        }
+        tail.push(grapheme);
+        tail_width += grapheme_width;
+    }
+    tail.reverse();
+    format!("…{}", tail.concat())
+}
+
+fn field(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(text));
+    format!("{text}{}", " ".repeat(padding))
 }
 
 pub(super) struct InputBox {
@@ -194,30 +269,50 @@ pub(super) fn draw(
     show_cursor: bool,
 ) {
     let backend = composer.backend();
+    let mark = backend_mark(backend, theme);
     let directory = app
         .spawn_target()
         .map(|directory| abbreviate_dir(&directory))
         .unwrap_or_default();
     let model = composer.model();
-    let model_segment = if model == "default" {
-        String::new()
-    } else {
-        format!("{model} ")
-    };
-    let mut metadata = vec![Span::styled(
-        format!("{}{} ", backend_mark(backend, theme), backend.name()),
-        fg(backend_mark_color(backend, theme)),
-    )];
-    if !model_segment.is_empty() {
-        metadata.push(Span::styled(model_segment, fg(theme.muted)));
-    }
-    metadata.push(Span::styled(directory, fg(theme.muted)));
 
-    let block = input_block(theme.border);
+    let block = input_block(theme.border).style(Style::default().bg(theme.surface).fg(theme.text));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
+    }
+
+    let layout = metadata_layout(
+        mark,
+        backend.name(),
+        model,
+        &directory,
+        inner.width as usize,
+    );
+    let mut metadata = vec![
+        Span::styled(
+            field(mark, INPUT_GUTTER),
+            fg(backend_mark_color(backend, theme)),
+        ),
+        Span::styled(backend.name().to_string(), fg(theme.text)),
+        Span::styled(" · ", fg(theme.faint)),
+        Span::styled(model.to_string(), fg(theme.muted)),
+        Span::styled(" · ", fg(theme.faint)),
+        Span::styled(layout.folder.clone(), fg(theme.muted)),
+    ];
+    if let Some(hint) = layout.hint {
+        let used = INPUT_GUTTER
+            + display_width(backend.name())
+            + display_width(" · ")
+            + display_width(model)
+            + display_width(" · ")
+            + display_width(&layout.folder)
+            + display_width(&hint);
+        metadata.push(Span::raw(
+            " ".repeat((inner.width as usize).saturating_sub(used)),
+        ));
+        metadata.push(Span::styled(hint, fg(theme.faint)));
     }
     frame.render_widget(
         Paragraph::new(Line::from(metadata)),
@@ -230,32 +325,53 @@ pub(super) fn draw(
         ..inner
     };
     if input.height > 0 {
+        let prefix = Span::styled(field("❯", INPUT_GUTTER), fg(theme.accent));
         if composer.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "describe a task · tab to switch agent",
-                    fg(theme.faint),
-                ))),
-                input,
-            );
+            let mut spans = vec![prefix, Span::styled("describe a task", fg(theme.muted))];
             if show_cursor {
-                frame.set_cursor_position((input.x, input.y));
+                spans.push(Span::styled("▏", fg(theme.accent)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), input);
+            if show_cursor {
+                let column = INPUT_GUTTER + display_width("describe a task");
+                let x = input.x + (column as u16).min(input.width - 1);
+                frame.set_cursor_position((x, input.y));
             }
         } else {
             let width = input.width as usize;
-            let mut segments = wrap_by_width(composer.text(), width, width);
-            if display_width(segments.last().unwrap()) == width {
+            let first = width.saturating_sub(INPUT_GUTTER);
+            let mut segments = wrap_by_width(composer.text(), first, width);
+            let final_budget = if segments.len() == 1 {
+                first.max(1)
+            } else {
+                width.max(1)
+            };
+            if display_width(segments.last().unwrap()) == final_budget {
                 segments.push(String::new());
             }
             let start = segments.len().saturating_sub(input.height as usize);
+            let last = segments.len() - 1;
             let lines = segments[start..]
                 .iter()
-                .map(|segment| Line::from(Span::styled(segment.clone(), fg(theme.text))))
+                .enumerate()
+                .map(|(visible_index, segment)| {
+                    let index = start + visible_index;
+                    let mut spans = Vec::new();
+                    if index == 0 {
+                        spans.push(prefix.clone());
+                    }
+                    spans.push(Span::styled(segment.clone(), fg(theme.text)));
+                    if show_cursor && index == last {
+                        spans.push(Span::styled("▏", fg(theme.accent)));
+                    }
+                    Line::from(spans)
+                })
                 .collect::<Vec<_>>();
             frame.render_widget(Paragraph::new(lines), input);
             if show_cursor {
                 let last_width = display_width(segments.last().unwrap()) as u16;
-                let x = input.x + last_width.min(input.width - 1);
+                let prefix_width = u16::from(segments.len() == 1) * INPUT_GUTTER as u16;
+                let x = input.x + (prefix_width + last_width).min(input.width - 1);
                 let y = input.y + (segments.len() - start - 1) as u16;
                 frame.set_cursor_position((x, y));
             }
@@ -321,4 +437,71 @@ fn abbreviate_dir(directory: &Path) -> String {
         return format!("~{rest}");
     }
     shown
+}
+
+#[cfg(test)]
+mod design_tests {
+    use super::{COMPOSER_HINT, box_height_for_viewport, metadata_layout, wrap_by_width};
+
+    #[test]
+    fn task_buffer_rewraps_when_the_width_changes() {
+        let text = "alpha beta gamma delta";
+
+        assert_eq!(
+            wrap_by_width(text, 12, 12),
+            vec!["alpha beta", "gamma delta"]
+        );
+        assert_eq!(
+            wrap_by_width(text, 7, 7),
+            vec!["alpha", "beta", "gamma", "delta"]
+        );
+    }
+
+    #[test]
+    fn oversized_word_hard_breaks_at_display_width() {
+        assert_eq!(
+            wrap_by_width("abcdefghijk", 4, 4),
+            vec!["abcd", "efgh", "ijk"]
+        );
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_terminal_cells() {
+        assert_eq!(wrap_by_width("一二三四", 5, 5), vec!["一二", "三四"]);
+        assert_eq!(wrap_by_width("🙂🙂🙂", 5, 5), vec!["🙂🙂", "🙂"]);
+    }
+
+    #[test]
+    fn caret_blinks_only_when_animation_is_enabled() {
+        assert!(super::caret_visible(0, true));
+        assert!(!super::caret_visible(550, true));
+        assert!(super::caret_visible(1_100, true));
+        assert!(super::caret_visible(550, false));
+    }
+
+    #[test]
+    fn composer_height_grows_and_stops_at_one_third_of_the_viewport() {
+        assert_eq!(box_height_for_viewport("", 20, 30), 4);
+        assert_eq!(
+            box_height_for_viewport("one two three four five six", 10, 30),
+            7
+        );
+        assert_eq!(box_height_for_viewport(&"x".repeat(200), 10, 18), 6);
+    }
+
+    #[test]
+    fn metadata_drops_hint_before_truncating_folder_from_the_left() {
+        let wide = metadata_layout("cx", "codex", "gpt 5.3", "~/git/curietech/agentos", 76);
+        assert_eq!(wide.hint.as_deref(), Some(COMPOSER_HINT));
+        assert_eq!(wide.folder, "~/git/curietech/agentos");
+
+        let without_hint = metadata_layout("cx", "codex", "gpt 5.3", "~/git/curietech/agentos", 52);
+        assert_eq!(without_hint.hint, None);
+        assert_eq!(without_hint.folder, "~/git/curietech/agentos");
+
+        let narrow = metadata_layout("cx", "codex", "gpt 5.3", "~/git/curietech/agentos", 32);
+        assert_eq!(narrow.hint, None);
+        assert!(narrow.folder.starts_with('…'));
+        assert!(narrow.folder.ends_with("/agentos"));
+    }
 }
