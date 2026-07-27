@@ -357,9 +357,26 @@ fn multi_backend_smoke() {
 }
 
 #[test]
+#[ignore = "helper: invoked only by the OpenCode live server test"]
+fn opencode_live_short_lived_child() {
+    let cwd = PathBuf::from(
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_CWD").expect("helper cwd environment"),
+    );
+    let prompt =
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_PROMPT").expect("helper prompt environment");
+    let backend = OpencodeBackend::with_runtime(OpencodeRuntime::new());
+    let spawned = backend
+        .spawn(&cwd, &prompt, None)
+        .expect("helper creates one server session");
+    let session_id = spawned
+        .session_id
+        .expect("helper receives exact session id");
+    println!("AGENT_VIEWER_OPENCODE_SESSION_ID={session_id}");
+}
+
+#[test]
 #[ignore = "live: starts or reuses a real opencode server and mutates one unique session"]
 fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
-    let runtime = OpencodeRuntime::new();
     let dir = tempfile::TempDir::new().unwrap();
     let cwd = dir.path().to_path_buf();
     let nonce = std::time::SystemTime::now()
@@ -367,27 +384,65 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
         .expect("system clock follows the Unix epoch")
         .as_nanos();
     let title_marker = format!("AV live {nonce}");
+    let test_executable = std::env::current_exe().expect("current test executable");
     let prompt = format!(
         "{title_marker}. Use the shell tool to run `sleep 20`, then reply with exactly \
          OPENCODE LIVE COMPLETE."
     );
 
-    let mut initiating = OpencodeBackend::with_runtime(runtime.clone());
-    let baseline: HashSet<String> = initiating
+    let mut baseline_backend = OpencodeBackend::with_runtime(OpencodeRuntime::new());
+    let baseline: HashSet<String> = baseline_backend
         .list()
         .expect("snapshot OpenCode ids")
         .into_iter()
         .map(|session| session.id)
         .collect();
+    drop(baseline_backend);
+
     let started = Instant::now();
-    let spawned = initiating
-        .spawn(&cwd, &prompt, None)
-        .expect("create session and accept prompt asynchronously");
+    let mut helper = std::process::Command::new(test_executable)
+        .args([
+            "--exact",
+            "opencode_live_short_lived_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AGENT_VIEWER_OPENCODE_E2E_CWD", &cwd)
+        .env("AGENT_VIEWER_OPENCODE_E2E_PROMPT", &prompt)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run initiating helper process");
+    let helper_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if helper.try_wait().expect("poll initiating helper").is_some() {
+            break;
+        }
+        if Instant::now() >= helper_deadline {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            panic!("initiating helper process did not exit promptly");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let helper = helper
+        .wait_with_output()
+        .expect("collect initiating helper output");
     let disconnected_after = started.elapsed();
-    assert_eq!(spawned.pid, None);
-    let session_id = spawned
-        .session_id
-        .expect("server create returns the exact session id");
+    assert!(
+        helper.status.success(),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&helper.stdout),
+        String::from_utf8_lossy(&helper.stderr)
+    );
+    let helper_stdout = String::from_utf8(helper.stdout).expect("helper stdout is UTF8");
+    let sentinel = "AGENT_VIEWER_OPENCODE_SESSION_ID=";
+    let session_id = helper_stdout
+        .lines()
+        .find_map(|line| line.split_once(sentinel).map(|(_, id)| id.trim()))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .expect("helper prints exact session id sentinel");
     assert!(
         !baseline.contains(&session_id),
         "create returned a preexisting session id"
@@ -396,8 +451,8 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
         disconnected_after < Duration::from_secs(15),
         "prompt_async did not return promptly: {disconnected_after:?}"
     );
-    drop(initiating);
 
+    let runtime = OpencodeRuntime::new();
     let seed_session = agent_viewer_core::Session {
         backend: agent_viewer_core::BackendKind::Opencode,
         id: session_id.clone(),
