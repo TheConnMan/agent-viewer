@@ -12,7 +12,7 @@ use agent_viewer_core::{AttachRefusal, Session};
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
-use crate::ops::{Mutation, run_mutation};
+use crate::ops::Mutation;
 use crate::{Key, Refresher, Ui};
 
 /// Enter/Space on a header toggles + persists the collapse. Returns true when a header was
@@ -182,7 +182,8 @@ pub(crate) fn apply_rename(ui: &mut Ui) {
     };
     let key = format!("{}:{}:rename", backend_kind.name(), id);
     let mutation = Mutation::Rename(session, name.clone());
-    if ui.mutations.submit(key, move || run_mutation(mutation)) {
+    let executor = ui.mutation_executor.clone();
+    if ui.mutations.submit(key, move || executor(mutation)) {
         ui.set_notice(format!("renaming… {name}"));
     }
 }
@@ -275,7 +276,8 @@ pub(crate) fn hide_selected(backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bo
 /// immediate "<verb>… <title>" notice (a duplicate keypress while pending is a no-op).
 fn submit_mutation(ui: &mut Ui, session: &Session, op: &str, verb: &str, mutation: Mutation) {
     let key = format!("{}:{}:{}", session.backend.name(), session.id, op);
-    if ui.mutations.submit(key, move || run_mutation(mutation)) {
+    let executor = ui.mutation_executor.clone();
+    if ui.mutations.submit(key, move || executor(mutation)) {
         ui.set_notice(format!("{verb}… {}", session.title));
     }
 }
@@ -458,10 +460,10 @@ pub(crate) fn spawn_from_composer(
 #[cfg(test)]
 mod tests {
     use super::{apply_attach_refusal, spawn_from_composer};
+    use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{select_session_row, sess, test_ui_with};
     use crate::ops::Mutation;
-    use crate::Refresher;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session};
     use agent_viewer_tui::mutations::MutationOutcome;
     use std::sync::{Arc, Mutex, mpsc::channel};

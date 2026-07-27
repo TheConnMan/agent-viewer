@@ -546,13 +546,13 @@ fn peek_expansion(
         Vec::new()
     };
     // Surface WHAT a blocked session is waiting on: codex from the parsed pending approval,
-    // claude from its state.json needs (session.summary), opencode has no needs-input signal.
+    // claude from its state.json needs, and OpenCode from the server input reason.
     let ask: Option<String> = if matches!(session.status, Status::NeedsInput { .. }) {
         match session.backend {
             BackendKind::Codex => peek.ask.as_ref().map(|s| format!("Awaiting approval: {s}")),
             BackendKind::Claude => (!session.summary.is_empty())
                 .then(|| format!("Awaiting input: {}", session.summary)),
-            BackendKind::Opencode => None,
+            BackendKind::Opencode => peek.ask.as_ref().map(|s| format!("Awaiting input: {s}")),
         }
     } else {
         None
@@ -644,7 +644,8 @@ fn composer_box_height(text: &str, inner_width: u16) -> u16 {
         1usize
     } else {
         let segments = wrap_by_width(text, inner_width as usize, inner_width as usize);
-        segments.len() + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
+        segments.len()
+            + usize::from(display_width(segments.last().unwrap()) == inner_width as usize)
     };
     input_lines.clamp(1, COMPOSER_MAX_LINES as usize) as u16 + 3
 }
@@ -775,10 +776,7 @@ fn draw_composer(
 
     frame.render_widget(
         Paragraph::new(Line::from(metadata_spans)),
-        Rect {
-            height: 1,
-            ..inner
-        },
+        Rect { height: 1, ..inner },
     );
 
     let input = Rect {
@@ -1716,12 +1714,7 @@ mod tests {
         (rows, (pos.x, pos.y))
     }
 
-    fn render_viewer(
-        w: u16,
-        h: u16,
-        text: &str,
-        mode: Mode,
-    ) -> (Vec<String>, (u16, u16)) {
+    fn render_viewer(w: u16, h: u16, text: &str, mode: Mode) -> (Vec<String>, (u16, u16)) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
