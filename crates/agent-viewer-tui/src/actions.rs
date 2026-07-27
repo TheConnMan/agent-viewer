@@ -364,7 +364,8 @@ fn attach_session(
                 return Ok(false);
             }
         };
-        let spec = spec_from_command(&command, rows, cols);
+        let mut spec = spec_from_command(&command, rows, cols);
+        spec.palette = ui.terminal_palette;
         match PtySession::spawn(spec) {
             Ok(pty) => {
                 ui.attached.insert(key.clone(), pty);

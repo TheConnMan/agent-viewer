@@ -438,6 +438,7 @@ pub(crate) mod tests {
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
             pending_reply: None,
             attached: HashMap::new(),
+            terminal_palette: None,
             focused: None,
             focused_session: None,
             focused_exited: false,
