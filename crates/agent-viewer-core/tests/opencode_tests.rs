@@ -12,11 +12,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -250,6 +250,69 @@ impl ScriptedServer {
         })
     }
 
+    fn spawn_verified_concurrent_routed(
+        route: impl Fn(&RecordedRequest) -> ScriptedResponse + Send + Sync + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind concurrent scripted server");
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let process = Some(Arc::new(ProcFixture::new_in(
+            new_proc_root(),
+            51003,
+            &listener,
+            addr,
+        )));
+        let process_for_thread = process.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let route = Arc::new(route);
+        let thread = std::thread::spawn(move || {
+            let mut connection_id = 0;
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        connection_id += 1;
+                        if let Some(process) = &process_for_thread {
+                            process.record_connection_at(&stream, connection_id);
+                        }
+                        let requests = Arc::clone(&requests_for_thread);
+                        let route = Arc::clone(&route);
+                        let current_connection = connection_id;
+                        std::thread::spawn(move || {
+                            while let Ok(request) =
+                                read_http_request(&mut stream, current_connection)
+                            {
+                                let response = route(&request);
+                                requests.lock().unwrap().push(request);
+                                if !response.delay.is_zero() {
+                                    std::thread::sleep(response.delay);
+                                }
+                                let close = response.close_connection;
+                                let _ = write_http_response(&mut stream, &response);
+                                if close {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            requests,
+            stop,
+            thread: Some(thread),
+            process,
+        }
+    }
+
     fn spawn_on_with_process(
         addr: SocketAddr,
         responses: Vec<ScriptedResponse>,
@@ -403,12 +466,16 @@ impl ProcFixture {
     }
 
     fn record_connection(&self, stream: &TcpStream) {
+        self.record_connection_at(stream, 0);
+    }
+
+    fn record_connection_at(&self, stream: &TcpStream, slot: usize) {
         let fd = self
             .root
             .path()
             .join(self.pid.to_string())
             .join("fd")
-            .join("101");
+            .join((101 + slot).to_string());
         let _ = std::fs::remove_file(&fd);
         std::os::unix::fs::symlink(format!("socket:[{}]", socket_inode(stream.as_raw_fd())), fd)
             .unwrap();
@@ -575,10 +642,6 @@ fn healthy_response() -> ScriptedResponse {
     ScriptedResponse::json(200, json!({"healthy": true, "version": "1.17.20"}))
 }
 
-fn empty_server_list_responses() -> Vec<ScriptedResponse> {
-    vec![healthy_response(), ScriptedResponse::json(200, json!([]))]
-}
-
 fn unused_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve free address");
     let addr = listener.local_addr().unwrap();
@@ -593,15 +656,6 @@ fn unused_addrs() -> [SocketAddr; 2] {
     drop(primary);
     drop(backup);
     addresses
-}
-
-fn runtime_for(
-    candidates: [SocketAddr; 2],
-    timeout: Duration,
-    durable_cwd: PathBuf,
-    launcher: impl Fn(Command) -> io::Result<()> + Send + Sync + 'static,
-) -> OpencodeRuntime {
-    OpencodeRuntime::for_test(candidates, timeout, durable_cwd, launcher)
 }
 
 fn secure_runtime_for(
@@ -665,21 +719,17 @@ fn assert_test_secret_pairs(requests: &[RecordedRequest]) {
     }
 }
 
+fn authenticated_requests(requests: &[RecordedRequest]) -> Vec<&RecordedRequest> {
+    requests
+        .iter()
+        .filter(|request| request.headers.contains_key("authorization"))
+        .collect()
+}
+
 fn managed_permission() -> Value {
     json!([
         {"permission": "agent-viewer.background", "pattern": "*", "action": "allow"}
     ])
-}
-
-fn no_launch_runtime(
-    candidates: [SocketAddr; 2],
-    timeout: Duration,
-    launcher_calls: Arc<AtomicUsize>,
-) -> OpencodeRuntime {
-    runtime_for(candidates, timeout, PathBuf::from("/"), move |_| {
-        launcher_calls.fetch_add(1, Ordering::SeqCst);
-        Err(io::Error::other("launcher was not expected"))
-    })
 }
 
 fn backend_with_runtime(runtime: OpencodeRuntime) -> OpencodeBackend {
@@ -711,234 +761,24 @@ fn encoded_component(value: &str) -> String {
 }
 
 #[test]
-fn opencode_runtime_reuses_healthy_primary_before_backup() {
-    let primary = ScriptedServer::spawn(empty_server_list_responses());
-    let backup = ScriptedServer::spawn(empty_server_list_responses());
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [primary.addr, backup.addr],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let mut backend = backend_with_runtime(runtime);
-
-    assert!(
-        backend
-            .list()
-            .expect("list from healthy primary")
-            .is_empty()
-    );
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        primary
-            .wait_for_requests(2)
-            .iter()
-            .map(|request| request.target.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "/global/health",
-            "/experimental/session?limit=10000&archived=true",
-        ]
-    );
-    assert!(
-        backup.requests().is_empty(),
-        "a healthy primary must stop endpoint selection"
-    );
-}
-
-#[test]
-fn opencode_runtime_reuses_healthy_backup_before_starting_free_primary() {
-    let primary = unused_addr();
-    let backup = ScriptedServer::spawn(empty_server_list_responses());
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [primary, backup.addr],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let mut backend = backend_with_runtime(runtime);
-
-    assert!(backend.list().expect("list from healthy backup").is_empty());
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(backup.wait_for_requests(2)[0].target, "/global/health");
-}
-
-#[test]
-fn opencode_runtime_skips_unrelated_primary_and_reuses_healthy_backup() {
-    let primary = ScriptedServer::spawn(vec![ScriptedResponse::raw(
-        200,
-        "text/html",
-        "<html>not opencode</html>",
-    )]);
-    let backup = ScriptedServer::spawn(empty_server_list_responses());
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [primary.addr, backup.addr],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let mut backend = backend_with_runtime(runtime);
-
-    assert!(backend.list().expect("list from backup").is_empty());
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(primary.wait_for_requests(1)[0].target, "/global/health");
-    assert_eq!(backup.wait_for_requests(2)[0].target, "/global/health");
-}
-
-#[test]
-fn opencode_spawn_starts_primary_with_exact_loopback_command_and_durable_cwd() {
-    let [primary, backup] = unused_addrs();
-    let durable_cwd = tempfile::TempDir::new().unwrap();
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let launched_server = Arc::new(Mutex::new(None));
-    let captured_for_launcher = Arc::clone(&captured);
-    let server_for_launcher = Arc::clone(&launched_server);
-    let runtime = runtime_for(
-        [primary, backup],
-        Duration::from_secs(1),
-        durable_cwd.path().to_path_buf(),
-        move |command| {
-            let args = command_args(&command);
-            let port = args
-                .windows(2)
-                .find(|pair| pair[0] == "--port")
-                .and_then(|pair| pair[1].parse::<u16>().ok())
-                .expect("launch carries a port");
-            captured_for_launcher.lock().unwrap().push((
-                command.get_program().to_string_lossy().into_owned(),
-                args,
-                command.get_current_dir().map(PathBuf::from),
-            ));
-            let server = ScriptedServer::spawn_on(
-                SocketAddr::from(([127, 0, 0, 1], port)),
-                vec![
-                    healthy_response(),
-                    ScriptedResponse::json(200, json!({"id": "ses_started_primary"})),
-                    ScriptedResponse::empty(204),
-                ],
-            )?;
-            *server_for_launcher.lock().unwrap() = Some(server);
-            Ok(())
-        },
-    );
-    let backend = backend_with_runtime(runtime);
-
-    let spawned = backend
-        .spawn(PathBuf::from("/tmp/project").as_path(), "hello", None)
-        .expect("spawn through started primary");
-    assert_eq!(spawned.pid, None);
-    assert_eq!(spawned.session_id.as_deref(), Some("ses_started_primary"));
-
-    let launches = captured.lock().unwrap();
-    assert_eq!(launches.len(), 1);
-    assert_eq!(launches[0].0, "opencode");
-    assert_eq!(
-        launches[0].1,
-        vec![
-            "serve".to_string(),
-            "--hostname".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            primary.port().to_string(),
-        ]
-    );
-    assert_eq!(launches[0].2.as_deref(), Some(durable_cwd.path()));
-    assert!(!launches[0].1.iter().any(|arg| arg == "--mdns"));
-}
-
-#[test]
-fn opencode_spawn_starts_backup_when_primary_is_an_unrelated_listener() {
-    let primary = ScriptedServer::spawn(vec![ScriptedResponse::raw(
-        200,
-        "text/plain",
-        "another service",
-    )]);
-    let backup = unused_addr();
-    let launched_ports = Arc::new(Mutex::new(Vec::new()));
-    let launched_server = Arc::new(Mutex::new(None));
-    let ports_for_launcher = Arc::clone(&launched_ports);
-    let server_for_launcher = Arc::clone(&launched_server);
-    let runtime = runtime_for(
-        [primary.addr, backup],
-        Duration::from_secs(1),
-        PathBuf::from("/"),
-        move |command| {
-            let args = command_args(&command);
-            let port = args
-                .windows(2)
-                .find(|pair| pair[0] == "--port")
-                .and_then(|pair| pair[1].parse::<u16>().ok())
-                .unwrap();
-            ports_for_launcher.lock().unwrap().push(port);
-            *server_for_launcher.lock().unwrap() = Some(ScriptedServer::spawn_on(
-                SocketAddr::from(([127, 0, 0, 1], port)),
-                vec![
-                    healthy_response(),
-                    ScriptedResponse::json(200, json!({"id": "ses_backup"})),
-                    ScriptedResponse::empty(204),
-                ],
-            )?);
-            Ok(())
-        },
-    );
-    let backend = backend_with_runtime(runtime);
-
-    let spawned = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "hello", None)
-        .expect("spawn through backup");
-    assert_eq!(spawned.session_id.as_deref(), Some("ses_backup"));
-    assert_eq!(*launched_ports.lock().unwrap(), vec![backup.port()]);
-}
-
-#[test]
-fn opencode_spawn_reports_both_occupied_candidates_without_launching() {
-    let primary = ScriptedServer::spawn(vec![ScriptedResponse::raw(
-        200,
-        "text/plain",
-        "primary collision",
-    )]);
-    let backup = ScriptedServer::spawn(vec![ScriptedResponse::raw(
-        200,
-        "text/plain",
-        "backup collision",
-    )]);
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [primary.addr, backup.addr],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let backend = backend_with_runtime(runtime);
-
-    let error = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "hello", None)
-        .expect_err("both collisions must fail");
-    let message = error.to_string();
-    assert!(
-        message.contains(&primary.addr.port().to_string()),
-        "{message}"
-    );
-    assert!(
-        message.contains(&backup.addr.port().to_string()),
-        "{message}"
-    );
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
 fn opencode_spawn_readiness_deadline_is_one_bounded_budget() {
     let [primary, backup] = unused_addrs();
     let launches = Arc::new(AtomicUsize::new(0));
     let launches_for_callback = Arc::clone(&launches);
-    let runtime = runtime_for(
-        [primary, backup],
-        Duration::from_millis(120),
-        PathBuf::from("/"),
-        move |_| {
+    let fixture = tempfile::TempDir::new().unwrap();
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates: [primary, backup],
+        startup_timeout: Duration::from_millis(120),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(move |_| {
             launches_for_callback.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        },
-    );
+            Ok(42)
+        }),
+        viewer_db_path: fixture.path().join("viewer.db"),
+        proc_root: fixture.path().join("proc"),
+        password_override: Some("test-secret".to_string()),
+        before_authorized_write: None,
+    });
     let backend = backend_with_runtime(runtime);
 
     let start = Instant::now();
@@ -956,36 +796,6 @@ fn opencode_spawn_readiness_deadline_is_one_bounded_budget() {
         error
     );
     assert!(launches.load(Ordering::SeqCst) >= 1);
-}
-
-#[test]
-fn opencode_health_requires_true_and_a_string_version() {
-    for body in [
-        ScriptedResponse::raw(200, "text/html", "<html>spa</html>"),
-        ScriptedResponse::raw(200, "application/json", "{broken"),
-        ScriptedResponse::json(200, json!({"healthy": false, "version": "1.17.20"})),
-        ScriptedResponse::json(200, json!({"healthy": true, "version": 11720})),
-        ScriptedResponse::raw(401, "application/json", "{\"error\":\"auth required\"}"),
-    ] {
-        let primary = ScriptedServer::spawn(vec![body]);
-        let backup = unused_addr();
-        let launcher_calls = Arc::new(AtomicUsize::new(0));
-        let runtime = no_launch_runtime(
-            [primary.addr, backup],
-            Duration::from_millis(100),
-            Arc::clone(&launcher_calls),
-        );
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let mut backend = backend_with_db_and_runtime(db_dir.path().join("missing.db"), runtime);
-        assert!(
-            backend
-                .list()
-                .expect("invalid health degrades quietly")
-                .is_empty(),
-            "invalid health must not become the server tier"
-        );
-        assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-    }
 }
 
 // --- Preserved v1 listing shape (order / labels / hidden) ---
@@ -1063,7 +873,7 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
         .as_object_mut()
         .unwrap()
         .insert(external_ids[0].clone(), json!({"type": "busy"}));
-    let primary = ScriptedServer::spawn(vec![
+    let primary = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, sessions),
         ScriptedResponse::json(200, status),
@@ -1087,12 +897,17 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
                 ]
             }]),
         ),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &primary,
         [primary.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let mut backend = backend_with_runtime(runtime);
 
@@ -1169,10 +984,12 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
         assert!(!external.daemon_hosted);
     }
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
+    let requests = primary.wait_for_requests(10);
+    assert_test_secret_pairs(&requests);
     assert_eq!(
-        primary
-            .wait_for_requests(5)
+        requests
             .iter()
+            .filter(|request| request.headers.contains_key("authorization"))
             .map(|request| request.target.clone())
             .collect::<Vec<_>>(),
         vec![
@@ -1235,7 +1052,7 @@ fn opencode_server_directory_snapshots_are_once_per_unique_managed_directory() {
             "time": {"created": 10, "updated": 10, "archived": 11}
         }
     ]);
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, sessions),
         ScriptedResponse::json(
@@ -1260,12 +1077,17 @@ fn opencode_server_directory_snapshots_are_once_per_unique_managed_directory() {
         ),
         ScriptedResponse::json(200, json!([])),
         ScriptedResponse::json(200, json!([])),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let mut backend = backend_with_runtime(runtime);
 
@@ -1285,10 +1107,12 @@ fn opencode_server_directory_snapshots_are_once_per_unique_managed_directory() {
 
     let first = encoded_component(first_directory);
     let second = encoded_component(second_directory);
+    let requests = server.wait_for_requests(16);
+    assert_test_secret_pairs(&requests);
     assert_eq!(
-        server
-            .wait_for_requests(8)
+        requests
             .iter()
+            .filter(|request| request.headers.contains_key("authorization"))
             .map(|request| request.target.clone())
             .collect::<Vec<_>>(),
         vec![
@@ -1305,7 +1129,7 @@ fn opencode_server_directory_snapshots_are_once_per_unique_managed_directory() {
     );
     assert_eq!(
         server.requests().len(),
-        8,
+        16,
         "directory snapshot calls scale with unique managed directories, not rows"
     );
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
@@ -1319,15 +1143,20 @@ fn opencode_healthy_server_api_failure_is_not_masked_by_sqlite() {
          VALUES ('ses_sqlite',NULL,'/tmp','must not leak through',1000,3000,NULL)",
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::raw(500, "text/plain", "session route failed"),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let mut backend = backend_with_db_and_runtime(path, runtime);
 
@@ -1349,30 +1178,128 @@ fn opencode_unavailable_runtime_uses_read_only_sqlite_without_launching() {
          VALUES ('ses_external',NULL,'/tmp','External compatibility row',1000,3000,NULL)",
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let candidates = unused_addrs();
-    let runtime = no_launch_runtime(
-        candidates,
-        Duration::from_millis(80),
-        Arc::clone(&launcher_calls),
-    );
-    let mut backend = backend_with_db_and_runtime(path, runtime);
+    let mut backend = OpencodeBackend::with_db(path);
 
     let listed = backend.list().expect("SQLite compatibility listing");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "ses_external");
     assert!(!listed[0].daemon_hosted);
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn opencode_missing_servers_use_sqlite_when_viewer_secret_storage_is_unavailable() {
+    let schema = common::read_fixture("opencode_session_schema.sql");
+    let inserts = [
+        "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+         VALUES ('ses_offline',NULL,'/tmp','Offline compatibility row',1000,3000,NULL)",
+    ];
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+    let proc_root = new_proc_root();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launches_for_runtime = Arc::clone(&launches);
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates: unused_addrs(),
+        startup_timeout: Duration::from_millis(80),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(move |_| {
+            launches_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("listing must not launch"))
+        }),
+        viewer_db_path: proc_root.path().to_path_buf(),
+        proc_root: proc_root.path().to_path_buf(),
+        password_override: None,
+        before_authorized_write: None,
+    });
+    let mut backend = backend_with_db_and_runtime(path, runtime);
+
+    let listed = backend
+        .list()
+        .expect("missing servers use the SQLite compatibility listing");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "ses_offline");
+    assert!(!listed[0].daemon_hosted);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn opencode_discovery_continues_after_primary_rejects_viewer_credentials() {
+    let proc_root = new_proc_root();
+    let primary = ScriptedServer::spawn_on_verified_in(
+        unused_addr(),
+        vec![unauthorized_health().keep_alive(), unauthorized_health()],
+        Arc::clone(&proc_root),
+        54001,
+    )
+    .expect("bind primary server");
+    let backup = ScriptedServer::spawn_on_verified_in(
+        unused_addr(),
+        secure_responses(vec![
+            healthy_response(),
+            ScriptedResponse::json(200, json!([])),
+            healthy_response(),
+            ScriptedResponse::raw(500, "text/plain", "unexpected mutation"),
+        ]),
+        Arc::clone(&proc_root),
+        54002,
+    )
+    .expect("bind backup server");
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launches_for_runtime = Arc::clone(&launches);
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates: [primary.addr, backup.addr],
+        startup_timeout: Duration::from_millis(250),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(move |_| {
+            launches_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("discovery must not launch"))
+        }),
+        viewer_db_path: proc_root.path().join("viewer.db"),
+        proc_root: proc_root.path().to_path_buf(),
+        password_override: Some("test-secret".to_string()),
+        before_authorized_write: None,
+    });
+    let mut backend = backend_with_runtime(runtime);
+
+    assert!(
+        backend
+            .list()
+            .expect("authenticated backup provides the listing")
+            .is_empty()
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert_eq!(primary.wait_for_requests(2).len(), 2);
+    assert_eq!(backup.wait_for_requests(4).len(), 4);
+    assert_test_secret_pairs(&primary.requests());
+    assert_test_secret_pairs(&backup.requests());
 }
 
 #[test]
 fn opencode_capabilities_follow_the_last_probed_tier_without_network_on_read() {
-    let server = ScriptedServer::spawn(empty_server_list_responses());
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": "ses_cap",
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "managed",
+                "permission": managed_permission(),
+                "time": {"created": 1, "updated": 2, "archived": 3}
+            }]),
+        ),
+    ]));
     let healthy_launcher_calls = Arc::new(AtomicUsize::new(0));
-    let healthy_runtime = no_launch_runtime(
+    let healthy_launcher_calls_for_runtime = Arc::clone(&healthy_launcher_calls);
+    let healthy_runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&healthy_launcher_calls),
+        move |_| {
+            healthy_launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let mut healthy = backend_with_runtime(healthy_runtime);
     healthy.list().expect("establish healthy tier");
@@ -1394,21 +1321,22 @@ fn opencode_capabilities_follow_the_last_probed_tier_without_network_on_read() {
     );
     let mut server_row = session_with_pid(None);
     server_row.daemon_hosted = true;
-    assert_eq!(healthy.capabilities_for(&server_row), healthy_caps);
+    assert!(
+        !healthy.capabilities_for(&server_row).attach,
+        "managed server rows must not advertise credentialed attach"
+    );
+    assert!(
+        healthy.capabilities_for(&session_with_pid(None)).attach,
+        "external rows remain locally attachable"
+    );
     assert_eq!(
         server.requests().len(),
         request_count,
         "capability reads must not perform HTTP"
     );
 
-    let fallback_launcher_calls = Arc::new(AtomicUsize::new(0));
-    let candidates = unused_addrs();
-    let fallback_runtime = no_launch_runtime(
-        candidates,
-        Duration::from_millis(80),
-        Arc::clone(&fallback_launcher_calls),
-    );
-    let mut fallback = backend_with_runtime(fallback_runtime);
+    let mut fallback =
+        OpencodeBackend::with_db(tempfile::TempDir::new().unwrap().path().join("missing.db"));
     fallback.list().expect("establish compatibility tier");
     assert_eq!(
         fallback.capabilities(),
@@ -1425,7 +1353,6 @@ fn opencode_capabilities_follow_the_last_probed_tier_without_network_on_read() {
         }
     );
     assert_eq!(healthy_launcher_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(fallback_launcher_calls.load(Ordering::SeqCst), 0);
 }
 
 // --- v2: three-tier heuristic (test 17) ---
@@ -1617,16 +1544,21 @@ fn server_session(id: &str, cwd: PathBuf) -> Session {
 
 #[test]
 fn opencode_spawn_create_then_prompt_returns_exact_id_and_model_shapes() {
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": "ses_exact_identity"})),
         ScriptedResponse::empty(204),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let backend = backend_with_runtime(runtime);
     let cwd = PathBuf::from("/tmp/space and 雪/?x=1&next=../");
@@ -1637,7 +1569,9 @@ fn opencode_spawn_create_then_prompt_returns_exact_id_and_model_shapes() {
         .expect("server spawn");
     assert_eq!(spawned.pid, None);
     assert_eq!(spawned.session_id.as_deref(), Some("ses_exact_identity"));
-    let requests = server.wait_for_requests(3);
+    let all_requests = server.wait_for_requests(6);
+    assert_test_secret_pairs(&all_requests);
+    let requests = authenticated_requests(&all_requests);
     assert_eq!(
         requests
             .iter()
@@ -1680,24 +1614,31 @@ fn opencode_spawn_create_then_prompt_returns_exact_id_and_model_shapes() {
 
 #[test]
 fn opencode_spawn_omits_default_model_and_rejects_malformed_model_before_mutation() {
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": "ses_default"})),
         ScriptedResponse::empty(204),
         healthy_response(),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let backend = backend_with_runtime(runtime);
 
     backend
         .spawn(PathBuf::from("/tmp").as_path(), "default prompt", None)
         .expect("default spawn");
-    let requests = server.wait_for_requests(3);
+    let all_requests = server.wait_for_requests(6);
+    assert_test_secret_pairs(&all_requests);
+    let requests = authenticated_requests(&all_requests);
     assert!(requests[1].json_body().get("model").is_none());
     assert!(requests[2].json_body().get("model").is_none());
 
@@ -1709,7 +1650,9 @@ fn opencode_spawn_omits_default_model_and_rejects_malformed_model_before_mutatio
         )
         .expect_err("malformed model must fail");
     assert!(error.to_string().contains("provider"), "{error}");
-    let after = server.wait_for_requests(4);
+    let all_after = server.wait_for_requests(8);
+    assert_test_secret_pairs(&all_after);
+    let after = authenticated_requests(&all_after);
     assert_eq!(
         after
             .iter()
@@ -1722,16 +1665,21 @@ fn opencode_spawn_omits_default_model_and_rejects_malformed_model_before_mutatio
 
 #[test]
 fn opencode_prompt_failure_reports_created_id_and_never_submits_twice() {
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": "ses_orphan_visible"})),
         ScriptedResponse::raw(200, "text/plain", "provider rejected prompt"),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
     let backend = backend_with_runtime(runtime);
 
@@ -1740,8 +1688,16 @@ fn opencode_prompt_failure_reports_created_id_and_never_submits_twice() {
         .expect_err("prompt failure must be visible");
     let message = error.to_string();
     assert!(message.contains("ses_orphan_visible"), "{message}");
-    assert!(message.contains("provider rejected prompt"), "{message}");
-    let requests = server.wait_for_requests(3);
+    assert!(
+        message.contains(
+            "POST /session/ses_orphan_visible/prompt_async?directory=%2Ftmp returned HTTP 200"
+        ),
+        "{message}"
+    );
+    assert!(!message.contains("provider rejected prompt"), "{message}");
+    let all_requests = server.wait_for_requests(6);
+    assert_test_secret_pairs(&all_requests);
+    let requests = authenticated_requests(&all_requests);
     assert_eq!(
         requests
             .iter()
@@ -1753,133 +1709,114 @@ fn opencode_prompt_failure_reports_created_id_and_never_submits_twice() {
 }
 
 #[test]
-fn opencode_shared_runtime_connects_spawn_and_fresh_listing_instances() {
-    let [primary, backup] = unused_addrs();
-    let launched_server = Arc::new(Mutex::new(None));
+fn opencode_managed_attach_is_refused_while_external_attach_stays_local() {
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": "ses_attach_exact",
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "managed",
+                "permission": managed_permission(),
+                "time": {"created": 1, "updated": 2, "archived": 3}
+            }]),
+        ),
+        healthy_response(),
+        healthy_response(),
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let server_for_launcher = Arc::clone(&launched_server);
-    let calls_for_launcher = Arc::clone(&launcher_calls);
-    let runtime = runtime_for(
-        [primary, backup],
-        Duration::from_secs(1),
-        PathBuf::from("/"),
-        move |command| {
-            calls_for_launcher.fetch_add(1, Ordering::SeqCst);
-            let args = command_args(&command);
-            let port = args
-                .windows(2)
-                .find(|pair| pair[0] == "--port")
-                .and_then(|pair| pair[1].parse::<u16>().ok())
-                .unwrap();
-            *server_for_launcher.lock().unwrap() = Some(ScriptedServer::spawn_on(
-                SocketAddr::from(([127, 0, 0, 1], port)),
-                vec![
-                    healthy_response(),
-                    ScriptedResponse::json(200, json!({"id": "ses_shared"})),
-                    ScriptedResponse::empty(204),
-                    healthy_response(),
-                    ScriptedResponse::json(
-                        200,
-                        json!([{
-                            "id": "ses_shared",
-                            "parentID": null,
-                            "directory": "/tmp",
-                            "title": "shared",
-                            "permission": managed_permission(),
-                            "time": {"created": 1, "updated": 2}
-                        }]),
-                    ),
-                    ScriptedResponse::json(200, json!({"ses_shared": {"type": "busy"}})),
-                    ScriptedResponse::json(200, json!([])),
-                    ScriptedResponse::json(200, json!([])),
-                ],
-            )?);
-            Ok(())
-        },
-    );
-
-    let first = backend_with_runtime(runtime.clone());
-    let result = first
-        .spawn(PathBuf::from("/tmp").as_path(), "shared runtime", None)
-        .expect("spawn");
-    drop(first);
-    let mut second = backend_with_runtime(runtime);
-    let row = second
-        .list()
-        .expect("fresh backend lists shared server")
-        .into_iter()
-        .find(|session| session.id == result.session_id.clone().unwrap())
-        .expect("exact spawned row");
-    assert_eq!(row.status, Status::Working);
-    assert!(row.daemon_hosted);
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn opencode_server_attach_uses_exact_url_id_and_never_forks() {
-    let server = ScriptedServer::spawn(vec![healthy_response(), healthy_response()]);
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
-    let backend = backend_with_runtime(runtime);
+    let mut backend = backend_with_runtime(runtime);
+    backend.list().expect("establish exact managed marker");
     let existing_dir = tempfile::TempDir::new().unwrap();
     let session = server_session("ses_attach_exact", existing_dir.path().to_path_buf());
 
-    let command = backend.attach_command(&session).expect("server attach");
+    let refusal = backend
+        .attach_command(&session)
+        .expect_err("managed session attach is refused before a credentialed command exists");
+    assert!(refusal.to_string().contains("managed"), "{refusal}");
+
+    let external = session_with_pid(None);
+    let command = backend
+        .attach_command(&external)
+        .expect("external session remains locally attachable");
     assert_eq!(command.get_program(), "opencode");
     assert_eq!(
         command_args(&command),
-        vec![
-            "attach".to_string(),
-            format!("http://{}", server.addr),
-            "-s".to_string(),
-            "ses_attach_exact".to_string(),
-        ]
+        vec!["-s".to_string(), "ses_cap".to_string()]
     );
-    assert_eq!(command.get_current_dir(), Some(existing_dir.path()));
-    assert!(!command_args(&command).iter().any(|arg| arg == "--fork"));
-
-    let missing = server_session(
-        "ses_missing_cwd",
-        existing_dir.path().join("deleted-directory"),
+    assert_eq!(
+        command.get_current_dir(),
+        Some(PathBuf::from("/tmp").as_path())
     );
-    let missing_command = backend
-        .attach_command(&missing)
-        .expect("deleted cwd does not block attach");
-    assert_eq!(missing_command.get_current_dir(), None);
+    let env = command
+        .get_envs()
+        .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+        .collect::<BTreeMap<_, _>>();
+    assert!(!env.contains_key("OPENCODE_SERVER_USERNAME"));
+    assert!(!env.contains_key("OPENCODE_SERVER_PASSWORD"));
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn opencode_stop_aborts_only_the_percent_encoded_session() {
-    let server = ScriptedServer::spawn(vec![
+    let id = "ses/雪?../../target#fragment";
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": id,
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "managed",
+                "permission": managed_permission(),
+                "time": {"created": 1, "updated": 2, "archived": 3}
+            }]),
+        ),
         healthy_response(),
         ScriptedResponse::json(200, json!(false)),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
-    let backend = backend_with_runtime(runtime);
-    let id = "ses/雪?../../target#fragment";
+    let mut backend = backend_with_runtime(runtime);
+    backend.list().expect("establish exact managed marker");
     let mut session = server_session(id, PathBuf::from("/tmp"));
     session.pid = Some(u32::MAX);
 
     backend
         .stop(&session)
         .expect("idle abort false is still an accepted response");
-    let requests = server.wait_for_requests(2);
-    assert_eq!(requests[1].method, "POST");
+    let all_requests = server.wait_for_requests(8);
+    assert_test_secret_pairs(&all_requests);
+    let requests = authenticated_requests(&all_requests);
+    let abort = requests.last().unwrap();
+    assert_eq!(abort.method, "POST");
     assert_eq!(
-        requests[1].target,
+        abort.target,
         format!("/session/{}/abort", encoded_component(id))
     );
-    assert!(requests[1].body.is_empty());
+    assert!(abort.body.is_empty());
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1887,7 +1824,19 @@ fn opencode_stop_aborts_only_the_percent_encoded_session() {
 fn opencode_server_session_mutations_use_exact_paths_and_json() {
     let id = "ses/\"雪?../../target#fragment";
     let encoded = encoded_component(id);
-    let server = ScriptedServer::spawn(vec![
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": id,
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "managed",
+                "permission": managed_permission(),
+                "time": {"created": 1, "updated": 2, "archived": 3}
+            }]),
+        ),
         healthy_response(),
         ScriptedResponse::json(200, json!({"id": id})),
         healthy_response(),
@@ -1896,14 +1845,20 @@ fn opencode_server_session_mutations_use_exact_paths_and_json() {
         ScriptedResponse::json(200, json!({"id": id})),
         healthy_response(),
         ScriptedResponse::json(200, json!(true)),
-    ]);
+    ]));
     let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
+    let launcher_calls_for_runtime = Arc::clone(&launcher_calls);
+    let runtime = secure_runtime_for(
+        &server,
         [server.addr, unused_addr()],
         Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
+        move |_| {
+            launcher_calls_for_runtime.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        },
     );
-    let backend = backend_with_runtime(runtime);
+    let mut backend = backend_with_runtime(runtime);
+    backend.list().expect("establish exact managed marker");
     let session = server_session(id, PathBuf::from("/tmp"));
     let name = "quoted \"name\" with 雪 / ? and ../";
 
@@ -1914,10 +1869,12 @@ fn opencode_server_session_mutations_use_exact_paths_and_json() {
     backend.unhide(id).expect("unarchive");
     backend.remove(&session).expect("delete");
 
-    let requests = server.wait_for_requests(8);
-    let mutations = requests
+    let requests = server.wait_for_requests(20);
+    assert_test_secret_pairs(&requests);
+    let mutations = authenticated_requests(&requests)
         .iter()
-        .filter(|request| request.target != "/global/health")
+        .filter(|request| request.method != "GET")
+        .copied()
         .collect::<Vec<_>>();
     assert_eq!(mutations.len(), 4);
     assert_eq!(mutations[0].method, "PATCH");
@@ -1943,115 +1900,6 @@ fn opencode_server_session_mutations_use_exact_paths_and_json() {
     assert_eq!(mutations[3].target, format!("/session/{encoded}"));
     assert!(mutations[3].body.is_empty());
     assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn opencode_server_message_peek_selects_newest_nonblank_ordered_text() {
-    let id = "ses/message?雪/../";
-    let server = ScriptedServer::spawn(vec![
-        healthy_response(),
-        ScriptedResponse::json(
-            200,
-            json!([
-                {
-                    "info": {"id": "msg_old", "role": "assistant", "time": {"created": 100}},
-                    "parts": [{"type": "text", "text": "older"}]
-                },
-                {
-                    "info": {"id": "msg_whitespace", "role": "user", "time": {"created": 400}},
-                    "parts": [{"type": "text", "text": "\n \n"}]
-                },
-                {
-                    "info": {"id": "msg_tool", "role": "assistant", "time": {"created": 300}},
-                    "parts": [{"type": "tool", "tool": "bash", "state": {"secret": "ignored"}}]
-                },
-                {
-                    "info": {
-                        "id": "msg_newest_text",
-                        "role": "assistant",
-                        "time": {"created": 200},
-                        "unrelated": "ignored"
-                    },
-                    "parts": [
-                        {"type": "text", "text": "line one\n"},
-                        {"type": "tool", "tool": "read"},
-                        {"type": "text", "text": "line two"}
-                    ]
-                }
-            ]),
-        ),
-    ]);
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [server.addr, unused_addr()],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let missing_db = tempfile::TempDir::new().unwrap().path().join("missing.db");
-
-    let item = runtime
-        .read_last_message(&missing_db, id)
-        .expect("server message read")
-        .expect("newest text message");
-    assert_eq!(item.role, "assistant");
-    assert_eq!(item.text, "line one\nline two");
-    let requests = server.wait_for_requests(2);
-    assert_eq!(
-        requests[1].target,
-        format!("/session/{}/message?limit=200", encoded_component(id))
-    );
-    assert_eq!(launcher_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn opencode_server_message_peek_prefers_newer_abort_over_older_user_text() {
-    let server = ScriptedServer::spawn(vec![
-        healthy_response(),
-        ScriptedResponse::json(
-            200,
-            json!([
-                {
-                    "info": {
-                        "id": "msg_user",
-                        "role": "user",
-                        "time": {"created": 400}
-                    },
-                    "parts": [
-                        {"type": "text", "text": "OLDER USER PROMPT MARKER"}
-                    ]
-                },
-                {
-                    "info": {
-                        "id": "msg_error",
-                        "role": "assistant",
-                        "time": {"created": 500},
-                        "error": {
-                            "name": "MessageAbortedError",
-                            "data": {
-                                "message": "Aborted",
-                                "responseBody": "unrelated provider payload"
-                            }
-                        }
-                    },
-                    "parts": []
-                }
-            ]),
-        ),
-    ]);
-    let launcher_calls = Arc::new(AtomicUsize::new(0));
-    let runtime = no_launch_runtime(
-        [server.addr, unused_addr()],
-        Duration::from_millis(250),
-        Arc::clone(&launcher_calls),
-    );
-    let missing_db = tempfile::TempDir::new().unwrap().path().join("missing.db");
-
-    let item = runtime
-        .read_last_message(&missing_db, "ses_error")
-        .expect("assistant error is parseable")
-        .expect("assistant error is visible");
-    assert_eq!(item.role, "assistant");
-    assert_eq!(item.text, "Aborted");
 }
 
 // --- run-mode companions: `opencode run` sessions are one-shots, not fleet members ---
@@ -2284,11 +2132,19 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
     assert!(backend.list().expect("chunked global list").is_empty());
     assert_test_secret_pairs(&chunked.wait_for_requests(4));
 
-    for response in [
-        ScriptedResponse::json(200, json!([])).without_framing(),
-        ScriptedResponse::empty(302).header("Location", "http://127.0.0.1:9/stolen"),
-        ScriptedResponse::json(200, json!([])).header("X-Oversized", &"x".repeat(70_000)),
-        ScriptedResponse::raw(200, "application/json", "x".repeat(20_000_000)),
+    for (response, expected) in [
+        (
+            ScriptedResponse::json(200, json!([])).without_framing(),
+            "framing",
+        ),
+        (
+            ScriptedResponse::json(200, json!([])).header("X-Oversized", &"x".repeat(70_000)),
+            "header",
+        ),
+        (
+            ScriptedResponse::raw(200, "application/json", "x".repeat(20_000_000)),
+            "body",
+        ),
     ] {
         let server =
             ScriptedServer::spawn_verified(secure_responses(vec![healthy_response(), response]));
@@ -2301,15 +2157,31 @@ fn secure_http_accepts_chunked_and_rejects_unframed_body_redirects_and_large_hea
         let error = backend.list().expect_err("unsafe HTTP response must fail");
         assert_test_secret_pairs(&server.wait_for_requests(4));
         let message = error.to_string().to_ascii_lowercase();
-        assert!(
-            message.contains("framing")
-                || message.contains("redirect")
-                || message.contains("header")
-                || message.contains("body")
-                || message.contains("large"),
-            "{message}"
-        );
+        assert!(message.contains(expected), "{message}");
     }
+
+    let redirect = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::empty(302).header("Location", "http://127.0.0.1:9/stolen"),
+    ]));
+    let mut backend = backend_with_runtime(secure_runtime_for(
+        &redirect,
+        [redirect.addr, unused_addr()],
+        Duration::from_millis(300),
+        |_| Err(io::Error::other("launcher was not expected")),
+    ));
+    let message = backend
+        .list()
+        .expect_err("redirect response must fail")
+        .to_string();
+    assert_test_secret_pairs(&redirect.wait_for_requests(4));
+    assert!(
+        message.contains("GET /experimental/session?limit=10000&archived=true returned HTTP 302"),
+        "{message}"
+    );
+    assert!(!message.contains("Location"), "{message}");
+    assert!(!message.contains("stolen"), "{message}");
+    assert!(!message.contains("127.0.0.1:9"), "{message}");
 }
 
 #[test]
@@ -2438,6 +2310,112 @@ fn startup_credentials_are_env_only_and_errors_are_sanitized() {
             env.get("OPENCODE_SERVER_PASSWORD"),
             Some(&Some("test-secret".to_string()))
         );
+    }
+}
+
+#[test]
+fn viewer_server_launch_marks_its_process_and_installs_a_shell_credential_scrubber() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join("net")).unwrap();
+    std::os::unix::fs::symlink("/proc/net/tcp", root.path().join("net/tcp")).unwrap();
+    let existing_ancestor = root.path().join("existing");
+    std::fs::create_dir(&existing_ancestor).unwrap();
+    std::fs::set_permissions(&existing_ancestor, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let state_dir = existing_ancestor.join("missing/state");
+    let launched = Arc::new(Mutex::new(Vec::<Command>::new()));
+    let launched_for_callback = Arc::clone(&launched);
+    let candidates = unused_addrs();
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates,
+        startup_timeout: Duration::from_millis(500),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(move |command| {
+            launched_for_callback.lock().unwrap().push(command);
+            Err(io::Error::other(
+                "launch intentionally stops after command capture",
+            ))
+        }),
+        viewer_db_path: state_dir.join("viewer.db"),
+        proc_root: root.path().to_path_buf(),
+        password_override: Some("test-secret".to_string()),
+        before_authorized_write: None,
+    });
+
+    let _ = backend_with_runtime(runtime).spawn(
+        PathBuf::from("/tmp").as_path(),
+        "must not reach a server",
+        None,
+    );
+
+    assert_eq!(
+        std::fs::metadata(&existing_ancestor)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751,
+        "existing server credential state ancestors remain unchanged"
+    );
+    assert_eq!(
+        std::fs::metadata(existing_ancestor.join("missing"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for private_file in [
+        state_dir.join("opencode_server.lock"),
+        state_dir.join("shell.env_OPENCODE_SERVER_USERNAME_OPENCODE_SERVER_PASSWORD.js"),
+    ] {
+        assert_eq!(
+            std::fs::metadata(private_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let launched = launched.lock().unwrap();
+    assert_eq!(launched.len(), 2);
+    for command in launched.iter() {
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get("AGENT_VIEWER_OPENCODE_SERVER"),
+            Some(&Some("1".to_string()))
+        );
+
+        let config = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .and_then(Option::as_deref)
+            .expect("viewer server launch supplies private plugin config");
+        let config: Value = serde_json::from_str(config).expect("plugin config is JSON");
+        assert!(
+            config
+                .get("plugin")
+                .and_then(Value::as_array)
+                .is_some_and(|plugins| !plugins.is_empty()),
+            "viewer server config includes a private plugin"
+        );
+        let config = config.to_string();
+        assert!(config.contains("shell.env"), "{config}");
+        assert!(config.contains("OPENCODE_SERVER_USERNAME"), "{config}");
+        assert!(config.contains("OPENCODE_SERVER_PASSWORD"), "{config}");
+        assert!(!config.contains("test-secret"), "{config}");
     }
 }
 
@@ -2736,6 +2714,45 @@ fn same_pinned_identity_with_failed_health_stays_pinned_and_does_not_start() {
 }
 
 #[test]
+fn same_pinned_identity_recovers_after_one_transient_health_failure() {
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(200, json!([])),
+        ScriptedResponse::raw(500, "text/plain", "temporarily unhealthy"),
+        healthy_response(),
+        ScriptedResponse::json(200, json!([])),
+    ]));
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launches_for_callback = Arc::clone(&launches);
+    let runtime = secure_runtime_for(
+        &server,
+        [server.addr, unused_addr()],
+        Duration::from_millis(250),
+        move |_| {
+            launches_for_callback.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("must not start"))
+        },
+    );
+    let mut backend = backend_with_runtime(runtime);
+    backend.list().expect("establish pin");
+
+    backend
+        .list()
+        .expect_err("one authenticated health request fails");
+    assert!(
+        backend
+            .list()
+            .expect("later probe retries the same pinned identity")
+            .is_empty()
+    );
+
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    let requests = server.wait_for_requests(10);
+    assert_eq!(requests.len(), 10);
+    assert_test_secret_pairs(&requests);
+}
+
+#[test]
 fn changed_pinned_identity_is_cleared_without_sending_replacement_credentials() {
     let server = ScriptedServer::spawn_verified(secure_responses(vec![
         healthy_response(),
@@ -2821,12 +2838,19 @@ fn stale_health_completion_cannot_publish_over_a_changed_process_generation() {
         "the delayed health result belongs to the old process generation"
     );
     let mut second = backend_with_runtime(runtime);
+    let before_later_probe = server.requests().len();
     let _ = second.list();
-    assert_eq!(
-        server.requests().len(),
-        2,
-        "the changed process receives no later authenticated request"
-    );
+    let requests = server.requests();
+    for request in &requests[before_later_probe..] {
+        assert!(
+            !request.headers.contains_key("authorization"),
+            "the changed process receives no later credential"
+        );
+        assert!(
+            request.body.is_empty(),
+            "the changed process receives no later request body"
+        );
+    }
 }
 
 #[test]
@@ -2856,9 +2880,10 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
                 let mut state = lock.lock().unwrap();
                 state.0 += 1;
                 ready.notify_all();
-                let (state, _) = ready
-                    .wait_timeout_while(state, Duration::from_millis(500), |state| !state.1)
+                let (state, timeout) = ready
+                    .wait_timeout_while(state, Duration::from_secs(1), |state| !state.1)
                     .unwrap();
+                assert!(!timeout.timed_out(), "first launch is released by the test");
                 drop(state);
                 let created = Arc::new(AtomicUsize::new(0));
                 let created_for_route = Arc::clone(&created);
@@ -2933,10 +2958,26 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
     });
     let (lock, ready) = &*launch_gate;
     let state = lock.lock().unwrap();
-    let (mut state, _) = ready
-        .wait_timeout_while(state, Duration::from_millis(500), |state| state.0 < 2)
+    let (mut state, timeout) = ready
+        .wait_timeout_while(state, Duration::from_millis(800), |state| state.0 < 1)
         .unwrap();
-    assert_eq!(state.0, 2, "both independent runtimes reached launch");
+    assert!(
+        !timeout.timed_out(),
+        "the lock holder reaches the launch callback before the test releases it"
+    );
+    assert_eq!(
+        state.0, 1,
+        "only the lock holder reaches the launch callback"
+    );
+    let (next_state, timeout) = ready
+        .wait_timeout_while(state, Duration::from_millis(200), |state| state.0 < 2)
+        .unwrap();
+    state = next_state;
+    assert!(timeout.timed_out(), "the second caller must wait locally");
+    assert_eq!(
+        state.0, 1,
+        "only the lock holder reaches the launch callback"
+    );
     state.1 = true;
     ready.notify_all();
     drop(state);
@@ -2950,7 +2991,7 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
     .into_iter()
     .collect::<std::collections::BTreeSet<_>>();
 
-    assert_eq!(launch_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(launch_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(successful_launches.load(Ordering::SeqCst), 1);
     assert_eq!(
         spawn_ids,
@@ -2992,6 +3033,256 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
 }
 
 #[test]
+fn detached_launch_loser_adopts_the_exact_verified_server_that_won_the_bind() {
+    let proc_root = new_proc_root();
+    let primary = unused_addr();
+    let backup = ScriptedServer::spawn(vec![]);
+    let launch_gate = Arc::new((Mutex::new((0_usize, false)), Condvar::new()));
+    let launch_attempts = Arc::new(AtomicUsize::new(0));
+    let successful_launches = Arc::new(AtomicUsize::new(0));
+    let launched_server = Arc::new(Mutex::new(None::<ScriptedServer>));
+    let make_runtime = |viewer_db_path: PathBuf| {
+        let proc_root_for_launcher = Arc::clone(&proc_root);
+        let gate = Arc::clone(&launch_gate);
+        let attempts = Arc::clone(&launch_attempts);
+        let successes = Arc::clone(&successful_launches);
+        let server_slot = Arc::clone(&launched_server);
+        OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+            candidates: [primary, backup.addr],
+            startup_timeout: Duration::from_secs(2),
+            durable_cwd: PathBuf::from("/"),
+            launcher: Arc::new(move |_| {
+                let launch_index = attempts.fetch_add(1, Ordering::SeqCst);
+                let launched_pid = 62101 + launch_index as u32;
+                let (lock, ready) = &*gate;
+                let mut state = lock.lock().unwrap();
+                state.0 += 1;
+                ready.notify_all();
+                let (state, _) = ready
+                    .wait_timeout_while(state, Duration::from_secs(1), |state| !state.1)
+                    .unwrap();
+                drop(state);
+                let created = Arc::new(AtomicUsize::new(0));
+                let created_for_route = Arc::clone(&created);
+                match ScriptedServer::spawn_on_verified_routed_in(
+                    primary,
+                    Arc::clone(&proc_root_for_launcher),
+                    launched_pid,
+                    move |request| {
+                        let authorized = request.headers.contains_key("authorization");
+                        match (request.method.as_str(), request.target.as_str(), authorized) {
+                            ("GET", "/global/health", false) => unauthorized_health().keep_alive(),
+                            ("GET", "/global/health", true) => healthy_response(),
+                            ("POST", target, true) if target.starts_with("/session?directory=") => {
+                                let index = created_for_route.fetch_add(1, Ordering::SeqCst);
+                                ScriptedResponse::json(
+                                    200,
+                                    json!({"id": format!("ses_detached_{index}")}),
+                                )
+                            }
+                            ("POST", target, true)
+                                if target.contains("/prompt_async?directory=") =>
+                            {
+                                ScriptedResponse::empty(204).without_framing()
+                            }
+                            (_, _, false) => unauthorized_health().keep_alive(),
+                            _ => ScriptedResponse::raw(500, "text/plain", "unexpected request"),
+                        }
+                    },
+                ) {
+                    Ok(server) => {
+                        successes.fetch_add(1, Ordering::SeqCst);
+                        *server_slot.lock().unwrap() = Some(server);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        let started = Instant::now();
+                        while started.elapsed() < Duration::from_millis(250) {
+                            if server_slot.lock().unwrap().is_some() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                Ok(launched_pid)
+            }),
+            viewer_db_path,
+            proc_root: proc_root.path().to_path_buf(),
+            password_override: Some("test-secret".to_string()),
+            before_authorized_write: None,
+        })
+    };
+    let first = make_runtime(proc_root.path().join("first/viewer.db"));
+    let second = make_runtime(proc_root.path().join("second/viewer.db"));
+    let first_worker = std::thread::spawn(move || {
+        backend_with_runtime(first).spawn(
+            PathBuf::from("/detached_one").as_path(),
+            "run sleep 20",
+            None,
+        )
+    });
+    let second_worker = std::thread::spawn(move || {
+        backend_with_runtime(second).spawn(
+            PathBuf::from("/detached_two").as_path(),
+            "run sleep 20",
+            None,
+        )
+    });
+    let (lock, ready) = &*launch_gate;
+    let state = lock.lock().unwrap();
+    let (mut state, _) = ready
+        .wait_timeout_while(state, Duration::from_millis(800), |state| state.0 < 2)
+        .unwrap();
+    assert_eq!(state.0, 2, "both detached launches reached the bind race");
+    state.1 = true;
+    ready.notify_all();
+    drop(state);
+
+    let first_spawn = first_worker.join().unwrap().expect("first exact spawn");
+    let second_spawn = second_worker.join().unwrap().expect("second exact spawn");
+    let spawn_ids = [
+        first_spawn.session_id.expect("first session id"),
+        second_spawn.session_id.expect("second session id"),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(launch_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(successful_launches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        spawn_ids,
+        ["ses_detached_0".to_string(), "ses_detached_1".to_string()]
+            .into_iter()
+            .collect()
+    );
+    let server_guard = launched_server.lock().unwrap();
+    let server = server_guard.as_ref().expect("one verified launch winner");
+    let requests = server.wait_for_requests(12);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST"
+                && request.target.starts_with("/session?directory="))
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.target.contains("/prompt_async?directory="))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn cloned_runtime_concurrent_discovery_publishes_one_identical_pin() {
+    let server = ScriptedServer::spawn_verified_concurrent_routed(|request| {
+        let authorized = request.headers.contains_key("authorization");
+        match (request.method.as_str(), request.target.as_str(), authorized) {
+            ("GET", "/global/health", false) => unauthorized_health().keep_alive(),
+            ("GET", "/global/health", true) => healthy_response(),
+            ("GET", "/experimental/session?limit=10000&archived=true", true) => {
+                ScriptedResponse::json(200, json!([]))
+            }
+            ("POST", target, true) if target.starts_with("/session?directory=") => {
+                ScriptedResponse::json(200, json!({"id": "ses_shared_pin"}))
+            }
+            ("POST", target, true) if target.contains("/prompt_async?directory=") => {
+                ScriptedResponse::empty(204).without_framing()
+            }
+            (_, _, false) => unauthorized_health().keep_alive(),
+            _ => ScriptedResponse::raw(500, "text/plain", "unexpected request"),
+        }
+    });
+    let authorization_gate = Arc::new((Mutex::new(0_usize), Condvar::new()));
+    let gate_for_hook = Arc::clone(&authorization_gate);
+    let hook = Arc::new(move || {
+        let (lock, ready) = &*gate_for_hook;
+        let mut arrivals = lock.lock().unwrap();
+        if *arrivals < 2 {
+            *arrivals += 1;
+            ready.notify_all();
+            let (next, timeout) = ready
+                .wait_timeout_while(arrivals, Duration::from_secs(1), |count| *count < 2)
+                .unwrap();
+            arrivals = next;
+            assert!(!timeout.timed_out(), "both discoveries reach authorization");
+        }
+        drop(arrivals);
+    });
+    let launches = Arc::new(AtomicUsize::new(0));
+    let launches_for_callback = Arc::clone(&launches);
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates: [server.addr, unused_addr()],
+        startup_timeout: Duration::from_millis(500),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(move |_| {
+            launches_for_callback.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("launcher was not expected"))
+        }),
+        viewer_db_path: server.proc_root().join("viewer.db"),
+        proc_root: server.proc_root(),
+        password_override: Some("test-secret".to_string()),
+        before_authorized_write: Some(hook),
+    });
+
+    let listing_runtime = runtime.clone();
+    let listing = std::thread::spawn(move || backend_with_runtime(listing_runtime).list());
+    let spawning = std::thread::spawn(move || {
+        backend_with_runtime(runtime).spawn(
+            PathBuf::from("/shared_pin").as_path(),
+            "shared pin",
+            None,
+        )
+    });
+
+    assert!(
+        listing
+            .join()
+            .expect("listing thread")
+            .expect("concurrent listing")
+            .is_empty()
+    );
+    assert_eq!(
+        spawning
+            .join()
+            .expect("spawning thread")
+            .expect("concurrent spawn")
+            .session_id
+            .as_deref(),
+        Some("ses_shared_pin")
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+    let requests = server.wait_for_requests(10);
+    assert_eq!(requests.len(), 10);
+    let mut requests_by_connection = BTreeMap::<usize, Vec<&RecordedRequest>>::new();
+    for request in &requests {
+        requests_by_connection
+            .entry(request.connection_id)
+            .or_default()
+            .push(request);
+    }
+    assert_eq!(requests_by_connection.len(), 5);
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(b"agent-viewer:test-secret")
+    );
+    for connection_requests in requests_by_connection.values() {
+        let [preflight, authorized] = connection_requests.as_slice() else {
+            panic!("each connection carries one preflight and one authorized request");
+        };
+        assert_eq!(preflight.method, "GET");
+        assert_eq!(preflight.target, "/global/health");
+        assert!(!preflight.headers.contains_key("authorization"));
+        assert!(preflight.body.is_empty());
+        assert_eq!(authorized.headers.get("authorization"), Some(&expected));
+    }
+}
+
+#[test]
 fn readiness_rejects_a_server_not_owned_by_the_exact_launched_pid() {
     let proc_root = new_proc_root();
     let primary = unused_addr();
@@ -3030,8 +3321,12 @@ fn readiness_rejects_a_server_not_owned_by_the_exact_launched_pid() {
     let guard = launched_server.lock().unwrap();
     let server = guard.as_ref().expect("fake server started");
     assert!(
-        server.requests().is_empty(),
-        "readiness must pin the returned pid instead of accepting another verified process"
+        server
+            .requests()
+            .iter()
+            .all(|request| !request.headers.contains_key("authorization")
+                && request.method != "POST"),
+        "a server not owned by the launched pid receives neither credentials nor work"
     );
 }
 
@@ -3098,5 +3393,198 @@ fn secret_storage_failure_refuses_startup_before_launcher() {
             .contains("credential")
             || error.to_string().to_ascii_lowercase().contains("secret"),
         "{error}"
+    );
+}
+
+#[test]
+fn rejected_candidate_is_retried_by_a_later_independent_listing_probe() {
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        unauthorized_health(),
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": "ses_retried_candidate",
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "retried",
+                "permission": null,
+                "time": {"created": 1, "updated": 2}
+            }]),
+        ),
+    ]));
+    let missing_db = tempfile::TempDir::new().unwrap().path().join("missing.db");
+    let mut backend = backend_with_db_and_runtime(
+        missing_db,
+        secure_runtime_for(
+            &server,
+            [server.addr, unused_addr()],
+            Duration::from_millis(250),
+            |_| Err(io::Error::other("launcher was not expected")),
+        ),
+    );
+
+    backend
+        .list()
+        .expect_err("the first credential rejection remains visible");
+    let listed = backend
+        .list()
+        .expect("a later listing retries the exact candidate");
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_retried_candidate"]
+    );
+    let requests = server.wait_for_requests(6);
+    assert_eq!(requests.len(), 6);
+    assert_test_secret_pairs(&requests);
+}
+
+#[test]
+fn http_error_body_never_leaks_credentials_or_terminal_controls() {
+    let authorization = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(b"agent-viewer:test-secret")
+    );
+    let response_body =
+        format!("test-secret {authorization}\u{1b}]8;;https://example.test\u{7}\n\u{7f}\u{9b}");
+    let server = ScriptedServer::spawn_verified(secure_responses(vec![
+        healthy_response(),
+        ScriptedResponse::json(
+            200,
+            json!([{
+                "id": "ses_error_sanitized",
+                "parentID": null,
+                "directory": "/tmp",
+                "title": "managed",
+                "permission": managed_permission(),
+                "time": {"created": 1, "updated": 2, "archived": 3}
+            }]),
+        ),
+        healthy_response(),
+        ScriptedResponse::raw(500, "text/plain", response_body),
+    ]));
+    let mut backend = backend_with_runtime(secure_runtime_for(
+        &server,
+        [server.addr, unused_addr()],
+        Duration::from_millis(250),
+        |_| Err(io::Error::other("launcher was not expected")),
+    ));
+    let managed = backend
+        .list()
+        .expect("establish managed id")
+        .pop()
+        .expect("managed row");
+
+    let error = backend
+        .rename(&managed, "must not leak")
+        .expect_err("HTTP failure remains visible");
+    let message = error.to_string();
+    assert!(
+        message.contains("PATCH /session/ses_error_sanitized"),
+        "{message}"
+    );
+    assert!(message.contains("HTTP 500"), "{message}");
+    assert!(!message.contains("test-secret"), "{message}");
+    assert!(!message.contains(&authorization), "{message}");
+    assert!(!message.contains('\u{1b}'), "{message}");
+    assert!(!message.contains("]8;;"), "{message}");
+    assert!(!message.contains('\n'), "{message}");
+    assert!(!message.contains('\u{7f}'), "{message}");
+    assert!(!message.contains('\u{9b}'), "{message}");
+}
+
+#[test]
+fn delayed_old_listing_cannot_authorize_a_mutation_after_replacement_generation() {
+    let proc_root = new_proc_root();
+    let mut old_listing = ScriptedResponse::json(
+        200,
+        json!([{
+            "id": "ses_old_generation",
+            "parentID": null,
+            "directory": "/old",
+            "title": "old generation",
+            "permission": managed_permission(),
+            "time": {"created": 1, "updated": 2}
+        }]),
+    );
+    old_listing.delay = Duration::from_millis(300);
+    let old = ScriptedServer::spawn_on_verified_in(
+        unused_addr(),
+        secure_responses(vec![healthy_response(), old_listing]),
+        Arc::clone(&proc_root),
+        68001,
+    )
+    .expect("bind old generation server");
+    let replacement = ScriptedServer::spawn_on_verified_routed_in(
+        unused_addr(),
+        Arc::clone(&proc_root),
+        68002,
+        |request| {
+            let authorized = request.headers.contains_key("authorization");
+            match (request.method.as_str(), request.target.as_str(), authorized) {
+                ("GET", "/global/health", false) => unauthorized_health().keep_alive(),
+                ("GET", "/global/health", true) => healthy_response(),
+                ("GET", "/experimental/session?limit=10000&archived=true", true) => {
+                    ScriptedResponse::json(200, json!([]))
+                }
+                ("PATCH", "/session/ses_old_generation", true) => {
+                    ScriptedResponse::json(200, json!({"id": "ses_old_generation"}))
+                }
+                _ => ScriptedResponse::raw(500, "text/plain", "unexpected request"),
+            }
+        },
+    )
+    .expect("bind replacement generation server");
+    let runtime = OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
+        candidates: [old.addr, replacement.addr],
+        startup_timeout: Duration::from_millis(500),
+        durable_cwd: PathBuf::from("/"),
+        launcher: Arc::new(|_| Err(io::Error::other("launcher was not expected"))),
+        viewer_db_path: proc_root.path().join("viewer.db"),
+        proc_root: proc_root.path().to_path_buf(),
+        password_override: Some("test-secret".to_string()),
+        before_authorized_write: None,
+    });
+
+    let old_runtime = runtime.clone();
+    let old_worker = std::thread::spawn(move || {
+        let mut backend = backend_with_runtime(old_runtime);
+        backend.list()
+    });
+    assert_eq!(old.wait_for_requests(4).len(), 4);
+    old.process()
+        .write_identity(2000, unsafe { libc::geteuid() }, None);
+
+    let mut replacement_backend = backend_with_runtime(runtime.clone());
+    assert!(
+        replacement_backend
+            .list()
+            .expect("replacement generation listing")
+            .is_empty()
+    );
+    let old_rows = old_worker
+        .join()
+        .expect("old listing worker")
+        .expect("old listing response");
+    assert_eq!(old_rows[0].id, "ses_old_generation");
+
+    let current = backend_with_runtime(runtime);
+    assert!(
+        current.hide("ses_old_generation").is_err(),
+        "an old listing must not authorize a current generation mutation"
+    );
+    let requests = replacement.requests();
+    assert!(
+        requests.iter().all(|request| request.method != "PATCH"),
+        "no mutation may reach the replacement generation"
+    );
+    assert_eq!(
+        requests.len(),
+        4,
+        "only the replacement listing may reach it"
     );
 }

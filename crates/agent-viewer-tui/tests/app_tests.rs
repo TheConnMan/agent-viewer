@@ -69,6 +69,76 @@ fn select(app: &mut App, id: &str) {
     panic!("session {id} not selectable");
 }
 
+fn hostile_title() -> (&'static str, &'static str) {
+    (
+        "Café 東京 🦀 Deploy\u{1b}[31m red\u{1b}[0m \u{1b}]8;;https://example.invalid\u{7}link\u{1b}]8;;\u{7} bell\u{7} line\ncarriage\rdelete\u{7f} c1\u{80}\u{9b}31m",
+        "Café 東京 🦀 Deploy[31m red[0m ]8;;https://example.invalidlink]8;; bell linecarriagedelete c131m",
+    )
+}
+
+fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expected: &str) {
+    select(app, id);
+    let stored = &app.selected().expect("selected session").title;
+    assert_eq!(stored, expected);
+    assert!(stored.chars().all(|character| !character.is_control()));
+    assert!(!stored.contains("\u{1b}["));
+    assert!(!stored.contains("\u{1b}]"));
+    assert!(!stored.contains('\u{9b}'));
+    assert!(stored.contains("Café 東京 🦀"));
+
+    let mode = Mode::Normal;
+    let composer = Composer::new();
+    let pulses = Pulses::new();
+    let pr_status = PrStatusCache::new();
+    let list_hit = RefCell::new(ListHit::default());
+    let mut terminal = Terminal::new(TestBackend::new(240, 12)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app,
+                    workspace: Path::new("/synthetic/safe-title"),
+                    mode: &mode,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 10_000,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                },
+            );
+        })
+        .unwrap();
+
+    // Ratatui gives the continuation cell of a wide grapheme a space symbol.
+    let mut continuation_cell = false;
+    let rendered =
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .fold(String::new(), |mut rendered, cell| {
+                if continuation_cell {
+                    continuation_cell = false;
+                } else {
+                    let symbol = cell.symbol();
+                    continuation_cell = UnicodeWidthStr::width(symbol) > 1;
+                    rendered.push_str(symbol);
+                }
+                rendered
+            });
+    assert!(rendered.contains("Café 東京 🦀 Deploy[31m red[0m ]8;;https"));
+    assert!(rendered.chars().all(|character| !character.is_control()));
+    assert!(!rendered.contains("\u{1b}["));
+    assert!(!rendered.contains("\u{1b}]"));
+    assert!(!rendered.contains('\u{9b}'));
+    assert!(rendered.contains("Café 東京 🦀"));
+}
+
 // --- Mouse hit-test selection ---
 
 #[test]
@@ -164,6 +234,47 @@ fn filter_matches_title_and_cwd_case_insensitive() {
     // Clearing restores.
     app.set_filter(String::new());
     assert_eq!(session_rows(app.visible()).len(), 2);
+}
+
+#[test]
+fn app_new_sanitizes_session_titles_before_storing_and_rendering() {
+    let (title, expected) = hostile_title();
+    let mut session = sess(
+        BackendKind::Codex,
+        "new-title",
+        "/synthetic/safe-title",
+        100,
+        Status::Idle,
+    );
+    session.title = title.to_string();
+
+    let mut app = App::new(vec![session]);
+
+    assert_title_is_safe_in_storage_and_rendering(&mut app, "new-title", expected);
+}
+
+#[test]
+fn set_sessions_sanitizes_session_titles_before_storing_and_rendering() {
+    let (title, expected) = hostile_title();
+    let mut app = App::new(vec![sess(
+        BackendKind::Codex,
+        "existing",
+        "/synthetic/safe-title",
+        200,
+        Status::Idle,
+    )]);
+    let mut refreshed = sess(
+        BackendKind::Codex,
+        "refreshed-title",
+        "/synthetic/safe-title",
+        100,
+        Status::Idle,
+    );
+    refreshed.title = title.to_string();
+
+    app.set_sessions(vec![refreshed]);
+
+    assert_title_is_safe_in_storage_and_rendering(&mut app, "refreshed-title", expected);
 }
 
 // --- v2 list model (tests 31-37) ---

@@ -1,16 +1,16 @@
 # Contract: opencode server runtime
 
-OpenCode server use is automatic and loopback only. The fixed candidates are `127.0.0.1:4096`, then `127.0.0.1:4097`. SQLite is read only compatibility enumeration only when no secure server is available. It is not job authority.
+OpenCode server use is automatic and loopback only. The fixed candidates are `127.0.0.1:4097`, then `127.0.0.1:4098`. SQLite is read only compatibility enumeration only when no secure server is available. It is not job authority.
 
 ## Lifecycle and credentials
 
-The viewer never stops or restarts a server. Spawn is the only operation that may start one. It starts `opencode serve --hostname 127.0.0.1 --port <port>` from the user home directory, preserving the normal environment and overriding only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`.
+The viewer never stops or restarts a server. Spawn is the only operation that may start one. It starts `opencode serve --hostname 127.0.0.1 --port <port>` from the user home directory, preserving the normal environment and overriding only `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD`. Task shells receive neither credential.
 
-Basic authentication uses nonempty `OPENCODE_SERVER_PASSWORD` and optional nonempty `OPENCODE_SERVER_USERNAME` overrides, or a generated stable secret stored in viewer SQLite. The stored secret is the only OpenCode runtime state kept in viewer SQLite.
+Basic authentication uses nonempty `OPENCODE_SERVER_PASSWORD` and optional nonempty `OPENCODE_SERVER_USERNAME` overrides, or a generated stable secret in owner only credential files. SQLite holds only viewer presentation state. The preexisting unused `opencode.server_url` setting remains unchanged.
 
-An occupied candidate is accepted only when it is the exact pinned OpenCode server process and requires authentication. A listener that returns `200` to unauthenticated `GET /global/health` is rejected as insecure. It is never stopped or restarted. Spawn may then use `4097` when that port is free.
+An occupied candidate is accepted only when it is the exact pinned OpenCode server process and requires authentication. A listener that returns `200` to unauthenticated `GET /global/health` is rejected as insecure. It is never stopped or restarted. Spawn may then use `4098` when that port is free.
 
-Runtime state contains a generation, the pinned identity, health, and the managed session ids. The identity includes pid, start time, listener inode, effective uid, and exact argv. A short state lock protects state and a separate startup mutex serializes starts.
+Runtime state contains a generation, the pinned identity, health, and the managed session ids. The identity includes pid, start time, listener inode, effective uid, and exact argv. Process shared ownership uses only `flock`; each viewer process serializes its own work locally.
 
 ## Request authentication
 
@@ -32,7 +32,7 @@ A metadata marker is invalid. Only exact marked rows are managed. Only they rece
 
 For each unique active managed directory, the viewer fetches status, permission, and question once. A failure marks every row in that directory, including external rows, `Unknown`. Otherwise external server enumerated rows use compatibility `Idle` status.
 
-Server mutations apply only to exact managed rows. Managed rows run `opencode attach http://<endpoint> -s <session_id>` with username and password environment values. External rows run `opencode -s <session_id>`. External deletion remains local `opencode session delete <id>`.
+Server mutations apply only to exact managed rows. Managed attach is refused because it would expose credentials. External rows run `opencode -s <session_id>`. External deletion remains local `opencode session delete <id>`.
 
 ## Endpoints used
 

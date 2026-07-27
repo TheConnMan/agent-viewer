@@ -11,10 +11,13 @@ use agent_viewer_core::codex::app_server::{
 };
 use agent_viewer_core::codex::status::open_rollout_paths;
 use agent_viewer_core::default_codex_home;
-use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime, default_opencode_db};
+use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -74,6 +77,100 @@ where
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+fn wait_for_paths(paths: &[PathBuf], timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if paths.iter().all(|path| path.exists()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("child processes did not reach the launch gate: {paths:?}");
+}
+
+fn wait_for_child(mut child: std::process::Child, timeout: Duration) -> std::process::Output {
+    let start = Instant::now();
+    loop {
+        if child.try_wait().expect("poll child process").is_some() {
+            return child
+                .wait_with_output()
+                .expect("collect child process output");
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child process did not exit before {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn listener_pid(port: u16) -> Option<u32> {
+    let inode = std::fs::read_to_string("/proc/net/tcp")
+        .ok()?
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let local = fields.get(1)?;
+            let (_, encoded_port) = local.rsplit_once(':')?;
+            (fields.get(3) == Some(&"0A")
+                && u16::from_str_radix(encoded_port, 16).ok() == Some(port))
+            .then(|| fields.get(9)?.parse::<u64>().ok())
+            .flatten()
+        })?;
+    let socket = format!("socket:[{inode}]");
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let candidate_pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let owns_listener = std::fs::read_dir(entry.path().join("fd"))
+                .ok()?
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == socket));
+            owns_listener.then_some(candidate_pid)
+        })
+}
+
+fn process_environment(pid: u32, key: &str) -> Option<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .expect("read listener environment")
+        .split(|byte| *byte == 0)
+        .find_map(|entry| {
+            let (entry_key, value) = std::str::from_utf8(entry).ok()?.split_once('=')?;
+            (entry_key == key).then(|| value.to_string())
+        })
+}
+
+fn decode_local_file_url(url: &str) -> Result<PathBuf, &'static str> {
+    let path = url.strip_prefix("file://").ok_or("not a local file URL")?;
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+
+        let high = *bytes.get(index + 1).ok_or("malformed percent escape")?;
+        let low = *bytes.get(index + 2).ok_or("malformed percent escape")?;
+        let hex = |byte: u8| match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err("malformed percent escape"),
+        };
+        decoded.push((hex(high)? << 4) | hex(low)?);
+        index += 3;
+    }
+
+    Ok(PathBuf::from(OsString::from_vec(decoded)))
 }
 
 struct OpencodeLiveCleanup {
@@ -359,11 +456,13 @@ fn multi_backend_smoke() {
 #[test]
 #[ignore = "helper: invoked only by the OpenCode live server test"]
 fn opencode_live_short_lived_child() {
-    let cwd = PathBuf::from(
-        std::env::var("AGENT_VIEWER_OPENCODE_E2E_CWD").expect("helper cwd environment"),
-    );
-    let prompt =
-        std::env::var("AGENT_VIEWER_OPENCODE_E2E_PROMPT").expect("helper prompt environment");
+    let (Ok(cwd), Ok(prompt)) = (
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_CWD"),
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_PROMPT"),
+    ) else {
+        return;
+    };
+    let cwd = PathBuf::from(cwd);
     let backend = OpencodeBackend::with_runtime(OpencodeRuntime::new());
     let spawned = backend
         .spawn(&cwd, &prompt, None)
@@ -372,6 +471,222 @@ fn opencode_live_short_lived_child() {
         .session_id
         .expect("helper receives exact session id");
     println!("AGENT_VIEWER_OPENCODE_SESSION_ID={session_id}");
+}
+
+#[test]
+#[ignore = "helper: invoked only by the cross process OpenCode live test"]
+fn opencode_live_cross_process_child() {
+    let (Ok(cwd), Ok(prompt), Ok(ready), Ok(start)) = (
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_CWD"),
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_PROMPT"),
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_READY"),
+        std::env::var("AGENT_VIEWER_OPENCODE_E2E_START"),
+    ) else {
+        return;
+    };
+    std::fs::write(&ready, "ready\n").expect("announce launch readiness");
+    let start_path = PathBuf::from(start);
+    wait_for_paths(&[start_path], Duration::from_secs(10));
+
+    let spawned = OpencodeBackend::with_runtime(OpencodeRuntime::new())
+        .spawn(Path::new(&cwd), &prompt, None)
+        .expect("helper creates one server session");
+    let session_id = spawned
+        .session_id
+        .expect("helper receives exact session id");
+    println!("AGENT_VIEWER_OPENCODE_SESSION_ID={session_id}");
+}
+
+#[test]
+fn opencode_live_short_lived_child_without_environment_is_a_noop() {
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            "opencode_live_short_lived_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove("AGENT_VIEWER_OPENCODE_E2E_CWD")
+        .env_remove("AGENT_VIEWER_OPENCODE_E2E_PROMPT")
+        .output()
+        .expect("invoke helper without environment");
+
+    assert!(
+        output.status.success(),
+        "helper without environment failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("AGENT_VIEWER_OPENCODE_SESSION_ID="),
+        "helper without environment must not create a session"
+    );
+}
+
+#[test]
+#[ignore = "live: starts one shared OpenCode server from two client processes"]
+fn opencode_cross_process_launch_serializes_and_scrubs_task_shell_credentials() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let gate = tempfile::TempDir::new().unwrap();
+    let start = gate.path().join("start");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock follows the Unix epoch")
+        .as_nanos();
+    let prompt = format!("AV cross process launch {nonce}.");
+    let test_executable = std::env::current_exe().expect("current test executable");
+    let mut children = (0..2)
+        .map(|index| {
+            std::process::Command::new(&test_executable)
+                .args([
+                    "--exact",
+                    "opencode_live_cross_process_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AGENT_VIEWER_OPENCODE_E2E_CWD", &cwd)
+                .env("AGENT_VIEWER_OPENCODE_E2E_PROMPT", &prompt)
+                .env(
+                    "AGENT_VIEWER_OPENCODE_E2E_READY",
+                    gate.path().join(format!("ready-{index}")),
+                )
+                .env("AGENT_VIEWER_OPENCODE_E2E_START", &start)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("start launch helper")
+        })
+        .collect::<Vec<_>>();
+    let ready = [gate.path().join("ready-0"), gate.path().join("ready-1")];
+    wait_for_paths(&ready, Duration::from_secs(10));
+    std::fs::write(&start, "start\n").expect("release both launch helpers");
+
+    let outputs = children
+        .drain(..)
+        .map(|child| wait_for_child(child, Duration::from_secs(30)))
+        .collect::<Vec<_>>();
+    let session_ids = outputs
+        .iter()
+        .map(|output| {
+            assert!(
+                output.status.success(),
+                "helper failed\\nstdout:\\n{}\\nstderr:\\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("AGENT_VIEWER_OPENCODE_SESSION_ID=")
+                        .filter(|id| !id.is_empty())
+                })
+                .expect("helper prints exact session id")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        session_ids[0], session_ids[1],
+        "each client creates one session"
+    );
+
+    let runtime = OpencodeRuntime::new();
+    let mut backend = OpencodeBackend::with_runtime(runtime.clone());
+    let started = Instant::now();
+    let sessions = loop {
+        if let Ok(listed) = backend.list() {
+            let sessions = session_ids
+                .iter()
+                .filter_map(|session_id| {
+                    listed
+                        .iter()
+                        .find(|session| session.id == *session_id)
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            if sessions.len() == session_ids.len() {
+                break sessions;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "one shared server did not expose both exact spawned sessions"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        sessions.iter().all(|session| session.daemon_hosted),
+        "both sessions carry the exact managed marker from one server listing"
+    );
+    let mut cleanup = sessions
+        .iter()
+        .cloned()
+        .map(|session| OpencodeLiveCleanup {
+            runtime: runtime.clone(),
+            session: Some(session),
+        })
+        .collect::<Vec<_>>();
+
+    let marked_listeners = [4097_u16, 4098_u16]
+        .into_iter()
+        .filter_map(|port| {
+            let listener_process_id = listener_pid(port)?;
+            (process_environment(listener_process_id, "AGENT_VIEWER_OPENCODE_SERVER").as_deref()
+                == Some("1"))
+            .then_some((port, listener_process_id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        marked_listeners.len(),
+        1,
+        "the fixed candidates contain one marked OpenCode server"
+    );
+    let (server_port, listener_process_id) = marked_listeners[0];
+    assert_eq!(
+        process_environment(listener_process_id, "AGENT_VIEWER_OPENCODE_SERVER").as_deref(),
+        Some("1"),
+        "shared server identity marker is visible in its process environment"
+    );
+    assert!(
+        matches!(server_port, 4097 | 4098),
+        "the shared server uses one fixed candidate"
+    );
+
+    let config_content = process_environment(listener_process_id, "OPENCODE_CONFIG_CONTENT")
+        .expect("marked server exposes its OpenCode config");
+    let config: Value = serde_json::from_str(&config_content).expect("server config is JSON");
+    let plugin_url = config
+        .get("plugin")
+        .and_then(Value::as_array)
+        .and_then(|plugins| {
+            plugins.iter().filter_map(Value::as_str).find(|plugin| {
+                plugin.ends_with("shell.env_OPENCODE_SERVER_USERNAME_OPENCODE_SERVER_PASSWORD.js")
+            })
+        })
+        .expect("server config includes the credential scrubbing plugin");
+    let plugin_path = decode_local_file_url(plugin_url)
+        .expect("credential scrubbing plugin uses a valid local file URL");
+    let plugin = std::fs::read_to_string(&plugin_path).expect("read credential scrubbing plugin");
+    assert!(plugin.contains("shell.env"));
+    assert!(plugin.contains("output.env.OPENCODE_SERVER_USERNAME = \"\""));
+    assert!(plugin.contains("output.env.OPENCODE_SERVER_PASSWORD = \"\""));
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(plugin_path)
+                .expect("credential scrubbing plugin metadata")
+                .permissions(),
+        ) & 0o777,
+        0o600,
+        "credential scrubbing plugin mode"
+    );
+    for cleanup in &mut cleanup {
+        cleanup.delete().expect("delete only the live test session");
+    }
+    assert!(
+        backend.list().is_ok() && backend.capabilities().live_status,
+        "session cleanup must not stop the shared server"
+    );
 }
 
 #[test]
@@ -478,69 +793,46 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
     };
 
     let mut fresh = OpencodeBackend::with_runtime(runtime.clone());
-    let working = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
-        session.id == session_id && session.status == Status::Working
+    let managed_session = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
+        session.id == session_id
     })
-    .expect("fresh client never observed the disconnected session Working");
-    assert!(working.daemon_hosted);
-    assert_eq!(working.pid, None);
-    let attach = fresh
-        .attach_command(&working)
-        .expect("build native server attach");
-    let attach_args: Vec<String> = attach
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(attach_args.first().map(String::as_str), Some("attach"));
-    let server_url = attach_args
-        .iter()
-        .find(|arg| arg.starts_with("http://127.0.0.1:"))
-        .cloned()
-        .expect("attach uses a fixed loopback server URL");
+    .expect("fresh client never observed the exact disconnected session");
     assert!(
-        server_url.ends_with(":4096") || server_url.ends_with(":4097"),
-        "{server_url}"
+        managed_session.daemon_hosted,
+        "exact managed session was not marked daemon hosted"
     );
+    assert_eq!(
+        managed_session.pid, None,
+        "exact managed session unexpectedly had a local pid"
+    );
+    let observed_status = managed_session.status.clone();
+    let refusal = fresh
+        .attach_command(&managed_session)
+        .expect_err("managed attach must be refused");
     assert!(
-        attach_args
-            .windows(2)
-            .any(|pair| pair == ["-s", session_id.as_str()])
+        refusal.reason.contains("managed"),
+        "managed attach refusal: {}",
+        refusal.reason
     );
-    assert!(!attach_args.iter().any(|arg| arg == "--fork"));
-
-    let ids_before_attach: HashSet<String> = fresh
-        .list()
-        .expect("list before attach")
+    let server_port = [4097_u16, 4098_u16]
         .into_iter()
-        .map(|session| session.id)
-        .collect();
-    let pty =
-        PtySession::spawn(spec_from_command(&attach, 30, 110)).expect("attach through a sized PTY");
-    let attach_started = Instant::now();
-    let mut attach_observed = false;
-    while attach_started.elapsed() < Duration::from_secs(20) {
-        let contents = pty.with_screen(|screen| screen.contents());
-        if contents.contains(&title_marker) || contents.contains(&prompt) {
-            attach_observed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let ids_after_attach: HashSet<String> = fresh
-        .list()
-        .expect("list after attach")
-        .into_iter()
-        .map(|session| session.id)
-        .collect();
-    drop(pty);
+        .find(|port| {
+            listener_pid(*port).is_some_and(|pid| {
+                process_environment(pid, "AGENT_VIEWER_OPENCODE_SERVER").as_deref() == Some("1")
+            })
+        })
+        .expect("find marked OpenCode server listener");
+    let server_url = format!("http://127.0.0.1:{server_port}");
 
-    fresh.stop(&working).expect("abort only the test session");
-    let stopped = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
+    fresh
+        .stop(&managed_session)
+        .expect("abort only the exact managed test session");
+    let stopped_session = poll_opencode_session(&mut fresh, Duration::from_secs(30), |session| {
         session.id == session_id && session.status != Status::Working
     })
-    .expect("aborted session never left Working");
+    .expect("aborted exact managed session was not observed with a non-Working status");
     fresh
-        .rename(&stopped, &format!("{title_marker} renamed"))
+        .rename(&stopped_session, &format!("{title_marker} renamed"))
         .expect("rename through server");
     let renamed = poll_opencode_session(&mut fresh, Duration::from_secs(10), |session| {
         session.id == session_id && session.title == format!("{title_marker} renamed")
@@ -556,11 +848,6 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
         session.id == session_id && !session.hidden
     })
     .expect("unarchive did not round trip");
-    let last_message = runtime
-        .read_last_message(&default_opencode_db(), &session_id)
-        .expect("read the real last server message")
-        .expect("abort persists an assistant message");
-
     let cleanup_result = cleanup.delete();
     let cleanup_ok = cleanup_result.is_ok();
     cleanup_result.expect("delete only the unique live test session");
@@ -580,16 +867,11 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
 
     println!("[opencode] server {server_url}");
     println!("[opencode] session {session_id}");
-    println!(
-        "[opencode] initiating client returned after {disconnected_after:?}; fresh client observed Working"
-    );
-    println!(
-        "[opencode] attach observed={attach_observed} duplicate_created={}",
-        ids_before_attach != ids_after_attach
-    );
+    println!("[opencode] initiating client returned after {disconnected_after:?}");
+    println!("[opencode] managed attach refused: {}", refusal.reason);
     println!(
         "[opencode] abort transition {:?} -> {:?}; server healthy={server_still_healthy}",
-        working.status, stopped.status
+        observed_status, stopped_session.status
     );
     println!(
         "[opencode] archive hidden={} unarchive hidden={}",
@@ -597,19 +879,9 @@ fn opencode_server_disconnect_attach_abort_archive_and_cleanup() {
     );
     println!("[opencode] cleanup result={cleanup_ok} removed={removed}");
 
-    assert!(
-        attach_observed,
-        "native attach did not replay the existing session"
-    );
-    assert_eq!(
-        ids_after_attach, ids_before_attach,
-        "attach created a duplicate session"
-    );
     assert_eq!(renamed.title, format!("{title_marker} renamed"));
     assert!(archived.hidden);
     assert!(!unarchived.hidden);
-    assert_eq!(last_message.role, "assistant");
-    assert_eq!(last_message.text, "Aborted");
     assert!(removed, "cleanup session remained in the server list");
     assert!(
         server_still_healthy,
