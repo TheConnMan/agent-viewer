@@ -82,9 +82,12 @@ companion.
 ## Inline spawn composer
 
 The list view carries a persistent composer in a rounded box between the list and the
-footer: `[cc] claude opus[1m] ~/git/foo ❯ …`. Just start typing to describe a task; `Tab`
-cycles the target agent (Claude → Codex → opencode), `Shift+Tab` cycles that agent's model,
-and `Enter` spawns it detached with that model. A Codex spawn goes into the shared
+footer. Its metadata row shows the backend, the selected model when it is not the default,
+and the target folder. The task input is below it, uses the full width, and wraps as it grows.
+Just start typing to describe a task. A bracketed multiline paste remains one draft with its
+line breaks preserved. `Tab` cycles the target agent among Claude, Codex, and opencode;
+`Shift+Tab` cycles that agent's model; and `Enter` explicitly submits the draft and spawns it
+detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
 daemon if none is running and never stops one. The models are discovered from each agent's
 CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
