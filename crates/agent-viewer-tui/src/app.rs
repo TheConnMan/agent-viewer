@@ -98,6 +98,7 @@ pub enum Row {
         summary: String,
         status: Status,
         hidden: bool,
+        created_at_ms: i64,
         updated_at_ms: i64,
         pr_refs: Vec<PrRef>,
     },
@@ -580,7 +581,7 @@ impl App {
         root
     }
 
-    /// The Session row for a session index (real summary + updated_at_ms).
+    /// The Session row for a session index (real summary plus creation and update times).
     fn session_row(s: &Session) -> Row {
         Row::Session {
             backend: s.backend,
@@ -589,6 +590,7 @@ impl App {
             summary: s.summary.clone(),
             status: s.status.clone(),
             hidden: s.hidden,
+            created_at_ms: s.created_at_ms,
             updated_at_ms: s.updated_at_ms,
             pr_refs: s.pr_refs.clone(),
         }
