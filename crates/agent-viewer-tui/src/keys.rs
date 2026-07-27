@@ -612,6 +612,7 @@ pub(crate) mod tests {
             pending_spawn: None,
             pending_reply: None,
             attached: HashMap::new(),
+            terminal_palette: None,
             focused: None,
             focused_session: None,
             focused_exited: false,
@@ -721,6 +722,7 @@ pub(crate) mod tests {
             envs: Vec::new(),
             rows: 24,
             cols: 80,
+            palette: None,
         })
         .expect("mouse recording child")
     }
@@ -742,6 +744,7 @@ pub(crate) mod tests {
             envs: Vec::new(),
             rows: 24,
             cols: 80,
+            palette: None,
         })
         .expect("mouse forwarding child")
     }
@@ -902,6 +905,7 @@ pub(crate) mod tests {
             envs: Vec::new(),
             rows: 24,
             cols: 80,
+            palette: None,
         })
         .expect("spawn real pty");
 
@@ -968,6 +972,7 @@ pub(crate) mod tests {
             envs: Vec::new(),
             rows: 24,
             cols: 80,
+            palette: None,
         })
         .expect("spawn real pty");
 
@@ -1046,6 +1051,7 @@ pub(crate) mod tests {
             envs: Vec::new(),
             rows: 24,
             cols: 80,
+            palette: None,
         })
         .expect("spawn real pty");
 
