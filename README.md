@@ -129,18 +129,12 @@ prefix-filtered live. While it is open, `↑`/`↓` move the highlight, `Tab` in
 highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-is (so
 `/implement RS-123` runs that slash command as the task prompt).
 
-## Inline peek and rename
+## Inline rename
 
-`Space` expands the selected row in place. The peek shows the session's last message
-word-wrapped to the panel width with its newlines preserved, and a short recent-tail of the
-prior items collapsed to one line each above it. A blocked (needs-input) row leads with a
-prominent header: `Awaiting approval: <command/patch>` for Codex or `Awaiting input:
-<question>` for Claude. opencode previews its own real last message from its SQLite store,
-falling back to status and cwd only when it has none. `Space` again or moving the cursor
-collapses it. `Ctrl+R` turns the selected row itself into an empty edit field — type the new
-name, `Enter` commits, `Esc` cancels, and `Enter` on a blank field cancels too. Neither is a
-modal. A Codex rename is retained immediately in its session index, even when its SQLite title
-still shows the prompt.
+`Ctrl+R` turns the selected row itself into an empty edit field. Type the new name, press
+`Enter` to commit, or press `Esc` to cancel. `Enter` on a blank field also cancels. The edit
+field is not a modal. A Codex rename is retained immediately in its session index, even when
+its SQLite title still shows the prompt.
 
 ## Keys
 
@@ -151,7 +145,7 @@ still shows the prompt.
   (Claude and Codex; opencode has too many, so use `/model` there).
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
-- `Space` — expand the selected row in place to peek its last message / metadata.
+- `Space` — collapse or expand a group when a group header is selected; does nothing on a session row.
 - `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
   pressing it always reports a footer notice that reply is not supported.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
@@ -187,22 +181,23 @@ job and a finished one (waking it in place); a row with no background-job id fal
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
 
-**A Codex session that cannot be joined opens its live transcript instead of forking it.**
+**A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
 `codex resume` process replays the transcript, finds it ends mid-turn, and writes a synthesized
 interruption into the running session's transcript, which then renders as "Conversation
-interrupted". So instead of that fork, the row expands into its inline peek, which tails the
-transcript live and read-only while the session keeps running untouched, and the footer says
-why. This applies only to `codex exec` sessions (background jobs and plugin dispatches), whose
-app-server runs inside the session's own process and cannot be joined by anything, the ChatGPT
-app included. Sessions you start in a terminal, and sessions the viewer spawns, are hosted by
-the shared daemon and are joined live.
+interrupted". The viewer refuses that attach and explains why in the footer. This applies only
+to `codex exec` sessions (background jobs and plugin dispatches), whose app server runs inside
+the session's own process and cannot be joined by anything, including the ChatGPT app.
+Sessions you start in a terminal, and sessions the viewer spawns, are hosted by the shared
+daemon and are joined live.
 
-Peek and reply are deliberately out of scope for this rebuild (a divergence from Fleet View,
-which binds `space` to reply — noted here so it is not mistaken for an oversight; see the
-constitution's Additional Constraints). `Ctrl+E` is reserved in the key list but always
-reports a footer notice that reply is not supported. Revisiting either is a future,
-separately-specified decision.
+Reply is deliberately out of scope for this rebuild. `Ctrl+E` is reserved in the key list but
+always reports a footer notice that reply is not supported. Revisiting it is a future,
+separately specified decision.
+
+This viewer binds `Space` to group collapse and expand, not to reply, which is a deliberate
+divergence from Fleet View, which binds `space` to reply — noted here so it is not mistaken
+for an oversight; see the constitution's Additional Constraints.
 
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

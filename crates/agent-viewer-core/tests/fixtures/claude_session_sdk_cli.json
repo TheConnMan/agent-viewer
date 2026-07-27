@@ -1,0 +1,13 @@
+{
+  "pid": 888,
+  "sessionId": "sdkc0001-7777-4133-a473-d3d004454dd0",
+  "cwd": "/home/user/proj/.worktrees/feature-x",
+  "startedAt": 1783710980000,
+  "procStart": "11935534",
+  "version": "2.1.220",
+  "peerProtocol": 1,
+  "kind": "interactive",
+  "entrypoint": "sdk-cli",
+  "name": "feature-x-61",
+  "nameSource": "derived"
+}

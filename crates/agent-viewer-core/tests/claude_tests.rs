@@ -2,8 +2,9 @@ mod common;
 
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
-    ClaudeBackend, parse_agents_json, parse_claude_json_models, parse_job_state,
-    read_claude_transcript,
+    ClaudeBackend, SessionRegistryEntry, is_sdk_entrypoint, mark_sdk_companions, parse_agents_json,
+    parse_claude_json_models, parse_job_state, parse_session_registry, read_claude_transcript,
+    sessions_root_from,
 };
 use agent_viewer_core::codex::rollout::TranscriptItem;
 use std::io::Write;
@@ -25,8 +26,8 @@ fn by_title<'a>(
 fn claude_parse_maps_six_states_and_pid() {
     let json = common::read_fixture("claude_agents_all.json");
     let parsed = parse_agents_json(&json).expect("parse agents json");
-    // 7 valid entries (the malformed missing-sessionId entry is skipped).
-    assert_eq!(parsed.len(), 7);
+    // 8 valid entries (the malformed missing-sessionId entry is skipped).
+    assert_eq!(parsed.len(), 8);
     assert!(parsed.iter().all(|s| s.title != "Orphan Missing SessionId"));
 
     let working = by_title(&parsed, "Working Task");
@@ -37,7 +38,7 @@ fn claude_parse_maps_six_states_and_pid() {
     assert_eq!(working.updated_at_ms, 1783659603260);
     assert_eq!(working.origin, SessionOrigin::Background);
     assert!(!working.hidden);
-    assert!(!working.companion); // claude rows are never companions
+    assert!(!working.companion); // entrypoint "cli" is a real fleet member
     assert_eq!(working.status, Status::Working);
     assert_eq!(working.pid, Some(111));
     // short id (entry "id") is now folded into the Session itself.
@@ -100,6 +101,154 @@ fn claude_origin_is_background_only_for_kind_background() {
     assert_eq!(
         by_title(&parsed, "Odd Kind Task").origin,
         SessionOrigin::Interactive
+    );
+}
+
+// A nested `claude -p` (the Agent SDK's headless entrypoint) registers itself in the same
+// agents list as a real fleet member, carrying a derived `<dir>-<n>` name nobody chose. It is
+// a companion, not a session Brian started, so the default view must exclude it while Ctrl+A
+// still reveals it. Both directions are asserted so a blanket `companion = true` cannot pass.
+#[test]
+fn mark_sdk_companions_flags_only_the_sdk_row() {
+    let json = common::read_fixture("claude_agents_all.json");
+    let mut parsed = parse_agents_json(&json).expect("parse agents json");
+    // The agents output alone never decides this: it does not publish `entrypoint`.
+    assert!(parsed.iter().all(|s| !s.companion));
+
+    // pid 888 is the fixture's nested row; 111/222 are live background jobs. Each entry
+    // reports the session id the row actually has, so the pid-reuse guard passes.
+    let ids: Vec<(u32, String)> = parsed
+        .iter()
+        .filter_map(|s| s.pid.map(|pid| (pid, s.id.clone())))
+        .collect();
+    mark_sdk_companions(&mut parsed, |pid| {
+        Some(SessionRegistryEntry {
+            session_id: ids
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, id)| id.clone()),
+            entrypoint: Some(match pid {
+                888 => "sdk-cli".to_string(),
+                _ => "cli".to_string(),
+            }),
+        })
+    });
+
+    let nested = by_title(&parsed, "feature-x-61");
+    assert!(nested.companion);
+    // Still a fully-formed row (hidden, not dropped), and it carries no short id, so the
+    // per-row capability gate already denies rename/delete on it.
+    assert_eq!(nested.id, "sdkc0001-7777-4133-a473-d3d004454dd0");
+    assert_eq!(nested.short_id, None);
+    assert_eq!(nested.origin, SessionOrigin::Interactive);
+
+    for session in &parsed {
+        if session.title == "feature-x-61" {
+            continue;
+        }
+        assert!(
+            !session.companion,
+            "{} must not be a companion",
+            session.title
+        );
+    }
+}
+
+// PURE classifier, exhaustive over the values seen live on this box plus the defensive cases.
+// `cli` covers BOTH a `claude --bg` job and an interactive terminal session, which is exactly
+// why the `sdk-` prefix is the discriminator and the absence of a job id is not.
+#[test]
+fn is_sdk_entrypoint_matches_only_the_sdk_prefix() {
+    assert!(is_sdk_entrypoint(Some("sdk-cli"))); // verified live: nested `claude -p`
+    assert!(is_sdk_entrypoint(Some("sdk-ts")));
+    assert!(is_sdk_entrypoint(Some("sdk-py")));
+
+    assert!(!is_sdk_entrypoint(Some("cli"))); // --bg jobs AND interactive sessions
+    assert!(!is_sdk_entrypoint(Some("vscode")));
+    assert!(!is_sdk_entrypoint(Some("sdk"))); // no separator: not the SDK family
+    assert!(!is_sdk_entrypoint(Some("")));
+    assert!(!is_sdk_entrypoint(None)); // absent field is a real session
+}
+
+// The registry is keyed by PID and the kernel recycles PIDs, so between the agents snapshot
+// and the registry read the file at <pid>.json can describe a DIFFERENT session. Flagging on
+// entrypoint alone would then hide a real row. The entry must prove it is this session.
+#[test]
+fn mark_sdk_companions_ignores_a_recycled_pid() {
+    let json = common::read_fixture("claude_agents_all.json");
+    let mut parsed = parse_agents_json(&json).expect("parse agents json");
+
+    // Every lookup returns an SDK entry belonging to somebody ELSE (or naming nobody).
+    mark_sdk_companions(&mut parsed, |_| {
+        Some(SessionRegistryEntry {
+            session_id: Some("some-other-session-id".to_string()),
+            entrypoint: Some("sdk-cli".to_string()),
+        })
+    });
+    assert!(
+        parsed.iter().all(|s| !s.companion),
+        "a mismatched sessionId must never flag a row"
+    );
+
+    mark_sdk_companions(&mut parsed, |_| {
+        Some(SessionRegistryEntry {
+            session_id: None,
+            entrypoint: Some("sdk-cli".to_string()),
+        })
+    });
+    assert!(
+        parsed.iter().all(|s| !s.companion),
+        "an entry with no sessionId proves nothing and must never flag a row"
+    );
+}
+
+// Both fixtures are verbatim captures of `~/.claude/sessions/<pid>.json` from this box
+// (claude 2.1.220), so a schema drift in that file shows up here rather than as a silently
+// un-filtered row.
+#[test]
+fn parse_session_registry_reads_identity_and_entrypoint() {
+    let sdk = parse_session_registry(&common::read_fixture("claude_session_sdk_cli.json"))
+        .expect("parse sdk registry entry");
+    assert_eq!(sdk.entrypoint.as_deref(), Some("sdk-cli"));
+    assert_eq!(
+        sdk.session_id.as_deref(),
+        Some("sdkc0001-7777-4133-a473-d3d004454dd0")
+    );
+    assert!(is_sdk_entrypoint(sdk.entrypoint.as_deref()));
+
+    let cli = parse_session_registry(&common::read_fixture("claude_session_cli.json"))
+        .expect("parse cli registry entry");
+    assert_eq!(cli.entrypoint.as_deref(), Some("cli"));
+    assert_eq!(
+        cli.session_id.as_deref(),
+        Some("work0001-6603-4ad5-be5b-f3ad6391d595")
+    );
+    assert!(!is_sdk_entrypoint(cli.entrypoint.as_deref()));
+
+    // Missing and wrong-typed fields degrade to None rather than erroring.
+    let sparse = parse_session_registry(r#"{"pid":1,"entrypoint":7}"#).expect("object parses");
+    assert_eq!(sparse, SessionRegistryEntry::default());
+
+    // Unparseable text yields no entry at all, so the row keeps its default (visible).
+    assert_eq!(parse_session_registry("not json"), None);
+}
+
+// Same CLAUDE_CONFIG_DIR precedence as the jobs root: a viewer that inherited the env var must
+// read the registry the `claude` it shells out to is actually writing.
+#[test]
+fn sessions_root_follows_the_config_dir_override() {
+    let home = PathBuf::from("/home/user");
+    assert_eq!(
+        sessions_root_from(None, &home),
+        PathBuf::from("/home/user/.claude/sessions")
+    );
+    assert_eq!(
+        sessions_root_from(Some("  "), &home),
+        PathBuf::from("/home/user/.claude/sessions")
+    );
+    assert_eq!(
+        sessions_root_from(Some("/alt/config"), &home),
+        PathBuf::from("/alt/config/sessions")
     );
 }
 

@@ -102,7 +102,7 @@ the blast radius of the change:
 
 - Logic in `-core` (parsers, resolvers, grouping, source parsing): unit tests with fixtures.
 - Status detection / spawner: the live e2e above (real `codex exec`, watch `running` to `done`).
-- TUI rendering, keys, peek/reply, layout: run `cargo run -p agent-viewer-tui` against the real
+- TUI rendering, keys, reply, layout: run `cargo run -p agent-viewer-tui` against the real
   session store, or the pty harness for a scripted headless check.
 - Mutations (archive/unarchive/rename/stop): drive them in the running TUI and confirm the row
   moves between visible/hidden or updates, since these run on a background worker.

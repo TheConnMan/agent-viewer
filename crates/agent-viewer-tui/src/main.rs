@@ -18,7 +18,7 @@ use agent_viewer_tui::model_cache::{ModelCache, is_stale};
 use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::terminal_title::set_terminal_title;
-use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
+use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -157,7 +157,6 @@ struct Ui {
     mode: Mode,
     notice: NoticeState,
     db: Option<ViewerDb>,
-    peek: PeekCache,
     /// Inline spawn composer (persistent on the list view).
     composer: Composer,
     /// Per-PTY left-arrow detach gate, keyed like `attached`. Reset only when a new PTY is
@@ -380,7 +379,6 @@ fn main() -> io::Result<()> {
         mode: Mode::Normal,
         notice: startup_notice,
         db,
-        peek: PeekCache::with_opencode_runtime(opencode_runtime.clone()),
         composer: Composer::new(),
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
@@ -447,8 +445,6 @@ fn run(
         {
             ui.pending_spawn = None;
         }
-        ui.peek.refresh(ui.app.selected());
-
         // Drain completed PR-status fetches, then request statuses for the visible rows.
         // app and pr_status are disjoint fields; destructuring borrows them separately so
         // the request pass needs no per-frame clone of the rows' pr_refs.
@@ -509,10 +505,8 @@ fn run(
                     workspace: &ui.workspace,
                     mode: &ui.mode,
                     notice: ui.notice.text(),
-                    peek: &ui.peek,
                     composer: &ui.composer,
                     pulses: &ui.pulses,
-                    expanded: ui.app.expanded(),
                     now_ms: now,
                     attach,
                     pr_status: &ui.pr_status,
@@ -851,7 +845,6 @@ mod tests {
             mode: Mode::Normal,
             notice: NoticeState::new(),
             db: None,
-            peek: PeekCache::new(),
             composer: Composer::new(),
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
