@@ -1,13 +1,55 @@
-use super::{fg, theme::Theme};
+use super::{
+    fg,
+    sprite::{HEIGHT as SPRITE_HEIGHT, Lighthouse, WIDTH as SPRITE_WIDTH},
+    theme::Theme,
+};
 use crate::app::App;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::path::Path;
 
-pub(super) fn draw(frame: &mut Frame, app: &App, workspace: &Path, theme: &Theme, area: Rect) {
+pub(super) const BASE_HEADER_HEIGHT: u16 = 6;
+pub(super) const SPRITE_HEADER_HEIGHT: u16 = SPRITE_HEIGHT + 1;
+pub(super) const COMFORTABLE_WIDTH: u16 = SPRITE_WIDTH + 2 + 39;
+
+const SPRITE_HEIGHT_BUDGET: u16 = 6;
+const MIN_LIST_ROWS: u16 = 8;
+const GAP_AND_FOOTER_ROWS: u16 = 2;
+
+pub(super) fn height(viewport: Rect, composer_height: u16) -> u16 {
+    let list_rows = viewport.height.saturating_sub(
+        BASE_HEADER_HEIGHT + SPRITE_HEIGHT_BUDGET + composer_height + GAP_AND_FOOTER_ROWS,
+    );
+    if viewport.width >= COMFORTABLE_WIDTH && list_rows >= MIN_LIST_ROWS {
+        SPRITE_HEADER_HEIGHT
+    } else {
+        BASE_HEADER_HEIGHT
+    }
+}
+
+pub(super) fn draw(
+    frame: &mut Frame,
+    app: &App,
+    workspace: &Path,
+    now_ms: i64,
+    theme: &Theme,
+    area: Rect,
+) {
+    let show_sprite = area.height >= SPRITE_HEADER_HEIGHT && area.width >= COMFORTABLE_WIDTH;
+    let text_x = if show_sprite {
+        area.x + SPRITE_WIDTH + 2
+    } else {
+        area.x
+    };
+    let text_area = Rect::new(
+        text_x,
+        area.y,
+        area.right().saturating_sub(text_x),
+        area.height,
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -18,7 +60,14 @@ pub(super) fn draw(frame: &mut Frame, app: &App, workspace: &Path, theme: &Theme
             Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(area);
+        .split(text_area);
+
+    if show_sprite {
+        frame.render_widget(
+            Lighthouse::new(theme, lamp_color(app, theme), now_ms),
+            Rect::new(area.x, area.y, SPRITE_WIDTH, SPRITE_HEIGHT),
+        );
+    }
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -30,6 +79,11 @@ pub(super) fn draw(frame: &mut Frame, app: &App, workspace: &Path, theme: &Theme
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), fg(theme.muted)),
+            Span::styled(if show_sprite { " · " } else { "" }, fg(theme.faint)),
+            Span::styled(
+                if show_sprite { theme.name.as_str() } else { "" },
+                fg(theme.muted),
+            ),
         ])),
         rows[1],
     );
@@ -56,4 +110,112 @@ pub(super) fn draw(frame: &mut Frame, app: &App, workspace: &Path, theme: &Theme
         ])),
         rows[3],
     );
+}
+
+fn lamp_color(app: &App, theme: &Theme) -> Color {
+    if app.needs_input_count() > 0 {
+        theme.warn
+    } else {
+        theme.accent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::path::PathBuf;
+
+    fn session(status: Status) -> Session {
+        Session {
+            backend: BackendKind::Codex,
+            id: "session".into(),
+            short_id: None,
+            origin: SessionOrigin::Interactive,
+            title: "session".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            git_branch: None,
+            status,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    fn render_header(
+        app: &App,
+        theme: &Theme,
+        viewport: Rect,
+        composer_height: u16,
+        now_ms: i64,
+    ) -> Buffer {
+        let header_height = height(viewport, composer_height);
+        let mut terminal = Terminal::new(TestBackend::new(viewport.width, header_height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    app,
+                    Path::new("/tmp/project"),
+                    now_ms,
+                    theme,
+                    Rect::new(0, 0, viewport.width, header_height),
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn block_count(buffer: &Buffer) -> usize {
+        buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "▀")
+            .count()
+    }
+
+    #[test]
+    fn lamp_uses_fleet_input_state() {
+        let mut theme = super::super::theme::amber(false);
+        theme.animation = false;
+        let clear = App::new(vec![session(Status::Working)]);
+        let alert = App::new(vec![session(Status::needs_input())]);
+        let viewport = Rect::new(0, 0, COMFORTABLE_WIDTH, 40);
+        let clear_buffer = render_header(&clear, &theme, viewport, 3, 0);
+        let alert_buffer = render_header(&alert, &theme, viewport, 3, 0);
+
+        assert_eq!(lamp_color(&clear, &theme), theme.accent);
+        assert_eq!(lamp_color(&alert, &theme), theme.warn);
+        assert_eq!(clear_buffer[(5, 1)].fg, theme.accent);
+        assert_eq!(alert_buffer[(5, 1)].fg, theme.warn);
+        assert_ne!(clear_buffer[(5, 1)].fg, alert_buffer[(5, 1)].fg);
+    }
+
+    #[test]
+    fn sprite_layout_preserves_a_usable_list() {
+        let theme = super::super::theme::mono16(false);
+        let app = App::new(Vec::new());
+        let comfortable = Rect::new(0, 0, COMFORTABLE_WIDTH, 40);
+        let narrow = Rect::new(0, 0, COMFORTABLE_WIDTH - 1, 40);
+        let short = Rect::new(0, 0, COMFORTABLE_WIDTH, 24);
+
+        assert_eq!(height(comfortable, 3), SPRITE_HEADER_HEIGHT);
+        assert_eq!(height(narrow, 3), BASE_HEADER_HEIGHT);
+        assert_eq!(height(short, 3), BASE_HEADER_HEIGHT);
+        assert_eq!(
+            block_count(&render_header(&app, &theme, comfortable, 3, 0)),
+            66
+        );
+        assert_eq!(block_count(&render_header(&app, &theme, narrow, 3, 0)), 0);
+        assert_eq!(block_count(&render_header(&app, &theme, short, 3, 0)), 0);
+    }
 }
