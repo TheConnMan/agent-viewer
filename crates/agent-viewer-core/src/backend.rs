@@ -154,10 +154,10 @@ pub struct Session {
     /// Associated PR references (claude jobs `state.json` children where kind=="pr");
     /// rendered as a right-aligned badge. Empty for codex/opencode.
     pub pr_refs: Vec<PrRef>,
-    /// codex only: this thread lives inside the shared `codex app-server` daemon, which holds
-    /// its rollout fd. Such a row carries no `pid` by design (the daemon's pid belongs to every
-    /// other thread it hosts too), is joined with `codex resume --remote`, and is stopped with
-    /// `turn/interrupt` rather than a signal. Always false for the other backends.
+    /// True when this session lives inside a shared backend runtime whose process hosts
+    /// multiple sessions. Such a row carries no `pid` because that process belongs to every
+    /// session it hosts. Codex joins and stops these rows through its app server. OpenCode
+    /// joins and stops them through its server API.
     pub daemon_hosted: bool,
 }
 
@@ -298,13 +298,21 @@ pub(crate) fn dedup_preserve(v: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The fixed v1 roster: Codex (default_codex_home), Claude ("claude" on PATH),
-/// Opencode (~/.local/share/opencode/opencode.db). No config surface.
+/// The fixed v1 roster. OpenCode uses its server first and falls back to its read only
+/// SQLite registry when no managed server is healthy. No config surface.
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
+    all_backends_with_opencode(crate::opencode::OpencodeRuntime::new())
+}
+
+/// The fixed v1 roster with a caller supplied OpenCode runtime. Callers with multiple
+/// backend sets use this factory so listing and actions observe the same server state.
+pub fn all_backends_with_opencode(
+    runtime: crate::opencode::OpencodeRuntime,
+) -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
         Box::new(crate::claude::ClaudeBackend::new()),
-        Box::new(crate::opencode::OpencodeBackend::new()),
+        Box::new(crate::opencode::OpencodeBackend::with_runtime(runtime)),
     ]
 }
 

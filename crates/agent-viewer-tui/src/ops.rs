@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::CodexBackend;
-use agent_viewer_core::opencode::OpencodeBackend;
+use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
 use agent_viewer_core::{Session, SpawnResult, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
@@ -80,20 +80,29 @@ fn spawn_selection_from_mutation(
 /// A fresh backend instance for a worker thread. The mutating methods (stop/remove/
 /// rename/hide) depend only on the passed id/session, never on cached list state, so a
 /// fresh instance behaves identically to the one in the main `backends` slice.
-fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
+fn fresh_backend(kind: BackendKind, opencode_runtime: &OpencodeRuntime) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
-        BackendKind::Opencode => Box::new(OpencodeBackend::new()),
+        BackendKind::Opencode => Box::new(OpencodeBackend::with_runtime(opencode_runtime.clone())),
     }
 }
 
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
 /// connection so the render loop never blocks. Returns the user-facing notice and any
 /// successful spawn identity needed by the UI.
+#[cfg(test)]
 pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
+    run_mutation_with_opencode(m, OpencodeRuntime::new())
+}
+
+/// Run one mutation with the OpenCode runtime shared by listing, actions, and peek.
+pub(crate) fn run_mutation_with_opencode(
+    m: Mutation,
+    opencode_runtime: OpencodeRuntime,
+) -> Result<MutationOutcome, String> {
     match m {
-        Mutation::Stop(s) => match fresh_backend(s.backend).stop(&s) {
+        Mutation::Stop(s) => match fresh_backend(s.backend, &opencode_runtime).stop(&s) {
             Ok(()) => Ok(MutationOutcome {
                 notice: format!("stopped: {}", s.title),
                 spawned: None,
@@ -101,7 +110,7 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
             Err(e) => Err(format!("stop failed: {e}")),
         },
         Mutation::Remove(s) => {
-            let backend = fresh_backend(s.backend);
+            let backend = fresh_backend(s.backend, &opencode_runtime);
             // Refuse BEFORE the terminate below. `remove` is advertised per backend but gated
             // per row (claude needs a short id), so an idless row used to be SIGTERMed and
             // only then declined, killing a live session that stayed in the list.
@@ -114,9 +123,9 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
             // a concurrent `stop` harmless. Terminate is idempotent (ESRCH/gone -> Ok) and
             // pid guarded by comm prefix, so it never signals a recycled pid.
             //
-            // NEVER for a daemon-hosted row: the pid on such a row could only be the codex
-            // app-server's, and SIGTERMing it would kill the daemon and every session inside
-            // it. `stop` interrupts those over the socket; remove just archives.
+            // NEVER for a shared runtime row. Any pid would belong to the host process and
+            // every session inside it. `stop` handles these through the backend runtime, and
+            // `remove` performs only the backend mutation.
             if let Some(pid) = s.pid.filter(|_| !s.daemon_hosted) {
                 let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
             }
@@ -135,14 +144,16 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
                 Err(e) => Err(format!("remove failed: {e}")),
             }
         }
-        Mutation::Rename(s, name) => match fresh_backend(s.backend).rename(&s, &name) {
-            Ok(()) => Ok(MutationOutcome {
-                notice: format!("renamed {}", s.backend.name()),
-                spawned: None,
-            }),
-            Err(e) => Err(format!("rename failed: {e}")),
-        },
-        Mutation::Hide(s) => fresh_backend(s.backend)
+        Mutation::Rename(s, name) => {
+            match fresh_backend(s.backend, &opencode_runtime).rename(&s, &name) {
+                Ok(()) => Ok(MutationOutcome {
+                    notice: format!("renamed {}", s.backend.name()),
+                    spawned: None,
+                }),
+                Err(e) => Err(format!("rename failed: {e}")),
+            }
+        }
+        Mutation::Hide(s) => fresh_backend(s.backend, &opencode_runtime)
             .hide(&s.id)
             .map(|()| MutationOutcome {
                 notice: format!("archived: {}", s.title),
@@ -162,7 +173,7 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
             else {
                 unreachable!();
             };
-            match fresh_backend(*backend).spawn(dir, task, model.as_deref()) {
+            match fresh_backend(*backend, &opencode_runtime).spawn(dir, task, model.as_deref()) {
                 // A pid means the viewer forked the worker itself, so record the spawn for the
                 // pin/stop overlay against a fresh connection, like every other viewer-DB
                 // follow-up here. Every successful spawn also carries enough metadata for the
@@ -181,7 +192,7 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
                 Err(e) => Err(format!("spawn failed: {e}")),
             }
         }
-        Mutation::Unhide(s) => fresh_backend(s.backend)
+        Mutation::Unhide(s) => fresh_backend(s.backend, &opencode_runtime)
             .unhide(&s.id)
             .map(|()| MutationOutcome {
                 notice: format!("unarchived: {}", s.title),
