@@ -8,4 +8,5 @@ pub mod mutations;
 pub mod peek;
 pub mod peek_cache;
 pub mod pr_cache;
+pub mod terminal_title;
 pub mod ui;

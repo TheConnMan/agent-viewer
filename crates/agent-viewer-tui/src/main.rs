@@ -16,6 +16,7 @@ use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
 use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
+use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, PeekCache, Pulses};
 
 use crossterm::event::{
@@ -151,6 +152,7 @@ impl NoticeState {
 /// Everything the run loop mutates, threaded through the key/tick handlers.
 struct Ui {
     app: App,
+    workspace: std::path::PathBuf,
     mode: Mode,
     notice: NoticeState,
     db: Option<ViewerDb>,
@@ -294,6 +296,7 @@ fn main() -> io::Result<()> {
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
     ui::set_glyph_marks(std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1"));
 
+    let workspace = std::env::current_dir().unwrap_or_default();
     let terminal_palette = capture_terminal_palette();
 
     // Inline brand-logo images are always attempted. The probe queries the terminal (stdin
@@ -371,6 +374,7 @@ fn main() -> io::Result<()> {
 
     let mut ui = Ui {
         app,
+        workspace,
         mode: Mode::Normal,
         notice: startup_notice,
         db,
@@ -406,6 +410,7 @@ fn main() -> io::Result<()> {
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
+    set_terminal_title(&mut io::stdout(), &ui.workspace);
     // Mouse capture powers click/hover row selection on the list, and while attached it lets
     // us forward real mouse reports to the child so the wheel scrolls the transcript instead
     // of the terminal's alternate-scroll turning it into arrow keys codex reads as history
@@ -497,6 +502,7 @@ fn run(
                 frame,
                 ui::Draw {
                     app: &ui.app,
+                    workspace: &ui.workspace,
                     mode: &ui.mode,
                     notice: ui.notice.text(),
                     peek: &ui.peek,
@@ -837,6 +843,7 @@ mod tests {
     fn test_ui(sessions: Vec<Session>) -> Ui {
         Ui {
             app: App::new(sessions),
+            workspace: PathBuf::from(CWD),
             mode: Mode::Normal,
             notice: NoticeState::new(),
             db: None,

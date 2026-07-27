@@ -6,6 +6,11 @@ across backends. It reads each agent's own local session store, shows every sess
 single live list, and lets you attach to one in an embedded terminal without leaving the
 viewer.
 
+The header identifies the viewer as `[av] Agent Viewer` with its version, the full
+launch workspace, and live totals for sessions awaiting input, working, and completed
+(including errors). The terminal tab title is `Agent Viewer · <launch directory name>`;
+when the launch directory cannot be determined, it falls back safely to `Agent Viewer`.
+
 ## Backends
 
 Three backends ship, and each advertises which capabilities it supports; the TUI gates

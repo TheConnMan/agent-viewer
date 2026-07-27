@@ -11,7 +11,7 @@ pub use crate::peek_cache::PeekCache;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, PrBadgeColor, PrRef, Session, Status};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -302,6 +302,7 @@ impl ListHit {
 /// Everything the frame needs, bundled so the entry point stays one argument wide.
 pub struct Draw<'a> {
     pub app: &'a App,
+    pub workspace: &'a Path,
     pub mode: &'a Mode,
     pub notice: &'a str,
     pub peek: &'a PeekCache,
@@ -360,7 +361,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(6),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(composer_h),
@@ -383,7 +384,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         expand_lines: &expand_lines,
     };
 
-    draw_header(frame, d.app, vertical[0]);
+    draw_header(frame, d.app, d.workspace, vertical[0]);
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
@@ -869,12 +870,9 @@ fn draw_reply(frame: &mut Frame, modal: &ReplyModal, area: Rect, session_title: 
 
 // --- Header ---------------------------------------------------------------------
 
-/// The app title with airy padding plus a right-aligned status summary. `area` is the 4-row
-/// header slice from the main layout: row 0 is a blank spacer, row 1 carries `Agent Viewer`
-/// in accent on the left and the `N running · M needs input` summary (muted) right-aligned on
-/// the same row, and rows 2-3 are blank spacers so the list below has breathing room. The
-/// status is dropped on terminals too narrow to hold it beside the title, so the title wins.
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+/// Render the product identity, launch workspace, and full-snapshot status counts between
+/// the leading gap and the two trailing rows of list breathing room.
+fn draw_header(frame: &mut Frame, app: &App, workspace: &Path, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -882,37 +880,50 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
-    let title_row = rows[1];
 
-    let title = Span::styled(
-        " Agent Viewer",
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD),
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" [av] ", fg(theme::ACCENT)),
+            Span::styled(
+                "Agent Viewer",
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), fg(theme::MUTED)),
+        ])),
+        rows[1],
     );
-    let running = app.running_count();
-    let needs = app.needs_input_count();
-    let status = format!("{running} running · {needs} needs input ");
-    let status_w = display_width(&status) as u16;
-
-    // Reserve the status region only when it fits beside the title (13 cols for " Agent
-    // Viewer" plus a one-column gap); otherwise the title claims the whole row.
-    if title_row.width > 13 + status_w + 1 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(status_w)])
-            .split(title_row);
-        frame.render_widget(Paragraph::new(Line::from(title)), cols[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(status, fg(theme::MUTED))))
-                .alignment(Alignment::Right),
-            cols[1],
-        );
-    } else {
-        frame.render_widget(Paragraph::new(Line::from(title)), title_row);
-    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Workspace ", fg(theme::MUTED)),
+            Span::styled(workspace.display().to_string(), fg(theme::TEXT)),
+        ])),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} awaiting input", app.needs_input_count()),
+                fg(theme::WARN),
+            ),
+            Span::styled(" · ", fg(theme::MUTED)),
+            Span::styled(
+                format!("{} working", app.running_count()),
+                fg(theme::ACCENT),
+            ),
+            Span::styled(" · ", fg(theme::MUTED)),
+            Span::styled(
+                format!("{} completed", app.completed_count()),
+                fg(theme::MUTED),
+            ),
+        ])),
+        rows[3],
+    );
 }
 
 // --- Main list ------------------------------------------------------------------
@@ -1729,6 +1740,7 @@ mod tests {
                 frame,
                 Draw {
                     app: &app,
+                    workspace: Path::new("/tmp"),
                     mode: &mode,
                     notice: "",
                     peek: &peek,
@@ -1834,6 +1846,7 @@ mod tests {
                 frame,
                 Draw {
                     app: &app,
+                    workspace: Path::new("/tmp"),
                     mode: &Mode::Normal,
                     notice: "",
                     peek: &peek,
