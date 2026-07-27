@@ -191,9 +191,26 @@ fn spawn_route_prefers_the_daemon_whenever_one_is_reachable() {
     // `codex exec` runs its app-server IN PROCESS, so an exec-spawned thread can never be
     // joined from outside no matter what attach does later. Spawning on the shared daemon is
     // the only way a spawned session stays joinable, so the daemon wins whenever it answers.
-    assert_eq!(spawn_route(Some(&daemon())), SpawnRoute::Daemon);
-    // With no daemon, exec is still better than not spawning at all.
-    assert_eq!(spawn_route(None), SpawnRoute::Exec);
+    let up = daemon();
+    assert_eq!(spawn_route(Some(&up), false), SpawnRoute::Daemon(&up));
+}
+
+#[test]
+fn spawn_route_refuses_rather_than_silently_spawning_an_unjoinable_session() {
+    // The regression this exists for: the daemon path used to fall through to `codex exec`
+    // whenever it failed, so a spawn that produced a session nobody could ever join looked
+    // exactly like a good one. A daemon poisoned by a deleted cwd then stayed invisible for
+    // hours while every viewer spawn quietly degraded. No daemon now means a visible refusal.
+    assert_eq!(spawn_route(None, false), SpawnRoute::Refuse);
+}
+
+#[test]
+fn spawn_route_takes_exec_only_when_explicitly_opted_in() {
+    // The escape hatch is deliberate and explicit, and it outranks the daemon so an operator
+    // who asks for exec is not silently given something else.
+    let up = daemon();
+    assert_eq!(spawn_route(None, true), SpawnRoute::Exec);
+    assert_eq!(spawn_route(Some(&up), true), SpawnRoute::Exec);
 }
 
 #[test]
@@ -216,10 +233,14 @@ fn attach_route_joins_a_daemon_hosted_thread_through_the_remote_socket() {
 }
 
 #[test]
-fn attach_route_refuses_a_foreign_live_turn_rather_than_fabricating_an_interrupt() {
+fn attach_route_refuses_a_foreign_live_turn_rather_than_forking_it() {
     // Mid-turn (Working or NeedsInput) with a live pid we do not host: a plain resume would
-    // append a synthesized TurnAborted to the rollout of a session that is still running, so
-    // attaching is destructive and must be refused instead.
+    // append a synthesized TurnAborted to the rollout of a session that is still running and
+    // show the user a fork of it, so attaching is destructive and must be refused instead.
+    //
+    // Since interactive `codex` sessions were measured to be daemon-hosted (2026-07-27), the
+    // only rows that land here are `codex exec` threads, which host their app-server in
+    // process and genuinely cannot be joined by anyone, the ChatGPT app included.
     for status in [
         Status::Working,
         Status::NeedsInput {
@@ -231,10 +252,17 @@ fn attach_route_refuses_a_foreign_live_turn_rather_than_fabricating_an_interrupt
         // not hosted by it either way.
         for available in [Some(&daemon()), None] {
             match attach_route(&session, available) {
-                AttachRoute::Refuse(reason) => assert!(
-                    reason.to_lowercase().contains("interrupt"),
-                    "the refusal must name the interrupt it is avoiding, got {reason:?}"
-                ),
+                AttachRoute::Refuse(reason) => {
+                    let reason = reason.to_lowercase();
+                    assert!(
+                        reason.contains("fork"),
+                        "the refusal must name the fork it is avoiding, got {reason:?}"
+                    );
+                    assert!(
+                        reason.contains("tail"),
+                        "and must point at the read-only tail it falls back to, got {reason:?}"
+                    );
+                }
                 other => panic!("mid-turn foreign thread must be refused, got {other:?}"),
             }
         }
@@ -277,18 +305,27 @@ fn attach_route_opens_a_daemon_hosted_row_locally_when_no_daemon_answers() {
 }
 
 #[test]
-fn attach_command_refuses_a_live_foreign_turn_with_the_reason_verbatim() {
+fn attach_command_refuses_a_live_foreign_turn_and_asks_for_the_read_only_tail() {
     // The wiring the TUI actually hits: a refused route surfaces as Err(AttachRefusal) whose
-    // reason is shown verbatim in the footer, never as a command that quietly corrupts the
+    // reason is shown verbatim in the footer, never as a command that quietly forks the
     // running session's rollout.
+    //
+    // The refusal is also flagged `tail`. Brian's requirement is that pressing Enter on a
+    // running row shows him what it is doing without forking it; a bare notice answers the
+    // wrong question. `codex exec` threads cannot be joined by anyone (their app-server is in
+    // process), so the honest answer is the transcript, live and read-only.
     let backend = CodexBackend::new(PathBuf::from("/tmp/does-not-matter"));
     let refusal = backend
         .attach_command(&routed_session(Status::Working, Some(4242), false))
         .expect_err("a live foreign turn must not be attachable");
     assert!(
-        refusal.reason.to_lowercase().contains("interrupt"),
-        "the footer notice must name the interrupt, got {:?}",
+        refusal.reason.to_lowercase().contains("fork"),
+        "the footer notice must name the fork it avoided, got {:?}",
         refusal.reason
+    );
+    assert!(
+        refusal.tail,
+        "a running-but-unjoinable row must fall back to the live tail, not a dead end"
     );
 }
 

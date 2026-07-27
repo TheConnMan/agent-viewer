@@ -408,7 +408,7 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{ensure_completions, handle_rename_key, is_quit_chord, open_filter};
     use crate::{NoticeState, Ui};
     use agent_viewer_core::{BackendKind, Session, Status};
@@ -422,7 +422,7 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
-    fn test_ui_with(sessions: Vec<Session>) -> Ui {
+    pub(crate) fn test_ui_with(sessions: Vec<Session>) -> Ui {
         Ui {
             app: App::new(sessions),
             mode: Mode::Normal,
@@ -447,7 +447,7 @@ mod tests {
         }
     }
 
-    fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
+    pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         Session {
             backend: BackendKind::Claude,
             id: id.into(),
@@ -540,7 +540,7 @@ mod tests {
     }
 
     /// Move the selection onto the session row for `id` (row 0 is a section header).
-    fn select_session_row(ui: &mut Ui, id: &str) {
+    pub(crate) fn select_session_row(ui: &mut Ui, id: &str) {
         let idx = ui
             .app
             .visible()

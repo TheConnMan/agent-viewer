@@ -4,11 +4,11 @@
 
 use std::io;
 
-use agent_viewer_core::Session;
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
 use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
+use agent_viewer_core::{AttachRefusal, Session};
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
@@ -296,6 +296,28 @@ pub(crate) fn attach_selected(
     Ok(())
 }
 
+/// What a refused attach does to the UI.
+///
+/// A `tail` refusal means the session IS running and watchable but cannot be JOINED: a
+/// `codex exec` thread hosts its app-server in process, so nothing outside it can subscribe to
+/// the live turn, the ChatGPT app included. The user pressed Enter to see what that row is
+/// doing, and the honest answer is the transcript itself, so the inline peek is opened (it
+/// tails the rollout and refreshes as the turn runs). What must never happen is a plain resume
+/// of a live thread, which forks it and appends a synthesized interrupt to its rollout.
+///
+/// The expansion only renders under the selected row (`App::sync_expanded` collapses it
+/// otherwise), so a refusal for some other row is left as a notice alone.
+fn apply_attach_refusal(ui: &mut Ui, session: &Session, refusal: AttachRefusal) {
+    let selected = ui
+        .app
+        .selected()
+        .is_some_and(|s| s.backend == session.backend && s.id == session.id);
+    if refusal.tail && selected {
+        ui.app.expand_selected();
+    }
+    ui.set_notice(refusal.reason);
+}
+
 /// Attach a GIVEN session (shared by `attach_selected` and the reply delivery path): reuse a
 /// live PTY (resize) or spawn one, and focus it. Returns true when it ended attached
 /// (Mode::Attached), false when it bailed with a notice.
@@ -338,7 +360,7 @@ fn attach_session(
         let command = match backend.attach_command(session) {
             Ok(command) => command,
             Err(refusal) => {
-                ui.set_notice(refusal.reason);
+                apply_attach_refusal(ui, session, refusal);
                 return Ok(false);
             }
         };
@@ -415,4 +437,53 @@ pub(crate) fn spawn_from_composer(
     // Hasten the next listing so the spawned row (and its bloom) appears promptly; the
     // notice survives until the 1s clear cadence since apply_snapshot preserves it.
     refresher.force();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_attach_refusal;
+    use crate::keys::tests::{select_session_row, sess, test_ui_with};
+    use agent_viewer_core::AttachRefusal;
+
+    #[test]
+    fn a_tailable_refusal_opens_the_live_read_only_tail() {
+        // Brian's requirement: pressing Enter on a running session must SHOW it, never fork
+        // it. A `codex exec` thread cannot be joined by anything (its app-server is in
+        // process), so the answer is the transcript, expanded inline and refreshed as the
+        // turn runs, plus the reason in the footer. A bare notice answers the wrong question.
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-attach", 100)]);
+        select_session_row(&mut ui, "s1");
+        let session = ui.app.selected().cloned().expect("row is selected");
+
+        apply_attach_refusal(
+            &mut ui,
+            &session,
+            AttachRefusal::tailable("cannot be joined"),
+        );
+
+        assert_eq!(
+            ui.app.expanded(),
+            Some(&(session.backend, session.id.clone())),
+            "the refused row must be expanded into its live tail"
+        );
+        assert_eq!(ui.notice.text, "cannot be joined");
+    }
+
+    #[test]
+    fn a_plain_refusal_stays_a_notice() {
+        // The other kind: nothing is running to watch (a backend with no attach at all), so
+        // expanding an empty transcript would only add noise to the answer.
+        let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-attach", 100)]);
+        select_session_row(&mut ui, "s1");
+        let session = ui.app.selected().cloned().expect("row is selected");
+
+        apply_attach_refusal(&mut ui, &session, AttachRefusal::new("no attach here"));
+
+        assert_eq!(
+            ui.app.expanded(),
+            None,
+            "nothing to tail, nothing to expand"
+        );
+        assert_eq!(ui.notice.text, "no attach here");
+    }
 }

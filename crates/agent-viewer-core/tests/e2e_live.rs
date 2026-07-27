@@ -519,3 +519,90 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
     // Tidy: keep the box's session list clean.
     let _ = backend.hide(&thread_id);
 }
+
+/// A real `codex exec` session must be classified as unjoinable on live data, and its attach
+/// must come back as a refusal that asks for the read-only tail.
+///
+/// This is the row shape the classification defect produced. `codex exec` hosts its app-server
+/// IN PROCESS, so it holds its own rollout fd and nothing outside can subscribe to its turn.
+/// The old daemon test scored "holds more than one rollout" as the daemon, and an exec session
+/// that spawns a subagent holds exactly two, which would have routed this row's attach to a
+/// `--remote` join on a daemon that does not host it: the fabricated interrupt, from the very
+/// path built to prevent it.
+///
+/// Deliberately spawned through `codex exec` directly rather than `backend.spawn`, because
+/// spawn now refuses to create an unjoinable session at all.
+#[test]
+#[ignore]
+fn codex_exec_row_is_unjoinable_and_falls_back_to_the_read_only_tail() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&repo)
+            .status()
+            .expect("run git init")
+            .success(),
+        "git init failed"
+    );
+
+    // A turn long enough to still be running when the assertions land.
+    let mut child = std::process::Command::new("codex")
+        .arg("exec")
+        .arg("--json")
+        .arg("-C")
+        .arg(&repo)
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("Run the shell command `sleep 60` and then reply with the word DONE.")
+        // stdin MUST be closed: with an inherited stdin, `codex exec` prints "Reading
+        // additional input from stdin..." and blocks forever instead of running the prompt.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn codex exec");
+
+    let mut backend = CodexBackend::new(default_codex_home());
+    let canon = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
+    let row = poll_session(&mut backend, Duration::from_secs(45), |s| {
+        std::fs::canonicalize(&s.cwd).unwrap_or_else(|_| s.cwd.clone()) == canon
+            && s.status == Status::Working
+    });
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let _ = child.kill();
+            panic!("the exec session never showed up as Working");
+        }
+    };
+    println!(
+        "[exec] row: status={:?} daemon_hosted={} pid={:?}",
+        row.status, row.daemon_hosted, row.pid
+    );
+
+    // The classification that everything downstream depends on: an exec session holds its OWN
+    // rollout, so it is a signalable pid and NOT a daemon host, even with a daemon running.
+    assert!(
+        !row.daemon_hosted,
+        "a codex exec session hosts itself and must never read as the daemon"
+    );
+    assert!(
+        row.pid.is_some(),
+        "an exec session's own pid is what makes it stoppable"
+    );
+
+    // And the answer to Enter on that row: refused (no fork), flagged for the live tail.
+    let refusal = backend
+        .attach_command(&row)
+        .expect_err("a live exec turn must not be joined");
+    println!("[exec] attach refusal: {}", refusal.reason);
+    assert!(
+        refusal.tail,
+        "the refusal must ask for the read-only tail rather than dead-end the user"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = backend.hide(&row.id);
+}

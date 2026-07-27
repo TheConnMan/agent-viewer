@@ -15,9 +15,10 @@ no data or whose CLI is not installed simply list empty — they never error the
 - **Codex** — full support. Reads the global registry (`~/.codex/state_*.sqlite`, table
   `threads`) plus the rollout transcripts under `~/.codex/sessions/`, resolves live
   running/done/errored status, spawns into the shared `codex app-server` daemon (starting one if
-  none is running, and falling back to a detached `codex exec` if the daemon cannot be reached),
-  attaches by joining that daemon (`codex resume --remote`), stops a hosted session by
-  interrupting its turn, and archives/unarchives.
+  none is running, and failing the spawn with the daemon's own error rather than quietly
+  creating a session nobody could ever join), attaches by joining that daemon
+  (`codex resume --remote`), stops a hosted session by interrupting its turn, and
+  archives/unarchives.
 - **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), remove (`claude rm`),
   and rename background sessions. Rename writes `name`/`nameSource` into that job's
   `~/.claude/jobs/<short>/state.json`, which is what Claude's own fleet view does and the only
@@ -174,12 +175,16 @@ job and a finished one (waking it in place); a row with no background-job id fal
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
 
-**A Codex session that is live in another process is refused rather than opened.** Attaching to
-a mid-turn session that the viewer does not host would not join it: the new `codex resume`
-process replays the transcript, finds it ends mid-turn, and writes a synthesized interruption
-into the running session's transcript, which then renders as "Conversation interrupted". The
-footer says so instead, and the session is left alone. Sessions the viewer spawned are hosted by
-the daemon, so they are always joinable live.
+**A Codex session that cannot be joined opens its live transcript instead of forking it.**
+Attaching to a mid-turn session the daemon does not host would not join it: the new
+`codex resume` process replays the transcript, finds it ends mid-turn, and writes a synthesized
+interruption into the running session's transcript, which then renders as "Conversation
+interrupted". So instead of that fork, the row expands into its inline peek, which tails the
+transcript live and read-only while the session keeps running untouched, and the footer says
+why. This applies only to `codex exec` sessions (background jobs and plugin dispatches), whose
+app-server runs inside the session's own process and cannot be joined by anything, the ChatGPT
+app included. Sessions you start in a terminal, and sessions the viewer spawns, are hosted by
+the shared daemon and are joined live.
 
 Peek and reply are deliberately out of scope for this rebuild (a divergence from Fleet View,
 which binds `space` to reply — noted here so it is not mistaken for an oversight; see the

@@ -123,8 +123,11 @@ build clean with clippy and tests passing.
     `turn/start`, and `turn/interrupt`), because a `codex exec` spawn hosts its app-server in
     process and produces a thread nobody can ever join, and because the daemon holds the
     rollout fd of every thread it hosts so a signal is not a safe stop. agent-viewer MAY start
-    a daemon and NEVER stops or restarts one. Read `SPEC.md` "Codex attach/resume" before
-    touching spawn, attach, or stop - the fabricated-interrupt behavior was measured live.
+    a daemon and NEVER stops or restarts one, and a daemon it starts is pinned to `$HOME`, never
+    the viewer's cwd - a daemon that inherits a `.worktrees/` cwd keeps answering "running" long
+    after that directory is deleted and then fails every spawn, box-wide. Read `SPEC.md`
+    "Codex attach/resume" before touching spawn, attach, or stop - the fabricated-interrupt
+    behavior, the daemon-cwd poisoning, and the argv-only daemon test were all measured live.
   - Claude rename writes `name`/`nameSource` into `~/.claude/jobs/<short>/state.json`, because
     Claude ships no `rename` subcommand and that file is its own store of record for the name.
     Read `SPEC.md` "Claude mutations" before touching it - the channel it does NOT use was

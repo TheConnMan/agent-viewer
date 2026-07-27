@@ -14,10 +14,10 @@
 mod common;
 
 use agent_viewer_core::codex::app_server::{
-    Daemon, SpawnAttempt, initialize_request, may_fall_back, parse_daemon_version, parse_thread_id,
-    remote_endpoint, thread_start_request, turn_interrupt_request, turn_start_request,
+    Daemon, daemon_start_command, initialize_request, parse_daemon_version, parse_thread_id,
+    remote_endpoint, stable_daemon_cwd, thread_start_request, turn_interrupt_request,
+    turn_start_request,
 };
-use agent_viewer_core::error::Error;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -282,29 +282,38 @@ fn parse_thread_id_rejects_errors_and_unparseable_lines() {
     );
 }
 
-// --- the fallback gate ---
+// --- starting a daemon that outlives its own cwd ---
 
-/// The defect this gate exists for: `thread/start` succeeds, `turn/start` then fails, and the
-/// caller falls back to `codex exec`. The thread already EXISTS and is already in the listing,
-/// so the user gets two rows and two agents from one Enter. Fallback is allowed only when the
-/// daemon created nothing at all.
+/// The live defect this pins, measured 2026-07-27. `ensure_daemon` started the daemon as a
+/// plain child, so it inherited agent-viewer's cwd, which was a git worktree under
+/// `.worktrees/`. The worktree was deleted when its branch merged; the daemon kept running and
+/// kept answering `daemon version` with `"status":"running"`, but EVERY `thread/start` failed
+/// with `failed to load configuration: No such file or directory (os error 2)`. Spawns then
+/// silently degraded to `codex exec` and attach correctly refused them, which is the bug Brian
+/// reported. The daemon is shared box-wide, so this broke every other codex client too.
 #[test]
-fn a_spawn_that_created_a_thread_never_falls_back_to_exec() {
-    assert!(
-        !may_fall_back(&SpawnAttempt::Started("thread-abc".to_string())),
-        "a started thread must not be spawned a second time"
+fn a_started_daemon_is_pinned_to_a_directory_it_cannot_outlive() {
+    let cmd = daemon_start_command(Path::new("/home/user"));
+    assert_eq!(
+        cmd.get_current_dir(),
+        Some(Path::new("/home/user")),
+        "the daemon must never inherit the viewer's cwd"
     );
-    assert!(
-        !may_fall_back(&SpawnAttempt::TurnFailed {
-            thread_id: "thread-abc".to_string(),
-            error: Error::Command("turn/start timed out".to_string()),
-        }),
-        "the thread exists even though its turn did not start"
+    let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+    assert_eq!(args, vec!["app-server", "daemon", "start"]);
+}
+
+#[test]
+fn the_daemon_cwd_falls_back_to_root_when_home_is_gone() {
+    let home = tempfile::TempDir::new().unwrap();
+    assert_eq!(
+        stable_daemon_cwd(home.path().to_path_buf()),
+        home.path(),
+        "a real home is the stable choice"
     );
-    assert!(
-        may_fall_back(&SpawnAttempt::NotCreated(Error::Command(
-            "connect failed".to_string()
-        ))),
-        "nothing was created, so exec is still safe"
+    assert_eq!(
+        stable_daemon_cwd(PathBuf::from("/nonexistent/home/of/nobody")),
+        PathBuf::from("/"),
+        "an unset or deleted HOME must not become a cwd the daemon can outlive"
     );
 }

@@ -218,6 +218,47 @@ daemon pid (returning `None` plus `daemon_hosted: true`), and `stop` routes a da
 to `turn/interrupt` over the socket, never to a signal. What such a row's fd does NOT do any
 more is decide its status: see the rule table below.
 
+**The daemon is identified from ARGV ALONE: `app-server` present, the `daemon` subcommand
+absent.** The live daemon's cmdline is `codex app-server --listen unix://`; the short-lived
+`codex app-server daemon version` / `daemon start` probes carry `daemon` and host nothing.
+Matching on `app-server` rather than on `--listen` errs deliberately toward calling a host a
+host, because the costly mistake here is the false negative (SIGTERM on a process hosting other
+people's threads) while a false positive only routes stop through `turn/interrupt`, which fails
+visibly instead of killing anything.
+
+This predicate previously also treated "holds more than one rollout fd" as proof of the daemon.
+That is measurably false and was removed: a plain
+`codex exec --json -C ... --dangerously-bypass-approvals-and-sandbox` (pid 2910115, live on
+2026-07-27) held TWO rollouts, its own plus a subagent thread it spawned (registry `source`
+`{"subagent":{"thread_spawn":...}}`). Scoring that as the daemon would route its attach to a
+`--remote` join on a daemon that does not host it, fabricating the exact interrupt this whole
+path exists to prevent, and would make its stop a silent no-op.
+
+**Interactive `codex` sessions ARE daemon-hosted, and therefore joinable.** Measured live on
+2026-07-27 with a pty harness (TIOCSWINSZ, raw mode, no `start_new_session`): a plain `codex`
+launched in a terminal with the daemon already up ran a real turn, and the ONLY holder of the
+new session's rollout fd was the listening daemon (pid 2950586), not the TUI process. So an
+ordinary terminal session can be joined with `resume --remote`, and the unjoinable rows are the
+`codex exec` ones (bg jobs, plugin dispatches), whose app-server is in process. Two earlier
+probes suggested the opposite; both were harness failures (no raw mode, `start_new_session`, so
+the prompt never reached the app) and are not evidence.
+
+**A viewer-started daemon is pinned to a cwd it cannot outlive** (`$HOME`, falling back to `/`).
+The daemon is long-lived and shared box-wide but inherits its starter's cwd, and agent-viewer
+routinely runs from a `.worktrees/` checkout that is deleted when its branch merges. Measured
+live on 2026-07-27: the daemon's `/proc/<pid>/cwd` pointed at a deleted worktree, `daemon
+version` still answered `"status":"running"`, and every `thread/start` failed with `failed to
+load configuration: No such file or directory (os error 2)`. Spawns then silently degraded to
+`codex exec` for hours, and every other codex client on the box was equally broken. Recovering
+required restarting the daemon from a real directory, which the viewer must never do itself.
+
+**No silent exec fallback.** The spawn path used to fall through to `codex exec` on any daemon
+failure, which is why the poisoned daemon above stayed invisible: a degraded spawn that produced
+an unjoinable session looked identical in the UI to a good one. Every viewer-spawned session
+must be joinable, so a spawn that cannot be is now a footer error naming the daemon's own
+failure. `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` restores the exec path as an explicit opt-in, and it
+outranks the daemon so an operator who asks for exec is not silently given something else.
+
 **Daemon-created threads are recorded with `source = vscode`,** because the daemon runs with
 the default `--session-source vscode`. Viewer-spawned rows therefore enumerate as
 interactive-origin. That is accepted, not worked around.
@@ -267,12 +308,14 @@ Implemented routing (all three seams are pure functions in `codex/mod.rs`, so th
 tested without a daemon):
 - **spawn:** `ensure_daemon()`, then `thread/start` + `turn/start` on it; the thread id comes
   back from `result.thread.id` and no pid is returned (the spawn record still resolves the new
-  row by cwd plus time window). A daemon RPC failure falls back to the `codex exec` path rather
-  than failing the user's spawn.
+  row by cwd plus time window). There is NO silent fallback: any daemon failure, and the
+  absence of a daemon, is a visible failed spawn carrying the daemon's own error. `codex exec`
+  is reachable only via `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`. See "No silent exec fallback".
 - **attach:** daemon-hosted plus a reachable daemon -> `codex resume --remote <endpoint> <id>`;
-  a foreign row that is mid-turn with a live pid -> refused with the reason shown verbatim in
-  the footer; everything else -> plain `codex resume <id>`. A daemon-hosted row whose daemon is
-  gone also takes the plain resume: there is no live turn left to protect.
+  a foreign row that is mid-turn with a live pid -> refused, and the refusal is flagged
+  `tail: true` so the TUI opens the row's inline peek (the live read-only transcript) with the
+  reason in the footer; everything else -> plain `codex resume <id>`. A daemon-hosted row whose
+  daemon is gone also takes the plain resume: there is no live turn left to protect.
 - **stop:** daemon-hosted -> `turn/interrupt` (the in-progress turn id is resolved first with
   `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
   a no-op success); else a pid -> SIGTERM as before; else unsupported.
