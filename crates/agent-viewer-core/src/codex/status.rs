@@ -45,6 +45,11 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         open_rollouts: HashMap::new(),
         attached_threads: HashSet::new(),
     };
+    let listening = std::fs::read_to_string("/proc/net/unix")
+        .map(|table| {
+            listening_socket_inodes(&table, &crate::default_codex_home().join(CONTROL_DIR))
+        })
+        .unwrap_or_default();
     for (pid, process) in sys.processes() {
         if !process.name().to_string_lossy().starts_with("codex") {
             continue;
@@ -59,31 +64,68 @@ pub fn scan_codex_processes() -> CodexProcessScan {
                 scan.attached_threads.insert(arg.to_string());
             }
         }
-        let owner = RolloutOwner {
-            pid: pid.as_u32(),
-            daemon: is_daemon_process(&args),
-        };
         let fd_dir = format!("/proc/{}/fd", pid.as_u32());
         let Ok(entries) = std::fs::read_dir(&fd_dir) else {
             continue;
         };
         let mut held: Vec<PathBuf> = Vec::new();
+        let mut holds_the_control_socket = false;
         for entry in entries.flatten() {
             let Ok(target) = std::fs::read_link(entry.path()) else {
                 continue;
             };
             let display = target.to_string_lossy();
+            if let Some(inode) = socket_inode(&display) {
+                holds_the_control_socket |= listening.contains(&inode);
+                continue;
+            }
             let stripped = display.strip_suffix(" (deleted)").unwrap_or(&display);
             let path = PathBuf::from(stripped);
             if !held.contains(&path) {
                 held.push(path);
             }
         }
+        let owner = RolloutOwner {
+            pid: pid.as_u32(),
+            daemon: holds_the_control_socket || is_daemon_process(&args),
+        };
         for path in held {
             record_owner(&mut scan.open_rollouts, path, owner);
         }
     }
     scan
+}
+
+/// The control-socket directory, relative to the codex home. Derived like every other codex
+/// path in this crate, never hardcoded absolute.
+const CONTROL_DIR: &str = "app-server-control";
+
+/// PURE: the inode of an fd whose /proc link target is `socket:[N]`, else None.
+fn socket_inode(link_target: &str) -> Option<u64> {
+    link_target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// PURE: inodes of the LISTENING unix sockets bound under `control_dir`, from /proc/net/unix.
+///
+/// Columns are `Num RefCount Protocol Flags Type St Inode Path`, and `St == 01` is
+/// SS_LISTENING (the accepting end, not a client connection). A process holding one of these
+/// fds IS the server bound to that path, which is the whole point: it is a fact about the
+/// kernel's socket table rather than a guess about a command line.
+fn listening_socket_inodes(proc_net_unix: &str, control_dir: &Path) -> HashSet<u64> {
+    proc_net_unix
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let inode = fields.nth(6)?.parse().ok()?;
+            let path = fields.next()?;
+            let listening = line.split_whitespace().nth(5) == Some("01");
+            (listening && Path::new(path).starts_with(control_dir)).then_some(inode)
+        })
+        .collect()
 }
 
 /// PURE: record who holds `path`, with the DAEMON always winning the entry.
@@ -147,49 +189,28 @@ fn is_daemon_process(args: &[std::borrow::Cow<'_, str>]) -> bool {
     is_app_server(args)
 }
 
-/// PURE: is `app-server` this command line's SUBCOMMAND?
+/// PURE: does this argv look like an app-server, as the BACKSTOP behind the socket check?
 ///
-/// The hard part is that the subcommand's index is not knowable from argv alone: global
-/// options come first and we cannot know which of them take a separate value, so
-/// `codex --profile exec app-server` and `codex --search app-server` disagree about what the
-/// first positional is. Rather than guess, both readings are computed and the answer is the
-/// SAFE union: a host under either parse is treated as a host. Disagreement therefore always
-/// resolves toward "do not signal this pid", which is the only direction whose mistake is
-/// recoverable.
+/// Deliberately crude, and deliberately biased. Three rounds of review were spent trying to
+/// locate the subcommand precisely in argv, and each rule traded one hypothetical for another
+/// (a fixed index breaks `codex -c k=v app-server`; scanning for prompt-taking subcommands
+/// breaks a profile named `exec`; a uniform option-arity parse breaks a boolean flag mixed
+/// with a value-taking one). That is unwinnable, because argv does not say which options take
+/// values and this crate does not own the CLI to find out.
 ///
-/// That also removes the need to know which subcommands carry a free-text prompt: under both
-/// readings `codex exec ... "app-server"` has `exec` as its subcommand, so the prompt can
-/// never be mistaken for one, and the same holds for `resume`, `review`, `fork`, or anything
-/// codex adds later.
+/// So argv stopped being the deciding signal. `scan_codex_processes` identifies the daemon by
+/// the LISTENING control socket it holds, which is a kernel fact and needs no CLI knowledge,
+/// and this remains only for the case where /proc/net/unix cannot be read. As a backstop it
+/// takes the safe bias: `app-server` anywhere means host, minus the `app-server daemon`
+/// probes, which host nothing. A false positive here only routes stop through
+/// `turn/interrupt`, which fails visibly; the false negative it protects against hands a
+/// host's pid to SIGTERM and kills every session inside it.
 fn is_app_server(args: &[std::borrow::Cow<'_, str>]) -> bool {
-    // argv[0] is the binary path; a codex installed under .../app-server/ is not a daemon.
-    let rest = args.get(1..).unwrap_or_default();
-    [true, false]
-        .into_iter()
-        .filter_map(|options_take_a_value| subcommand_of(rest, options_take_a_value))
-        // `app-server daemon version|start` is a short-lived probe that hosts nothing.
-        .any(|(name, next)| name == "app-server" && next != Some("daemon"))
-}
-
-/// PURE: the first token that is a subcommand under this reading, plus the token after it.
-/// `--opt=value` is always self-contained; `options_take_a_value` decides whether a bare
-/// `-x` / `--opt` also consumes the token that follows.
-fn subcommand_of<'a>(
-    args: &'a [std::borrow::Cow<'a, str>],
-    options_take_a_value: bool,
-) -> Option<(&'a str, Option<&'a str>)> {
-    let mut i = 0;
-    while let Some(arg) = args.get(i).map(|arg| arg.as_ref()) {
-        if !arg.starts_with('-') {
-            return Some((arg, args.get(i + 1).map(|arg| arg.as_ref())));
-        }
-        i += if options_take_a_value && !arg.contains('=') {
-            2
-        } else {
-            1
-        };
-    }
-    None
+    // Skip argv[0]: a codex installed under a path containing "app-server" is not a daemon.
+    let Some(at) = args.iter().skip(1).position(|arg| arg == "app-server") else {
+        return false;
+    };
+    args.get(at + 2).is_none_or(|next| next != "daemon")
 }
 
 /// PURE: does this argv token have the shape of a codex thread id (a 36-char UUID)? Shape-based
@@ -357,9 +378,13 @@ impl Default for StatusResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::{RolloutOwner, is_daemon_process, looks_like_thread_id, record_owner};
+    use super::{
+        RolloutOwner, is_daemon_process, listening_socket_inodes, looks_like_thread_id,
+        record_owner, socket_inode,
+    };
     use std::borrow::Cow;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn argv(args: &[&str]) -> Vec<Cow<'static, str>> {
@@ -371,38 +396,33 @@ mod tests {
     /// the REAL captured argv of the running daemon and against every codex command line that
     /// must NOT match.
     #[test]
-    fn the_daemon_is_recognized_by_its_argv_and_nothing_else_is() {
+    fn the_argv_backstop_is_biased_toward_calling_a_host_a_host() {
         // Live capture from /proc/<pid>/cmdline of the running app-server on this box.
-        let daemon = argv(&[
+        assert!(is_daemon_process(&argv(&[
             "/home/user/.codex/packages/standalone/current/codex",
             "app-server",
             "--listen",
             "unix://",
-        ]);
-        assert!(is_daemon_process(&daemon));
-        // A future release that drops `--listen` from the daemon's own argv must still read as
-        // a host, because the costly mistake is the false negative (SIGTERM on a process that
-        // hosts other people's threads).
-        assert!(is_daemon_process(&argv(&["codex", "app-server"])));
-        // Same reason: a host started with global options before the subcommand is still a
-        // host, whatever shape those options take. Requiring `app-server` at a fixed index
-        // would hand the daemon's pid to SIGTERM.
+        ])));
+        // Every argv shape three rounds of review produced as a counterexample. The backstop
+        // answers "host" to all of them ON PURPOSE: it cannot locate a subcommand reliably
+        // (argv does not say which options take values), and the recoverable mistake is the
+        // false positive, which only makes stop fail visibly. The false negative it is
+        // guarding against SIGTERMs a process hosting other people's threads.
         for hosts in [
+            argv(&["codex", "app-server"]),
             argv(&["codex", "-c", "model=gpt-5", "app-server", "--listen"]),
-            argv(&["codex", "--config=model=gpt-5", "app-server", "--listen"]),
-            // A profile whose NAME is a subcommand: the option value must not be read as one.
             argv(&["codex", "--profile", "exec", "app-server", "--listen"]),
-            // A boolean flag directly before the subcommand: nothing may swallow it.
-            argv(&["codex", "--search", "app-server", "--listen"]),
+            argv(&["codex", "--search", "-c", "k=v", "app-server", "--listen"]),
         ] {
             assert!(is_daemon_process(&hosts), "must read as a host: {hosts:?}");
         }
 
         let not_daemons = [
             argv(&["codex", "exec", "--json", "-C", "/tmp", "do a thing"]),
-            // The one that broke this predicate: a plain exec session that spawned a subagent
-            // thread held TWO rollout fds (pid 2910115, live on 2026-07-27), which the old
-            // multi-rollout heuristic scored as the daemon.
+            // The one that broke this predicate originally: a plain exec session that spawned
+            // a subagent thread held TWO rollout fds (pid 2910115, live on 2026-07-27), which
+            // the old multi-rollout heuristic scored as the daemon.
             argv(&[
                 "codex",
                 "exec",
@@ -424,20 +444,6 @@ mod tests {
             // host nothing. These are the reason the rule excludes `daemon`.
             argv(&["codex", "app-server", "daemon", "version"]),
             argv(&["codex", "app-server", "daemon", "start"]),
-            // A task prompt is ONE argv token, so a bare-presence test would score these
-            // ordinary sessions as the daemon and strip their real pids.
-            argv(&["codex", "exec", "--json", "-C", "/tmp", "app-server"]),
-            argv(&["codex", "exec", "app-server", "daemon"]),
-            argv(&[
-                "codex",
-                "resume",
-                "019fa125-fa8e-7133-9aab-820742609be3",
-                "app-server",
-            ]),
-            // The same for any other prompt-taking subcommand, present or future: the rule
-            // never needs to know their names.
-            argv(&["codex", "review", "app-server"]),
-            argv(&["codex", "fork", "app-server"]),
             // argv[0] alone is the binary path, never evidence of anything.
             argv(&["/opt/app-server/codex", "exec", "do a thing"]),
             // sysinfo returns an empty argv for a process it could not read.
@@ -451,10 +457,52 @@ mod tests {
         }
     }
 
-    /// Two codex processes can hold one rollout at once, and the sweep visits them in HashMap
-    /// order. Whichever order they arrive in, the daemon must own the entry: the losing case
-    /// would report a signalable pid for a daemon-hosted row and SIGTERM a codex TUI's process
-    /// group on Ctrl+X.
+    /// THE decisive signal, and why the argv backstop above is allowed to be crude: the daemon
+    /// is whoever holds the LISTENING control socket. That is a kernel fact, so no command line
+    /// a user invents can produce a false negative, and a process merely CONNECTED to the
+    /// socket (any client, including the viewer) must not be mistaken for it.
+    #[test]
+    fn the_listening_control_socket_identifies_the_daemon() {
+        let home = Path::new("/home/user/.codex/app-server-control");
+        // Real /proc/net/unix shape: Num RefCount Protocol Flags Type St Inode Path.
+        let table = "\
+Num       RefCount Protocol Flags    Type St Inode Path
+ffff0001: 00000002 00000000 00010000 0001 01 111111 /home/user/.codex/app-server-control/app-server-control.sock
+ffff0002: 00000003 00000000 00000000 0001 03 222222 /home/user/.codex/app-server-control/app-server-control.sock
+ffff0003: 00000002 00000000 00010000 0001 01 333333 /run/user/1000/other.sock
+ffff0004: 00000002 00000000 00010000 0001 01 444444
+";
+        let found = listening_socket_inodes(table, home);
+
+        assert!(found.contains(&111111), "the listening end IS the daemon");
+        assert!(
+            !found.contains(&222222),
+            "a CONNECTED client on the same path is not the daemon"
+        );
+        assert!(
+            !found.contains(&333333),
+            "a listening socket somewhere else is not the daemon"
+        );
+        assert!(
+            !found.contains(&444444),
+            "an unbound socket has no path to match"
+        );
+    }
+
+    #[test]
+    fn only_socket_fds_yield_an_inode() {
+        assert_eq!(socket_inode("socket:[111111]"), Some(111111));
+        for other in [
+            "/home/user/.codex/sessions/2026/07/27/rollout-x.jsonl",
+            "socket:[]",
+            "socket:[abc]",
+            "anon_inode:[eventpoll]",
+            "/dev/pts/3",
+        ] {
+            assert_eq!(socket_inode(other), None, "{other}");
+        }
+    }
+
     #[test]
     fn the_daemon_wins_the_entry_in_either_scan_order() {
         let rollout = PathBuf::from("/home/user/.codex/sessions/rollout-x.jsonl");
