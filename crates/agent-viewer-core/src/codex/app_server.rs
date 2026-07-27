@@ -250,19 +250,31 @@ pub fn daemon_start_command(cwd: &Path) -> std::process::Command {
 /// start` is idempotent, and this NEVER stops or restarts a daemon - other clients (and every
 /// other thread it hosts) live in that process. Its output says `"started"`, not `"running"`,
 /// so availability is confirmed by re-probing until the socket answers or the deadline passes.
-pub fn ensure_daemon() -> Option<Daemon> {
+///
+/// The error is the POINT, not a formality. A spawn refuses outright when no daemon can be
+/// reached, and that refusal is all the user gets to act on, so "codex is not installed",
+/// "daemon start exited 1: <its stderr>" and "started but never answered" have to arrive as
+/// three different sentences. Collapsing them into one generic notice is what makes a
+/// misconfigured box look like a broken viewer.
+pub fn ensure_daemon() -> std::result::Result<Daemon, String> {
     if let Some(daemon) = probe_daemon() {
-        return Some(daemon);
+        return Ok(daemon);
     }
     let cmd = daemon_start_command(&stable_daemon_cwd(crate::home_dir()));
     let deadline = Instant::now() + START_TIMEOUT;
-    crate::spawn::run_with_timeout(cmd, START_TIMEOUT);
+    if let Err(why) = crate::spawn::run_reporting_failure(cmd, START_TIMEOUT) {
+        // Do not return yet: `daemon start` can fail because another client won the race and
+        // is already listening, which is a success for us. Only report it if nothing answers.
+        return probe_daemon().ok_or(why);
+    }
     loop {
         if let Some(daemon) = probe_daemon() {
-            return Some(daemon);
+            return Ok(daemon);
         }
         if Instant::now() >= deadline {
-            return None;
+            return Err(
+                "`codex app-server daemon start` reported success but no daemon answered".into(),
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     }

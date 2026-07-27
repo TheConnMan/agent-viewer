@@ -45,24 +45,40 @@ pub const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Run `cmd`, returning captured stdout as a String if it exits 0 within `timeout`.
 /// On timeout the child is killed; any failure (spawn error, non-zero exit, timeout,
-/// non-utf8 stdout) returns None. Poll-based (no new deps): spawn with piped stdout and
-/// null stderr, then loop `try_wait()` with a short sleep until the deadline. Used to
-/// bound the best-effort model-discovery shell-outs (`codex debug models`,
-/// `opencode models`) so a hung CLI cannot freeze the caller indefinitely.
-///
-/// stdout is drained by a reader thread rather than after the wait: a child whose output
-/// exceeds the OS pipe buffer (64KB on Linux) blocks on write until someone reads, so
-/// waiting for exit first deadlocks until the deadline kills it - and a model catalog is
-/// exactly the kind of output that grows past that buffer.
+/// non-utf8 stdout) returns None. Used to bound the best-effort model-discovery shell-outs
+/// (`codex debug models`, `opencode models`) so a hung CLI cannot freeze the caller
+/// indefinitely: there, every failure means the same thing (no catalog today), so the reason
+/// is genuinely not worth carrying.
 pub(crate) fn run_with_timeout(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     timeout: std::time::Duration,
 ) -> Option<String> {
+    run_reporting_failure(cmd, timeout).ok()
+}
+
+/// `run_with_timeout` for callers that must TELL THE USER why it failed, returning the
+/// failure as a one-line diagnostic naming the command.
+///
+/// The Option-returning wrapper above is right for best-effort discovery, where every failure
+/// is equally "no catalog today". It is wrong wherever the failure is the answer: a spawn that
+/// the user must act on has to say whether codex was missing, exited non-zero (with its
+/// stderr), or hung, not just that something did not work.
+pub(crate) fn run_reporting_failure(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, String> {
     use std::io::Read;
+    let described = describe(&cmd);
     cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run `{described}`: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("`{described}` gave no stdout pipe"))?;
+    let mut stderr = child.stderr.take();
     // A channel, not a join handle: a grandchild inheriting the pipe can hold it open past
     // the child's exit, and joining on that would block the caller with no deadline at all.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -71,12 +87,27 @@ pub(crate) fn run_with_timeout(
         let read = stdout.read_to_end(&mut buf).is_ok();
         let _ = tx.send(read.then_some(buf));
     });
+    // stderr is small (a diagnostic line) and is only read once the child is gone, so it needs
+    // no reader thread of its own.
+    let mut drain_stderr = move || {
+        let mut buf = String::new();
+        if let Some(pipe) = stderr.as_mut() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf.trim().to_string()
+    };
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return None;
+                    let why = drain_stderr();
+                    let why = if why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {why}")
+                    };
+                    return Err(format!("`{described}` exited {status}{why}"));
                 }
                 // The child is gone, so the pipe is at EOF and the reader is about to finish;
                 // the floor keeps a child that exits right on the deadline from losing its
@@ -84,20 +115,32 @@ pub(crate) fn run_with_timeout(
                 let remaining = deadline
                     .saturating_duration_since(std::time::Instant::now())
                     .max(std::time::Duration::from_secs(1));
-                let buf = rx.recv_timeout(remaining).ok()??;
-                return String::from_utf8(buf).ok();
+                let buf = rx
+                    .recv_timeout(remaining)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| format!("`{described}` stdout was unreadable"))?;
+                return String::from_utf8(buf)
+                    .map_err(|_| format!("`{described}` printed non-utf8 stdout"));
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(format!("`{described}` timed out after {timeout:?}"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(_) => return None,
+            Err(e) => return Err(format!("could not wait for `{described}`: {e}")),
         }
     }
+}
+
+/// PURE: the program plus its args, for naming a command in an error the user reads.
+fn describe(cmd: &std::process::Command) -> String {
+    let mut parts = vec![cmd.get_program().to_string_lossy().to_string()];
+    parts.extend(cmd.get_args().map(|a| a.to_string_lossy().to_string()));
+    parts.join(" ")
 }
 
 /// Shared detached-spawn helper (codex + opencode; claude self-detaches):
@@ -164,7 +207,7 @@ pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::run_with_timeout;
+    use super::{run_reporting_failure, run_with_timeout};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -175,6 +218,36 @@ mod tests {
         assert_eq!(
             run_with_timeout(cmd, Duration::from_secs(3)),
             Some("hi".to_string())
+        );
+    }
+
+    /// The Option wrapper throws away WHY, which is correct for best-effort discovery and
+    /// wrong for a spawn refusal the user has to act on. These pin the three failures that a
+    /// generic "no daemon" notice used to hide.
+    #[test]
+    fn run_reporting_failure_names_the_command_and_the_reason() {
+        let mut missing = Command::new("definitely-not-a-real-binary-xyzzy");
+        missing.arg("start");
+        let err = run_reporting_failure(missing, Duration::from_secs(3)).unwrap_err();
+        assert!(
+            err.contains("definitely-not-a-real-binary-xyzzy start"),
+            "a missing binary must name itself, got {err:?}"
+        );
+
+        let mut failing = Command::new("sh");
+        failing.arg("-c").arg("echo 'config is broken' >&2; exit 3");
+        let err = run_reporting_failure(failing, Duration::from_secs(3)).unwrap_err();
+        assert!(
+            err.contains("config is broken"),
+            "a non-zero exit must carry its stderr, got {err:?}"
+        );
+
+        let mut hanging = Command::new("sh");
+        hanging.arg("-c").arg("sleep 5");
+        let err = run_reporting_failure(hanging, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "a hung command must say so, got {err:?}"
         );
     }
 

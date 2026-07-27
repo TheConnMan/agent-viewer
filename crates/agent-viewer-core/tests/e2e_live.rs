@@ -401,9 +401,12 @@ fn claude_live_rename_round_trips_through_the_agents_listing() {
 #[test]
 #[ignore = "live: needs a reachable codex app-server daemon (auth + network)"]
 fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
-    let Some(daemon) = ensure_daemon() else {
-        eprintln!("[skip] no codex app-server daemon reachable on this box");
-        return;
+    let daemon = match ensure_daemon() {
+        Ok(daemon) => daemon,
+        Err(why) => {
+            eprintln!("[skip] no codex app-server daemon reachable on this box: {why}");
+            return;
+        }
     };
     println!("[daemon] socket {}", daemon.socket_path.display());
 
