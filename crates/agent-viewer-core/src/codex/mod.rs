@@ -18,19 +18,44 @@ use std::path::Path;
 
 /// Which spawn path a new session takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpawnRoute {
-    Daemon,
+pub enum SpawnRoute<'a> {
+    /// Start the thread on the shared daemon. The only spawn that stays joinable.
+    Daemon(&'a app_server::Daemon),
+    /// `codex exec`, taken ONLY when explicitly opted into.
     Exec,
+    /// No daemon and no opt-in: refuse loudly rather than create an unjoinable session.
+    Refuse,
 }
 
-/// PURE: the daemon wins whenever one is reachable. `codex exec` runs its app-server IN
-/// PROCESS, so an exec-spawned thread can never be joined from outside no matter what attach
-/// does later; with no daemon, exec is still better than not spawning at all.
-pub fn spawn_route(daemon: Option<&app_server::Daemon>) -> SpawnRoute {
-    match daemon {
-        Some(_) => SpawnRoute::Daemon,
-        None => SpawnRoute::Exec,
+/// Opt-in env var for the unjoinable `codex exec` spawn path.
+pub const EXEC_SPAWN_ENV: &str = "AGENT_VIEWER_CODEX_EXEC_SPAWN";
+
+/// Shown verbatim when a spawn is refused because no daemon could be reached or started.
+const NO_DAEMON_SPAWN_REFUSAL: &str = "no codex app-server daemon could be started, and a \
+    session spawned without one can never be joined; start one with `codex app-server daemon \
+    start` (or set AGENT_VIEWER_CODEX_EXEC_SPAWN=1 to spawn an unjoinable exec session)";
+
+/// PURE: the daemon wins whenever one is reachable, and there is NO silent fallback.
+///
+/// `codex exec` runs its app-server IN PROCESS, so an exec-spawned thread can never be joined
+/// from outside no matter what attach does later. This used to fall back to exec whenever the
+/// daemon path failed for any reason, which made a degraded spawn look identical to a good one
+/// in the UI. That is exactly how a daemon poisoned by a deleted cwd stayed invisible for
+/// hours on 2026-07-27 while every viewer spawn quietly became unjoinable. A spawn that cannot
+/// be joined is now a visible failure, and exec is reachable only through `EXEC_SPAWN_ENV`.
+pub fn spawn_route(daemon: Option<&app_server::Daemon>, exec_opt_in: bool) -> SpawnRoute<'_> {
+    if exec_opt_in {
+        return SpawnRoute::Exec;
     }
+    match daemon {
+        Some(daemon) => SpawnRoute::Daemon(daemon),
+        None => SpawnRoute::Refuse,
+    }
+}
+
+/// IMPURE: has the operator opted into the unjoinable `codex exec` spawn path?
+fn exec_spawn_opt_in() -> bool {
+    std::env::var(EXEC_SPAWN_ENV).as_deref() == Ok("1")
 }
 
 /// How a row is attached: a true join through the hosting daemon, a plain local resume, or a
@@ -42,15 +67,24 @@ pub enum AttachRoute {
     Refuse(&'static str),
 }
 
-/// Shown verbatim in the footer when attach is refused. It names the interrupt because that is
-/// the damage being avoided: a plain resume of a live thread appends a synthesized
-/// `TurnAborted{Interrupted}` to the rollout of a session that is still running.
-const LIVE_TURN_REFUSAL: &str =
-    "session is live in another codex process; attaching would fabricate an interrupt";
+/// Shown verbatim in the footer when a row cannot be joined and falls back to the live tail.
+/// It names the fork because that is the damage being avoided: a plain resume of a live thread
+/// appends a synthesized `TurnAborted{Interrupted}` to the rollout of a session that is still
+/// running, and shows the user a forked copy of it.
+///
+/// This only ever fires for `codex exec` sessions now. Measured live on 2026-07-27: an
+/// interactive `codex` launch delegates to the shared daemon (the new session's rollout fd was
+/// held by the listening daemon and NOT by the TUI process), so ordinary terminal sessions are
+/// daemon-hosted and joinable. `codex exec` hosts its app-server in process, so the sessions
+/// bg jobs and plugins create are the unjoinable ones.
+const LIVE_TURN_REFUSAL: &str = concat!(
+    "session runs inside its own codex exec process and cannot be joined; ",
+    "showing a live read-only tail instead of forking it"
+);
 
 /// PURE attach routing:
-///   daemon-hosted + a reachable daemon                -> Remote (a real live join)
-///   foreign + mid-turn (Working|NeedsInput) + a pid    -> Refuse (a resume would corrupt it)
+///   daemon-hosted + a reachable daemon                 -> Remote (a real live join)
+///   foreign + mid-turn (Working|NeedsInput) + a pid    -> Refuse (a resume would fork it)
 ///   everything else                                    -> Local
 ///
 /// A daemon-hosted row whose daemon is gone falls to Local: there is no live thread left to
@@ -317,32 +351,36 @@ impl Backend for CodexBackend {
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<Option<u32>> {
         // Prefer the shared daemon: a thread it hosts is the only kind that can be joined
-        // later, and it may be started here (never stopped, never restarted).
-        let daemon = app_server::ensure_daemon();
-        if let (SpawnRoute::Daemon, Some(daemon)) = (spawn_route(daemon.as_ref()), daemon.as_ref())
-        {
-            let attempt = app_server::try_spawn_thread(daemon, dir, task, model);
-            match attempt {
-                // No pid to return: the daemon owns the thread, and its pid must never be
-                // handed back as a killable one (it is every other hosted thread's pid too).
-                // The costs of that are real but small: `record_spawn` is pid-keyed, so a
-                // daemon-hosted row gets no viewer spawn record, which means no pin (it does
-                // not need one - a `vscode`-source row is not a companion) and no first-sight
-                // bloom. Stop goes through turn/interrupt instead of a signal. Same shape as
-                // the claude backend, which also self-detaches and returns None.
-                app_server::SpawnAttempt::Started(_) => return Ok(None),
-                // The thread EXISTS and is already in the listing; only its first turn failed.
-                // Falling back here would run the user's task a second time (two rows, two
-                // agents, one Enter), so surface it against the thread that is there.
-                attempt if !app_server::may_fall_back(&attempt) => {
-                    return Err(crate::error::Error::Command(format!(
-                        "codex app-server spawn incomplete: {}",
+        // later, and it may be started here (never stopped, never restarted). Skip the probe
+        // entirely when exec is forced, so an opt-in never starts a daemon it will not use.
+        let exec_opt_in = exec_spawn_opt_in();
+        let daemon = (!exec_opt_in).then(app_server::ensure_daemon).flatten();
+        match spawn_route(daemon.as_ref(), exec_opt_in) {
+            SpawnRoute::Daemon(daemon) => {
+                return match app_server::try_spawn_thread(daemon, dir, task, model) {
+                    // No pid to return: the daemon owns the thread, and its pid must never be
+                    // handed back as a killable one (it is every other hosted thread's pid
+                    // too). The costs of that are real but small: `record_spawn` is pid-keyed,
+                    // so a daemon-hosted row gets no viewer spawn record, which means no pin
+                    // (it does not need one - a `vscode`-source row is not a companion) and no
+                    // first-sight bloom. Stop goes through turn/interrupt instead of a signal.
+                    // Same shape as the claude backend, which also self-detaches and returns
+                    // None.
+                    app_server::SpawnAttempt::Started(_) => Ok(None),
+                    // Every other outcome is a hard failure carrying the daemon's own error.
+                    // There is deliberately no exec fallback: it would either double-run the
+                    // task (the thread already exists after `thread/start`) or silently hand
+                    // back an unjoinable session, and both were real defects.
+                    attempt => Err(crate::error::Error::Command(format!(
+                        "codex app-server spawn failed: {}",
                         spawn_failure_reason(&attempt)
-                    )));
-                }
-                // Nothing was created, so the exec path below is still safe.
-                _ => {}
+                    ))),
+                };
             }
+            SpawnRoute::Refuse => {
+                return Err(crate::error::Error::Command(NO_DAEMON_SPAWN_REFUSAL.into()));
+            }
+            SpawnRoute::Exec => {}
         }
         let cmd = codex_spawn_command(dir, task, model);
         let log_path = crate::default_codex_home()
@@ -401,7 +439,9 @@ impl Backend for CodexBackend {
             // and atomically subscribes to live updates.
             AttachRoute::Remote(endpoint) => cli::resume_remote_command(&endpoint, &session.id),
             AttachRoute::Local => cli::resume_command(&session.id),
-            AttachRoute::Refuse(reason) => return Err(AttachRefusal::new(reason)),
+            // Not an error the user must dismiss: the row IS running, it just cannot be
+            // joined, so the caller falls back to watching it read-only.
+            AttachRoute::Refuse(reason) => return Err(AttachRefusal::tailable(reason)),
         };
         // `codex resume` inherits the viewer's cwd and otherwise prompts "Choose working
         // directory" on attach. Pin it to the session's own cwd when that directory still

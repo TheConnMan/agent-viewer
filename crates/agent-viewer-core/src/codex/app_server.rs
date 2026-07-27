@@ -60,8 +60,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for `codex app-server daemon start` plus the re-probes that follow it. The start
 /// itself returned in 0.5s on this box, and it prints `"status":"started"` rather than
 /// `"running"`, so availability is confirmed by re-probing, not by that output. Deliberately
-/// tighter than `MODEL_PROBE_TIMEOUT`: this one runs on the composer's key path, and a wedged
-/// start should degrade to the `codex exec` spawn path rather than freeze the UI.
+/// tighter than `MODEL_PROBE_TIMEOUT`: a wedged start must surface as a failed spawn the user
+/// can act on rather than freeze the composer.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// PURE: the daemon described by `codex app-server daemon version` stdout, or None when no
@@ -217,6 +217,35 @@ pub fn probe_daemon() -> Option<Daemon> {
     parse_daemon_version(&stdout)
 }
 
+/// PURE: the working directory a viewer-started daemon must run in, given the home directory
+/// to prefer.
+///
+/// The daemon is long-lived, shared box-wide, and inherits the cwd of whoever started it.
+/// agent-viewer routinely runs from a git worktree under `.worktrees/` that is DELETED as soon
+/// as its branch merges, so a daemon that inherited the viewer's cwd outlives its own working
+/// directory. Measured live on 2026-07-27: the daemon's `/proc/<pid>/cwd` pointed at a deleted
+/// worktree, `daemon version` still answered `"status":"running"`, and every single
+/// `thread/start` failed with `failed to load configuration: No such file or directory`. That
+/// poisoned daemon then broke spawning for hours and for every other codex client on the box.
+///
+/// Home is stable for the life of the box; `/` is the fallback when HOME is unset or gone.
+/// Never the viewer's own cwd.
+pub fn stable_daemon_cwd(home: PathBuf) -> PathBuf {
+    if home.is_dir() {
+        home
+    } else {
+        PathBuf::from("/")
+    }
+}
+
+/// PURE builder: `codex app-server daemon start`, pinned to a cwd it cannot outlive.
+pub fn daemon_start_command(cwd: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("codex");
+    cmd.arg("app-server").arg("daemon").arg("start");
+    cmd.current_dir(cwd);
+    cmd
+}
+
 /// IMPURE: the daemon to spawn on, starting one if none is listening. `codex app-server daemon
 /// start` is idempotent, and this NEVER stops or restarts a daemon - other clients (and every
 /// other thread it hosts) live in that process. Its output says `"started"`, not `"running"`,
@@ -225,8 +254,7 @@ pub fn ensure_daemon() -> Option<Daemon> {
     if let Some(daemon) = probe_daemon() {
         return Some(daemon);
     }
-    let mut cmd = std::process::Command::new("codex");
-    cmd.arg("app-server").arg("daemon").arg("start");
+    let cmd = daemon_start_command(&stable_daemon_cwd(crate::home_dir()));
     let deadline = Instant::now() + START_TIMEOUT;
     crate::spawn::run_with_timeout(cmd, START_TIMEOUT);
     loop {
@@ -240,9 +268,10 @@ pub fn ensure_daemon() -> Option<Daemon> {
     }
 }
 
-/// How far a daemon spawn got. The distinction is load-bearing for the caller's fallback: once
-/// `thread/start` has returned, the thread EXISTS and shows up in the listing, so falling back
-/// to `codex exec` would run the user's task twice (two rows, two agents, one Enter).
+/// How far a daemon spawn got. Every non-`Started` outcome is now a hard, visible failure (see
+/// `spawn_route`), so the distinction survives to tell the user WHICH half broke: a
+/// `TurnFailed` left a real thread in the listing that they can attach to and retry, while
+/// `NotCreated` left nothing behind at all.
 #[derive(Debug)]
 pub enum SpawnAttempt {
     /// Thread created and its first turn accepted.
@@ -250,13 +279,8 @@ pub enum SpawnAttempt {
     /// The thread exists but its first turn did not start. There is a row either way, so this
     /// must be surfaced against that thread, never retried as a second spawn.
     TurnFailed { thread_id: String, error: Error },
-    /// Nothing was created (no daemon, no connection, no thread), so the exec path is safe.
+    /// Nothing was created (no daemon, no connection, no thread).
     NotCreated(Error),
-}
-
-/// PURE: may the caller fall back to `codex exec`? Only when the daemon created nothing.
-pub fn may_fall_back(attempt: &SpawnAttempt) -> bool {
-    matches!(attempt, SpawnAttempt::NotCreated(_))
 }
 
 /// IMPURE: start a thread on `daemon` and kick off its first turn. The turn keeps running after

@@ -18,12 +18,27 @@ pub enum Error {
 #[error("{reason}")]
 pub struct AttachRefusal {
     pub reason: String,
+    /// Should the caller fall back to the read-only live tail (the inline peek) instead of
+    /// just printing `reason`? True when the session IS running and watchable but cannot be
+    /// joined, which is the whole point: the user asked to see it, and a transcript that
+    /// updates as it runs is the honest answer. False when there is nothing to watch (a
+    /// backend that does not support attach at all).
+    pub tail: bool,
 }
 
 impl AttachRefusal {
     pub fn new(reason: impl Into<String>) -> AttachRefusal {
         AttachRefusal {
             reason: reason.into(),
+            tail: false,
+        }
+    }
+
+    /// A refusal whose row should fall back to the read-only live tail.
+    pub fn tailable(reason: impl Into<String>) -> AttachRefusal {
+        AttachRefusal {
+            reason: reason.into(),
+            tail: true,
         }
     }
 }

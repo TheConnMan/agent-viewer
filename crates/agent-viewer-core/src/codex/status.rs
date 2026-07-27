@@ -59,8 +59,10 @@ pub fn scan_codex_processes() -> CodexProcessScan {
                 scan.attached_threads.insert(arg.to_string());
             }
         }
-        // Collect this process's fds first: whether it is the daemon depends on how many
-        // DISTINCT rollouts it holds, which is only known once they are all read.
+        let owner = RolloutOwner {
+            pid: pid.as_u32(),
+            daemon: is_daemon_process(&args),
+        };
         let fd_dir = format!("/proc/{}/fd", pid.as_u32());
         let Ok(entries) = std::fs::read_dir(&fd_dir) else {
             continue;
@@ -77,11 +79,6 @@ pub fn scan_codex_processes() -> CodexProcessScan {
                 held.push(path);
             }
         }
-        let rollouts = held.iter().filter(|path| looks_like_rollout(path)).count();
-        let owner = RolloutOwner {
-            pid: pid.as_u32(),
-            daemon: is_daemon_process(&args, rollouts),
-        };
         for path in held {
             record_owner(&mut scan.open_rollouts, path, owner);
         }
@@ -116,32 +113,32 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, RolloutOwner> {
     scan_codex_processes().open_rollouts
 }
 
-/// PURE: is this codex process an app-server hosting other people's threads? Two independent
-/// signals, either of which is enough, because this single predicate is what keeps `stop` from
-/// SIGTERMing the daemon and every session inside it:
-///   1. the argv shape `codex app-server --listen unix://...` (verified live from
-///      /proc/<pid>/cmdline); both args are required so the short-lived
-///      `codex app-server daemon version` probe is not mistaken for the daemon.
-///   2. more than one distinct rollout held open at once. A per-session codex process has
-///      exactly one rollout; only a host of several threads has more (the live daemon held 3).
-///      This is the belt and braces for signal 1: a future codex release that drops `--listen`
-///      from the daemon's argv would otherwise silently turn Ctrl+X into "kill every session".
-fn is_daemon_process(args: &[std::borrow::Cow<'_, str>], rollouts_held: usize) -> bool {
-    is_app_server(args) || rollouts_held > 1
+/// PURE: is this codex process an app-server hosting other people's threads? Decided from
+/// ARGV ALONE, because this single predicate is what keeps `stop` from SIGTERMing the daemon
+/// and every session inside it.
+///
+/// The rule is `app-server` present and the `daemon` subcommand absent. The live daemon's
+/// cmdline is `codex app-server --listen unix://` (captured from /proc/<pid>/cmdline), while
+/// the short-lived `codex app-server daemon version` / `daemon start` probes carry `daemon`
+/// and host nothing. Matching on `app-server` rather than on `--listen` errs toward calling a
+/// host a host: the costly mistake here is the FALSE NEGATIVE (Ctrl+X SIGTERMs a process
+/// hosting other people's threads), while a false positive only routes stop through
+/// `turn/interrupt`, which fails visibly instead of killing anything.
+///
+/// This USED to also treat "holds more than one rollout fd" as proof of the daemon. That is
+/// measurably false and was removed: a plain
+/// `codex exec --json -C ... --dangerously-bypass-approvals-and-sandbox` (pid 2910115, live on
+/// 2026-07-27) held TWO rollouts, its own plus a subagent thread it spawned (registry source
+/// `{"subagent":{"thread_spawn":...}}`). Misclassifying an exec session as the daemon routes
+/// attach to a `--remote` join on a daemon that does not host that thread, which fabricates
+/// the exact interrupt this whole path exists to prevent, and turns stop into a silent no-op.
+fn is_daemon_process(args: &[std::borrow::Cow<'_, str>]) -> bool {
+    is_app_server(args)
 }
 
-/// PURE: the argv half of `is_daemon_process`.
+/// PURE: the argv test above, kept as its own name because it is what the rule reads as.
 fn is_app_server(args: &[std::borrow::Cow<'_, str>]) -> bool {
-    args.iter().any(|arg| arg == "app-server") && args.iter().any(|arg| arg == "--listen")
-}
-
-/// PURE: does this open fd point at a codex rollout transcript
-/// (`.../rollout-<ts>-<uuid>.jsonl`)? Only rollouts count toward the multi-thread signal
-/// above; a process holding two log files is not a daemon.
-fn looks_like_rollout(path: &Path) -> bool {
-    path.file_name()
-        .map(|name| name.to_string_lossy())
-        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+    args.iter().any(|arg| arg == "app-server") && !args.iter().any(|arg| arg == "daemon")
 }
 
 /// PURE: does this argv token have the shape of a codex thread id (a 36-char UUID)? Shape-based
@@ -309,12 +306,10 @@ impl Default for StatusResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RolloutOwner, is_daemon_process, looks_like_rollout, looks_like_thread_id, record_owner,
-    };
+    use super::{RolloutOwner, is_daemon_process, looks_like_thread_id, record_owner};
     use std::borrow::Cow;
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn argv(args: &[&str]) -> Vec<Cow<'static, str>> {
         args.iter().map(|a| Cow::Owned(a.to_string())).collect()
@@ -333,11 +328,26 @@ mod tests {
             "--listen",
             "unix://",
         ]);
-        assert!(is_daemon_process(&daemon, 1));
-        assert!(is_daemon_process(&daemon, 0), "argv alone is enough");
+        assert!(is_daemon_process(&daemon));
+        // A future release that drops `--listen` from the daemon's own argv must still read as
+        // a host, because the costly mistake is the false negative (SIGTERM on a process that
+        // hosts other people's threads).
+        assert!(is_daemon_process(&argv(&["codex", "app-server"])));
 
         let not_daemons = [
             argv(&["codex", "exec", "--json", "-C", "/tmp", "do a thing"]),
+            // The one that broke this predicate: a plain exec session that spawned a subagent
+            // thread held TWO rollout fds (pid 2910115, live on 2026-07-27), which the old
+            // multi-rollout heuristic scored as the daemon.
+            argv(&[
+                "codex",
+                "exec",
+                "--json",
+                "-C",
+                "/home/user/git/agent-viewer",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "clicking on things should do what enter does",
+            ]),
             argv(&["codex", "resume", "019fa125-fa8e-7133-9aab-820742609be3"]),
             argv(&[
                 "codex",
@@ -346,7 +356,8 @@ mod tests {
                 "unix:///home/user/.codex/app-server-control/app-server-control.sock",
                 "019fa125-fa8e-7133-9aab-820742609be3",
             ]),
-            // The short-lived availability probe: `app-server` without `--listen`.
+            // The short-lived availability probes, which carry the `daemon` subcommand and
+            // host nothing. These are the reason the rule excludes `daemon`.
             argv(&["codex", "app-server", "daemon", "version"]),
             argv(&["codex", "app-server", "daemon", "start"]),
             // sysinfo returns an empty argv for a process it could not read.
@@ -354,36 +365,9 @@ mod tests {
         ];
         for args in &not_daemons {
             assert!(
-                !is_daemon_process(args, 1),
+                !is_daemon_process(args),
                 "must not read as the daemon: {args:?}"
             );
-        }
-
-        // Belt and braces: whatever the argv says, a process holding more than one rollout is
-        // hosting other people's threads (the live daemon held 3).
-        for args in &not_daemons {
-            assert!(
-                is_daemon_process(args, 2),
-                "two rollouts at once is a host: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_rollout_transcripts_count_toward_the_multi_thread_signal() {
-        assert!(looks_like_rollout(Path::new(
-            "/home/user/.codex/sessions/2026/07/27/rollout-2026-07-27T01-41-01-019fa13b-87fd-7b21-88c7-0a53d9735a14.jsonl"
-        )));
-        assert!(looks_like_rollout(Path::new(
-            "/home/user/.codex/archived_sessions/rollout-2026-07-27T01-17-28-019fa125-fa8e-7133-9aab-820742609be3.jsonl"
-        )));
-        for other in [
-            "/home/user/.codex/bg-logs/1785113777.log",
-            "/home/user/.codex/sessions/2026/07/27/rollout-2026-07-27.txt",
-            "/dev/pts/3",
-            "/home/user/.codex/history.jsonl",
-        ] {
-            assert!(!looks_like_rollout(Path::new(other)), "{other}");
         }
     }
 
