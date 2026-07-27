@@ -722,7 +722,7 @@ fn truncate_to(s: &str, width: usize) -> String {
 
 /// Width math for one session row, kept pure so it is unit-testable.
 ///
-/// The row is `<glyph><space><mark><space><name>[<2sp><detail>]<pad><right cluster>`,
+/// The row is `<glyph><mark><name>[<2sp><detail>]<pad><right cluster>`,
 /// flush-left (glyph in column 0). `mark_width` is the measured display width of the brand
 /// mark (some marks are ambiguous-width — the caller measures, never assumes 1). `right_len`
 /// is the measured width of the whole right-aligned cluster (`<pr> <status word> <time>`),
@@ -737,8 +737,8 @@ pub fn row_layout(
     detail: &str,
     right_len: usize,
 ) -> (String, String, usize) {
-    // Fixed left decorations before the name: glyph + space + mark + space (flush, no indent).
-    let left_fixed = 3 + mark_width;
+    // Fixed left decorations before the name: glyph + mark (flush, no indent).
+    let left_fixed = 1 + mark_width;
     // Reserve the right cluster plus at least one space of separation.
     let content = width.saturating_sub(left_fixed + right_len + 1);
 

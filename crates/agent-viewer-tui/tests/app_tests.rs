@@ -596,7 +596,7 @@ fn row_layout_reserves_right_cluster_for_long_titles() {
     assert!(detail.is_empty());
     // The whole row (flush left + name + pad + right cluster) fits exactly in width, so the
     // status word + time cluster is never pushed off the line.
-    let left_fixed = 3 + mark_width;
+    let left_fixed = 1 + mark_width;
     assert_eq!(left_fixed + name.chars().count() + pad + right_len, width);
 }
 
@@ -608,7 +608,7 @@ fn row_layout_fits_name_and_summary_with_flush_right_cluster() {
     let (name, detail, pad) = row_layout(width, mark_width, "sess", "a short summary", right_len);
     assert_eq!(name, "sess");
     assert_eq!(detail, "a short summary");
-    let used = (3 + mark_width) + name.chars().count() + 2 + detail.chars().count();
+    let used = (1 + mark_width) + name.chars().count() + 2 + detail.chars().count();
     assert_eq!(used + pad + right_len, width);
 }
 
@@ -617,7 +617,7 @@ fn row_layout_drops_summary_when_no_room() {
     // Width fits the name and the reserved right cluster but leaves nothing for a summary.
     let mark_width = 1;
     let right_len = 8;
-    let width = (3 + mark_width) + 4 + 1 + right_len; // left_fixed + name(4) + gap + cluster
+    let width = (1 + mark_width) + 4 + 1 + right_len; // left_fixed + name(4) + gap + cluster
     let (name, detail, pad) = row_layout(width, mark_width, "sess", "wont fit", right_len);
     assert_eq!(name, "sess");
     assert!(detail.is_empty());
