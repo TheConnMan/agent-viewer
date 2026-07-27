@@ -677,8 +677,9 @@ fn format_elapsed_buckets() {
 }
 
 #[test]
-fn rows_carry_summary_and_updated() {
+fn rows_carry_summary_created_and_updated() {
     let mut s = sess(BackendKind::Codex, "sx", "/p", 12_345, Status::Working);
+    s.created_at_ms = 1_000;
     s.summary = "one-line preview".to_string();
     let app = App::new(vec![s]);
     let rows = app.visible();
@@ -690,10 +691,12 @@ fn rows_carry_summary_and_updated() {
     match row {
         Row::Session {
             summary,
+            created_at_ms,
             updated_at_ms,
             ..
         } => {
             assert_eq!(summary, "one-line preview");
+            assert_eq!(*created_at_ms, 1_000);
             assert_eq!(*updated_at_ms, 12_345);
         }
         _ => unreachable!(),
