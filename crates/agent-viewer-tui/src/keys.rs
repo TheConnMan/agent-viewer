@@ -349,7 +349,10 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     // active list is empty.
     let suggesting = ui.composer.suggestions_active();
     let model_cmd = ui.composer.is_model_command();
+    let theme_cmd = ui.composer.is_theme_command();
     match key.code {
+        KeyCode::Down if theme_cmd => ui.themes.move_preview(1),
+        KeyCode::Up if theme_cmd => ui.themes.move_preview(-1),
         KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
         KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
         // Arrows navigate or act at all times.
@@ -366,14 +369,27 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             // captures Tab so it does not fall through to `cycle_backend`.
             ui.composer.accept_model();
         }
+        KeyCode::Tab if theme_cmd => {}
         KeyCode::Tab => ui.composer.cycle_backend(),
         KeyCode::BackTab => ui.composer.cycle_model(),
         KeyCode::Backspace => ui.composer.backspace(),
         // Esc dismisses an open popup first; a second Esc clears the composer as before.
+        KeyCode::Esc if theme_cmd => {
+            ui.themes.cancel_picker();
+            ui.composer.clear();
+        }
         KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
-            if ui.composer.model_picking() {
+            if theme_cmd {
+                let theme_id = ui.themes.commit_picker().to_string();
+                if let Some(db) = &ui.db
+                    && let Err(error) = agent_viewer_tui::ui::theme::persist_theme(db, &theme_id)
+                {
+                    ui.set_notice(format!("could not persist theme: {error}"));
+                }
+                ui.composer.clear();
+            } else if ui.composer.model_picking() {
                 // A /model picker is up: Enter picks the highlighted model.
                 ui.composer.accept_model();
             } else if ui.composer.is_model_command() {
@@ -409,6 +425,11 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             }
         }
         _ => {}
+    }
+    if ui.composer.is_theme_command() {
+        ui.themes.open_picker();
+    } else if ui.themes.picker_open() {
+        ui.themes.cancel_picker();
     }
     // Refresh the slash-command list for the (possibly new) backend/target and text.
     ensure_completions(ui);
@@ -590,6 +611,15 @@ pub(crate) mod tests {
         c: char,
         modifiers: KeyModifiers,
     ) -> bool {
+        press_normal_code(ui, backends, KeyCode::Char(c), modifiers)
+    }
+
+    fn press_normal_code(
+        ui: &mut Ui,
+        backends: &[Box<dyn agent_viewer_core::Backend>],
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> bool {
         ui.models.seed(
             BackendKind::Claude,
             vec![ui.composer.model().to_string()],
@@ -608,7 +638,7 @@ pub(crate) mod tests {
         .expect("fixed terminal");
 
         handle_normal_key(
-            key(KeyCode::Char(c), modifiers),
+            key(code, modifiers),
             modifiers.contains(KeyModifiers::CONTROL),
             backends,
             &refresher,
@@ -626,6 +656,7 @@ pub(crate) mod tests {
             notice: NoticeState::default(),
             db: None,
             composer: Composer::new(),
+            themes: agent_viewer_tui::ui::ThemeState::default(),
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
@@ -679,6 +710,7 @@ pub(crate) mod tests {
                         pr_status: &ui.pr_status,
                         logos: None,
                         list_hit: &ui.list_hit,
+                        themes: &ui.themes,
                     },
                 );
             })
@@ -2603,6 +2635,43 @@ pub(crate) mod tests {
         assert!(!composer.accept_model());
         assert_eq!(composer.model(), before_model);
         assert_eq!(composer.backend(), before_backend);
+    }
+
+    #[test]
+    fn theme_picker_escape_reverts_and_enter_persists() {
+        use agent_viewer_core::state::ViewerDb;
+        use agent_viewer_tui::ui::theme::{persist_theme, persisted_theme};
+
+        let directory = tempfile::tempdir().expect("viewer state");
+        let db = ViewerDb::open(&directory.path().join("viewer.db")).expect("viewer db");
+        persist_theme(&db, "amber").expect("seed theme");
+        let mut ui = test_ui_with(Vec::new());
+        ui.db = Some(db);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        for character in "/theme".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        assert!(ui.themes.picker_open());
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(ui.themes.active().id, "terminal");
+        press_normal_code(&mut ui, &backends, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ui.themes.active().id, "amber");
+        assert_eq!(
+            persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
+            Some("amber")
+        );
+
+        for character in "/theme".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ui.themes.active().id, "terminal");
+        assert_eq!(
+            persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
+            Some("terminal")
+        );
     }
 
     #[test]

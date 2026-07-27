@@ -6,7 +6,7 @@ use agent_viewer_core::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{App, Composer};
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::terminal_title::{format_terminal_title, set_terminal_title};
-use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, draw};
+use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, ThemeState, draw};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -38,6 +38,7 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
     let pulses = Pulses::new();
     let pr_status = PrStatusCache::new();
     let list_hit = RefCell::new(ListHit::default());
+    let themes = ThemeState::default();
     let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
 
     terminal
@@ -56,6 +57,7 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     pr_status: &pr_status,
                     logos: None,
                     list_hit: &list_hit,
+                    themes: &themes,
                 },
             );
         })

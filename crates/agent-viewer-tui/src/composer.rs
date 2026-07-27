@@ -257,6 +257,10 @@ impl Composer {
         self.text == "/model" || self.text.starts_with("/model ")
     }
 
+    pub fn is_theme_command(&self) -> bool {
+        self.text.trim_end() == "/theme"
+    }
+
     /// The filter typed after `/model` (empty for the bare command).
     fn model_filter(&self) -> &str {
         self.text
