@@ -23,7 +23,10 @@ use std::path::Path;
 
 #[cfg(test)]
 use composer::{InputBox, MAX_LINES as COMPOSER_MAX_LINES, draw_input_box, wrap_by_width};
-use composer::{box_height as composer_box_height, input_box_height, input_inner_width};
+use composer::{
+    box_height_for_viewport as composer_box_height, caret_visible, input_box_height,
+    input_inner_width,
+};
 use list::{pr_badge, rename_buffer, rename_row_item, row_to_item, status_display_word};
 pub use theme::{Theme, ThemeState};
 
@@ -323,7 +326,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             let prefix = format!("↳ reply {title_seg}❯ ");
             input_box_height(display_width(&prefix), &m.buffer, inner_w)
         }
-        _ => composer_box_height(d.composer.text(), inner_w),
+        _ => composer_box_height(d.composer.text(), inner_w, frame.area().height),
     };
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
@@ -383,7 +386,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             d.logos,
             theme,
             vertical[3],
-            matches!(d.mode, Mode::Normal),
+            matches!(d.mode, Mode::Normal) && caret_visible(d.now_ms, theme.animation),
         );
     }
     draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, theme, vertical[4]);
@@ -1319,29 +1322,22 @@ mod tests {
         assert!(metadata.contains("gpt-5.3-codex"));
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
-        assert!(
-            metadata.starts_with(&format!(
-                "│{}codex",
-                backend_mark(BackendKind::Codex, themes.active())
-            )),
-            "compact metadata: {metadata:?}"
-        );
-        // The input begins immediately inside the border, leaving no horizontal padding.
-        assert_eq!(&rows[top + 2], &format!("│hello{}│", " ".repeat(43)));
-        assert_eq!((cursor.x, cursor.y), (6, (top + 2) as u16));
+        assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
+        assert_eq!(&rows[top + 2], &format!("│❯    hello▏{}│", " ".repeat(37)));
+        assert_eq!((cursor.x, cursor.y), (11, (top + 2) as u16));
     }
 
     #[test]
     fn composer_exact_width_input_adds_a_cursor_continuation_row() {
-        // A 12 column frame leaves 10 input columns after the borders, so 10 chars fill the
-        // row exactly and the cursor needs a continuation row below it.
+        // The gutter leaves five cells on the first row, so ten characters use a continuation
+        // row and the caret remains visible after the final character.
         let (rows, cursor) = render_viewer(12, 18, "0123456789", Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "│0123456789│");
-        assert_eq!(&rows[top + 3], "│          │");
-        assert_eq!(cursor, (1, (top + 3) as u16));
+        assert_eq!(&rows[top + 2], "│❯    01234│");
+        assert_eq!(&rows[top + 3], "│56789▏    │");
+        assert_eq!(cursor, (6, (top + 3) as u16));
     }
 
     #[test]
@@ -1350,13 +1346,12 @@ mod tests {
         let (rows, cursor) = render_viewer(12, 18, text, Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
-        // 10 input columns: "abcdef界gh" fills the first row, and the blank line survives.
-        assert_eq!(bottom - top + 1, 7);
-        assert_eq!(&rows[top + 2], "│abcdef界gh│");
-        assert_eq!(&rows[top + 3], "│          │");
-        assert_eq!(&rows[top + 4], "│ijklmnopqr│");
-        assert_eq!(&rows[top + 5], "│st        │");
-        assert_eq!(cursor, (3, (top + 5) as u16));
+        // The viewport cap scrolls the earlier lines while keeping the blank line and tail.
+        assert_eq!(bottom - top + 1, 6);
+        assert_eq!(&rows[top + 2], "│          │");
+        assert_eq!(&rows[top + 3], "│ijklmnopqr│");
+        assert_eq!(&rows[top + 4], "│st▏       │");
+        assert_eq!(cursor, (3, (top + 4) as u16));
     }
 
     #[test]
@@ -1428,21 +1423,20 @@ mod tests {
         // The list title begins directly after the status glyph and complete mark slot.
         assert_ne!(buf[(0, list_y as u16)].symbol(), " ");
         assert_eq!(buf[(1 + mark_width, list_y as u16)].symbol(), "a");
-        // Metadata begins with the mark in column 1 and its backend name follows the mark.
-        assert_eq!(buf[(1 + mark_width, (top + 1) as u16)].symbol(), "c");
-        // The task input also starts at column 1, directly inside its border.
-        assert_eq!(buf[(1, (top + 2) as u16)].symbol(), "t");
+        // Metadata uses a five cell mark field. The input uses the same gutter.
+        assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
+        assert_eq!(buf[(1, (top + 2) as u16)].symbol(), "❯");
+        assert_eq!(buf[(6, (top + 2) as u16)].symbol(), "t");
     }
 
     #[test]
     fn composer_wraps_the_input_at_word_boundaries() {
-        // A 20 column frame leaves 18 input columns. The text breaks after "wrap" rather than
-        // splitting "boundaries", and no wrapped row opens with the eaten space.
+        // The first row accounts for the gutter and breaks before the whole next word.
         let (rows, _) = render_viewer(20, 24, "wrap at word boundaries here", Mode::Normal);
         let (top, _) = composer_bounds(&rows);
 
-        assert_eq!(&rows[top + 2], "│wrap at word      │");
-        assert_eq!(&rows[top + 3], "│boundaries here   │");
+        assert_eq!(&rows[top + 2], "│❯    wrap at word │");
+        assert_eq!(&rows[top + 3], "│boundaries here▏  │");
     }
 
     #[test]
@@ -1454,9 +1448,9 @@ mod tests {
         let (rows, cursor) = render_viewer(20, 24, &text, Mode::Normal);
         let (top, bottom) = composer_bounds(&rows);
 
-        assert_eq!(bottom - top + 1, 13);
+        assert_eq!(bottom - top + 1, 8);
         assert!(rows[top + 1].contains("claude"));
-        assert!(rows[top + 2].contains("line05"));
+        assert!(rows[top + 2].contains("line10"));
         assert!(rows[bottom - 1].contains("line14"));
         assert_eq!(cursor, (7, (bottom - 1) as u16));
     }
