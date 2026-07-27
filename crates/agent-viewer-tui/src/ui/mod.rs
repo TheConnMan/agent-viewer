@@ -5,6 +5,7 @@ mod composer;
 mod header;
 mod list;
 mod overlay;
+mod palette;
 mod sprite;
 pub mod theme;
 
@@ -29,6 +30,7 @@ use composer::{
     input_inner_width,
 };
 use list::{pr_badge, rename_buffer, rename_row_item, row_to_item, status_display_word};
+pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use theme::{Theme, ThemeState};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -207,6 +209,7 @@ pub struct ReplyModal {
 /// composer and inline rename both live on the Normal list view.
 pub enum Mode {
     Normal,
+    Palette(PaletteState),
     Filter,
     Rename(RenameModal),
     Reply(ReplyModal),
@@ -423,6 +426,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     if matches!(d.mode, Mode::Help) {
         overlay::draw_help(frame, theme, frame.area());
     }
+    if let Mode::Palette(state) = d.mode {
+        palette::draw(frame, state, d.now_ms, theme);
+    }
 }
 
 /// Per-row decorations layered over the list model.
@@ -635,6 +641,7 @@ fn draw_footer(
 ) {
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
+        Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
         Mode::Help => Line::from("help — Esc/? to close"),
@@ -657,7 +664,7 @@ fn draw_footer(
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Ctrl+K palette · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme.muted),
                 ))
