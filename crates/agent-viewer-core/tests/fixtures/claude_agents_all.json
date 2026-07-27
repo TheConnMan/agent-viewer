@@ -64,6 +64,14 @@
     "name": "No State Task"
   },
   {
+    "pid": 888,
+    "cwd": "/home/user/proj/.worktrees/feature-x",
+    "kind": "interactive",
+    "startedAt": 1783710980000,
+    "sessionId": "sdkc0001-7777-4133-a473-d3d004454dd0",
+    "name": "feature-x-61"
+  },
+  {
     "id": "orph0001",
     "cwd": "/home/user/proj-orphan",
     "kind": "background",

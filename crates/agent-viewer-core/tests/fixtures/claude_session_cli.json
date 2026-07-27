@@ -1,0 +1,17 @@
+{
+  "pid": 111,
+  "sessionId": "work0001-6603-4ad5-be5b-f3ad6391d595",
+  "cwd": "/home/user/proj-working",
+  "startedAt": 1783659603260,
+  "procStart": "11809960",
+  "version": "2.1.220",
+  "peerProtocol": 1,
+  "kind": "bg",
+  "entrypoint": "cli",
+  "name": "Working Task",
+  "jobId": "work0001",
+  "updatedAt": 1783659603260,
+  "status": "busy",
+  "statusUpdatedAt": 1783659603260,
+  "bridgeSessionId": "session_01BGctU8M2eCfpvRuRWZZ6gV"
+}
