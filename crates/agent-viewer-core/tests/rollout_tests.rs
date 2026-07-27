@@ -1,11 +1,36 @@
 mod common;
 
+use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
     PendingApproval, TailState, TranscriptItem, pending_approval, read_session_meta,
     read_transcript, tail_state,
 };
+use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
+
+fn codex_session(rollout_path: Option<PathBuf>) -> Session {
+    Session {
+        backend: BackendKind::Codex,
+        id: "activity-session".to_string(),
+        short_id: None,
+        origin: SessionOrigin::Interactive,
+        title: "Activity session".to_string(),
+        cwd: PathBuf::from("/home/user/project"),
+        git_branch: None,
+        status: Status::Done,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path,
+        pr_refs: Vec::new(),
+        daemon_hosted: false,
+    }
+}
 
 // --- Preserved v1 tests (unchanged behavior) ---
 
@@ -88,6 +113,83 @@ fn transcript_excludes_empty_text_items() {
                 text: "world".to_string(),
             },
         ]
+    );
+}
+
+#[test]
+fn codex_turn_activity_normalizes_filters_and_tolerates_bad_timestamps() {
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"not-a-timestamp","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"bad time"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"missing time"}}]}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let backend = CodexBackend::new(PathBuf::from("/unused"));
+    let session = codex_session(Some(path));
+    assert_eq!(
+        backend
+            .turn_activity(&session, Duration::MAX)
+            .expect("activity"),
+        vec![1_783_717_630_000, 1_783_717_630_000]
+    );
+    assert!(
+        backend
+            .turn_activity(&session, Duration::ZERO)
+            .expect("old turns excluded")
+            .is_empty()
+    );
+}
+
+#[test]
+fn codex_turn_activity_is_tail_bounded_and_missing_is_empty() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("large.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-07-10T21:07:09.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"outside tail"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(file, "{}", "x".repeat(128 * 1024)).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-07-10T21:07:12.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"inside tail"}}]}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let backend = CodexBackend::new(PathBuf::from("/unused"));
+    assert_eq!(
+        backend
+            .turn_activity(&codex_session(Some(path)), Duration::MAX)
+            .expect("bounded activity"),
+        vec![1_783_717_632_000]
+    );
+    assert!(
+        backend
+            .turn_activity(&codex_session(None), Duration::MAX)
+            .expect("no transcript")
+            .is_empty()
+    );
+    assert!(
+        backend
+            .turn_activity(
+                &codex_session(Some(dir.path().join("missing.jsonl"))),
+                Duration::MAX
+            )
+            .expect("missing transcript")
+            .is_empty()
     );
 }
 

@@ -1,5 +1,6 @@
 mod common;
 
+use agent_viewer_core::Session;
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
     ClaudeBackend, SessionRegistryEntry, is_sdk_entrypoint, mark_sdk_companions, parse_agents_json,
@@ -9,6 +10,7 @@ use agent_viewer_core::claude::{
 use agent_viewer_core::codex::rollout::TranscriptItem;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Find the session whose title matches. parse_agents_json now returns `Vec<Session>`
 /// with the short id folded into `Session.short_id` (no more (Session, String) tuple).
@@ -418,6 +420,62 @@ fn read_claude_transcript_skips_text_empty_message() {
                 text: "a real reply".to_string(),
             },
         ]
+    );
+}
+
+fn claude_session(rollout_path: Option<PathBuf>) -> Session {
+    Session {
+        backend: BackendKind::Claude,
+        id: "activity-session".to_string(),
+        short_id: Some("activity".to_string()),
+        origin: SessionOrigin::Background,
+        title: "Activity session".to_string(),
+        cwd: PathBuf::from("/home/user/project"),
+        git_branch: None,
+        status: Status::Done,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path,
+        pr_refs: Vec::new(),
+        daemon_hosted: false,
+    }
+}
+
+#[test]
+fn claude_turn_activity_normalizes_filters_and_missing_is_empty() {
+    let backend = ClaudeBackend::with_binary("/unused/claude");
+    let path = common::fixture_path("claude_transcript.jsonl");
+    let session = claude_session(Some(path));
+    assert_eq!(
+        backend
+            .turn_activity(&session, Duration::MAX)
+            .expect("activity"),
+        vec![1_783_717_630_000, 1_783_717_631_250]
+    );
+    assert!(
+        backend
+            .turn_activity(&session, Duration::ZERO)
+            .expect("old turns excluded")
+            .is_empty()
+    );
+    assert!(
+        backend
+            .turn_activity(&claude_session(None), Duration::MAX)
+            .expect("no transcript")
+            .is_empty()
+    );
+    assert!(
+        backend
+            .turn_activity(
+                &claude_session(Some(PathBuf::from("/missing/claude.jsonl"))),
+                Duration::MAX
+            )
+            .expect("missing transcript")
+            .is_empty()
     );
 }
 

@@ -51,7 +51,7 @@ pub enum TailState {
 
 /// Read at most the final 64 KiB of `path` as text (lossy UTF-8). Shared by
 /// `tail_state` and `pending_approval` so both classify over the identical window.
-fn tail_window(path: &std::path::Path) -> Result<String> {
+pub(crate) fn tail_window(path: &std::path::Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let window: u64 = 64 * 1024;
@@ -282,4 +282,54 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
         }
     }
     Ok(items)
+}
+
+/// Read turn timestamps from the same final 64 KiB window used by status detection.
+pub(crate) fn read_turn_activity(
+    path: &std::path::Path,
+    window: std::time::Duration,
+) -> Result<Vec<i64>> {
+    let text = tail_window(path)?;
+    let (cutoff, now) = crate::activity_window(window);
+    let mut timestamps = Vec::new();
+    for line in text.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
+            continue;
+        };
+        if crate::json_str(&value, "type") != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if !matches!(
+            crate::json_str(payload, "role"),
+            Some("user") | Some("assistant")
+        ) {
+            continue;
+        }
+        let has_text = payload
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|chunk| {
+                    matches!(
+                        crate::json_str(chunk, "type"),
+                        Some("input_text") | Some("output_text")
+                    ) && crate::json_str(chunk, "text").is_some_and(|text| !text.is_empty())
+                })
+            });
+        if !has_text {
+            continue;
+        }
+        let Some(timestamp) = crate::json_str(&value, "timestamp")
+            .and_then(crate::rfc3339_millis)
+            .filter(|timestamp| (*timestamp >= cutoff) && (*timestamp <= now))
+        else {
+            continue;
+        };
+        timestamps.push(timestamp);
+    }
+    timestamps.sort_unstable();
+    Ok(timestamps)
 }

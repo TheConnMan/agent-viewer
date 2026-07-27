@@ -2331,6 +2331,37 @@ impl Backend for OpencodeBackend {
         }
     }
 
+    fn turn_activity(&self, session: &Session, window: Duration) -> Result<Vec<i64>> {
+        if !self.db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = crate::open_readonly(&self.db_path)?;
+        let (cutoff, now) = crate::activity_window(window);
+        let mut stmt = conn.prepare(
+            "SELECT time_created, data FROM message \
+             WHERE session_id = ?1 AND typeof(time_created) = 'integer' \
+             AND time_created >= ?2 AND time_created <= ?3 \
+             ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session.id, cutoff, now], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut timestamps = Vec::new();
+        for row in rows {
+            let (timestamp, data) = row?;
+            let Some(value) = crate::parse_json_line(&data) else {
+                continue;
+            };
+            if matches!(
+                crate::json_str(&value, "role"),
+                Some("user") | Some("assistant")
+            ) {
+                timestamps.push(timestamp);
+            }
+        }
+        Ok(timestamps)
+    }
+
     fn available_models(&self) -> Vec<String> {
         self.models_cache
             .get_or_init(|| {
