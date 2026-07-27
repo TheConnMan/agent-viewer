@@ -68,6 +68,64 @@ impl<W: io::Write> Drop for BracketedPasteGuard<W> {
     }
 }
 
+/// Apply a changed mouse-capture request once. Input handlers only update `Ui`, so unit tests
+/// never emit terminal control bytes; the live run loop calls this directly after each event.
+fn sync_mouse_capture<W: io::Write>(
+    writer: &mut W,
+    applied: &mut bool,
+    requested: bool,
+) -> io::Result<()> {
+    if *applied != requested {
+        keys::write_mouse_capture(writer, requested)?;
+        *applied = requested;
+    }
+    Ok(())
+}
+
+/// Route one terminal event, then synchronize mouse reporting with the input handler's
+/// requested UI state. Keeping the writer injectable makes the live bridge testable without
+/// writing control sequences to the invoking terminal.
+fn process_event<B: ratatui::backend::Backend, W: io::Write>(
+    event: Event,
+    backends: &[Box<dyn Backend>],
+    refresher: &Refresher,
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    writer: &mut W,
+    applied_mouse_capture: &mut bool,
+) -> io::Result<bool> {
+    let quit = match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            keys::handle_key(key, backends, refresher, ui, terminal)?
+        }
+        Event::Resize(_, _) => {
+            if let Some(key) = &ui.focused
+                && let Some(pty) = ui.attached.get_mut(key)
+            {
+                let size = terminal
+                    .size()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
+            }
+            false
+        }
+        Event::Mouse(me) => {
+            keys::handle_mouse_event(me, backends, ui, terminal)?;
+            false
+        }
+        Event::Paste(text) => {
+            keys::handle_paste(&text, ui);
+            false
+        }
+        _ => false,
+    };
+    if quit {
+        return Ok(true);
+    }
+    let _ = sync_mouse_capture(writer, applied_mouse_capture, ui.mouse_capture);
+    Ok(false)
+}
+
 /// The refresh worker's handles: newest-listing snapshots in, forced-refresh wakes out.
 struct Refresher {
     snapshots: Receiver<Snapshot>,
@@ -413,17 +471,20 @@ fn main() -> io::Result<()> {
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
-    // Mouse capture powers click/hover row selection on the list, and while attached it lets
-    // us forward real mouse reports to the child so the wheel scrolls the transcript instead
-    // of the terminal's alternate-scroll turning it into arrow keys codex reads as history
-    // navigation. It also swallows drag-select, and the Shift-to-override convention is not
-    // universal, so Ctrl+T toggles it off on demand (see `keys::set_mouse_capture`). Starts on
-    // to match `ui.mouse_capture`. Best-effort: a terminal that rejects the sequence leaves
-    // the keyboard nav.
+    // Mouse capture powers click/hover row selection on the list. Attached transcripts turn it
+    // off so ordinary terminal drag-selection works, and every return to the list restores it.
+    // Ctrl+T remains the manual override. Starts on to match `ui.mouse_capture`.
     let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let mut applied_mouse_capture = true;
     let result = {
         let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
-        run(&mut terminal, &action_backends, &refresher, &mut ui)
+        run(
+            &mut terminal,
+            &action_backends,
+            &refresher,
+            &mut ui,
+            &mut applied_mouse_capture,
+        )
     };
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -435,6 +496,7 @@ fn run(
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
+    applied_mouse_capture: &mut bool,
 ) -> io::Result<()> {
     loop {
         let now = now_ms();
@@ -522,28 +584,18 @@ fn run(
         } else {
             POLL
         };
-        if event::poll(poll)? {
-            match event::read()? {
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press
-                        && keys::handle_key(key, backends, refresher, ui, terminal)? =>
-                {
-                    return Ok(());
-                }
-                Event::Resize(_, _) => {
-                    if let Some(key) = &ui.focused
-                        && let Some(pty) = ui.attached.get_mut(key)
-                    {
-                        let size = terminal.size()?;
-                        let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
-                    }
-                }
-                Event::Mouse(me) => {
-                    keys::handle_mouse_event(me, backends, ui, terminal)?;
-                }
-                Event::Paste(text) => keys::handle_paste(&text, ui),
-                _ => {}
-            }
+        if event::poll(poll)?
+            && process_event(
+                event::read()?,
+                backends,
+                refresher,
+                ui,
+                terminal,
+                &mut io::stdout(),
+                applied_mouse_capture,
+            )?
+        {
+            return Ok(());
         }
     }
 }
@@ -864,6 +916,143 @@ mod tests {
             mouse_capture: true,
             mouse_press: None,
             terminal_palette: None,
+        }
+    }
+
+    #[test]
+    fn mouse_capture_terminal_sequences_follow_only_state_transitions() {
+        let mut output = Vec::new();
+        let mut applied = true;
+
+        sync_mouse_capture(&mut output, &mut applied, false).expect("disable mouse capture");
+        let disabled_len = output.len();
+        assert!(!applied);
+        assert!(disabled_len > 0, "disable must write a terminal sequence");
+
+        sync_mouse_capture(&mut output, &mut applied, false).expect("same state is a no-op");
+        assert_eq!(
+            output.len(),
+            disabled_len,
+            "unchanged state must not emit again"
+        );
+
+        sync_mouse_capture(&mut output, &mut applied, true).expect("enable mouse capture");
+        assert!(applied);
+        assert!(
+            output.len() > disabled_len,
+            "restoring list capture must write its terminal sequence"
+        );
+    }
+
+    #[test]
+    fn event_bridge_writes_mouse_sequences_for_attach_then_detach() {
+        const DISABLE_MOUSE_CAPTURE: &[u8] =
+            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+        const ENABLE_MOUSE_CAPTURE: &[u8] =
+            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+
+        let mut ui = test_ui(vec![session(
+            BackendKind::Opencode,
+            "attached",
+            1_000,
+            false,
+        )]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Opencode, "attached".to_string()))
+        );
+        let current_model = ui.composer.model().to_string();
+        ui.models
+            .seed(BackendKind::Claude, vec![current_model], true);
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend)];
+        let (_snapshots_tx, snapshots) = channel();
+        let (wake, _wake_rx) = channel();
+        let refresher = Refresher { snapshots, wake };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("test terminal");
+        let mut output = Vec::new();
+        let mut applied = true;
+
+        assert!(
+            !process_event(
+                Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Right,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                &backends,
+                &refresher,
+                &mut ui,
+                &mut terminal,
+                &mut output,
+                &mut applied,
+            )
+            .expect("attach event"),
+            "attach must not quit the viewer"
+        );
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert!(!ui.mouse_capture);
+        assert!(!applied);
+        assert_eq!(output, DISABLE_MOUSE_CAPTURE);
+
+        assert!(
+            !process_event(
+                Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(']'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                )),
+                &backends,
+                &refresher,
+                &mut ui,
+                &mut terminal,
+                &mut output,
+                &mut applied,
+            )
+            .expect("detach event"),
+            "detach must not quit the viewer"
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.mouse_capture);
+        assert!(applied);
+        assert_eq!(
+            output,
+            [DISABLE_MOUSE_CAPTURE, ENABLE_MOUSE_CAPTURE].concat(),
+        );
+    }
+
+    struct AttachingBackend;
+
+    impl Backend for AttachingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Opencode
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities {
+                attach: true,
+                ..agent_viewer_core::Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("listing is not exercised by the event bridge")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by the event bridge")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            Ok(command)
         }
     }
 

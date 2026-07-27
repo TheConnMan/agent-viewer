@@ -41,6 +41,16 @@ impl LogoMarks {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn halfblocks_for_test() -> anyhow::Result<LogoMarks> {
+        let picker = Picker::halfblocks();
+        Ok(LogoMarks {
+            claude: build_protocol(&picker, CLAUDE_SVG)?,
+            codex: build_protocol(&picker, CODEX_SVG)?,
+            opencode: build_protocol(&picker, OPENCODE_SVG)?,
+        })
+    }
+
     /// The fixed protocol for a backend's mark, for wrapping in `Image::new`.
     pub fn image(&self, backend: BackendKind) -> &Protocol {
         match backend {
