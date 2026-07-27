@@ -346,6 +346,12 @@ tested without a daemon):
   `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
   a no-op success); else a pid -> SIGTERM as before; else unsupported.
 
+**Host terminal palette forwarding.** Before entering the alternate screen, the TUI captures
+the host terminal foreground and background once and passes the cached pair to attached PTYs.
+An attached child that queries OSC 10 or OSC 11 receives the matching cached color. Capture is
+best effort: if either color is unavailable, no palette is forwarded and neither query receives
+a fabricated reply. Never use hard coded fallback colors.
+
 Transport: the control socket is a Unix socket that upgrades to RFC6455 WebSocket at `/rpc`
 (handshake URL `ws://localhost/rpc`), driven by blocking `tungstenite` over
 `std::os::unix::net::UnixStream` since this crate is synchronous. A client offering
