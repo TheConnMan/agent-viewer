@@ -131,10 +131,6 @@ pub struct App {
     root_cache: HashMap<PathBuf, PathBuf>,
     /// The armed (backend, id, armed_at_ms) for the two-stage Ctrl+X.
     armed_kill: Option<(BackendKind, String, i64)>,
-    /// The row expanded in place for an inline peek (keyed by session). Held in App so the
-    /// rebuild path can centrally collapse it the moment the selection diverges from it
-    /// (regroup / show-all / filter / cursor move), never rendering the wrong transcript.
-    expanded: Option<(BackendKind, String)>,
     /// Cached `hidden_count()` value, recomputed with the rows (it depends on exactly the
     /// same inputs), so the per-frame footer never re-filters the session list.
     hidden_rows: usize,
@@ -155,7 +151,6 @@ impl App {
             rows: Vec::new(),
             root_cache: HashMap::new(),
             armed_kill: None,
-            expanded: None,
             hidden_rows: 0,
             collapsed: HashSet::new(),
         };
@@ -238,10 +233,7 @@ impl App {
             .iter()
             .filter(|session| match &session.status {
                 Status::Done | Status::Error => true,
-                Status::Working
-                | Status::NeedsInput { .. }
-                | Status::Idle
-                | Status::Unknown => {
+                Status::Working | Status::NeedsInput { .. } | Status::Idle | Status::Unknown => {
                     false
                 }
             })
@@ -314,7 +306,6 @@ impl App {
         });
         if let Some(idx) = found {
             self.selected = idx;
-            self.sync_expanded();
             true
         } else {
             false
@@ -379,7 +370,6 @@ impl App {
         let len = self.rows.len();
         if len == 0 {
             self.selected = 0;
-            self.sync_expanded();
             return;
         }
         let step: i32 = if delta >= 0 { 1 } else { -1 };
@@ -403,19 +393,15 @@ impl App {
                 self.selected = c;
             }
         }
-        self.sync_expanded();
     }
 
     /// Mouse hit-test target: select the visible row at `idx` (an index into `visible()`),
     /// if it exists and is selectable (a header or session row, never a Spacer). Returns
-    /// whether the selection changed to a valid row. Mirrors `move_selection`'s post-move
-    /// `sync_expanded` so a mouse-driven selection collapses a stale peek the same way a
-    /// keyboard move does.
+    /// whether the selection changed to a valid row.
     pub fn select_visible_index(&mut self, idx: usize) -> bool {
         match self.rows.get(idx) {
             Some(r) if !matches!(r, Row::Spacer) => {
                 self.selected = idx;
-                self.sync_expanded();
                 true
             }
             _ => false,
@@ -458,38 +444,8 @@ impl App {
         self.selected
     }
 
-    /// (backend, id) of the currently selected session row, if any.
-    fn selected_key(&self) -> Option<(BackendKind, String)> {
-        match self.rows.get(self.selected)? {
-            Row::Session { backend, id, .. } => Some((*backend, id.clone())),
-            _ => None,
-        }
-    }
-
-    /// Force the selected row's inline peek open (so the ask above a reply input is visible).
-    /// No-op-safe: leaves the expansion unset when nothing selectable is under the cursor.
-    pub fn expand_selected(&mut self) {
-        self.expanded = self.selected_key();
-    }
-
-    /// Space: toggle the inline peek expansion of the selected row (one at a time).
-    pub fn toggle_expanded(&mut self) {
-        let key = self.selected_key();
-        self.expanded = match (key, self.expanded.take()) {
-            (Some(k), Some(e)) if k == e => None, // already expanded -> collapse
-            (Some(k), _) => Some(k),
-            (None, _) => None,
-        };
-    }
-
-    /// The currently inline-expanded row, if any.
-    pub fn expanded(&self) -> Option<&(BackendKind, String)> {
-        self.expanded.as_ref()
-    }
-
-    /// The session behind a (backend, id) key (for resolving expansion content by the
-    /// EXPANDED key rather than the selection, which may have since diverged, and for the
-    /// rename flow which must target the row by id even after a reorder).
+    /// The session behind a (backend, id) key. Used by flows that must retain their target
+    /// even after a refresh reorders the list.
     pub fn session_for(&self, key: &(BackendKind, String)) -> Option<&Session> {
         self.find_session(key.0, &key.1)
     }
@@ -509,21 +465,9 @@ impl App {
             |r| matches!(r, Row::Session { backend, id, .. } if *backend == key.0 && *id == key.1),
         ) {
             self.selected = idx;
-            self.sync_expanded();
             true
         } else {
             false
-        }
-    }
-
-    /// Collapse the expansion whenever the selected row is no longer the expanded row (a
-    /// regroup / show-all / filter / cursor move landed elsewhere). Called after every
-    /// selection settle so a stale expansion can never render another session's transcript.
-    fn sync_expanded(&mut self) {
-        if let Some(e) = &self.expanded
-            && self.selected_key().as_ref() != Some(e)
-        {
-            self.expanded = None;
         }
     }
 
@@ -728,13 +672,11 @@ impl App {
         rows
     }
 
-    /// Clamp selection into bounds and snap it onto a Session row when possible, then sync
-    /// the inline expansion (collapse it if the selection has moved off the expanded row).
+    /// Clamp selection into bounds and snap it onto a Session row when possible.
     fn clamp_selection(&mut self) {
         let len = self.rows.len();
         if len == 0 {
             self.selected = 0;
-            self.sync_expanded();
             return;
         }
         if self.selected >= len {
@@ -754,7 +696,6 @@ impl App {
                 self.selected = found;
             }
         }
-        self.sync_expanded();
     }
 }
 
