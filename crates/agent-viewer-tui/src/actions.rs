@@ -12,6 +12,7 @@ use agent_viewer_core::{AttachRefusal, Session};
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
+use crate::keys::set_mouse_capture;
 use crate::ops::{Mutation, run_mutation};
 use crate::{Key, Refresher, Ui};
 
@@ -149,10 +150,10 @@ pub(crate) fn open_reply(_backends: &[Box<dyn Backend>], ui: &mut Ui) {
 }
 
 /// Reply is not supported by any backend.
-pub(crate) fn send_reply(
+pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     _backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    _terminal: &mut ratatui::DefaultTerminal,
+    _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     if !matches!(ui.mode, Mode::Reply(_)) {
         return Ok(());
@@ -383,6 +384,9 @@ fn attach_session<B: ratatui::backend::Backend>(
     ui.focused = Some(key);
     ui.focused_session = Some(session.clone());
     ui.mode = Mode::Attached;
+    // Attached transcripts default to native terminal selection. The run loop applies the
+    // matching terminal mode sequence after this action returns.
+    set_mouse_capture(ui, false);
     Ok(true)
 }
 
