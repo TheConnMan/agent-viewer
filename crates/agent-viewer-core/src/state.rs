@@ -8,6 +8,8 @@
 use crate::backend::{BackendKind, Session};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::Path;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS spawned (\
@@ -92,6 +94,38 @@ fn is_unusable_file(error: &crate::error::Error) -> bool {
     )
 }
 
+fn create_state_parent(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current);
+        current = current.parent().unwrap_or(current);
+    }
+
+    for directory in missing.into_iter().rev() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn restrict_database_files(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_os_string();
+        file.push(suffix);
+        let file = std::path::PathBuf::from(file);
+        if file.exists() {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
 /// An unresolved viewer-spawned session record (pin candidate awaiting a session id).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnRecord {
@@ -122,8 +156,11 @@ impl ViewerDb {
 
     /// tests: temp path.
     pub fn open(path: &std::path::Path) -> Result<ViewerDb> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            create_state_parent(parent)?;
         }
         let db = match ViewerDb::try_open(path) {
             Ok(db) => db,
@@ -153,6 +190,7 @@ impl ViewerDb {
         // Best effort: a lock contention failure here leaves the legacy tables in place for
         // the next open rather than discarding a usable DB.
         let _ = db.conn.execute_batch(DROP_LEGACY_TABLES);
+        restrict_database_files(path)?;
         Ok(db)
     }
 
@@ -417,6 +455,44 @@ impl ViewerDb {
                 rusqlite::params!["opencode.server_url"],
             )?;
             Ok(())
+        }
+    }
+
+    pub fn opencode_server_secret(&self) -> Result<String> {
+        use base64::Engine;
+        use std::io::Read;
+
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let existing = transaction.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params!["opencode.server_password"],
+            |row| row.get::<_, String>(0),
+        );
+        match existing {
+            Ok(secret) => {
+                transaction.commit()?;
+                Ok(secret)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let mut random = [0u8; 32];
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+                let candidate = base64::engine::general_purpose::STANDARD.encode(random);
+                transaction.execute(
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+                    rusqlite::params!["opencode.server_password", candidate],
+                )?;
+                let secret = transaction.query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    rusqlite::params!["opencode.server_password"],
+                    |row| row.get::<_, String>(0),
+                )?;
+                transaction.commit()?;
+                Ok(secret)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 

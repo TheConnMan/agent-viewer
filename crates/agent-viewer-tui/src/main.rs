@@ -6,7 +6,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_viewer_core::backend::{Backend, BackendKind, all_backends};
+use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencode};
+use agent_viewer_core::opencode::OpencodeRuntime;
 use agent_viewer_core::pty::{PtySession, TerminalPalette};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{SpawnRecord, ViewerDb, apply_viewer_state, match_spawn};
@@ -225,7 +226,7 @@ struct Ui {
     last_backend_error: String,
     /// Blocking backend mutations run off the render thread.
     mutations: MutationRunner,
-    /// Backend mutation boundary used by composer submission on the runner thread.
+    /// Backend mutation boundary used by every submission on the runner thread.
     mutation_executor: Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>,
     /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
     models: ModelCache,
@@ -366,7 +367,8 @@ fn main() -> io::Result<()> {
         Err(_) => None,
     };
 
-    let mut list_backends = all_backends();
+    let opencode_runtime = OpencodeRuntime::new();
+    let mut list_backends = all_backends_with_opencode(opencode_runtime.clone());
     let db = ViewerDb::open_default().ok();
 
     // Startup refresh BEFORE entering the alt screen so the first paint is not empty. If
@@ -428,6 +430,7 @@ fn main() -> io::Result<()> {
         models.request(backend);
     }
 
+    let mutation_runtime = opencode_runtime.clone();
     let mut ui = Ui {
         app,
         workspace,
@@ -438,7 +441,9 @@ fn main() -> io::Result<()> {
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
-        mutation_executor: Arc::new(ops::run_mutation),
+        mutation_executor: Arc::new(move |mutation| {
+            ops::run_mutation_with_opencode(mutation, mutation_runtime.clone())
+        }),
         models,
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
@@ -462,7 +467,7 @@ fn main() -> io::Result<()> {
     // those rows). Spawn used to be here too and is now a `Mutation::Spawn` on the runner,
     // because a codex spawn dials the daemon and may start one.
     let refresher = spawn_refresh_worker(list_backends);
-    let action_backends = all_backends();
+    let action_backends = all_backends_with_opencode(opencode_runtime);
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
