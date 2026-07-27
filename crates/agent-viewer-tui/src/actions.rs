@@ -443,7 +443,8 @@ pub(crate) fn spawn_from_composer(
         now_ms(),
         notice,
     );
-    if !ui.mutations.submit(key, move || run_mutation(mutation)) {
+    let executor = ui.mutation_executor.clone();
+    if !ui.mutations.submit(key, move || executor(mutation)) {
         return;
     }
     ui.set_notice(format!("spawning… on {}", backend_kind.name()));
@@ -455,9 +456,99 @@ pub(crate) fn spawn_from_composer(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_attach_refusal;
+    use super::{apply_attach_refusal, spawn_from_composer};
+    use crate::keys::handle_paste;
     use crate::keys::tests::{select_session_row, sess, test_ui_with};
-    use agent_viewer_core::AttachRefusal;
+    use crate::ops::Mutation;
+    use crate::Refresher;
+    use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session};
+    use agent_viewer_tui::mutations::MutationOutcome;
+    use std::sync::{Arc, Mutex, mpsc::channel};
+    use std::time::{Duration, Instant};
+
+    struct SpawnCapableBackend;
+
+    impl agent_viewer_core::Backend for SpawnCapableBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                spawn: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("listing is not exercised by composer submission")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("the external mutation executor must intercept spawn")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            unreachable!("attach is not exercised by composer submission")
+        }
+    }
+
+    fn inert_refresher() -> Refresher {
+        let (_snapshot_tx, snapshots) = channel();
+        let (wake, _wake_rx) = channel();
+        Refresher { snapshots, wake }
+    }
+
+    #[test]
+    fn multiline_paste_submits_once_only_when_the_composer_action_runs() {
+        let payload = "first line\nsecond line\nthird line";
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let mut ui = test_ui_with(vec![sess(
+            "spawn_target",
+            "/tmp/agentviewer_composer_submit",
+            100,
+        )]);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            match mutation {
+                Mutation::Spawn { task, .. } => recorded.lock().unwrap().push(task),
+                _ => panic!("composer submission must only execute spawn"),
+            }
+            Ok(MutationOutcome {
+                notice: "recorded".to_string(),
+                spawned: None,
+            })
+        });
+
+        handle_paste(payload, &mut ui);
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(ui.composer.text(), payload);
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(SpawnCapableBackend)];
+        spawn_from_composer(&backends, &inert_refresher(), &mut ui);
+
+        assert_eq!(ui.composer.text(), "");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "recording mutation executor did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(*calls.lock().unwrap(), vec![payload.to_string()]);
+        assert!(ui.mutations.poll().is_none());
+    }
 
     #[test]
     fn a_tailable_refusal_opens_the_live_read_only_tail() {

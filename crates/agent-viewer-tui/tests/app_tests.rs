@@ -736,6 +736,26 @@ fn composer_edit_and_backend_cycle() {
 }
 
 #[test]
+fn composer_bulk_append_keeps_one_multiline_draft_and_picker_state() {
+    let mut c = Composer::new();
+    c.cycle_backend();
+    c.set_models(
+        vec!["default".into(), "chosen".into()],
+        BackendKind::Codex,
+    );
+    c.cycle_model();
+    for ch in "/implement ".chars() {
+        c.push_char(ch);
+    }
+
+    c.push_str("first\r\n\r\nthird\n界");
+
+    assert_eq!(c.text(), "/implement first\n\nthird\n界");
+    assert_eq!(c.backend(), BackendKind::Codex);
+    assert_eq!(c.model(), "chosen");
+}
+
+#[test]
 fn spawn_target_by_project_is_group_root_by_state_is_cwd() {
     // A real git-marked project so project_root(sub) folds up to the repo root, letting the
     // two grouping modes yield different spawn targets.
