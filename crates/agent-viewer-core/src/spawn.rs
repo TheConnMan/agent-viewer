@@ -56,6 +56,11 @@ pub(crate) fn run_with_timeout(
     run_reporting_failure(cmd, timeout).ok()
 }
 
+/// How long a failed command's stderr may take to arrive once the child is gone. The pipe is
+/// at EOF by then, so this is slack for the reader thread to finish, not a real wait; a
+/// descendant still holding the pipe open must cost the caller this and no more.
+const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// `run_with_timeout` for callers that must TELL THE USER why it failed, returning the
 /// failure as a one-line diagnostic naming the command.
 ///
@@ -78,7 +83,10 @@ pub(crate) fn run_reporting_failure(
         .stdout
         .take()
         .ok_or_else(|| format!("`{described}` gave no stdout pipe"))?;
-    let mut stderr = child.stderr.take();
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("`{described}` gave no stderr pipe"))?;
     // A channel, not a join handle: a grandchild inheriting the pipe can hold it open past
     // the child's exit, and joining on that would block the caller with no deadline at all.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -87,21 +95,27 @@ pub(crate) fn run_reporting_failure(
         let read = stdout.read_to_end(&mut buf).is_ok();
         let _ = tx.send(read.then_some(buf));
     });
-    // stderr is small (a diagnostic line) and is only read once the child is gone, so it needs
-    // no reader thread of its own.
-    let mut drain_stderr = move || {
-        let mut buf = String::new();
-        if let Some(pipe) = stderr.as_mut() {
-            let _ = pipe.read_to_string(&mut buf);
-        }
-        buf.trim().to_string()
-    };
+    // stderr gets its OWN reader thread for both of the reasons stdout does: a command that
+    // writes more than the pipe buffer (64KB) blocks on write until someone reads, and a
+    // descendant that inherited the pipe can hold it open past the parent's exit. Draining it
+    // inline after the wait would turn either case into a hang past the deadline.
+    let (etx, erx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = etx.send(String::from_utf8_lossy(&buf).trim().to_string());
+    });
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    let why = drain_stderr();
+                    // Bounded: the reason is worth waiting a moment for, never forever.
+                    let why = erx
+                        .recv_timeout(STDERR_DRAIN_GRACE)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
                     let why = if why.is_empty() {
                         String::new()
                     } else {
@@ -248,6 +262,45 @@ mod tests {
         assert!(
             err.contains("timed out"),
             "a hung command must say so, got {err:?}"
+        );
+    }
+
+    /// Both pipes need a concurrent reader. A command that writes more than the pipe buffer
+    /// to stderr blocks on write until someone reads it, so draining stderr only after the
+    /// child exits deadlocks until the deadline and reports a timeout instead of the error.
+    #[test]
+    fn run_reporting_failure_survives_stderr_larger_than_the_pipe_buffer() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("yes stderr-noise | head -n 20000 >&2; exit 4");
+        let start = Instant::now();
+        let err = run_reporting_failure(cmd, Duration::from_secs(10)).unwrap_err();
+        assert!(
+            err.contains("exited") && err.contains("stderr-noise"),
+            "must report the exit and its stderr, got {} chars: {:?}",
+            err.len(),
+            &err[..err.len().min(120)]
+        );
+        assert!(
+            !err.contains("timed out"),
+            "a big stderr must not be mistaken for a hang"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "took too long");
+    }
+
+    /// A descendant that inherited stderr can hold the pipe open after the parent exits.
+    /// The reason is worth a moment, never an unbounded wait.
+    #[test]
+    fn run_reporting_failure_gives_up_on_stderr_a_grandchild_still_holds() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sh -c 'sleep 30' & exit 5");
+        let start = Instant::now();
+        let err = run_reporting_failure(cmd, Duration::from_secs(30)).unwrap_err();
+        assert!(err.contains("exited"), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "a held-open stderr pipe must not stall the caller, took {:?}",
+            start.elapsed()
         );
     }
 

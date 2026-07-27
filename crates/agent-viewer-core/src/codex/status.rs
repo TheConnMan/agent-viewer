@@ -117,16 +117,24 @@ pub fn open_rollout_paths() -> HashMap<PathBuf, RolloutOwner> {
 /// ARGV ALONE, because this single predicate is what keeps `stop` from SIGTERMing the daemon
 /// and every session inside it.
 ///
-/// The rule is `app-server` as the SUBCOMMAND (argv[1]) and `daemon` not the word after it.
-/// The live daemon's cmdline is `codex app-server --listen unix://` (captured from
-/// /proc/<pid>/cmdline), while the short-lived `codex app-server daemon version` /
-/// `daemon start` probes carry `daemon` and host nothing. Matching on `app-server` rather than
-/// on `--listen` errs toward calling a host a host: the costly mistake here is the FALSE
-/// NEGATIVE (Ctrl+X SIGTERMs a process hosting other people's threads), while a false positive
-/// only routes stop through `turn/interrupt`, which fails visibly instead of killing anything.
+/// The rule is `app-server` anywhere after argv[0], MINUS the two shapes where that word is
+/// not the subcommand. The live daemon's cmdline is `codex app-server --listen unix://`
+/// (captured from /proc/<pid>/cmdline).
 ///
-/// Position matters, not mere presence: a task prompt is a single argv token, so
-/// `codex exec ... "app-server"` would otherwise read as the daemon and lose its real pid.
+/// The asymmetry decides every judgement call here. A FALSE NEGATIVE means Ctrl+X SIGTERMs a
+/// process hosting other people's threads, killing all of them. A false positive only routes
+/// stop through `turn/interrupt`, which fails visibly and kills nothing. So the default is
+/// "this is a host", and only shapes proven otherwise are carved out:
+///
+///   1. `app-server daemon ...` - the short-lived `daemon version` / `daemon start` probes,
+///      which host nothing.
+///   2. the word appearing AFTER `exec` or `resume` - those are the two subcommands that take
+///      a free-text positional, so `codex exec ... "app-server"` is a user's task prompt, and
+///      reading it as the daemon would strip that session's real pid.
+///
+/// Deliberately NOT a fixed argv index: `codex -c key=value app-server --listen` is a real
+/// host whose subcommand is not argv[1], and requiring the index would hand its pid to SIGTERM.
+/// Anything unrecognised keeps the safe answer.
 ///
 /// This USED to also treat "holds more than one rollout fd" as proof of the daemon. That is
 /// measurably false and was removed: a plain
@@ -139,11 +147,24 @@ fn is_daemon_process(args: &[std::borrow::Cow<'_, str>]) -> bool {
     is_app_server(args)
 }
 
+/// The codex subcommands that take a free-text positional, so a word after one of them may be
+/// a user's prompt or a thread id rather than a subcommand of its own.
+const PROMPT_BEARING_SUBCOMMANDS: [&str; 2] = ["exec", "resume"];
+
 /// PURE: the argv test above, kept as its own name because it is what the rule reads as.
-/// argv[0] is the binary, so the subcommand is argv[1] and its own subcommand is argv[2].
 fn is_app_server(args: &[std::borrow::Cow<'_, str>]) -> bool {
-    let at = |i: usize| args.get(i).map(|arg| arg.as_ref());
-    at(1) == Some("app-server") && at(2) != Some("daemon")
+    // Start at 1: argv[0] is the binary path, and a codex installed at .../app-server/codex
+    // must not match on its own path.
+    let Some(at) = args.iter().skip(1).position(|arg| arg == "app-server") else {
+        return false;
+    };
+    let at = at + 1;
+    if args.get(at + 1).is_some_and(|arg| arg == "daemon") {
+        return false;
+    }
+    !args[1..at]
+        .iter()
+        .any(|arg| PROMPT_BEARING_SUBCOMMANDS.contains(&arg.as_ref()))
 }
 
 /// PURE: does this argv token have the shape of a codex thread id (a 36-char UUID)? Shape-based
@@ -338,6 +359,16 @@ mod tests {
         // a host, because the costly mistake is the false negative (SIGTERM on a process that
         // hosts other people's threads).
         assert!(is_daemon_process(&argv(&["codex", "app-server"])));
+        // Same reason: a host started with a global option before the subcommand is still a
+        // host. Requiring `app-server` at a fixed index would hand its pid to SIGTERM.
+        assert!(is_daemon_process(&argv(&[
+            "codex",
+            "-c",
+            "model=gpt-5",
+            "app-server",
+            "--listen",
+            "unix://",
+        ])));
 
         let not_daemons = [
             argv(&["codex", "exec", "--json", "-C", "/tmp", "do a thing"]),
@@ -365,9 +396,18 @@ mod tests {
             // host nothing. These are the reason the rule excludes `daemon`.
             argv(&["codex", "app-server", "daemon", "version"]),
             argv(&["codex", "app-server", "daemon", "start"]),
-            // A task prompt is ONE argv token, so a bare-presence test would score this
-            // ordinary exec session as the daemon and strip its real pid.
+            // A task prompt is ONE argv token, so a bare-presence test would score these
+            // ordinary sessions as the daemon and strip their real pids.
             argv(&["codex", "exec", "--json", "-C", "/tmp", "app-server"]),
+            argv(&["codex", "exec", "app-server", "daemon"]),
+            argv(&[
+                "codex",
+                "resume",
+                "019fa125-fa8e-7133-9aab-820742609be3",
+                "app-server",
+            ]),
+            // argv[0] alone is the binary path, never evidence of anything.
+            argv(&["/opt/app-server/codex", "exec", "do a thing"]),
             // sysinfo returns an empty argv for a process it could not read.
             argv(&[]),
         ];
