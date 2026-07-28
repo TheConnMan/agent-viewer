@@ -198,9 +198,10 @@ job and a finished one (waking it in place); a row with no background-job id fal
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
-While attached, the mouse wheel scrolls the child terminal transcript rather than its prompt
-history. This applies to attachable Codex, Claude, and external opencode sessions. Returning
-to the list restores its mouse behavior; `Ctrl+T` toggles either mode manually.
+While attached, the mouse wheel scrolls session content. Codex scrolls the viewer's retained
+transcript, while Claude and external opencode sessions receive the wheel in their attached
+terminal. Returning to the list restores its mouse behavior; `Ctrl+T` toggles either mode
+manually.
 
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new

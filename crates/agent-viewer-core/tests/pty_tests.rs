@@ -3,7 +3,7 @@
 //! gotcha is load-bearing: a 0x0 pty renders nothing (see memory
 //! pty-tui-testing-needs-winsize), so test 27 fails if the winsize is not set.
 
-use agent_viewer_core::pty::{PtySession, PtySpec, TerminalPalette};
+use agent_viewer_core::pty::{PtySession, PtySpec, TerminalPalette, VIEWPORT_SCROLLBACK_ROWS};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +16,7 @@ fn spec(program: &str, args: &[&str], rows: u16, cols: u16) -> PtySpec {
         envs: Vec::new(),
         rows,
         cols,
+        scrollback_rows: 0,
         palette: None,
     }
 }
@@ -35,6 +36,17 @@ fn wait_for_screen(session: &PtySession, timeout: Duration, needle: &str) -> boo
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn wait_for_scrollback(session: &PtySession, timeout: Duration, expected: usize) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if session.with_screen(|screen| screen.scrollback()) == expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
     false
 }
@@ -108,6 +120,192 @@ fn pty_resize_applies() {
     session.resize(30, 100).expect("resize");
     assert_eq!(session.with_screen(|s| s.size()), (30, 100));
     session.kill();
+}
+
+#[test]
+fn pty_viewport_follows_live_output_and_preserves_a_scrolled_view() {
+    let sync_file = sync_file("viewport-live");
+    let script = r#"
+        stty raw -echo
+        for index in $(seq 0 7); do
+            if [ "$index" -eq 7 ]; then
+                printf 'viewport-%04d' "$index"
+            else
+                printf 'viewport-%04d\r\n' "$index"
+            fi
+        done
+        printf initial > "$VIEWPORT_SYNC_FILE"
+        IFS= read -r -n 1 acknowledgement
+        [ "$acknowledgement" = a ] || exit 1
+
+        printf '\r\nviewport-0008'
+        printf live > "$VIEWPORT_SYNC_FILE"
+        IFS= read -r -n 1 acknowledgement
+        [ "$acknowledgement" = b ] || exit 1
+
+        printf '\r\nviewport-0009'
+        printf preserved > "$VIEWPORT_SYNC_FILE"
+        sleep 30
+    "#;
+    let mut session = PtySession::spawn(PtySpec {
+        scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        envs: vec![(
+            "VIEWPORT_SYNC_FILE".to_string(),
+            sync_file.to_string_lossy().into_owned(),
+        )],
+        ..spec("bash", &["-c", script], 4, 40)
+    })
+    .expect("spawn viewport probe");
+
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "initial"),
+        "the child did not finish the initial viewport"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "viewport-0007"),
+        "the initial live tail did not render"
+    );
+    assert_eq!(
+        session.with_screen(|screen| screen.scrollback()),
+        0,
+        "new sessions must begin at the live tail"
+    );
+
+    session.write_input(b"a").expect("release live tail update");
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "live"),
+        "the child did not emit the live tail update"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "viewport-0008"),
+        "offset zero did not follow new output"
+    );
+    assert_eq!(
+        session.with_screen(|screen| screen.scrollback()),
+        0,
+        "live output must not move a viewport already at the tail"
+    );
+
+    assert_eq!(session.scroll_viewport_up(2), 2);
+    let historical_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        historical_view.contains("viewport-0003"),
+        "scrolling up did not reveal history beyond the terminal height: {historical_view:?}"
+    );
+    assert!(
+        !historical_view.contains("viewport-0008"),
+        "the historical viewport still showed the live tail: {historical_view:?}"
+    );
+
+    session
+        .write_input(b"b")
+        .expect("release preserved viewport update");
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "preserved"),
+        "the child did not emit output while scrolled"
+    );
+    assert!(
+        wait_for_scrollback(&session, Duration::from_secs(5), 3),
+        "new output did not advance the offset to preserve the historical viewport"
+    );
+    assert_eq!(
+        session.with_screen(|screen| screen.contents()),
+        historical_view,
+        "new output changed the visible rows while the viewport was scrolled"
+    );
+
+    assert_eq!(session.scroll_viewport_down(1), 2);
+    assert_eq!(session.scroll_viewport_down(usize::MAX), 0);
+    let live_tail = session.with_screen(|screen| screen.contents());
+    assert!(
+        live_tail.contains("viewport-0009"),
+        "scrolling down to zero did not restore the newest output: {live_tail:?}"
+    );
+
+    session.kill();
+    std::fs::remove_file(sync_file).expect("remove viewport synchronization file");
+}
+
+#[test]
+fn pty_viewport_retains_exactly_two_thousand_history_rows() {
+    let sync_file = sync_file("viewport-bounded");
+    let script = r#"
+        stty raw -echo
+        for index in $(seq 0 2002); do
+            if [ "$index" -eq 2002 ]; then
+                printf 'bounded-%04d' "$index"
+            else
+                printf 'bounded-%04d\r\n' "$index"
+            fi
+        done
+        printf filled > "$VIEWPORT_SYNC_FILE"
+        IFS= read -r -n 1 acknowledgement
+        [ "$acknowledgement" = x ] || exit 1
+
+        printf '\r\nbounded-2003'
+        printf evicted > "$VIEWPORT_SYNC_FILE"
+        sleep 30
+    "#;
+    let mut session = PtySession::spawn(PtySpec {
+        scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        envs: vec![(
+            "VIEWPORT_SYNC_FILE".to_string(),
+            sync_file.to_string_lossy().into_owned(),
+        )],
+        ..spec("bash", &["-c", script], 3, 32)
+    })
+    .expect("spawn bounded viewport probe");
+
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "filled"),
+        "the child did not fill the scrollback"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "bounded-2002"),
+        "the newest row did not reach the live tail"
+    );
+    assert_eq!(
+        session.scroll_viewport_up(usize::MAX),
+        2_000,
+        "the viewport must clamp at exactly two thousand history rows"
+    );
+    let oldest_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        oldest_view.contains("bounded-0000") && oldest_view.contains("bounded-0002"),
+        "the oldest retained edge was not visible before eviction: {oldest_view:?}"
+    );
+
+    session
+        .write_input(b"x")
+        .expect("release the first bounded eviction");
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "evicted"),
+        "the child did not emit the row that forces eviction"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "bounded-0003"),
+        "the oldest viewport did not advance after bounded eviction"
+    );
+    assert_eq!(
+        session.scroll_viewport_up(usize::MAX),
+        2_000,
+        "bounded history grew past two thousand rows"
+    );
+    let evicted_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        !evicted_view.contains("bounded-0000") && evicted_view.contains("bounded-0001"),
+        "the wrong edge was evicted from bounded history: {evicted_view:?}"
+    );
+
+    assert_eq!(session.scroll_viewport_down(usize::MAX), 0);
+    let newest_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        newest_view.contains("bounded-2003"),
+        "the newest retained edge was not visible at the live tail: {newest_view:?}"
+    );
+
+    session.kill();
+    std::fs::remove_file(sync_file).expect("remove bounded viewport synchronization file");
 }
 
 #[test]
@@ -292,6 +490,7 @@ fn pty_answers_fragmented_palette_queries_with_configured_colors() {
         printf 'palette-ok\n'
     "#;
     let mut session = PtySession::spawn(PtySpec {
+        scrollback_rows: 0,
         palette: Some(palette([0x12, 0x34, 0x56], [0xab, 0xcd, 0xef])),
         envs: vec![(
             ("PALETTE_SYNC_FILE").to_string(),
@@ -401,6 +600,7 @@ fn pty_keeps_palette_replies_and_concurrent_input_frames_intact() {
     "#;
     let session = Arc::new(Mutex::new(
         PtySession::spawn(PtySpec {
+            scrollback_rows: 0,
             palette: Some(palette([0x01, 0x23, 0x45], [0x67, 0x89, 0xab])),
             envs: vec![(
                 ("PALETTE_SYNC_FILE").to_string(),
