@@ -47,11 +47,13 @@ fn truncate_display_width(text: &str, width: usize) -> String {
     text[..end].to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn row_to_item(
     row: &Row,
     pulses: &Pulses,
     now_ms: i64,
     pr_status: &crate::pr_cache::PrStatusCache,
+    show_activity: bool,
     width: usize,
     title_width: usize,
     theme: &Theme,
@@ -78,6 +80,7 @@ pub(super) fn row_to_item(
             backend,
             id,
             summary,
+            activity,
             status,
             title,
             created_at_ms,
@@ -112,10 +115,12 @@ pub(super) fn row_to_item(
                     mark_color: backend_mark_color(*backend, theme),
                     name: title,
                     status,
+                    activity: activity.as_deref(),
                     summary,
                     pr: &pr_badge(pr_refs),
                     pr_color,
                     elapsed: &elapsed,
+                    show_activity,
                     width,
                     title_width,
                 },
@@ -177,18 +182,21 @@ struct SessionRow<'a> {
     mark_color: ratatui::style::Color,
     name: &'a str,
     status: &'a Status,
+    activity: Option<&'a str>,
     summary: &'a str,
     pr: &'a str,
     pr_color: ratatui::style::Color,
     elapsed: &'a str,
+    show_activity: bool,
     width: usize,
     title_width: usize,
 }
 
 fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     let word = status_display_word(row.status);
+    let activity_width = usize::from(row.show_activity) * 10;
     let (title, status, pr, summary, pad) = crate::app::row_layout(
-        row.width,
+        row.width.saturating_sub(activity_width),
         mark_width(row.mark),
         row.name,
         row.title_width,
@@ -204,6 +212,16 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         Span::raw(" "),
         Span::styled(status, fg(status_color(row.status, theme))),
     ];
+    if row.show_activity {
+        let ribbon = row.activity.unwrap_or("▁▁▁▁▁▁▁▁");
+        let color = if row.activity.is_some() && matches!(row.status, Status::Working) {
+            theme.accent
+        } else {
+            theme.faint
+        };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(ribbon.to_string(), fg(color)));
+    }
     let has_pr = !pr.is_empty();
     let has_summary = !summary.is_empty();
     if has_pr || has_summary {
@@ -223,6 +241,38 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+pub fn activity_ribbon(timestamps: &[i64], now_ms: i64, window_ms: i64) -> String {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if window_ms <= 0 {
+        return BLOCKS[0].to_string().repeat(8);
+    }
+
+    let start_ms = now_ms.saturating_sub(window_ms);
+    let mut buckets = [0usize; 8];
+    for timestamp in timestamps {
+        if *timestamp < start_ms || *timestamp > now_ms {
+            continue;
+        }
+        let elapsed = (*timestamp - start_ms) as i128;
+        let mut bucket = (elapsed * 8 / window_ms as i128) as usize;
+        bucket = bucket.min(7);
+        buckets[bucket] += 1;
+    }
+
+    let busiest = buckets.iter().copied().max().unwrap_or(0);
+    buckets
+        .into_iter()
+        .map(|count| {
+            if count == 0 || busiest == 0 {
+                BLOCKS[0]
+            } else {
+                let level = (count * 7).div_ceil(busiest);
+                BLOCKS[level]
+            }
+        })
+        .collect()
+}
+
 fn section_label(section: Section) -> &'static str {
     match section {
         Section::NeedsInput => "NEEDS INPUT",
@@ -237,5 +287,127 @@ fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) ->
         format!("▶ {label}  ({count} hidden)")
     } else {
         format!("▼ {label}  ({count})")
+    }
+}
+#[cfg(test)]
+mod activity_ribbon_tests {
+    use super::{SessionRow, activity_ribbon, session_line};
+    use agent_viewer_core::Status;
+
+    const HOUR_MS: i64 = 60 * 60 * 1_000;
+    const BUCKET_MS: i64 = HOUR_MS / 8;
+    const NOW_MS: i64 = HOUR_MS;
+
+    fn timestamps(counts: [usize; 8]) -> Vec<i64> {
+        counts
+            .into_iter()
+            .enumerate()
+            .flat_map(|(bucket, count)| {
+                std::iter::repeat_n(bucket as i64 * BUCKET_MS + BUCKET_MS / 2, count)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timestamp_series_buckets_to_stuck_cliff() {
+        assert_eq!(
+            activity_ribbon(&timestamps([8, 5, 2, 1, 0, 0, 0, 0]), NOW_MS, HOUR_MS),
+            "█▆▃▂▁▁▁▁"
+        );
+    }
+
+    #[test]
+    fn per_row_scaling_preserves_shape_across_volume() {
+        let low = activity_ribbon(&timestamps([1, 2, 3, 4, 3, 2, 1, 0]), NOW_MS, HOUR_MS);
+        let high = activity_ribbon(
+            &timestamps([10, 20, 30, 40, 30, 20, 10, 0]),
+            NOW_MS,
+            HOUR_MS,
+        );
+        assert_eq!(low, high);
+    }
+
+    #[test]
+    fn timestamps_outside_window_are_excluded() {
+        let mut series = timestamps([0, 0, 0, 0, 0, 0, 0, 1]);
+        series.extend([NOW_MS - HOUR_MS - 1, NOW_MS + 1]);
+        assert_eq!(activity_ribbon(&series, NOW_MS, HOUR_MS), "▁▁▁▁▁▁▁█");
+    }
+
+    #[test]
+    fn empty_series_is_a_flat_floor() {
+        assert_eq!(activity_ribbon(&[], NOW_MS, HOUR_MS), "▁▁▁▁▁▁▁▁");
+    }
+
+    fn rendered_row(width: usize, show_activity: bool, summary: &str) -> String {
+        let themes = crate::ui::ThemeState::default();
+        let theme = themes.active();
+        let line = session_line(
+            SessionRow {
+                glyph: "✽",
+                glyph_color: theme.accent,
+                mark: "[cx]",
+                mark_color: theme.cx,
+                name: "Activity session",
+                status: &Status::Working,
+                activity: Some("█▆▃▂▁▁▁▁"),
+                summary,
+                pr: "#42",
+                pr_color: theme.ok,
+                elapsed: "3m",
+                show_activity,
+                width,
+                title_width: 32,
+            },
+            theme,
+        );
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ribbon_width_gate_and_secondary_truncation_order() {
+        let summary = "summary ".repeat(30);
+        let wide = rendered_row(140, true, &summary);
+        assert!(wide.contains("█▆▃▂▁▁▁▁"));
+        assert!(wide.contains("#42"));
+        assert!(!wide.contains(&summary));
+
+        let narrow = rendered_row(100, false, &summary);
+        assert!(!narrow.contains("█▆▃▂▁▁▁▁"));
+        assert!(narrow.contains("#42"));
+    }
+
+    #[test]
+    fn working_row_without_activity_uses_faint_floor() {
+        let themes = crate::ui::ThemeState::default();
+        let theme = themes.active();
+        let line = session_line(
+            SessionRow {
+                glyph: "✽",
+                glyph_color: theme.accent,
+                mark: "[cx]",
+                mark_color: theme.cx,
+                name: "No activity",
+                status: &Status::Working,
+                activity: None,
+                summary: "",
+                pr: "",
+                pr_color: theme.ok,
+                elapsed: "3m",
+                show_activity: true,
+                width: 140,
+                title_width: 32,
+            },
+            theme,
+        );
+        let ribbon = line
+            .spans
+            .iter()
+            .find(|span| span.content == "▁▁▁▁▁▁▁▁")
+            .expect("flat activity ribbon");
+        assert_eq!(ribbon.style.fg, Some(theme.faint));
     }
 }

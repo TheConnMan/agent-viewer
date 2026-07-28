@@ -24,7 +24,8 @@ use std::path::Path;
 #[cfg(test)]
 use composer::{InputBox, MAX_LINES as COMPOSER_MAX_LINES, draw_input_box, wrap_by_width};
 use composer::{box_height as composer_box_height, input_box_height, input_inner_width};
-use list::{pr_badge, rename_buffer, rename_row_item, row_to_item, status_display_word};
+pub use list::activity_ribbon;
+use list::{rename_buffer, rename_row_item, row_to_item};
 pub use theme::{Theme, ThemeState};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -238,6 +239,23 @@ pub struct ListHit {
 }
 
 impl ListHit {
+    pub fn rendered_range(
+        &self,
+        row_count: usize,
+        lookahead: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.area.width == 0 || self.area.height == 0 {
+            return None;
+        }
+        let start = self.offset.min(row_count);
+        let end = self
+            .offset
+            .saturating_add(self.area.height as usize)
+            .saturating_add(lookahead)
+            .min(row_count);
+        Some(start..end)
+    }
+
     /// Reverse a terminal cell `(x, y)` to the selectable `visible()`-row index under it, if
     /// the point falls on a selectable row within the list area. Pure — unit-testable with no
     /// terminal. Returns `None` outside the area, on a blank spacer, or on a cell shadowed by
@@ -440,6 +458,8 @@ fn draw_list(
     area: Rect,
 ) -> ListHit {
     let width = area.width as usize;
+    let show_activity = width >= 126;
+    let layout_width = width.saturating_sub(usize::from(show_activity) * 10);
     let rows = app.visible();
     let desired_title_width = rows
         .iter()
@@ -450,8 +470,6 @@ fn draw_list(
         .max()
         .unwrap_or(0)
         .min(40);
-    // Resolve narrow viewport degradation once for the whole visible list. The smallest
-    // viable row width becomes the shared width, so individual summaries cannot move status.
     let title_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -471,13 +489,13 @@ fn draw_list(
                     *updated_at_ms
                 };
                 let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
-                let pr = pr_badge(pr_refs);
+                let pr = list::pr_badge(pr_refs);
                 let (visible_title, _, _, _, _) = crate::app::row_layout(
-                    width,
+                    layout_width,
                     mark_width(backend_mark(*backend, theme)),
                     title,
                     desired_title_width,
-                    status_display_word(status),
+                    list::status_display_word(status),
                     &pr,
                     summary,
                     display_width(&elapsed),
@@ -527,6 +545,7 @@ fn draw_list(
                         pulses,
                         now_ms,
                         pr_status,
+                        show_activity,
                         width,
                         title_width,
                         theme,
@@ -541,6 +560,7 @@ fn draw_list(
                     pulses,
                     now_ms,
                     pr_status,
+                    show_activity,
                     width,
                     title_width,
                     theme,
@@ -849,6 +869,82 @@ mod tests {
         assert_eq!(title.bg, theme.selbg);
         assert_eq!(summary.bg, theme.selbg);
         assert_ne!(title.fg, summary.fg);
+    }
+
+    fn render_activity_row(width: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut app = App::new(vec![Session {
+            backend: BackendKind::Codex,
+            id: "activity-row".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "Activity".into(),
+            cwd: "/tmp/agent-viewer-activity".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: "summary ".repeat(30),
+            pid: None,
+            rollout_path: None,
+            pr_refs: vec![agent_viewer_core::PrRef {
+                id: "42".into(),
+                href: None,
+            }],
+            daemon_hosted: false,
+        }]);
+        app.set_activity_ribbon(BackendKind::Codex, "activity-row", Some("█▆▃▂▁▁▁▁".into()));
+        let height = app.visible().len() as u16;
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::default();
+        let theme = theme::amber(false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    &app,
+                    &pulses,
+                    0,
+                    &pr_status,
+                    ListDeco { rename: None },
+                    None,
+                    &theme,
+                    Rect::new(0, 0, width, height),
+                );
+            })
+            .unwrap();
+        terminal
+    }
+
+    #[test]
+    fn activity_ribbon_renders_at_140_and_drops_before_pr_at_100() {
+        let wide = render_activity_row(140);
+        let wide_buffer = wide.backend().buffer();
+        let wide_text: String = (0..140).map(|x| wide_buffer[(x, 1)].symbol()).collect();
+        assert!(wide_text.contains("█▆▃▂▁▁▁▁"));
+        assert!(wide_text.contains("#42"));
+        assert!(!wide_text.contains(&"summary ".repeat(30)));
+
+        let narrow = render_activity_row(100);
+        let narrow_buffer = narrow.backend().buffer();
+        let narrow_text: String = (0..100).map(|x| narrow_buffer[(x, 1)].symbol()).collect();
+        assert!(!narrow_text.contains("█▆▃▂▁▁▁▁"));
+        assert!(narrow_text.contains("#42"));
+    }
+
+    #[test]
+    fn activity_request_range_is_viewport_plus_lookahead_not_full_list() {
+        let hit = ListHit {
+            area: Rect::new(0, 0, 140, 20),
+            offset: 2_000,
+            item_to_row: Vec::new(),
+            blocked: None,
+        };
+        assert_eq!(hit.rendered_range(4_000, 8), Some(2_000..2_028));
+        assert_eq!(ListHit::default().rendered_range(4_000, 8), None);
     }
 
     #[test]

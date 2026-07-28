@@ -47,10 +47,115 @@ const PULSE_MS: i64 = 400;
 /// Abandoned spawn records (no matching session after this long) are deleted.
 const SPAWN_ABANDON_MS: i64 = 600_000;
 const PALETTE_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
+const ACTIVITY_WINDOW: Duration = Duration::from_secs(60 * 60);
+const ACTIVITY_REFRESH_MS: i64 = 30_000;
+const ACTIVITY_LOOKAHEAD: usize = 8;
 
 type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
 type Snapshot = (Vec<Session>, String, usize);
+type ActivityResult = (BackendKind, String, Option<String>);
+
+struct ActivityRequest {
+    sessions: Vec<Session>,
+    now_ms: i64,
+}
+
+struct ActivityEntry {
+    transcript_version: i64,
+    fetched_at_ms: i64,
+    timestamps: Vec<i64>,
+}
+
+struct ActivityWorker {
+    requests: Sender<ActivityRequest>,
+    results: Receiver<ActivityResult>,
+}
+
+impl ActivityWorker {
+    fn new(backends: Vec<Box<dyn Backend>>) -> ActivityWorker {
+        let (request_tx, request_rx) = channel::<ActivityRequest>();
+        let (result_tx, result_rx) = channel::<ActivityResult>();
+        thread::spawn(move || {
+            let mut cache = HashMap::new();
+            while let Ok(request) = request_rx.recv() {
+                for result in
+                    activity_results(&backends, &mut cache, request.sessions, request.now_ms)
+                {
+                    if result_tx.send(result).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        ActivityWorker {
+            requests: request_tx,
+            results: result_rx,
+        }
+    }
+
+    fn request(&self, sessions: Vec<Session>, now_ms: i64) {
+        let _ = self.requests.send(ActivityRequest { sessions, now_ms });
+    }
+
+    fn poll(&self) -> Option<ActivityResult> {
+        self.results.try_recv().ok()
+    }
+}
+
+fn activity_results(
+    backends: &[Box<dyn Backend>],
+    cache: &mut HashMap<Key, ActivityEntry>,
+    sessions: Vec<Session>,
+    now_ms: i64,
+) -> Vec<ActivityResult> {
+    let mut results = Vec::with_capacity(sessions.len());
+    let mut seen = HashSet::new();
+    for session in sessions {
+        let key = (session.backend, session.id.clone());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let should_read = match cache.get(&key) {
+            None => true,
+            Some(entry) => {
+                entry.transcript_version != session.updated_at_ms
+                    && now_ms - entry.fetched_at_ms >= ACTIVITY_REFRESH_MS
+            }
+        };
+        if should_read {
+            let timestamps = backends
+                .iter()
+                .find(|backend| backend.kind() == session.backend)
+                .and_then(|backend| backend.turn_activity(&session, ACTIVITY_WINDOW).ok())
+                .unwrap_or_default();
+            cache.insert(
+                key.clone(),
+                ActivityEntry {
+                    transcript_version: session.updated_at_ms,
+                    fetched_at_ms: now_ms,
+                    timestamps,
+                },
+            );
+        }
+        let ribbon = cache.get(&key).and_then(|entry| {
+            let start_ms = now_ms.saturating_sub(ACTIVITY_WINDOW.as_millis() as i64);
+            entry
+                .timestamps
+                .iter()
+                .any(|timestamp| *timestamp >= start_ms && *timestamp <= now_ms)
+                .then(|| {
+                    ui::activity_ribbon(
+                        &entry.timestamps,
+                        now_ms,
+                        ACTIVITY_WINDOW.as_millis() as i64,
+                    )
+                })
+        });
+        results.push((session.backend, session.id, ribbon));
+    }
+    results
+}
 
 struct BracketedPasteGuard<W: io::Write> {
     writer: W,
@@ -478,6 +583,8 @@ fn main() -> io::Result<()> {
     // `codex app-server daemon version` for a daemon-hosted row (about 34ms, and only for
     // those rows). Spawn used to be here too and is now a `Mutation::Spawn` on the runner,
     // because a codex spawn dials the daemon and may start one.
+    let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
+    let activity = ActivityWorker::new(activity_backends);
     let refresher = spawn_refresh_worker(list_backends);
     let action_backends = all_backends_with_opencode(opencode_runtime);
 
@@ -494,6 +601,7 @@ fn main() -> io::Result<()> {
             &mut terminal,
             &action_backends,
             &refresher,
+            &activity,
             &mut ui,
             &mut applied_mouse_capture,
         )
@@ -507,11 +615,16 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
+    activity: &ActivityWorker,
     ui: &mut Ui,
     applied_mouse_capture: &mut bool,
 ) -> io::Result<()> {
+    let mut last_activity_request_ms = None;
     loop {
         let now = now_ms();
+        while let Some((backend, id, ribbon)) = activity.poll() {
+            ui.app.set_activity_ribbon(backend, &id, ribbon);
+        }
         if ui
             .pending_spawn
             .as_ref()
@@ -590,6 +703,28 @@ fn run(
                 },
             );
         })?;
+
+        let activity_due = last_activity_request_ms
+            .is_none_or(|last| now.saturating_sub(last) >= ACTIVITY_REFRESH_MS);
+        if activity_due
+            && !matches!(ui.mode, Mode::Attached)
+            && let Some(range) = ui
+                .list_hit
+                .borrow()
+                .rendered_range(ui.app.visible().len(), ACTIVITY_LOOKAHEAD)
+        {
+            let sessions = ui.app.visible()[range]
+                .iter()
+                .filter_map(|row| match row {
+                    Row::Session { backend, id, .. } => {
+                        ui.app.session_for(&(*backend, id.clone())).cloned()
+                    }
+                    _ => None,
+                })
+                .collect();
+            activity.request(sessions, now);
+            last_activity_request_ms = Some(now);
+        }
 
         // Animate the list faster while there are working/needs-input rows or a live bloom.
         let poll = if wants_fast_ticks(ui) {
@@ -853,7 +988,10 @@ mod tests {
         io as test_io,
         panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
-        sync::{Arc as TestArc, Mutex},
+        sync::{
+            Arc as TestArc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     const CWD: &str = "/tmp";
@@ -1074,6 +1212,101 @@ mod tests {
             command.args(["-c", "sleep 30"]);
             Ok(command)
         }
+    }
+
+    struct CountingActivityBackend {
+        reads: TestArc<AtomicUsize>,
+        timestamps: Vec<i64>,
+    }
+
+    impl Backend for CountingActivityBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Codex
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("listing is not exercised by the activity cache")
+        }
+
+        fn turn_activity(
+            &self,
+            _session: &Session,
+            _window: Duration,
+        ) -> agent_viewer_core::Result<Vec<i64>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.timestamps.clone())
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by the activity cache")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attaching is not exercised by the activity cache")
+        }
+    }
+
+    #[test]
+    fn repeated_renders_do_not_repeat_backend_activity_reads() {
+        const NOW_MS: i64 = 3_600_000;
+        let reads = TestArc::new(AtomicUsize::new(0));
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(CountingActivityBackend {
+            reads: reads.clone(),
+            timestamps: vec![3_100_000, 3_200_000, 3_300_000],
+        })];
+        let session = session(BackendKind::Codex, "active", 1_000, false);
+        let mut cache = HashMap::new();
+        let first = activity_results(&backends, &mut cache, vec![session.clone()], NOW_MS);
+        let second = activity_results(
+            &backends,
+            &mut cache,
+            vec![session.clone()],
+            NOW_MS + ACTIVITY_REFRESH_MS,
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(first[0].2, second[0].2);
+
+        let mut ui = test_ui(vec![session]);
+        ui.app
+            .set_activity_ribbon(first[0].0, &first[0].1, first[0].2.clone());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    ui::draw(
+                        frame,
+                        ui::Draw {
+                            app: &ui.app,
+                            workspace: &ui.workspace,
+                            mode: &ui.mode,
+                            notice: ui.notice.text(),
+                            composer: &ui.composer,
+                            pulses: &ui.pulses,
+                            now_ms: NOW_MS,
+                            attach: None,
+                            pr_status: &ui.pr_status,
+                            logos: None,
+                            list_hit: &ui.list_hit,
+                            themes: &ui.themes,
+                        },
+                    );
+                })
+                .unwrap();
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     fn apply_listing(ui: &mut Ui, sessions: Vec<Session>) {
