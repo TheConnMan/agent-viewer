@@ -6,9 +6,10 @@ use agent_viewer_core::codex::rollout::{
     read_transcript, tail_state,
 };
 use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status};
+use common::rfc3339_at;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn codex_session(rollout_path: Option<PathBuf>) -> Session {
     Session {
@@ -133,6 +134,11 @@ fn codex_turn_activity_normalizes_filters_and_tolerates_bad_timestamps() {
         r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"missing time"}}]}}}}"#
     )
     .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-07-10T21:07:11.000Z","type":"response_item","payload":{{"type":"reasoning","role":"assistant","content":[{{"type":"output_text","text":"protocol noise"}}]}}}}"#
+    )
+    .unwrap();
     drop(file);
 
     let backend = CodexBackend::new(PathBuf::from("/unused"));
@@ -141,7 +147,7 @@ fn codex_turn_activity_normalizes_filters_and_tolerates_bad_timestamps() {
         backend
             .turn_activity(&session, Duration::MAX)
             .expect("activity"),
-        vec![1_783_717_630_000, 1_783_717_630_000]
+        vec![1_783_717_630_000, 1_783_717_630_000, 1_783_717_632_000,]
     );
     assert!(
         backend
@@ -152,19 +158,75 @@ fn codex_turn_activity_normalizes_filters_and_tolerates_bad_timestamps() {
 }
 
 #[test]
-fn codex_turn_activity_is_tail_bounded_and_missing_is_empty() {
+fn codex_turn_activity_reads_full_history_and_meaningful_calls() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("large.jsonl");
     let mut file = std::fs::File::create(&path).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let early_user = now - 50;
+    let call = now - 40;
+    let later_assistant = now - 10;
     writeln!(
         file,
-        r#"{{"timestamp":"2026-07-10T21:07:09.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"outside tail"}}]}}}}"#
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"before padding"}}]}}}}"#,
+        rfc3339_at(early_user)
     )
     .unwrap();
     writeln!(file, "{}", "x".repeat(128 * 1024)).unwrap();
     writeln!(
         file,
-        r#"{{"timestamp":"2026-07-10T21:07:12.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"inside tail"}}]}}}}"#
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"after padding"}}]}}}}"#,
+        rfc3339_at(later_assistant)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{{}}","call_id":"call_1"}}}}"#,
+        rfc3339_at(call)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch","input":"patch","call_id":"call_2"}}}}"#,
+        rfc3339_at(call)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"not-a-timestamp","type":"response_item","payload":{{"type":"function_call","name":"exec_command"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch"}}}}"#
+    )
+    .unwrap();
+    writeln!(file, "{{not json").unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call","name":""}}}}"#,
+        rfc3339_at(now - 35)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_1","output":"done"}}}}"#,
+        rfc3339_at(now - 30)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"function_call","name":"exec_command"}}}}"#,
+        rfc3339_at(now + 3_600)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"expired"}}]}}}}"#,
+        rfc3339_at(now - 7_200)
     )
     .unwrap();
     drop(file);
@@ -172,9 +234,23 @@ fn codex_turn_activity_is_tail_bounded_and_missing_is_empty() {
     let backend = CodexBackend::new(PathBuf::from("/unused"));
     assert_eq!(
         backend
-            .turn_activity(&codex_session(Some(path)), Duration::MAX)
-            .expect("bounded activity"),
-        vec![1_783_717_632_000]
+            .turn_activity(
+                &codex_session(Some(path.clone())),
+                Duration::from_secs(60 * 60)
+            )
+            .expect("full activity"),
+        vec![
+            early_user * 1_000,
+            call * 1_000,
+            call * 1_000,
+            later_assistant * 1_000,
+        ]
+    );
+    assert!(
+        backend
+            .turn_activity(&codex_session(Some(path)), Duration::ZERO)
+            .expect("old turns excluded")
+            .is_empty()
     );
     assert!(
         backend

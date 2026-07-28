@@ -148,8 +148,8 @@ viewer itself spawned, and `Ctrl+A` and `Ctrl+F` both surface companion rows.
 Path: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. Parse with `serde_json`
 line-by-line (`BufReader`). For the list, read only the **first line** (`session_meta`, has
 `payload.cwd`, `payload.id`, `payload.originator`, `cli_version`) and the **last few lines**
-for the terminal marker. The core also exposes full-file transcript readers for later
-surfaces. The TUI does not consume them.
+for the terminal marker. The core also exposes full-file transcript readers for the activity
+ribbon, which renders complete streamed Codex history including named tool activity.
 
 - Message content: `type:"response_item"`, `payload.role`, `payload.content[].text`
   (assistant text is `content[].type == "output_text"`).

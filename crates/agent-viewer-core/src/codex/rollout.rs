@@ -284,16 +284,23 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
     Ok(items)
 }
 
-/// Read turn timestamps from the same final 64 KiB window used by status detection.
+/// Read turn timestamps from the full rollout history.
 pub(crate) fn read_turn_activity(
     path: &std::path::Path,
     window: std::time::Duration,
 ) -> Result<Vec<i64>> {
-    let text = tail_window(path)?;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
     let (cutoff, now) = crate::activity_window(window);
     let mut timestamps = Vec::new();
-    for line in text.lines() {
-        let Some(value) = crate::parse_json_line(line) else {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line);
+        let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
         if crate::json_str(&value, "type") != Some("response_item") {
@@ -302,24 +309,27 @@ pub(crate) fn read_turn_activity(
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        if !matches!(
+        let text_activity = matches!(
             crate::json_str(payload, "role"),
             Some("user") | Some("assistant")
-        ) {
-            continue;
-        }
-        let has_text = payload
-            .get("content")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|content| {
-                content.iter().any(|chunk| {
-                    matches!(
-                        crate::json_str(chunk, "type"),
-                        Some("input_text") | Some("output_text")
-                    ) && crate::json_str(chunk, "text").is_some_and(|text| !text.is_empty())
-                })
-            });
-        if !has_text {
+        ) && matches!(crate::json_str(payload, "type"), Some("message") | None)
+            && payload
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|chunk| {
+                        matches!(
+                            crate::json_str(chunk, "type"),
+                            Some("input_text") | Some("output_text")
+                        ) && crate::json_str(chunk, "text").is_some_and(|text| !text.is_empty())
+                    })
+                });
+        let named_call = matches!(
+            crate::json_str(payload, "type"),
+            Some("function_call") | Some("custom_tool_call")
+        ) && crate::json_str(payload, "name").is_some_and(|name| !name.is_empty());
+        let meaningful = text_activity || named_call;
+        if !meaningful {
             continue;
         }
         let Some(timestamp) = crate::json_str(&value, "timestamp")
