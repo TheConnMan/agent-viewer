@@ -368,6 +368,9 @@ struct Ui {
     /// the terminal so the user can drag-select and copy; `handle_mouse` gates on this.
     mouse_capture: bool,
     mouse_press: Option<keys::MousePress>,
+    /// The header mascot on screen. Ctrl+G cycles it so the candidate sprites can be compared
+    /// live in one build.
+    sprite: ui::SpriteKind,
 }
 
 impl Ui {
@@ -581,6 +584,7 @@ fn main() -> io::Result<()> {
         list_hit: RefCell::new(ListHit::default()),
         mouse_capture: true,
         mouse_press: None,
+        sprite: ui::SpriteKind::default(),
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
@@ -706,6 +710,7 @@ fn run(
                     logos: ui.logos.as_ref(),
                     list_hit: &ui.list_hit,
                     themes: &ui.themes,
+                    sprite: ui.sprite,
                 },
             );
         })?;
@@ -1080,6 +1085,7 @@ mod tests {
             mouse_capture: true,
             mouse_press: None,
             terminal_palette: None,
+            sprite: ui::SpriteKind::default(),
         }
     }
 
@@ -1306,6 +1312,7 @@ mod tests {
                             logos: None,
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
+                    sprite: ui.sprite,
                         },
                     );
                 })

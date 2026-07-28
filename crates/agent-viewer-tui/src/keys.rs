@@ -323,6 +323,13 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     );
 }
 
+/// Swap the header mascot for the next candidate and say which one is now on screen, so the
+/// three can be judged against the same live fleet.
+fn cycle_sprite(ui: &mut Ui) {
+    ui.sprite = ui.sprite.next();
+    ui.set_notice(format!("sprite: {} (ctrl+g)", ui.sprite.label()));
+}
+
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
 /// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
 /// decision is unit-testable without a live terminal.
@@ -357,6 +364,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
         return Ok(false);
@@ -1081,6 +1089,7 @@ pub(crate) mod tests {
             list_hit: std::cell::RefCell::new(agent_viewer_tui::ui::ListHit::default()),
             mouse_capture: true,
             mouse_press: None,
+            sprite: Default::default(),
         }
     }
 
@@ -1121,6 +1130,7 @@ pub(crate) mod tests {
                         logos: None,
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
+                        sprite: ui.sprite,
                     },
                 );
             })
@@ -1156,6 +1166,7 @@ pub(crate) mod tests {
                         logos: None,
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
+                        sprite: ui.sprite,
                     },
                 );
             })
