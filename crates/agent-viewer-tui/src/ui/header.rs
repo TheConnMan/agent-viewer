@@ -254,16 +254,35 @@ mod tests {
         assert_ne!(constellation, turbine);
     }
 
+    /// Names round-trip through storage: a saved sprite must come back as the same sprite, and
+    /// anything unrecognized must fall back rather than resolving to some other mascot.
+    #[test]
+    fn sprite_names_round_trip_and_unknown_names_fall_back() {
+        for sprite in SpriteKind::ALL {
+            assert_eq!(SpriteKind::from_name(Some(sprite.name())), Some(sprite));
+        }
+        assert_eq!(
+            SpriteKind::from_name(Some(" turbine ")),
+            Some(SpriteKind::Turbine)
+        );
+        assert_eq!(SpriteKind::from_name(Some("nonsense")), None);
+        assert_eq!(SpriteKind::from_name(None), None);
+    }
+
     #[test]
     fn cycling_visits_every_sprite_and_returns_to_the_start() {
-        let start = SpriteKind::default();
-        let cycle = [start, start.next(), start.next().next()];
+        let mut sprite = SpriteKind::default();
+        let mut seen = Vec::new();
+        for _ in 0..SpriteKind::ALL.len() {
+            seen.push(sprite);
+            sprite = sprite.next();
+        }
 
-        assert_eq!(start, SpriteKind::Lighthouse);
-        assert_eq!(cycle[1], SpriteKind::Constellation);
-        assert_eq!(cycle[2], SpriteKind::Turbine);
-        assert_eq!(cycle[2].next(), start);
-        assert_eq!(cycle[1].label(), "constellation");
+        assert_eq!(sprite, SpriteKind::default(), "the cycle must close");
+        assert_eq!(seen.len(), SpriteKind::ALL.len());
+        for kind in SpriteKind::ALL {
+            assert!(seen.contains(&kind), "{} is unreachable", kind.name());
+        }
     }
 
     #[test]

@@ -390,6 +390,15 @@ impl Ui {
     }
 }
 
+/// The header mascot to open on: `AV_SPRITE` wins for a one-off look, then the persisted
+/// choice, then the default. An unknown name in either place falls back rather than erroring.
+fn startup_sprite(db: Option<&ViewerDb>) -> ui::SpriteKind {
+    let persisted = db.and_then(|db| db.header_sprite().ok().flatten());
+    ui::SpriteKind::from_name(std::env::var("AV_SPRITE").ok().as_deref())
+        .or_else(|| ui::SpriteKind::from_name(persisted.as_deref()))
+        .unwrap_or_default()
+}
+
 fn is_palette_response(event: &TerminaEvent) -> bool {
     let TerminaEvent::Osc(Osc::ChangeDynamicColors(slot, colors)) = event else {
         return false;
@@ -487,6 +496,7 @@ fn main() -> io::Result<()> {
     let mut list_backends = all_backends_with_opencode(opencode_runtime.clone());
     let db = ViewerDb::open_default().ok();
     let persisted_theme = db.as_ref().and_then(ui::theme::persisted_theme);
+    let startup_sprite = startup_sprite(db.as_ref());
     let (themes, theme_notices) = ui::ThemeState::load(
         ui::glyph_marks(),
         persisted_theme.as_deref(),
@@ -584,7 +594,7 @@ fn main() -> io::Result<()> {
         list_hit: RefCell::new(ListHit::default()),
         mouse_capture: true,
         mouse_press: None,
-        sprite: ui::SpriteKind::default(),
+        sprite: startup_sprite,
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
