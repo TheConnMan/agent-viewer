@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same branch/PR.
 concurrency:
   group: ci-${{ github.ref }}
@@ -40,3 +43,39 @@ jobs:
       # Live e2e tests are #[ignore] by default; a plain test run skips them.
       - name: Test
         run: cargo test --workspace
+
+  native-build:
+    name: build / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --workspace --locked --target ${{ matrix.target }}
+
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/debug/agent-viewer --version
+
+      - name: Smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "target/${{ matrix.target }}/debug/agent-viewer.exe" --version'
