@@ -35,7 +35,7 @@ Codex maintains a global session registry. Read it and its name index read only.
   `id TEXT PK`, `rollout_path TEXT`, `created_at`, `updated_at` / `updated_at_ms`,
   `source TEXT`, `cwd TEXT`, `title TEXT`, `archived INTEGER DEFAULT 0`, `archived_at`,
   `model TEXT` (read only for the model-picker fallback via `distinct_models`, not per row),
-  `preview TEXT`. Order by `updated_at_ms DESC`. Other columns exist in the schema
+  `preview TEXT`. Order by `updated_at_ms ASC`, retaining the existing `id DESC` tie break. Other columns exist in the schema
   (`git_branch`, `git_origin_url`, `first_user_message`, `thread_source`, `agent_nickname`,
   `agent_role`) but the reader does not load them.
 - `source` is a **serialized enum, not a flat string**. Observed values: `cli`, `exec`,
@@ -536,6 +536,8 @@ Cargo workspace. Live-refresh the registry every ~1-2s.
 
 - Single list: sessions grouped by project or state, with status glyphs based on
   opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
+  Project groups remain alphabetic and their members order by `created_at_ms` ascending.
+  State sections remain fixed and their members order by `updated_at_ms` ascending.
 - Keys: `Enter` attach/resume when the composer is empty, or spawn a composed task; bare letters
   and numbers type into the composer, including when empty, and `/` composes; `Ctrl+D` hide
   (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` toggles a selected group

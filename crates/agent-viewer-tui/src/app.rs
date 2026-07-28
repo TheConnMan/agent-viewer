@@ -638,7 +638,7 @@ impl App {
         let filtering = !self.filter.is_empty();
         let include_all = self.show_all || filtering;
 
-        // Visible session indices (exclusion + filter), recency DESC.
+        // Visible session indices (exclusion + filter), recency ASC.
         let mut indices: Vec<usize> = self
             .sessions
             .iter()
@@ -647,7 +647,7 @@ impl App {
             .filter(|(_, s)| self.passes_filter(s))
             .map(|(i, _)| i)
             .collect();
-        indices.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].updated_at_ms));
+        indices.sort_by_key(|&i| self.sessions[i].updated_at_ms);
 
         // Cache the suppressed-row count alongside the rows (same inputs, same lifetime).
         // While filtering, every match is shown, so nothing that matches is hidden.
@@ -724,7 +724,7 @@ impl App {
     /// ByProject: group by memoized project_root ACROSS backends. Groups are ordered by
     /// directory path (case-insensitive) so the list stays stable — starting or updating
     /// a session never reorders the groups. Sessions within a group are ordered by start
-    /// time (created_at_ms) DESC, newest first; start time never changes, so existing rows
+    /// time (created_at_ms) ASC, oldest first. Start time never changes, so existing rows
     /// don't shuffle when a session's activity updates.
     fn build_project_rows(&mut self, indices: &[usize]) -> Vec<Row> {
         let mut order: Vec<PathBuf> = Vec::new();
@@ -739,7 +739,7 @@ impl App {
         }
         // Stable group order: sort roots by path (case-insensitive), independent of any
         // session's recency, so a new session cannot move a group. Within each group,
-        // order by start time DESC.
+        // order by start time ASC.
         order.sort_by(|a, b| {
             a.to_string_lossy()
                 .to_lowercase()
@@ -747,7 +747,16 @@ impl App {
                 .then_with(|| a.cmp(b))
         });
         for members in by_root.values_mut() {
-            members.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].created_at_ms));
+            members.sort_by(|&a, &b| {
+                self.sessions[a]
+                    .created_at_ms
+                    .cmp(&self.sessions[b].created_at_ms)
+                    .then_with(|| {
+                        self.sessions[b]
+                            .updated_at_ms
+                            .cmp(&self.sessions[a].updated_at_ms)
+                    })
+            });
         }
         // Roots are computed above (the only &mut self borrow, via root_of); the emit loop
         // below reads self.collapsed / self.sessions immutably.

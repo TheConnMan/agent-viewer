@@ -226,7 +226,7 @@ pub trait Backend: Send {
         self.capabilities()
     }
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
-    /// Sessions are returned recency-sorted (updated_at_ms DESC).
+    /// Sessions are returned by updated_at_ms ascending.
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
     /// Epoch millisecond timestamps of turn events for `session` within the last
     /// `window`, oldest first. Empty when the backend cannot say.

@@ -86,15 +86,16 @@ fn group_by_project_orders_groups_by_directory_name() {
 }
 
 #[test]
-fn group_by_project_sorts_sessions_by_start_time_desc() {
+fn group_by_project_sorts_sessions_by_start_time_ascending() {
     let root = "/synthetic/root";
     // s_old started first (created 100) but was updated most recently (updated 900).
     // s_new started later (created 500) but updated earlier (updated 200).
-    // Sorting on start time DESC => s_new before s_old; sorting on updated_at would
-    // flip them, so this differential proves the key is created_at_ms.
+    // Equal creation values retain their input order even when update order disagrees.
     let sessions = vec![
-        sess_ct("s_old", root, 100, 900),
         sess_ct("s_new", root, 500, 200),
+        sess_ct("tie_z", root, 300, 800),
+        sess_ct("s_old", root, 100, 900),
+        sess_ct("tie_a", root, 300, 100),
     ];
     let groups = group_by_project(sessions);
     assert_eq!(
@@ -103,6 +104,6 @@ fn group_by_project_sorts_sessions_by_start_time_desc() {
             .iter()
             .map(|s| s.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["s_new", "s_old"]
+        vec!["s_old", "tie_z", "tie_a", "s_new"]
     );
 }
