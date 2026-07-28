@@ -844,7 +844,7 @@ fn truncate_to(s: &str, width: usize) -> String {
 /// Width math for one session row, kept pure so it is unit-testable.
 ///
 /// The row is
-/// `<glyph><mark><title><space><status><2sp><summary><space><pr><pad><elapsed>`.
+/// `<glyph><mark><title><space><status><2sp><summary><summary_gap><pad><pr><space><elapsed>`.
 /// The title keeps the supplied shared width whenever that column fits. Narrow rows may
 /// reduce it enough to retain complete secondary fields. The PR badge is always atomic.
 #[allow(clippy::too_many_arguments)]
@@ -928,6 +928,7 @@ pub fn row_layout(
         + UnicodeWidthStr::width(pr_out.as_str())
         + pr_summary_gap
         + UnicodeWidthStr::width(summary_out.as_str())
+        + 1
         + elapsed_width;
     let pad = width.saturating_sub(used);
     (title_out, status.to_string(), pr_out, summary_out, pad)

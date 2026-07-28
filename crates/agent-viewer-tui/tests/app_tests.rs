@@ -754,12 +754,14 @@ fn row_layout_pads_titles_so_every_status_starts_in_the_same_column() {
         + 2
         + UnicodeWidthStr::width(short_summary.as_str())
         + short_pad
+        + 1
         + elapsed_width;
     let long_used = status_start_after_long_title
         + UnicodeWidthStr::width(long_status.as_str())
         + 2
         + UnicodeWidthStr::width(long_summary.as_str())
         + long_pad
+        + 1
         + elapsed_width;
     assert_eq!(short_used, width);
     assert_eq!(long_used, width);
@@ -786,15 +788,17 @@ fn row_layout_keeps_pr_with_secondary_and_elapsed_flush_right_at_narrow_width() 
     assert!(!summary.is_empty());
     assert!(UnicodeWidthStr::width(title.as_str()) < 40);
 
+    let summary_pr_gap = usize::from(!summary.is_empty() && !pr.is_empty());
     let used = (1 + mark_width)
         + UnicodeWidthStr::width(title.as_str())
         + 1
         + UnicodeWidthStr::width(status.as_str())
         + 2
+        + UnicodeWidthStr::width(summary.as_str())
+        + summary_pr_gap
+        + pad
         + UnicodeWidthStr::width(pr.as_str())
         + 1
-        + UnicodeWidthStr::width(summary.as_str())
-        + pad
         + elapsed_width;
     assert_eq!(used, width);
 }
@@ -854,7 +858,16 @@ fn row_layout_shrinks_title_to_keep_one_complete_summary_grapheme() {
     assert!(pr.is_empty());
     assert!(UnicodeWidthStr::width(title.as_str()) < 20);
     assert!(summary.starts_with(first_grapheme));
-    assert!(pad >= 1);
+    let used = 2
+        + UnicodeWidthStr::width(title.as_str())
+        + 1
+        + UnicodeWidthStr::width(status.as_str())
+        + 2
+        + UnicodeWidthStr::width(summary.as_str())
+        + pad
+        + 1
+        + 2;
+    assert_eq!(used, 32);
 }
 
 #[test]
@@ -877,10 +890,14 @@ fn row_layout_truncates_titles_at_grapheme_boundaries() {
 fn row_layout_always_separates_elapsed_from_preceding_content() {
     let (title, status, pr, summary, pad) =
         row_layout(30, 1, "release", 7, "Done", "#9", "ready", 2);
-    let secondary = format!("{pr} {summary}");
-    let rendered = format!("{title} {status}  {secondary}{}3m", " ".repeat(pad));
+    let summary_pr_gap = " ".repeat(usize::from(!summary.is_empty() && !pr.is_empty()));
+    let rendered = format!(
+        "  {title} {status}  {summary}{summary_pr_gap}{}{pr} 3m",
+        " ".repeat(pad)
+    );
 
-    assert!(rendered.ends_with(" 3m"));
+    assert!(rendered.ends_with("#9 3m"));
+    assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 30);
 }
 
 #[test]
@@ -904,11 +921,21 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
         BackendKind::Claude,
         "done",
         "/synthetic/shared",
-        9_820_000,
+        9_100_000,
         Status::Done,
     );
     done.title = "Deploy".to_string();
     done.summary = "finished".to_string();
+    done.pr_refs = vec![
+        PrRef {
+            id: "41".to_string(),
+            href: None,
+        },
+        PrRef {
+            id: "42".to_string(),
+            href: None,
+        },
+    ];
 
     let app = App::new(vec![needs, done]);
     let mode = Mode::Normal;
@@ -969,8 +996,12 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     let needs_elapsed = column(needs_y, "2h").unwrap();
     let done_title = column(done_y, "Deploy").unwrap();
     let done_status = column(done_y, "Done").unwrap();
+    let done_pr = column(done_y, "2 PRs").unwrap();
     let done_summary = column(done_y, "finished").unwrap();
-    let done_elapsed = column(done_y, "3m").unwrap();
+    let done_elapsed = column(done_y, "15m").unwrap();
+    let needs_pr_right = needs_pr + "#315".len() as u16;
+    let done_pr_right = done_pr + "2 PRs".len() as u16;
+    let elapsed_column = done_elapsed;
 
     assert!(needs_title < needs_status);
     assert!(needs_status < needs_summary);
@@ -978,9 +1009,14 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     assert!(needs_pr < needs_elapsed);
     assert!(done_title < done_status);
     assert!(done_status < done_summary);
-    assert!(done_summary < done_elapsed);
+    assert!(done_summary < done_pr);
+    assert!(done_pr < done_elapsed);
     assert_eq!(needs_status, done_status);
     assert_eq!(needs_status - needs_title - 1, 40);
+    assert_eq!(needs_pr_right, done_pr_right);
+    assert_eq!(needs_pr_right + 1, elapsed_column);
+    assert_eq!(needs_elapsed, elapsed_column + 1);
+    assert_eq!(buffer[(elapsed_column, needs_y)].symbol(), " ");
     assert_eq!(buffer[(needs_pr, needs_y)].fg, theme::amber(false).accent);
     assert_eq!(
         buffer[(needs_summary, needs_y)].fg,
@@ -992,8 +1028,7 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     );
     assert_eq!(buffer[(done_summary, done_y)].fg, theme::amber(false).muted);
     assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::amber(false).muted);
-    assert_eq!(needs_elapsed + 2, width);
-    assert_eq!(done_elapsed + 2, width);
+    assert_eq!(done_elapsed + 3, width);
 }
 
 #[test]
