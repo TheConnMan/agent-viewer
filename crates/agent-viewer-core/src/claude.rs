@@ -843,36 +843,51 @@ pub fn read_claude_transcript(
     Ok(items)
 }
 
-/// Read turn timestamps from the final 64 KiB of a Claude transcript.
+/// Read turn timestamps from the full Claude transcript.
 fn read_claude_turn_activity(
     path: &std::path::Path,
     window: std::time::Duration,
 ) -> Result<Vec<i64>> {
-    let text = crate::codex::rollout::tail_window(path)?;
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
     let (cutoff, now) = crate::activity_window(window);
     let mut timestamps = Vec::new();
-    for line in text.lines() {
-        let Some(value) = crate::parse_json_line(line) else {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line);
+        let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
-        if !matches!(
-            crate::json_str(&value, "type"),
-            Some("user") | Some("assistant")
-        ) {
+        let Some(record_type) = crate::json_str(&value, "type") else {
+            continue;
+        };
+        if !matches!(record_type, "user" | "assistant") {
             continue;
         }
-        let has_text = match value
+        let meaningful = match value
             .get("message")
             .and_then(|message| message.get("content"))
         {
             Some(serde_json::Value::String(text)) => !text.is_empty(),
-            Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|block| {
-                crate::json_str(block, "type") == Some("text")
-                    && crate::json_str(block, "text").is_some_and(|text| !text.is_empty())
-            }),
+            Some(serde_json::Value::Array(blocks)) => {
+                blocks.iter().any(|block| {
+                    crate::json_str(block, "type") == Some("text")
+                        && crate::json_str(block, "text").is_some_and(|text| !text.is_empty())
+                }) || (record_type == "assistant"
+                    && blocks.iter().any(|block| {
+                        crate::json_str(block, "type") == Some("tool_use")
+                            && crate::json_str(block, "name").is_some_and(|name| !name.is_empty())
+                    }))
+            }
             _ => false,
         };
-        if !has_text {
+        if !meaningful {
             continue;
         }
         let Some(timestamp) = crate::json_str(&value, "timestamp")
