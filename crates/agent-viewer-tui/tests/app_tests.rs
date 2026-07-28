@@ -121,6 +121,7 @@ fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expect
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
@@ -1112,6 +1113,7 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
@@ -1222,6 +1224,7 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })

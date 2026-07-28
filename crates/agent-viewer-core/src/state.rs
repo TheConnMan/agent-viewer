@@ -405,6 +405,16 @@ impl ViewerDb {
         self.set_setting("sort_order", value)
     }
 
+    /// The header mascot, stored by name. The viewer owns the set of valid names; an unknown one
+    /// simply falls back to its default, so a downgrade cannot wedge the header.
+    pub fn header_sprite(&self) -> Result<Option<String>> {
+        self.setting("header_sprite")
+    }
+
+    pub fn set_header_sprite(&self, name: &str) -> Result<()> {
+        self.set_setting("header_sprite", name)
+    }
+
     pub fn retention_window_ms(&self) -> Result<i64> {
         Ok(self
             .setting("retention_window_ms")?

@@ -368,6 +368,9 @@ struct Ui {
     /// the terminal so the user can drag-select and copy; `handle_mouse` gates on this.
     mouse_capture: bool,
     mouse_press: Option<keys::MousePress>,
+    /// The header mascot on screen. Ctrl+G cycles it so the candidate sprites can be compared
+    /// live in one build.
+    sprite: ui::SpriteKind,
 }
 
 impl Ui {
@@ -385,6 +388,15 @@ impl Ui {
             self.pending_reply = None;
         }
     }
+}
+
+/// The header mascot to open on: `AV_SPRITE` wins for a one-off look, then the persisted
+/// choice, then the default. An unknown name in either place falls back rather than erroring.
+fn startup_sprite(db: Option<&ViewerDb>) -> ui::SpriteKind {
+    let persisted = db.and_then(|db| db.header_sprite().ok().flatten());
+    ui::SpriteKind::from_name(std::env::var("AV_SPRITE").ok().as_deref())
+        .or_else(|| ui::SpriteKind::from_name(persisted.as_deref()))
+        .unwrap_or_default()
 }
 
 fn is_palette_response(event: &TerminaEvent) -> bool {
@@ -484,6 +496,7 @@ fn main() -> io::Result<()> {
     let mut list_backends = all_backends_with_opencode(opencode_runtime.clone());
     let db = ViewerDb::open_default().ok();
     let persisted_theme = db.as_ref().and_then(ui::theme::persisted_theme);
+    let startup_sprite = startup_sprite(db.as_ref());
     let (themes, theme_notices) = ui::ThemeState::load(
         ui::glyph_marks(),
         persisted_theme.as_deref(),
@@ -581,6 +594,7 @@ fn main() -> io::Result<()> {
         list_hit: RefCell::new(ListHit::default()),
         mouse_capture: true,
         mouse_press: None,
+        sprite: startup_sprite,
     };
 
     // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
@@ -706,6 +720,7 @@ fn run(
                     logos: ui.logos.as_ref(),
                     list_hit: &ui.list_hit,
                     themes: &ui.themes,
+                    sprite: ui.sprite,
                 },
             );
         })?;
@@ -1080,6 +1095,7 @@ mod tests {
             mouse_capture: true,
             mouse_press: None,
             terminal_palette: None,
+            sprite: ui::SpriteKind::default(),
         }
     }
 
@@ -1315,6 +1331,7 @@ mod tests {
                             logos: None,
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
+                    sprite: ui.sprite,
                         },
                     );
                 })
