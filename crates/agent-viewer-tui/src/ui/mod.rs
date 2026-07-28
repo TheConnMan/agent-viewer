@@ -477,6 +477,27 @@ fn draw_list(
     };
     let layout_width = width.saturating_sub(project_width + usize::from(show_activity) * 10);
     let rows = app.visible();
+    let elapsed_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session {
+                created_at_ms,
+                updated_at_ms,
+                ..
+            } => {
+                let started_at_ms = if *created_at_ms > 0 {
+                    *created_at_ms
+                } else {
+                    *updated_at_ms
+                };
+                Some(display_width(&crate::app::format_elapsed(
+                    now_ms - started_at_ms,
+                )))
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
     let desired_title_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -494,17 +515,9 @@ fn draw_list(
                 title,
                 summary,
                 status,
-                created_at_ms,
-                updated_at_ms,
                 pr_refs,
                 ..
             } => {
-                let started_at_ms = if *created_at_ms > 0 {
-                    *created_at_ms
-                } else {
-                    *updated_at_ms
-                };
-                let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
                 let pr = list::pr_badge(pr_refs);
                 let (visible_title, _, _, _, _) = crate::app::row_layout(
                     layout_width,
@@ -514,7 +527,7 @@ fn draw_list(
                     list::status_display_word(status),
                     &pr,
                     summary,
-                    display_width(&elapsed),
+                    elapsed_width,
                 );
                 Some(display_width(&visible_title))
             }
@@ -565,6 +578,7 @@ fn draw_list(
                         project_width,
                         width,
                         title_width,
+                        elapsed_width,
                         theme,
                     ));
                     item_backends.push(Some(*backend));
@@ -581,6 +595,7 @@ fn draw_list(
                     project_width,
                     width,
                     title_width,
+                    elapsed_width,
                     theme,
                 ));
                 item_backends.push(None);

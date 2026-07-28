@@ -754,12 +754,14 @@ fn row_layout_pads_titles_so_every_status_starts_in_the_same_column() {
         + 2
         + UnicodeWidthStr::width(short_summary.as_str())
         + short_pad
+        + 1
         + elapsed_width;
     let long_used = status_start_after_long_title
         + UnicodeWidthStr::width(long_status.as_str())
         + 2
         + UnicodeWidthStr::width(long_summary.as_str())
         + long_pad
+        + 1
         + elapsed_width;
     assert_eq!(short_used, width);
     assert_eq!(long_used, width);
@@ -786,15 +788,17 @@ fn row_layout_keeps_pr_with_secondary_and_elapsed_flush_right_at_narrow_width() 
     assert!(!summary.is_empty());
     assert!(UnicodeWidthStr::width(title.as_str()) < 40);
 
+    let summary_pr_gap = usize::from(!summary.is_empty() && !pr.is_empty());
     let used = (1 + mark_width)
         + UnicodeWidthStr::width(title.as_str())
         + 1
         + UnicodeWidthStr::width(status.as_str())
         + 2
+        + UnicodeWidthStr::width(summary.as_str())
+        + summary_pr_gap
+        + pad
         + UnicodeWidthStr::width(pr.as_str())
         + 1
-        + UnicodeWidthStr::width(summary.as_str())
-        + pad
         + elapsed_width;
     assert_eq!(used, width);
 }
@@ -854,7 +858,16 @@ fn row_layout_shrinks_title_to_keep_one_complete_summary_grapheme() {
     assert!(pr.is_empty());
     assert!(UnicodeWidthStr::width(title.as_str()) < 20);
     assert!(summary.starts_with(first_grapheme));
-    assert!(pad >= 1);
+    let used = 2
+        + UnicodeWidthStr::width(title.as_str())
+        + 1
+        + UnicodeWidthStr::width(status.as_str())
+        + 2
+        + UnicodeWidthStr::width(summary.as_str())
+        + pad
+        + 1
+        + 2;
+    assert_eq!(used, 32);
 }
 
 #[test]
@@ -877,10 +890,14 @@ fn row_layout_truncates_titles_at_grapheme_boundaries() {
 fn row_layout_always_separates_elapsed_from_preceding_content() {
     let (title, status, pr, summary, pad) =
         row_layout(30, 1, "release", 7, "Done", "#9", "ready", 2);
-    let secondary = format!("{pr} {summary}");
-    let rendered = format!("{title} {status}  {secondary}{}3m", " ".repeat(pad));
+    let summary_pr_gap = " ".repeat(usize::from(!summary.is_empty() && !pr.is_empty()));
+    let rendered = format!(
+        "  {title} {status}  {summary}{summary_pr_gap}{}{pr} 3m",
+        " ".repeat(pad)
+    );
 
-    assert!(rendered.ends_with(" 3m"));
+    assert!(rendered.ends_with("#9 3m"));
+    assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 30);
 }
 
 #[test]
