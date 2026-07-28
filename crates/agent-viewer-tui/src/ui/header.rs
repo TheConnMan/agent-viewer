@@ -1,6 +1,9 @@
 use super::{
     fg,
-    sprite::{HEIGHT as SPRITE_HEIGHT, Lighthouse, WIDTH as SPRITE_WIDTH},
+    sprite::{
+        Constellation, Fleet, HEIGHT as SPRITE_HEIGHT, Lighthouse, SpriteKind, Turbine,
+        WIDTH as SPRITE_WIDTH,
+    },
     theme::Theme,
 };
 use crate::app::App;
@@ -36,6 +39,7 @@ pub(super) fn draw(
     workspace: &Path,
     now_ms: i64,
     theme: &Theme,
+    sprite: SpriteKind,
     area: Rect,
 ) {
     let show_sprite = area.height >= SPRITE_HEADER_HEIGHT && area.width >= COMFORTABLE_WIDTH;
@@ -63,10 +67,20 @@ pub(super) fn draw(
         .split(text_area);
 
     if show_sprite {
-        frame.render_widget(
-            Lighthouse::new(theme, lamp_color(app, theme), now_ms),
-            Rect::new(area.x, area.y, SPRITE_WIDTH, SPRITE_HEIGHT),
-        );
+        let slot = Rect::new(area.x, area.y, SPRITE_WIDTH, SPRITE_HEIGHT);
+        let lamp = lamp_color(app, theme);
+        match sprite {
+            SpriteKind::Lighthouse => {
+                frame.render_widget(Lighthouse::new(theme, lamp, now_ms), slot)
+            }
+            SpriteKind::Constellation => {
+                frame.render_widget(Constellation::new(theme, fleet(app), now_ms), slot)
+            }
+            SpriteKind::Turbine => frame.render_widget(
+                Turbine::new(theme, lamp, app.running_count(), now_ms),
+                slot,
+            ),
+        }
     }
 
     frame.render_widget(
@@ -120,6 +134,15 @@ fn lamp_color(app: &App, theme: &Theme) -> Color {
     }
 }
 
+/// The same three counts the header's totals line reports, handed to the sprite as data.
+fn fleet(app: &App) -> Fleet {
+    Fleet {
+        needs_input: app.needs_input_count(),
+        working: app.running_count(),
+        done: app.completed_count(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +181,17 @@ mod tests {
         composer_height: u16,
         now_ms: i64,
     ) -> Buffer {
+        render_sprite_header(app, theme, viewport, composer_height, now_ms, SpriteKind::Lighthouse)
+    }
+
+    fn render_sprite_header(
+        app: &App,
+        theme: &Theme,
+        viewport: Rect,
+        composer_height: u16,
+        now_ms: i64,
+        sprite: SpriteKind,
+    ) -> Buffer {
         let header_height = height(viewport, composer_height);
         let mut terminal = Terminal::new(TestBackend::new(viewport.width, header_height)).unwrap();
         terminal
@@ -168,6 +202,7 @@ mod tests {
                     Path::new("/tmp/project"),
                     now_ms,
                     theme,
+                    sprite,
                     Rect::new(0, 0, viewport.width, header_height),
                 );
             })
@@ -198,6 +233,56 @@ mod tests {
         assert_eq!(clear_buffer[(5, 1)].fg, theme.accent);
         assert_eq!(alert_buffer[(5, 1)].fg, theme.warn);
         assert_ne!(clear_buffer[(5, 1)].fg, alert_buffer[(5, 1)].fg);
+    }
+
+    #[test]
+    fn each_sprite_kind_draws_its_own_mascot_in_the_same_slot() {
+        let mut theme = super::super::theme::amber(false);
+        theme.animation = false;
+        let app = App::new(vec![session(Status::Working)]);
+        let viewport = Rect::new(0, 0, COMFORTABLE_WIDTH, 40);
+        let render = |sprite| render_sprite_header(&app, &theme, viewport, 3, 0, sprite);
+        let lighthouse = render(SpriteKind::Lighthouse);
+        let constellation = render(SpriteKind::Constellation);
+        let turbine = render(SpriteKind::Turbine);
+
+        for buffer in [&lighthouse, &constellation, &turbine] {
+            assert_eq!(block_count(buffer), 66);
+        }
+        assert_ne!(lighthouse, constellation);
+        assert_ne!(lighthouse, turbine);
+        assert_ne!(constellation, turbine);
+    }
+
+    /// Names round-trip through storage: a saved sprite must come back as the same sprite, and
+    /// anything unrecognized must fall back rather than resolving to some other mascot.
+    #[test]
+    fn sprite_names_round_trip_and_unknown_names_fall_back() {
+        for sprite in SpriteKind::ALL {
+            assert_eq!(SpriteKind::from_name(Some(sprite.name())), Some(sprite));
+        }
+        assert_eq!(
+            SpriteKind::from_name(Some(" turbine ")),
+            Some(SpriteKind::Turbine)
+        );
+        assert_eq!(SpriteKind::from_name(Some("nonsense")), None);
+        assert_eq!(SpriteKind::from_name(None), None);
+    }
+
+    #[test]
+    fn cycling_visits_every_sprite_and_returns_to_the_start() {
+        let mut sprite = SpriteKind::default();
+        let mut seen = Vec::new();
+        for _ in 0..SpriteKind::ALL.len() {
+            seen.push(sprite);
+            sprite = sprite.next();
+        }
+
+        assert_eq!(sprite, SpriteKind::default(), "the cycle must close");
+        assert_eq!(seen.len(), SpriteKind::ALL.len());
+        for kind in SpriteKind::ALL {
+            assert!(seen.contains(&kind), "{} is unreachable", kind.name());
+        }
     }
 
     #[test]

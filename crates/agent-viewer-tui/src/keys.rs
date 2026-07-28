@@ -10,7 +10,7 @@ use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, St
 use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::ui::{
-    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget,
+    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -320,6 +320,23 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     );
 }
 
+/// Ctrl+G advances the header mascot; the palette picks one directly. Both land here so the
+/// choice is announced and persisted the same way.
+fn cycle_sprite(ui: &mut Ui) {
+    set_sprite(ui, ui.sprite.next());
+}
+
+fn set_sprite(ui: &mut Ui, sprite: SpriteKind) {
+    ui.sprite = sprite;
+    if let Some(db) = &ui.db
+        && let Err(error) = db.set_header_sprite(sprite.name())
+    {
+        ui.set_notice(format!("sprite: {} (not saved: {error})", sprite.name()));
+        return;
+    }
+    ui.set_notice(format!("sprite: {} · ⌃G for the next", sprite.name()));
+}
+
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
 /// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
 /// decision is unit-testable without a live terminal.
@@ -354,6 +371,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
         return Ok(false);
@@ -468,6 +486,23 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
         })
         .unwrap_or_else(Capabilities::none);
     let mut items = palette_action_items(selected, capabilities);
+    items.extend(SpriteKind::ALL.into_iter().map(|sprite| {
+        let active = sprite == ui.sprite;
+        PaletteItem::new(
+            PaletteGroup::Sprites,
+            if active { "◉" } else { "○" },
+            sprite.name(),
+            if active {
+                format!("{} · showing now", sprite.detail())
+            } else {
+                sprite.detail().to_string()
+            },
+            (sprite == ui.sprite.next()).then_some("⌃G"),
+            true,
+            None,
+            PaletteTarget::Sprite(sprite),
+        )
+    }));
 
     let mut seen = HashSet::new();
     let mut sessions = ui
@@ -806,6 +841,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
         PaletteTarget::Model { backend, name } => {
             select_palette_model(ui, backend, name);
         }
+        PaletteTarget::Sprite(sprite) => set_sprite(ui, sprite),
         PaletteTarget::Command(command) => {
             ui.composer.clear();
             ui.composer.push_str(&format!("/{command} "));
@@ -1078,6 +1114,7 @@ pub(crate) mod tests {
             list_hit: std::cell::RefCell::new(agent_viewer_tui::ui::ListHit::default()),
             mouse_capture: true,
             mouse_press: None,
+            sprite: Default::default(),
         }
     }
 
@@ -1118,6 +1155,7 @@ pub(crate) mod tests {
                         logos: None,
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
+                        sprite: ui.sprite,
                     },
                 );
             })
@@ -1153,6 +1191,7 @@ pub(crate) mod tests {
                         logos: None,
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
+                        sprite: ui.sprite,
                     },
                 );
             })
@@ -2046,6 +2085,51 @@ pub(crate) mod tests {
         assert!(matches!(ui.mode, Mode::Normal));
         assert_eq!(ui.composer.model(), "opus[1m]");
         assert_eq!(ui.composer.text(), "existing draft");
+    }
+
+    /// The palette is the discoverable way to switch mascots, so searching one by name and
+    /// pressing Enter must actually swap the header sprite (not merely list it).
+    #[test]
+    fn palette_picks_a_header_sprite_by_name() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.push_str("existing draft");
+        open_palette(&[], &mut ui);
+        let mut terminal = test_terminal();
+        for character in "turbine".chars() {
+            handle_palette_key(
+                key(KeyCode::Char(character), KeyModifiers::NONE),
+                &[],
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("type palette query");
+        }
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("accept palette sprite");
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.sprite, super::SpriteKind::Turbine);
+        assert!(ui.notice.text().contains("turbine"));
+        assert_eq!(ui.composer.text(), "existing draft");
+    }
+
+    #[test]
+    fn ctrl_g_cycles_the_header_sprite() {
+        let mut ui = test_ui_with(Vec::new());
+        let start = ui.sprite;
+
+        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
+        assert_eq!(ui.sprite, start.next());
+
+        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
+        assert_eq!(ui.sprite, start.next().next());
+        assert_ne!(ui.sprite, start);
+        assert!(ui.notice.text().contains(ui.sprite.name()));
     }
 
     #[test]

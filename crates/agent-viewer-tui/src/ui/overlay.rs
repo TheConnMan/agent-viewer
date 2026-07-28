@@ -213,6 +213,7 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Ctrl+A", "show all (companions + archived)"),
         ("Ctrl+D / Ctrl+U", "archive / unarchive"),
         ("Ctrl+F", "filter (searches hidden too)"),
+        ("Ctrl+G", "cycle the header sprite"),
         ("Ctrl+T", "mouse off/on (off = drag to select + copy)"),
         ("?", "this help"),
         ("Ctrl+C", "quit"),

@@ -32,6 +32,7 @@ use composer::{
 pub use list::activity_ribbon;
 use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
+pub use sprite::SpriteKind;
 pub use theme::{Theme, ThemeState};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -313,6 +314,9 @@ pub struct Draw<'a> {
     /// back to a row. Written each frame via interior mutability (draw borrows `&` throughout).
     pub list_hit: &'a RefCell<ListHit>,
     pub themes: &'a ThemeState,
+    /// Which header mascot to draw. Cycled live with Ctrl+G while the candidates are being
+    /// compared.
+    pub sprite: SpriteKind,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -371,7 +375,15 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     };
     let deco = ListDeco { rename };
 
-    header::draw(frame, d.app, d.workspace, d.now_ms, theme, vertical[0]);
+    header::draw(
+        frame,
+        d.app,
+        d.workspace,
+        d.now_ms,
+        theme,
+        d.sprite,
+        vertical[0],
+    );
     // The composer cursor blinks only in Normal mode (the composer is the active input);
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
@@ -705,7 +717,7 @@ fn draw_footer(
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Ctrl+K palette · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme.muted),
                 ))
@@ -824,6 +836,7 @@ mod tests {
                         logos: None,
                         list_hit: &list_hit,
                         themes,
+                        sprite: Default::default(),
                     },
                 );
             })
@@ -1721,6 +1734,7 @@ mod tests {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
@@ -1826,6 +1840,7 @@ mod tests {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
@@ -1933,6 +1948,7 @@ mod tests {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
