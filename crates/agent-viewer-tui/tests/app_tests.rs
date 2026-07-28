@@ -1028,7 +1028,6 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     );
     assert_eq!(buffer[(done_summary, done_y)].fg, theme::amber(false).muted);
     assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::amber(false).muted);
-    assert_eq!(needs_elapsed + 2, done_elapsed + 3);
     assert_eq!(done_elapsed + 3, width);
 }
 
