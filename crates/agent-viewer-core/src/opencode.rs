@@ -2338,10 +2338,17 @@ impl Backend for OpencodeBackend {
         let conn = crate::open_readonly(&self.db_path)?;
         let (cutoff, now) = crate::activity_window(window);
         let mut stmt = conn.prepare(
-            "SELECT time_created, data FROM message \
-             WHERE session_id = ?1 AND typeof(time_created) = 'integer' \
-             AND time_created >= ?2 AND time_created <= ?3 \
-             ORDER BY time_created ASC, id ASC",
+            "WITH RECURSIVE descendants(id) AS ( \
+                 SELECT id FROM session WHERE id = ?1 \
+                 UNION \
+                 SELECT child.id FROM session AS child \
+                 JOIN descendants AS parent ON child.parent_id = parent.id \
+             ) \
+             SELECT message.time_created, message.data FROM message \
+             JOIN descendants ON message.session_id = descendants.id \
+             WHERE typeof(message.time_created) = 'integer' \
+             AND message.time_created >= ?2 AND message.time_created <= ?3 \
+             ORDER BY message.time_created ASC, message.id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![session.id, cutoff, now], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))

@@ -447,6 +447,28 @@ fn claude_session(rollout_path: Option<PathBuf>) -> Session {
     }
 }
 
+fn write_claude_activity(path: &std::path::Path, timestamp: i64) {
+    std::fs::create_dir_all(path.parent().expect("transcript parent"))
+        .expect("create transcript parent");
+    let mut file = std::fs::File::create(path).expect("create transcript");
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"activity"}}]}}}}"#,
+        rfc3339_at(timestamp)
+    )
+    .expect("write transcript");
+}
+
+fn write_claude_agent_meta(path: &std::path::Path, parent_agent_id: &str, spawn_depth: u64) {
+    let meta = serde_json::json!({
+        "agentType": "Explore",
+        "description": "Activity fixture",
+        "parentAgentId": parent_agent_id,
+        "spawnDepth": spawn_depth,
+    });
+    std::fs::write(path, meta.to_string()).expect("write agent metadata");
+}
+
 #[test]
 fn claude_turn_activity_normalizes_filters_and_missing_is_empty() {
     let backend = ClaudeBackend::with_binary("/unused/claude");
@@ -566,6 +588,57 @@ fn claude_turn_activity_reads_full_history_and_tool_use() {
     );
 }
 
+#[test]
+fn claude_turn_activity_includes_only_requested_subtree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let root_path = dir.path().join("root.jsonl");
+    let child_root = dir.path().join("root").join("subagents");
+    let child_a_path = child_root.join("agent-achild.jsonl");
+    let child_a_meta = child_root.join("agent-achild.meta.json");
+    let child_b_path = child_root.join("agent-asibling.jsonl");
+    let child_b_meta = child_root.join("agent-asibling.meta.json");
+    let grandchild_path = child_root.join("agent-agrandchild.jsonl");
+    let grandchild_meta = child_root.join("agent-agrandchild.meta.json");
+    let malformed_path = child_root.join("agent-amalformed.jsonl");
+    let malformed_meta = child_root.join("agent-amalformed.meta.json");
+    let unrelated_path = dir.path().join("unrelated.jsonl");
+
+    write_claude_activity(&root_path, now - 5);
+    write_claude_activity(&child_a_path, now - 4);
+    write_claude_activity(&child_b_path, now - 3);
+    write_claude_activity(&grandchild_path, now - 2);
+    write_claude_activity(&malformed_path, now - 1);
+    write_claude_activity(&unrelated_path, now - 1);
+    write_claude_agent_meta(&child_a_meta, "aroot", 1);
+    write_claude_agent_meta(&child_b_meta, "aroot", 1);
+    write_claude_agent_meta(&grandchild_meta, "achild", 2);
+    std::fs::write(&malformed_meta, b"{not json\n").expect("write malformed metadata");
+
+    let backend = ClaudeBackend::with_binary("/unused/claude");
+    assert_eq!(
+        backend
+            .turn_activity(&claude_session(Some(root_path)), Duration::from_secs(60))
+            .expect("root subtree activity"),
+        vec![
+            (now - 5) * 1_000,
+            (now - 4) * 1_000,
+            (now - 3) * 1_000,
+            (now - 2) * 1_000,
+            (now - 1) * 1_000,
+        ]
+    );
+    assert_eq!(
+        backend
+            .turn_activity(&claude_session(Some(child_a_path)), Duration::from_secs(60))
+            .expect("child subtree activity"),
+        vec![(now - 4) * 1_000, (now - 2) * 1_000]
+    );
+}
+
 // --- Preserved v1 test ---
 
 #[test]
@@ -638,6 +711,91 @@ fn claude_list_orders_enriched_updates_ascending_with_stable_ties() {
             .collect::<Vec<_>>(),
         vec![(1000, 1000), (3000, 2000), (2000, 2000)]
     );
+}
+
+#[test]
+fn claude_list_finds_project_transcript_without_job_transcript_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    let session_id = "63b17067-62f0-4bba-b99f-cefca201104c";
+    let interactive_session_id = "149c7bf0-632a-4c12-9806-a4acd181afcc";
+    let missing_state_session_id = "9b2e5c65-e558-4b87-a3cf-f63933292ef0";
+    let cwd = "/home/theconnman/git/rutherford-soddy";
+    let agents = serde_json::json!([
+        {
+            "id": "rs459",
+            "cwd": cwd,
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": session_id,
+            "name": "RS 459",
+            "state": "working"
+        },
+        {
+            "cwd": cwd,
+            "kind": "interactive",
+            "startedAt": 2000,
+            "sessionId": interactive_session_id,
+            "name": "Interactive",
+            "state": "idle"
+        },
+        {
+            "id": "missing_state",
+            "cwd": cwd,
+            "kind": "background",
+            "startedAt": 3000,
+            "sessionId": missing_state_session_id,
+            "name": "Missing state",
+            "state": "working"
+        }
+    ]);
+    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", agents)).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config_root = dir.path().join("config");
+    let jobs_root = config_root.join("jobs");
+    let state_path = jobs_root.join("rs459").join("state.json");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    std::fs::write(&state_path, r#"{"detail":"Still working"}"#).unwrap();
+
+    let project_root = config_root
+        .join("projects")
+        .join("-home-theconnman-git-rutherford-soddy");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let expected = [
+        (session_id, project_root.join(format!("{session_id}.jsonl"))),
+        (
+            interactive_session_id,
+            project_root.join(format!("{interactive_session_id}.jsonl")),
+        ),
+        (
+            missing_state_session_id,
+            project_root.join(format!("{missing_state_session_id}.jsonl")),
+        ),
+    ];
+    for (_, transcript) in &expected {
+        std::fs::write(transcript, "").unwrap();
+    }
+
+    let mut backend = ClaudeBackend::with_roots(
+        binary.to_str().unwrap(),
+        jobs_root,
+        config_root.join("sessions"),
+    );
+    let sessions = backend.list().expect("list claude sessions");
+
+    assert_eq!(sessions.len(), 3);
+    for (expected_id, expected_transcript) in expected {
+        let session = sessions
+            .iter()
+            .find(|session| session.id == expected_id)
+            .expect("listed session");
+        assert_eq!(session.cwd, PathBuf::from(cwd));
+        assert_eq!(
+            session.rollout_path.as_deref(),
+            Some(expected_transcript.as_path())
+        );
+    }
 }
 
 #[test]

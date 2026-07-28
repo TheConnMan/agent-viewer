@@ -68,6 +68,10 @@ are pending or failing or a review is requested, green when checks have passed, 
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or
 unresolvable.
 
+Wide rows also show a one hour activity ribbon. A session's ribbon includes meaningful activity
+from its own recursive subagent subtree, so a parent remains visibly active while its descendants
+work. A child row shows only its own subtree.
+
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
 `✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
 

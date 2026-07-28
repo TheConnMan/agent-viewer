@@ -32,6 +32,7 @@ pub struct Thread {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub source: super::source::Source,
+    pub parent_thread_id: Option<String>,
     pub cwd: std::path::PathBuf,
     pub git_branch: Option<String>,
     pub title: String,
@@ -70,12 +71,14 @@ impl Registry {
         )?;
         let mut threads = stmt
             .query_map([], |row| {
+                let raw_source = row.get::<_, String>(4)?;
                 Ok(Thread {
                     id: row.get(0)?,
                     rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
                     created_at_ms: row.get(2)?,
                     updated_at_ms: row.get(3)?,
-                    source: Source::parse(&row.get::<_, String>(4)?),
+                    source: Source::parse(&raw_source),
+                    parent_thread_id: spawn_parent_thread_id(&raw_source),
                     cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
                     git_branch: row.get(6)?,
                     title: row.get(7)?,
@@ -105,6 +108,18 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(models)
     }
+}
+
+fn spawn_parent_thread_id(raw_source: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw_source)
+        .ok()?
+        .get("subagent")?
+        .get("thread_spawn")?
+        .get("parent_thread_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_string)
 }
 
 fn read_thread_names(path: &std::path::Path) -> std::collections::HashMap<String, String> {
