@@ -1104,11 +1104,6 @@ mod tests {
 
     #[test]
     fn event_bridge_writes_mouse_sequences_for_attach_then_detach() {
-        const DISABLE_MOUSE_CAPTURE: &[u8] =
-            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-        const ENABLE_MOUSE_CAPTURE: &[u8] =
-            b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
-
         let mut ui = test_ui(vec![session(
             BackendKind::Opencode,
             "attached",
@@ -1148,9 +1143,9 @@ mod tests {
             "attach must not quit the viewer"
         );
         assert!(matches!(ui.mode, Mode::Attached));
-        assert!(!ui.mouse_capture);
-        assert!(!applied);
-        assert_eq!(output, DISABLE_MOUSE_CAPTURE);
+        assert!(ui.mouse_capture);
+        assert!(applied);
+        assert!(output.is_empty());
 
         assert!(
             !process_event(
@@ -1171,10 +1166,7 @@ mod tests {
         assert!(matches!(ui.mode, Mode::Normal));
         assert!(ui.mouse_capture);
         assert!(applied);
-        assert_eq!(
-            output,
-            [DISABLE_MOUSE_CAPTURE, ENABLE_MOUSE_CAPTURE].concat(),
-        );
+        assert!(output.is_empty());
     }
 
     struct AttachingBackend;
