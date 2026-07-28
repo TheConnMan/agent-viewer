@@ -98,6 +98,7 @@ pub enum Row {
         id: String,
         title: String,
         summary: String,
+        activity: Option<String>,
         status: Status,
         hidden: bool,
         created_at_ms: i64,
@@ -160,6 +161,8 @@ pub struct App {
     /// Cached render model. Rebuilt only when sessions/filter/show_all/group_mode
     /// change; cursor movement leaves it untouched.
     rows: Vec<Row>,
+    /// Latest background computed activity ribbon for each session.
+    activity_ribbons: HashMap<(BackendKind, String), String>,
     /// Memoized project_root(cwd). cwds are stable, so this survives refresh ticks
     /// and stops re-walking the filesystem for sessions we have already grouped.
     root_cache: HashMap<PathBuf, PathBuf>,
@@ -185,6 +188,7 @@ impl App {
             show_all: false,
             group_mode: GroupMode::ByProject,
             rows: Vec::new(),
+            activity_ribbons: HashMap::new(),
             root_cache: HashMap::new(),
             armed_kill: None,
             hidden_rows: 0,
@@ -205,6 +209,11 @@ impl App {
         let mut sessions = sessions;
         sanitize_session_titles(&mut sessions);
         self.sessions = sessions;
+        self.activity_ribbons.retain(|(backend, id), _| {
+            self.sessions
+                .iter()
+                .any(|session| session.backend == *backend && session.id == *id)
+        });
         self.rebuild_rows();
         if let Some(anchor) = session_anchor
             && self.select_by_key(&anchor)
@@ -222,6 +231,44 @@ impl App {
     /// The render model (borrows the cached rows; rendered fresh every frame).
     pub fn visible(&self) -> &[Row] {
         &self.rows
+    }
+
+    pub fn set_activity_ribbon(&mut self, backend: BackendKind, id: &str, ribbon: Option<String>) {
+        let key = (backend, id.to_string());
+        match ribbon {
+            Some(ribbon) => {
+                self.activity_ribbons.insert(key, ribbon.clone());
+                for row in &mut self.rows {
+                    if let Row::Session {
+                        backend: row_backend,
+                        id: row_id,
+                        activity,
+                        ..
+                    } = row
+                        && *row_backend == backend
+                        && row_id == id
+                    {
+                        *activity = Some(ribbon.clone());
+                    }
+                }
+            }
+            None => {
+                self.activity_ribbons.remove(&key);
+                for row in &mut self.rows {
+                    if let Row::Session {
+                        backend: row_backend,
+                        id: row_id,
+                        activity,
+                        ..
+                    } = row
+                        && *row_backend == backend
+                        && row_id == id
+                    {
+                        *activity = None;
+                    }
+                }
+            }
+        }
     }
 
     pub fn session_ids_for_backend(&self, backend: BackendKind) -> HashSet<String> {
@@ -570,6 +617,7 @@ impl App {
             id: s.id.clone(),
             title: s.title.clone(),
             summary: s.summary.clone(),
+            activity: None,
             status: s.status.clone(),
             hidden: s.hidden,
             created_at_ms: s.created_at_ms,
@@ -614,6 +662,17 @@ impl App {
             GroupMode::ByState => self.build_state_rows(&indices),
             GroupMode::ByProject => self.build_project_rows(&indices),
         };
+        for row in &mut self.rows {
+            if let Row::Session {
+                backend,
+                id,
+                activity,
+                ..
+            } = row
+            {
+                *activity = self.activity_ribbons.get(&(*backend, id.clone())).cloned();
+            }
+        }
     }
 
     /// ByState: fixed section order, empty sections omitted. Every member row renders —
