@@ -9,7 +9,7 @@ mod palette;
 mod sprite;
 pub mod theme;
 
-use crate::app::{App, Composer, Row};
+use crate::app::{App, Composer, GroupMode, Row};
 use crate::logos::LogoMarks;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
@@ -470,7 +470,12 @@ fn draw_list(
 ) -> ListHit {
     let width = area.width as usize;
     let show_activity = width >= 126;
-    let layout_width = width.saturating_sub(usize::from(show_activity) * 10);
+    let project_width = match app.group_mode() {
+        GroupMode::ByState if width >= 130 => 26,
+        GroupMode::ByState => 20,
+        GroupMode::ByProject => 0,
+    };
+    let layout_width = width.saturating_sub(project_width + usize::from(show_activity) * 10);
     let rows = app.visible();
     let desired_title_width = rows
         .iter()
@@ -557,6 +562,7 @@ fn draw_list(
                         now_ms,
                         pr_status,
                         show_activity,
+                        project_width,
                         width,
                         title_width,
                         theme,
@@ -572,6 +578,7 @@ fn draw_list(
                     now_ms,
                     pr_status,
                     show_activity,
+                    project_width,
                     width,
                     title_width,
                     theme,
@@ -883,7 +890,10 @@ mod tests {
         assert_ne!(title.fg, summary.fg);
     }
 
-    fn render_activity_row(width: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    fn render_activity_row(
+        width: u16,
+        group_by_state: bool,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         let mut app = App::new(vec![Session {
             backend: BackendKind::Codex,
             id: "activity-row".into(),
@@ -906,6 +916,9 @@ mod tests {
             }],
             daemon_hosted: false,
         }]);
+        if group_by_state {
+            app.toggle_group_mode();
+        }
         app.set_activity_ribbon(BackendKind::Codex, "activity-row", Some("█▆▃▂▁▁▁▁".into()));
         let height = app.visible().len() as u16;
         let pulses = Pulses::new();
@@ -933,18 +946,28 @@ mod tests {
 
     #[test]
     fn activity_ribbon_renders_at_140_and_drops_before_pr_at_100() {
-        let wide = render_activity_row(140);
+        let wide = render_activity_row(140, false);
         let wide_buffer = wide.backend().buffer();
         let wide_text: String = (0..140).map(|x| wide_buffer[(x, 1)].symbol()).collect();
         assert!(wide_text.contains("█▆▃▂▁▁▁▁"));
         assert!(wide_text.contains("#42"));
         assert!(!wide_text.contains(&"summary ".repeat(30)));
 
-        let narrow = render_activity_row(100);
+        let narrow = render_activity_row(100, false);
         let narrow_buffer = narrow.backend().buffer();
         let narrow_text: String = (0..100).map(|x| narrow_buffer[(x, 1)].symbol()).collect();
         assert!(!narrow_text.contains("█▆▃▂▁▁▁▁"));
         assert!(narrow_text.contains("#42"));
+    }
+
+    #[test]
+    fn state_group_places_project_before_activity_ribbon() {
+        let terminal = render_activity_row(140, true);
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..140).map(|x| buffer[(x, 1)].symbol()).collect();
+        let project = text.find("/tmp/agent-viewer").unwrap();
+        let ribbon = text.find("█▆▃▂▁▁▁▁").unwrap();
+        assert!(project < ribbon);
     }
 
     #[test]
