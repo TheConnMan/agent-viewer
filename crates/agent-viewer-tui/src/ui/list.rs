@@ -54,6 +54,7 @@ pub(super) fn row_to_item(
     now_ms: i64,
     pr_status: &crate::pr_cache::PrStatusCache,
     show_activity: bool,
+    project_width: usize,
     width: usize,
     title_width: usize,
     theme: &Theme,
@@ -80,6 +81,7 @@ pub(super) fn row_to_item(
             backend,
             id,
             summary,
+            project,
             activity,
             status,
             title,
@@ -115,12 +117,14 @@ pub(super) fn row_to_item(
                     mark_color: backend_mark_color(*backend, theme),
                     name: title,
                     status,
+                    project: project.as_deref(),
                     activity: activity.as_deref(),
                     summary,
                     pr: &pr_badge(pr_refs),
                     pr_color,
                     elapsed: &elapsed,
                     show_activity,
+                    project_width,
                     width,
                     title_width,
                 },
@@ -182,12 +186,14 @@ struct SessionRow<'a> {
     mark_color: ratatui::style::Color,
     name: &'a str,
     status: &'a Status,
+    project: Option<&'a str>,
     activity: Option<&'a str>,
     summary: &'a str,
     pr: &'a str,
     pr_color: ratatui::style::Color,
     elapsed: &'a str,
     show_activity: bool,
+    project_width: usize,
     width: usize,
     title_width: usize,
 }
@@ -196,7 +202,7 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     let word = status_display_word(row.status);
     let activity_width = usize::from(row.show_activity) * 10;
     let (title, status, pr, summary, pad) = crate::app::row_layout(
-        row.width.saturating_sub(activity_width),
+        row.width.saturating_sub(activity_width + row.project_width),
         mark_width(row.mark),
         row.name,
         row.title_width,
@@ -212,6 +218,14 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         Span::raw(" "),
         Span::styled(status, fg(status_color(row.status, theme))),
     ];
+    if let Some(project) = row.project {
+        let content_width = row.project_width.saturating_sub(2);
+        let mut project = truncate_display_width(project, content_width);
+        project
+            .push_str(&" ".repeat(content_width.saturating_sub(display_width(project.as_str()))));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(project, fg(theme.faint)));
+    }
     if row.show_activity {
         let ribbon = row.activity.unwrap_or("▁▁▁▁▁▁▁▁");
         let color = if row.activity.is_some() && matches!(row.status, Status::Working) {
@@ -350,12 +364,14 @@ mod activity_ribbon_tests {
                 mark_color: theme.cx,
                 name: "Activity session",
                 status: &Status::Working,
+                project: None,
                 activity: Some("█▆▃▂▁▁▁▁"),
                 summary,
                 pr: "#42",
                 pr_color: theme.ok,
                 elapsed: "3m",
                 show_activity,
+                project_width: 0,
                 width,
                 title_width: 32,
             },
@@ -392,12 +408,14 @@ mod activity_ribbon_tests {
                 mark_color: theme.cx,
                 name: "No activity",
                 status: &Status::Working,
+                project: None,
                 activity: None,
                 summary: "",
                 pr: "",
                 pr_color: theme.ok,
                 elapsed: "3m",
                 show_activity: true,
+                project_width: 0,
                 width: 140,
                 title_width: 32,
             },
@@ -409,5 +427,42 @@ mod activity_ribbon_tests {
             .find(|span| span.content == "▁▁▁▁▁▁▁▁")
             .expect("flat activity ribbon");
         assert_eq!(ribbon.style.fg, Some(theme.faint));
+    }
+
+    #[test]
+    fn project_column_precedes_activity_ribbon() {
+        let themes = crate::ui::ThemeState::default();
+        let theme = themes.active();
+        let line = session_line(
+            SessionRow {
+                glyph: "✽",
+                glyph_color: theme.accent,
+                mark: "[cx]",
+                mark_color: theme.cx,
+                name: "Activity session",
+                status: &Status::Working,
+                project: Some("example-user/agent-viewer"),
+                activity: Some("█▆▃▂▁▁▁▁"),
+                summary: "summary",
+                pr: "#42",
+                pr_color: theme.ok,
+                elapsed: "3m",
+                show_activity: true,
+                project_width: 26,
+                width: 140,
+                title_width: 32,
+            },
+            theme,
+        );
+        let text: String = line
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+        let project = text.find("example-user/agent-viewer").unwrap();
+        let ribbon = text.find("█▆▃▂▁▁▁▁").unwrap();
+        let summary = text.find("summary").unwrap();
+        assert!(project < ribbon);
+        assert!(ribbon < summary);
     }
 }
