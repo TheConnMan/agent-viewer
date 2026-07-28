@@ -14,8 +14,8 @@ const COLS: usize = WIDTH as usize;
 
 type Grid = [[u8; COLS]; ROWS];
 
-/// Which header mascot is drawn. Cycled live with Ctrl+G so the candidates can be compared in
-/// one build; all of them occupy the same 11x6 cell box, so the header layout never changes.
+/// Which header mascot is drawn. Cycled with Ctrl+G or picked from the command palette; every
+/// one occupies the same 11x6 cell box, so the header layout never changes with the choice.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SpriteKind {
     #[default]
@@ -33,11 +33,43 @@ impl SpriteKind {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// Every sprite, in cycle order. Drives the palette listing so a new sprite shows up there
+    /// by adding one variant.
+    pub const ALL: [SpriteKind; 3] = [
+        SpriteKind::Lighthouse,
+        SpriteKind::Constellation,
+        SpriteKind::Turbine,
+    ];
+
+    /// Resolve a stored or env-supplied name. `None` for anything unknown, so a stale setting
+    /// falls back to the default instead of wedging the header.
+    pub fn from_name(value: Option<&str>) -> Option<Self> {
+        let value = value?.trim();
+        SpriteKind::ALL
+            .into_iter()
+            .find(|sprite| sprite.name() == value)
+    }
+
+    /// Both the display label and the persisted id; they are deliberately the same string so a
+    /// setting written by one build reads back the same way in the next.
+    pub fn name(self) -> &'static str {
         match self {
             SpriteKind::Lighthouse => "lighthouse",
             SpriteKind::Constellation => "constellation",
             SpriteKind::Turbine => "turbine",
+        }
+    }
+
+    /// What the sprite's motion actually encodes, shown as the palette row's detail.
+    pub fn detail(self) -> &'static str {
+        match self {
+            SpriteKind::Lighthouse => {
+                "header sprite · beam sweeps outward, lamp warns on needs-input"
+            }
+            SpriteKind::Constellation => {
+                "header sprite · one star per session, brightest need input"
+            }
+            SpriteKind::Turbine => "header sprite · spins with the working count, parks when idle",
         }
     }
 }
@@ -228,8 +260,8 @@ const BLADE_LEN: i32 = 4;
 const BLADES: i32 = 3;
 /// One blade straight up: the pose a stopped rotor parks in.
 const PARKED_ANGLE: f32 = -TAU / 4.0;
-const FASTEST_REVOLUTION_MS: i64 = 800;
-const BASE_REVOLUTION_MS: i64 = 2_600;
+const FASTEST_REVOLUTION_MS: i64 = 2_400;
+const BASE_REVOLUTION_MS: i64 = 6_000;
 
 pub(super) struct Turbine<'a> {
     theme: &'a Theme,
@@ -284,11 +316,12 @@ impl Widget for Turbine<'_> {
 }
 
 /// Revolution period for a fleet: `None` when nothing is working, so the rotor parks. More
-/// concurrent sessions spin it faster, down to a floor.
+/// concurrent sessions spin it faster, but the curve flattens quickly - dividing straight by the
+/// working count pegs a real fleet at the floor and the rotor just looks frantic.
 fn revolution_ms(working: usize) -> Option<i64> {
     match working {
         0 => None,
-        n => Some((BASE_REVOLUTION_MS / n as i64).max(FASTEST_REVOLUTION_MS)),
+        n => Some((BASE_REVOLUTION_MS * 2 / (n as i64 + 1)).max(FASTEST_REVOLUTION_MS)),
     }
 }
 
@@ -568,6 +601,19 @@ mod tests {
         assert_eq!(revolution_ms(1), Some(BASE_REVOLUTION_MS));
         assert!(revolution_ms(3).unwrap() < revolution_ms(1).unwrap());
         assert_eq!(revolution_ms(50), Some(FASTEST_REVOLUTION_MS));
+    }
+
+    /// A busy fleet must not peg the rotor at its floor: the whole point of the speed mapping is
+    /// that the difference between a quiet fleet and a busy one stays visible.
+    #[test]
+    fn a_realistic_fleet_stays_well_off_the_speed_floor() {
+        let busy = revolution_ms(9).unwrap();
+
+        assert!(
+            busy >= 2_000,
+            "a sub-2s revolution reads as frantic at the 10fps redraw, got {busy}ms"
+        );
+        assert!(revolution_ms(1).unwrap() >= busy * 2);
     }
 
     #[test]

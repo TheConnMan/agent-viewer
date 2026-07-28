@@ -7,6 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::overlay::centered_rect;
+use super::sprite::SpriteKind;
 use super::{Theme, fg};
 use agent_viewer_core::BackendKind;
 
@@ -16,6 +17,9 @@ pub enum PaletteGroup {
     Sessions,
     Models,
     Commands,
+    // Last on purpose: group order outranks match score, so a decoration row must never beat a
+    // session or model the query actually meant.
+    Sprites,
 }
 
 impl PaletteGroup {
@@ -25,6 +29,7 @@ impl PaletteGroup {
             Self::Sessions => "SESSIONS",
             Self::Models => "MODELS",
             Self::Commands => "COMMANDS",
+            Self::Sprites => "HEADER SPRITE",
         }
     }
 }
@@ -47,6 +52,7 @@ pub enum PaletteTarget {
     Action(PaletteAction),
     Session { backend: BackendKind, id: String },
     Model { backend: BackendKind, name: String },
+    Sprite(SpriteKind),
     Command(String),
 }
 
@@ -191,6 +197,7 @@ impl PaletteState {
             .filter_map(|(index, item)| {
                 if query.is_empty() {
                     let default = (item.group == PaletteGroup::Actions && item.enabled)
+                        || item.group == PaletteGroup::Sprites
                         || item.group == PaletteGroup::Sessions;
                     return default.then_some((index, 0));
                 }
