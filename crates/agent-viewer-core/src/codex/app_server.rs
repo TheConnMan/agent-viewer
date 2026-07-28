@@ -21,6 +21,7 @@
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 /// A reachable app-server daemon, identified by the control socket it listens on. The path is
@@ -36,25 +37,30 @@ pub struct Daemon {
 /// one. No compression is offered: the daemon rejects a client advertising
 /// `permessage-deflate` with "Missing, duplicated or incorrect header
 /// sec-websocket-extensions" and drops the connection, and tungstenite offers none.
+#[cfg(target_os = "linux")]
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 
 /// How long one whole exchange (connect, initialize, and the request) may take. Generous
 /// against a busy daemon but finite: this runs on the TUI's background worker and on the
 /// attach key path, so it can never be allowed to block forever. `thread/start` answered in
 /// 0.16s on this box.
+#[cfg(target_os = "linux")]
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the polite close on drop may take. Short on purpose: the connection is finished
 /// with, and a wedged peer must not hold the caller in `drop`.
+#[cfg(target_os = "linux")]
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Read slice while waiting for a response. tungstenite hands a timed-out read back as
 /// `WouldBlock` for the caller to retry, so the deadline is enforced by the retry loop rather
 /// than by one long blocking read.
+#[cfg(target_os = "linux")]
 const READ_SLICE: Duration = Duration::from_millis(250);
 
 /// `codex app-server daemon version` is a fast local probe (34ms measured on this box); the
 /// deadline only exists so a wedged CLI cannot hang an attach keypress.
+#[cfg(target_os = "linux")]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Budget for `codex app-server daemon start` plus the re-probes that follow it. The start
@@ -62,6 +68,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `"running"`, so availability is confirmed by re-probing, not by that output. Deliberately
 /// tighter than `MODEL_PROBE_TIMEOUT`: a wedged start must surface as a failed spawn the user
 /// can act on rather than freeze the composer.
+#[cfg(target_os = "linux")]
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// PURE: the daemon described by `codex app-server daemon version` stdout, or None when no
@@ -210,11 +217,19 @@ fn response_for(line: &str, expect_id: i64) -> Option<serde_json::Value> {
 /// IMPURE: the daemon currently listening, or None. Probe ONLY - this never starts anything,
 /// which is what `stop` and `attach` need: if no daemon answers, a thread it hosted is not
 /// hosted any more, so there is nothing to join and nothing to interrupt.
+#[cfg(target_os = "linux")]
 pub fn probe_daemon() -> Option<Daemon> {
     let mut cmd = std::process::Command::new("codex");
     cmd.arg("app-server").arg("daemon").arg("version");
     let stdout = crate::spawn::run_with_timeout(cmd, PROBE_TIMEOUT)?;
     parse_daemon_version(&stdout)
+}
+
+/// The Linux Unix domain socket path is the only measured daemon transport. Portable builds
+/// never probe or claim a daemon.
+#[cfg(not(target_os = "linux"))]
+pub fn probe_daemon() -> Option<Daemon> {
+    None
 }
 
 /// PURE: the working directory a viewer-started daemon must run in, given the home directory
@@ -256,6 +271,7 @@ pub fn daemon_start_command(cwd: &Path) -> std::process::Command {
 /// "daemon start exited 1: <its stderr>" and "started but never answered" have to arrive as
 /// three different sentences. Collapsing them into one generic notice is what makes a
 /// misconfigured box look like a broken viewer.
+#[cfg(target_os = "linux")]
 pub fn ensure_daemon() -> std::result::Result<Daemon, String> {
     if let Some(daemon) = probe_daemon() {
         return Ok(daemon);
@@ -280,6 +296,12 @@ pub fn ensure_daemon() -> std::result::Result<Daemon, String> {
     }
 }
 
+/// Starting the shared daemon is unsupported outside the measured Linux transport.
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_daemon() -> std::result::Result<Daemon, String> {
+    Err("codex app-server daemon transport is unavailable on this platform".to_string())
+}
+
 /// How far a daemon spawn got. Every non-`Started` outcome is now a hard, visible failure (see
 /// `spawn_route`), so the distinction survives to tell the user WHICH half broke: a
 /// `TurnFailed` left a real thread in the listing that they can attach to and retry, while
@@ -298,6 +320,7 @@ pub enum SpawnAttempt {
 /// IMPURE: start a thread on `daemon` and kick off its first turn. The turn keeps running after
 /// this client disconnects (verified live: the rollout grew 3778 bytes post-disconnect and the
 /// turn ran to completion), so a spawn is exactly connect, start, turn, disconnect.
+#[cfg(target_os = "linux")]
 pub fn try_spawn_thread(
     daemon: &Daemon,
     cwd: &Path,
@@ -329,6 +352,17 @@ pub fn try_spawn_thread(
     }
 }
 
+/// Portable Codex builds do not start daemon hosted threads.
+#[cfg(not(target_os = "linux"))]
+pub fn try_spawn_thread(
+    _daemon: &Daemon,
+    _cwd: &Path,
+    _task: &str,
+    _model: Option<&str>,
+) -> SpawnAttempt {
+    SpawnAttempt::NotCreated(Error::Unsupported("codex"))
+}
+
 /// IMPURE: `try_spawn_thread` for callers that only need the id or an error (the live test).
 pub fn spawn_thread(
     daemon: &Daemon,
@@ -348,6 +382,7 @@ pub fn spawn_thread(
 /// IMPURE: interrupt whatever turn is in progress on `thread_id`. `turn/interrupt` needs the
 /// turn id, so the thread is read over the same connection first. A thread with no live turn
 /// is a no-op success: there is nothing to stop, which is not an error.
+#[cfg(target_os = "linux")]
 pub fn interrupt_thread(daemon: &Daemon, thread_id: &str) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
     let mut client = Client::connect(daemon, deadline)?;
@@ -366,6 +401,12 @@ pub fn interrupt_thread(daemon: &Daemon, thread_id: &str) -> Result<()> {
     }
 }
 
+/// Portable Codex builds cannot interrupt a daemon hosted turn.
+#[cfg(not(target_os = "linux"))]
+pub fn interrupt_thread(_daemon: &Daemon, _thread_id: &str) -> Result<()> {
+    Err(Error::Unsupported("codex"))
+}
+
 /// PURE: is this the daemon's "the turn is already over" answer rather than a real failure?
 fn is_no_active_turn(error: &Error) -> bool {
     error.to_string().contains("no active turn to interrupt")
@@ -374,10 +415,12 @@ fn is_no_active_turn(error: &Error) -> bool {
 /// One blocking JSON-RPC connection to the daemon: a tungstenite WebSocket over the control
 /// socket, already through `initialize`. Every exchange is bounded by a caller-supplied
 /// deadline, and dropping the client closes the connection.
+#[cfg(target_os = "linux")]
 struct Client {
     socket: tungstenite::WebSocket<std::os::unix::net::UnixStream>,
 }
 
+#[cfg(target_os = "linux")]
 impl Client {
     /// Connect, upgrade, and complete the `initialize` handshake. The house style here is
     /// `cli::rename`'s bounded exchange: initialize carrying clientInfo, then the real
@@ -445,6 +488,7 @@ impl Client {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Client {
     fn drop(&mut self) {
         // Politely close, then let the stream drop. The daemon keeps every thread this
@@ -458,6 +502,7 @@ impl Drop for Client {
 }
 
 /// Time left before `deadline`, or Err once it has passed.
+#[cfg(target_os = "linux")]
 fn remaining(deadline: Instant) -> Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {

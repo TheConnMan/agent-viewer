@@ -86,6 +86,39 @@ impl Capabilities {
     }
 }
 
+/// PURE capability ceiling for the OpenCode implementation available on each platform.
+///
+/// The Linux backend may narrow this at runtime when its authenticated server is unavailable.
+/// Portable builds expose only the read only SQLite and CLI compatibility actions.
+pub const fn opencode_capabilities_for_platform(
+    platform: crate::platform::Platform,
+) -> Capabilities {
+    match platform {
+        crate::platform::Platform::Linux => Capabilities {
+            spawn: true,
+            attach: true,
+            rename: true,
+            archive: true,
+            delete: true,
+            stop: true,
+            needs_input: true,
+            pr_refs: false,
+            live_status: true,
+        },
+        crate::platform::Platform::Macos | crate::platform::Platform::Windows => Capabilities {
+            spawn: true,
+            attach: true,
+            rename: false,
+            archive: false,
+            delete: true,
+            stop: false,
+            needs_input: false,
+            pr_refs: false,
+            live_status: false,
+        },
+    }
+}
+
 /// Six-state model. `Working`/`NeedsInput`/`Idle` describe a live session; `Done`/`Error`
 /// describe a finished one. `Unknown` is the deliberate escape hatch for "the backend cannot
 /// say": a resolver that cannot determine status MUST return `Unknown` rather than

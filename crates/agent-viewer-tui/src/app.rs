@@ -813,8 +813,9 @@ fn section_of(status: &Status) -> Section {
 }
 
 fn project_label(root: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let git_root = PathBuf::from(home).join("git");
+    let home = agent_viewer_core::home_dir();
+    if !home.as_os_str().is_empty() {
+        let git_root = home.join("git");
         if let Ok(relative) = root.strip_prefix(git_root) {
             return relative.to_string_lossy().into_owned();
         }
