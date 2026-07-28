@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_logo_and_prompt_share_the_same_padded_start_cell() {
+    fn composer_logo_and_prompt_keep_their_padded_offsets() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -854,7 +854,8 @@ mod tests {
         assert_eq!(buffer[(5, 1)].symbol(), " ");
         assert_eq!(buffer[(6, 1)].symbol(), "c");
         assert_eq!(buffer[(1, 2)].symbol(), " ");
-        assert_eq!(buffer[(2, 2)].symbol(), "❯");
+        assert_eq!(buffer[(2, 2)].symbol(), " ");
+        assert_eq!(buffer[(3, 2)].symbol(), "❯");
         assert_eq!(buffer[(6, 2)].symbol(), "d");
     }
 
@@ -1624,7 +1625,7 @@ mod tests {
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
         assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
-        assert_eq!(&rows[top + 2], &format!("│ ❯   hello▏{}│", " ".repeat(37)));
+        assert_eq!(&rows[top + 2], &format!("│  ❯  hello▏{}│", " ".repeat(37)));
         assert_eq!((cursor.x, cursor.y), (11, (top + 2) as u16));
     }
 
@@ -1645,7 +1646,7 @@ mod tests {
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "│ ❯   01234│");
+        assert_eq!(&rows[top + 2], "│  ❯  01234│");
         assert_eq!(&rows[top + 3], "│56789▏    │");
         assert_eq!(cursor, (6, (top + 3) as u16));
     }
@@ -1734,7 +1735,8 @@ mod tests {
         // Metadata uses a five cell mark field. The input uses the same gutter.
         assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
         assert_eq!(buf[(1, (top + 2) as u16)].symbol(), " ");
-        assert_eq!(buf[(2, (top + 2) as u16)].symbol(), "❯");
+        assert_eq!(buf[(2, (top + 2) as u16)].symbol(), " ");
+        assert_eq!(buf[(3, (top + 2) as u16)].symbol(), "❯");
         assert_eq!(buf[(6, (top + 2) as u16)].symbol(), "t");
     }
 
@@ -1744,7 +1746,7 @@ mod tests {
         let (rows, _) = render_viewer(20, 24, "wrap at word boundaries here", Mode::Normal);
         let (top, _) = composer_bounds(&rows);
 
-        assert_eq!(&rows[top + 2], "│ ❯   wrap at word │");
+        assert_eq!(&rows[top + 2], "│  ❯  wrap at word │");
         assert_eq!(&rows[top + 3], "│boundaries here▏  │");
     }
 
