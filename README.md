@@ -180,9 +180,11 @@ its SQLite title still shows the prompt.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
-- `Ctrl+T` — toggle mouse reporting. Off hands the mouse back to your terminal so you can
-  drag-select and copy text; on restores left click row activation, hover row selection, and
-  wheel scrolling. A footer notice names the mode you just switched to.
+- `Ctrl+T` — toggle mouse reporting. The list starts with capture on for left click activation,
+  hover row selection, and wheel scrolling. A successful attach starts with capture off, so the
+  transcript is immediately selectable in the host terminal. While attached, press `Ctrl+T` to
+  enable capture for Codex retained transcript scrolling or Claude and external opencode wheel
+  forwarding. Detaching restores list mouse controls. A footer notice names the mode.
 - `?` — key help.
 - `Ctrl+C` — quit.
 
@@ -201,10 +203,10 @@ job and a finished one (waking it in place); a row with no background-job id fal
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
-While attached, the mouse wheel scrolls session content. Codex scrolls the viewer's retained
-transcript, while Claude and external opencode sessions receive the wheel in their attached
-terminal. Returning to the list restores its mouse behavior; `Ctrl+T` toggles either mode
-manually.
+Codex, Claude, and external opencode attached transcripts are immediately selectable in the host
+terminal. While attached, press `Ctrl+T` to enable capture for session scrolling. Codex scrolls
+the viewer's retained transcript, while Claude and external opencode sessions receive the wheel
+in their attached terminal. Detaching restores the list mouse controls.
 
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new

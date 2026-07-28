@@ -584,11 +584,13 @@ remain safe cross platform smoke paths.
 
 ### Mouse capture must be escapable (`Ctrl+T`)
 
-The viewer enables mouse capture at startup, for two real reasons: click/hover row selection
-on the list, and attached session content scrolling. Codex wheel reports move the viewer's
-local PTY viewport by three rows, using its bounded 2,000 row scrollback. Claude and external
-opencode attached terminals receive native wheel forwarding. External opencode behavior is
-described as its supported attach path, not as a live verification claim.
+The viewer enables mouse capture at startup for list click and hover row selection. A successful
+attach requests capture off, so Codex, Claude, and external opencode transcripts are immediately
+selectable in the host terminal. While attached, `Ctrl+T` requests capture on for session
+scrolling. Codex wheel reports move the viewer's local PTY viewport by three rows, using its
+bounded 2,000 row scrollback. Claude and external opencode attached terminals receive native
+wheel forwarding. Detaching requests capture on to restore list mouse controls. External
+opencode behavior is described as its supported attach path, not as a live verification claim.
 
 The cost is that **capture swallows the terminal's own drag-select**, so text cannot be copied
 out of the viewer. This spec previously waved that away with "the terminal's native text
@@ -596,7 +598,7 @@ selection still works with Shift held in most terminals" — "most" is the bug. 
 a per-terminal convention, not a protocol guarantee, and where it is absent the content on
 screen is simply uncopyable.
 
-`Ctrl+T` therefore toggles mouse reporting at runtime, sending the real
+`Ctrl+T` toggles mouse reporting at runtime, sending the real
 `DisableMouseCapture`/`EnableMouseCapture` sequences and flipping `Ui::mouse_capture`. Rules:
 - The chord is claimed in **every** mode, attach included. The attached transcript is the
   surface users most want to copy out of, so the child does not receive `Ctrl+T` (the same
@@ -605,7 +607,8 @@ screen is simply uncopyable.
   a terminal that ignored the disable sequence — cannot steer the selection.
 - Each toggle sets a footer notice naming the new mode and the way back, because the state is
   otherwise invisible.
-- Capture starts **on**; the toggle is opt-out, not opt-in.
+- List capture starts **on**. A successful attach requests capture **off**. Attached `Ctrl+T`
+  requests capture **on**, and every detach requests capture **on**.
 
 ## Testing
 

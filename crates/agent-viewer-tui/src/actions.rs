@@ -383,8 +383,8 @@ fn attach_session<B: ratatui::backend::Backend>(
     ui.focused = Some(key);
     ui.focused_session = Some(session.clone());
     ui.mode = Mode::Attached;
-    // Keep capture active so wheel input is forwarded to the attached child terminal.
-    set_mouse_capture(ui, true);
+    // Selection comes first after attach, so the terminal can copy transcript text directly.
+    set_mouse_capture(ui, false);
     Ok(true)
 }
 

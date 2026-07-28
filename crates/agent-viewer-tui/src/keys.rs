@@ -61,11 +61,8 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
     }
-    // Ctrl+T flips mouse capture, which is the only way to get the terminal's own text
-    // selection back (with capture on, drag-select is swallowed as mouse reports, and the
-    // Shift override is not universal across terminals). Claimed in EVERY mode, attach
-    // included: the attached transcript is the surface users most want to copy out of, so
-    // the child does not get this chord.
+    // Ctrl+T toggles mouse capture in every mode. When capture is on, it provides an escape
+    // hatch for terminal text selection. The child does not get this chord.
     if is_mouse_toggle_chord(key, ctrl) {
         set_mouse_capture(ui, !ui.mouse_capture);
         return Ok(false);
@@ -2158,7 +2155,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_attachable_backend_keeps_mouse_capture_enabled_after_attach() {
+    fn every_attachable_backend_releases_mouse_capture_after_attach() {
         let mut capture_states = Vec::new();
         for backend in [
             BackendKind::Codex,
@@ -2188,11 +2185,11 @@ pub(crate) mod tests {
         assert_eq!(
             capture_states,
             vec![
-                (BackendKind::Codex, true),
-                (BackendKind::Claude, true),
-                (BackendKind::Opencode, true),
+                (BackendKind::Codex, false),
+                (BackendKind::Claude, false),
+                (BackendKind::Opencode, false),
             ],
-            "attaching must retain mouse reports so the attached child receives wheel events"
+            "attaching must hand mouse input back to the terminal for transcript selection"
         );
     }
 
@@ -3122,10 +3119,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn external_opencode_wheel_reaches_the_child_as_an_xterm_report() {
+    fn external_opencode_wheel_reaches_the_child_after_ctrl_t_opt_in() {
         let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
         session.backend = BackendKind::Opencode;
-        let key = (BackendKind::Opencode, session.id.clone());
+        let session_key = (BackendKind::Opencode, session.id.clone());
         let mut ui = test_ui_with(vec![session]);
         select_session_row(&mut ui, "a");
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
@@ -3135,12 +3132,36 @@ pub(crate) mod tests {
         crate::actions::attach_selected(&backends, &mut ui, &mut terminal)
             .expect("attach external opencode session");
         assert!(matches!(ui.mode, Mode::Attached));
+        assert!(
+            !ui.mouse_capture,
+            "attached transcripts must release capture for native terminal selection"
+        );
+
+        let (_snapshot_tx, snapshots) =
+            std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
+        let (wake, _wake_rx) = std::sync::mpsc::channel();
+        let refresher = crate::Refresher { snapshots, wake };
+        assert!(
+            !super::handle_key(
+                key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &backends,
+                &refresher,
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("opt into attached mouse capture"),
+            "Ctrl+T must not quit the viewer"
+        );
+        assert!(
+            ui.mouse_capture,
+            "Ctrl+T must opt into mouse capture before forwarding attached wheel input"
+        );
 
         // Replace the inert fake attach command with a raw child that advertises SGR mouse
         // tracking and prints the exact bytes it receives.
         ui.attached
-            .insert(key.clone(), mouse_scroll_forwarding_pty());
-        wait_for_pty_screen(&ui, &key, "READY");
+            .insert(session_key.clone(), mouse_scroll_forwarding_pty());
+        wait_for_pty_screen(&ui, &session_key, "READY");
 
         handle_mouse_event(
             mouse(MouseEventKind::ScrollUp, 5, 5),
@@ -3151,7 +3172,7 @@ pub(crate) mod tests {
         .expect("forward attached wheel event");
 
         // The child must receive SGR wheel-up (button 64), not ESC [ A prompt-history input.
-        wait_for_pty_screen(&ui, &key, "1b 5b 3c 36 34 3b 36 3b 35 4d");
+        wait_for_pty_screen(&ui, &session_key, "1b 5b 3c 36 34 3b 36 3b 35 4d");
         assert!(matches!(ui.mode, Mode::Attached));
     }
 
