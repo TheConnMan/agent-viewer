@@ -352,8 +352,7 @@ fn attach_session<B: ratatui::backend::Backend>(
         let claude_fallback = session.backend == BackendKind::Claude
             && session.short_id.as_deref().unwrap_or_default().is_empty();
         if claude_fallback {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let config = std::path::PathBuf::from(&home).join(".claude.json");
+            let config = agent_viewer_core::home_dir().join(".claude.json");
             let _ = ensure_trusted(&config, &session.cwd);
         }
         let command = match backend.attach_command(session) {

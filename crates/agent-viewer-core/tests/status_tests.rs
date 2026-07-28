@@ -1,51 +1,39 @@
 mod common;
 
 use agent_viewer_core::backend::Status;
-use agent_viewer_core::codex::status::{RolloutOwner, StatusResolver, resolve_status};
-use std::collections::HashMap;
+use agent_viewer_core::codex::status::{FdSignal, RolloutOwner, StatusResolver, resolve_status};
 use std::io::Write;
 use std::path::PathBuf;
 
-fn empty_map() -> HashMap<PathBuf, RolloutOwner> {
-    HashMap::new()
+fn closed() -> FdSignal {
+    FdSignal::Closed
 }
 
-/// An open map holding the canonical form of `path` mapped to an owner, keyed the way the
-/// live `/proc/fd` scan keys it.
-fn open_owned_by(path: &std::path::Path, owner: RolloutOwner) -> HashMap<PathBuf, RolloutOwner> {
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut map = HashMap::new();
-    map.insert(canon, owner);
-    map
+fn unavailable() -> FdSignal {
+    FdSignal::Unavailable
 }
 
 /// The fd is held by the session's OWN codex process: an ordinary killable pid.
-fn open_with(path: &std::path::Path) -> HashMap<PathBuf, RolloutOwner> {
-    open_owned_by(
-        path,
-        RolloutOwner {
-            pid: 4242,
-            daemon: false,
-        },
-    )
+fn held_by_session() -> FdSignal {
+    FdSignal::Held(RolloutOwner {
+        pid: 4242,
+        daemon: false,
+    })
 }
 
 /// The fd is held by the shared `codex app-server` daemon.
-fn open_with_daemon(path: &std::path::Path) -> HashMap<PathBuf, RolloutOwner> {
-    open_owned_by(
-        path,
-        RolloutOwner {
-            pid: 9999,
-            daemon: true,
-        },
-    )
+fn held_by_daemon() -> FdSignal {
+    FdSignal::Held(RolloutOwner {
+        pid: 9999,
+        daemon: true,
+    })
 }
 
 #[test]
 fn needs_input_when_open_and_awaiting() {
     let path = common::fixture_path("rollout_approval.jsonl");
     assert_eq!(
-        resolve_status(&path, &open_with(&path), false),
+        resolve_status(&path, held_by_session(), false),
         Status::NeedsInput {
             reason: Some("awaiting approval".to_string())
         }
@@ -56,7 +44,7 @@ fn needs_input_when_open_and_awaiting() {
 fn working_when_open_and_midturn() {
     let path = common::fixture_path("rollout_midturn.jsonl");
     assert_eq!(
-        resolve_status(&path, &open_with(&path), false),
+        resolve_status(&path, held_by_session(), false),
         Status::Working
     );
 }
@@ -66,7 +54,7 @@ fn idle_when_open_and_complete() {
     // Live session between turns: held open + tail Complete -> Idle.
     let path = common::fixture_path("rollout_complete.jsonl");
     assert_eq!(
-        resolve_status(&path, &open_with(&path), false),
+        resolve_status(&path, held_by_session(), false),
         Status::Idle
     );
 }
@@ -74,20 +62,20 @@ fn idle_when_open_and_complete() {
 #[test]
 fn done_when_closed_and_complete() {
     let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Done);
+    assert_eq!(resolve_status(&path, closed(), false), Status::Done);
 }
 
 #[test]
 fn failed_when_closed_and_midturn() {
     let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Error);
+    assert_eq!(resolve_status(&path, closed(), false), Status::Error);
 }
 
 #[test]
 fn failed_when_file_missing() {
     // Missing file, empty map: Failed, never panics.
     let path = PathBuf::from("/nonexistent/rollout-does-not-exist.jsonl");
-    assert_eq!(resolve_status(&path, &empty_map(), false), Status::Error);
+    assert_eq!(resolve_status(&path, closed(), false), Status::Error);
 }
 
 #[test]
@@ -97,9 +85,11 @@ fn resolver_reresolves_when_session_closes_without_file_change() {
     // UNCHANGED it must resolve Done, never the cached Idle.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
     let mut resolver = StatusResolver::new();
-    let open = open_with(&path);
-    assert_eq!(resolver.resolve(&path, &open, false).0, Status::Idle);
-    assert_eq!(resolver.resolve(&path, &empty_map(), false).0, Status::Done);
+    assert_eq!(
+        resolver.resolve(&path, held_by_session(), false).0,
+        Status::Idle
+    );
+    assert_eq!(resolver.resolve(&path, closed(), false).0, Status::Done);
 }
 
 #[test]
@@ -111,18 +101,15 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     let mut resolver = StatusResolver::new();
     for p in [&complete, &midturn, &missing] {
         assert_eq!(
-            resolver.resolve(p, &empty_map(), false).0,
-            resolve_status(p, &empty_map(), false)
+            resolver.resolve(p, closed(), false).0,
+            resolve_status(p, closed(), false)
         );
     }
 
     // ...and invalidates its (mtime, len) cache when the file changes.
     let (_dir, path) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
-    assert_eq!(
-        resolver.resolve(&path, &empty_map(), false).0,
-        Status::Error
-    );
+    assert_eq!(resolver.resolve(&path, closed(), false).0, Status::Error);
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -133,7 +120,7 @@ fn resolver_matches_pure_and_recomputes_on_change() {
     )
     .unwrap();
     drop(f);
-    assert_eq!(resolver.resolve(&path, &empty_map(), false).0, Status::Done);
+    assert_eq!(resolver.resolve(&path, closed(), false).0, Status::Done);
 }
 
 // --- who holds the fd: the session's own process, or the shared app-server daemon ---
@@ -143,7 +130,7 @@ fn resolver_returns_the_pid_when_the_sessions_own_process_holds_the_fd() {
     let path = common::fixture_path("rollout_midturn.jsonl");
     let mut resolver = StatusResolver::new();
     assert_eq!(
-        resolver.resolve(&path, &open_with(&path), false),
+        resolver.resolve(&path, held_by_session(), false),
         (Status::Working, Some(4242), false)
     );
 }
@@ -173,13 +160,13 @@ fn resolver_withholds_the_daemon_pid_and_flags_the_row_daemon_hosted() {
         let path = common::fixture_path(fixture);
         let mut resolver = StatusResolver::new();
         assert_eq!(
-            resolver.resolve(&path, &open_with_daemon(&path), false),
+            resolver.resolve(&path, held_by_daemon(), false),
             (expected.clone(), None, true),
             "{fixture} under a daemon-held fd"
         );
         // The pure entry point sees the same status; only the pid/host answer is new.
         assert_eq!(
-            resolve_status(&path, &open_with_daemon(&path), false),
+            resolve_status(&path, held_by_daemon(), false),
             expected,
             "{fixture} via resolve_status"
         );
@@ -196,12 +183,12 @@ fn a_finished_daemon_hosted_row_reaches_done_even_though_the_fd_is_still_open() 
     let path = common::fixture_path("rollout_complete.jsonl");
     let mut resolver = StatusResolver::new();
     assert_eq!(
-        resolver.resolve(&path, &open_with_daemon(&path), false),
+        resolver.resolve(&path, held_by_daemon(), false),
         (Status::Done, None, true)
     );
     // The same file under the session's OWN process is still Idle: that fd does mean "alive".
     assert_eq!(
-        resolver.resolve(&path, &open_with(&path), false),
+        resolver.resolve(&path, held_by_session(), false),
         (Status::Idle, Some(4242), false)
     );
 }
@@ -214,18 +201,18 @@ fn an_attached_client_holds_a_daemon_hosted_row_at_idle_instead_of_done() {
     let complete = common::fixture_path("rollout_complete.jsonl");
     let mut resolver = StatusResolver::new();
     assert_eq!(
-        resolver.resolve(&complete, &open_with_daemon(&complete), true),
+        resolver.resolve(&complete, held_by_daemon(), true),
         (Status::Idle, None, true)
     );
 
     let midturn = common::fixture_path("rollout_midturn.jsonl");
     let approval = common::fixture_path("rollout_approval.jsonl");
     assert_eq!(
-        resolver.resolve(&midturn, &open_with_daemon(&midturn), true),
+        resolver.resolve(&midturn, held_by_daemon(), true),
         (Status::Working, None, true)
     );
     assert_eq!(
-        resolver.resolve(&approval, &open_with_daemon(&approval), true),
+        resolver.resolve(&approval, held_by_daemon(), true),
         (
             Status::NeedsInput {
                 reason: Some("awaiting approval".to_string())
@@ -244,7 +231,7 @@ fn a_daemon_hosted_row_with_no_readable_tail_is_working() {
     let mut resolver = StatusResolver::new();
     for attached in [false, true] {
         assert_eq!(
-            resolver.resolve(&path, &open_with_daemon(&path), attached),
+            resolver.resolve(&path, held_by_daemon(), attached),
             (Status::Working, None, true),
             "attached={attached}"
         );
@@ -269,13 +256,13 @@ fn the_attached_flag_changes_nothing_for_a_row_the_daemon_does_not_host() {
         (&approval, true, awaiting.clone()),
         (&approval, false, Status::Error),
     ];
-    for (path, open, expected) in cases {
-        let held = if open { open_with(path) } else { empty_map() };
+    for (path, is_held, expected) in cases {
+        let evidence = if is_held { held_by_session() } else { closed() };
         for attached in [false, true] {
             assert_eq!(
-                resolve_status(path, &held, attached),
+                resolve_status(path, evidence, attached),
                 expected,
-                "{path:?} open={open} attached={attached}"
+                "{path:?} held={is_held} attached={attached}"
             );
         }
     }
@@ -286,7 +273,53 @@ fn resolver_reports_no_pid_and_no_daemon_host_when_the_fd_is_closed() {
     let path = common::fixture_path("rollout_complete.jsonl");
     let mut resolver = StatusResolver::new();
     assert_eq!(
-        resolver.resolve(&path, &empty_map(), false),
+        resolver.resolve(&path, closed(), false),
         (Status::Done, None, false)
+    );
+}
+
+#[test]
+fn unavailable_process_evidence_is_not_observed_closed() {
+    let midturn = common::fixture_path("rollout_midturn.jsonl");
+    assert_eq!(
+        resolve_status(&midturn, unavailable(), false),
+        Status::Unknown
+    );
+    assert_eq!(resolve_status(&midturn, closed(), false), Status::Error);
+}
+
+#[test]
+fn unavailable_process_evidence_reports_only_proven_completion() {
+    let complete = common::fixture_path("rollout_complete.jsonl");
+    let approval = common::fixture_path("rollout_approval.jsonl");
+    let midturn = common::fixture_path("rollout_midturn.jsonl");
+    let missing = PathBuf::from("/nonexistent/rollout-not-written-yet.jsonl");
+
+    assert_eq!(
+        resolve_status(&complete, unavailable(), false),
+        Status::Done
+    );
+    for path in [&approval, &midturn, &missing] {
+        assert_eq!(
+            resolve_status(path, unavailable(), false),
+            Status::Unknown,
+            "{path:?} is not proven complete"
+        );
+    }
+}
+
+#[test]
+fn unavailable_process_evidence_never_claims_a_pid_or_daemon() {
+    let complete = common::fixture_path("rollout_complete.jsonl");
+    let midturn = common::fixture_path("rollout_midturn.jsonl");
+    let mut resolver = StatusResolver::new();
+
+    assert_eq!(
+        resolver.resolve(&complete, unavailable(), false),
+        (Status::Done, None, false)
+    );
+    assert_eq!(
+        resolver.resolve(&midturn, unavailable(), false),
+        (Status::Unknown, None, false)
     );
 }

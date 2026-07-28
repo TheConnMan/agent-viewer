@@ -183,13 +183,11 @@ fn describe(cmd: &std::process::Command) -> String {
     parts.join(" ")
 }
 
-/// Shared detached-spawn helper (codex + opencode; claude self-detaches):
-/// unsafe pre_exec calling libc::setsid() (new session, no ctty); stdin Stdio::null();
-/// stdout+stderr appended to log_path (parent dir created if missing); do NOT wait.
+/// Shared detached spawn helper for every backend.
+/// Unix starts a new session. Windows uses detached process creation flags.
+/// Standard input is null and output is appended to the log path. The child is not waited.
 /// Returns the child PID.
 pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path) -> Result<u32> {
-    use std::os::unix::process::CommandExt;
-
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -201,14 +199,30 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
-    // SAFETY: setsid() is async-signal-safe and the only work done in the child between
-    // fork and exec; it detaches the spawned process into its own session (no ctty).
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: setsid() is async-signal-safe and the only work done in the child between
+        // fork and exec; it detaches the spawned process into its own session (no ctty).
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
     let child = cmd.spawn()?;
     Ok(child.id())
 }
@@ -217,6 +231,7 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
 /// `expected_comm_prefix` ("codex" / "opencode"), else Err(Command("comm mismatch")).
 /// If getpgid(pid) == pid (process leads its own group) send SIGTERM to the group
 /// (-pid), else to the single pid. ESRCH (already gone) -> Ok(()). Never SIGKILL in v2.
+#[cfg(target_os = "linux")]
 pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
     // pid-reuse guard: the live comm must still be the tool we spawned.
     let comm = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
@@ -243,6 +258,11 @@ pub fn terminate(pid: u32, expected_comm_prefix: &str) -> Result<()> {
     } else {
         Err(Error::Command(format!("kill failed: {err}")))
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn terminate(_pid: u32, _expected_comm_prefix: &str) -> Result<()> {
+    Err(Error::Unsupported("process termination"))
 }
 
 #[cfg(test)]

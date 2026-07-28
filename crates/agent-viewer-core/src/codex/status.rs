@@ -15,6 +15,17 @@ pub struct RolloutOwner {
     pub daemon: bool,
 }
 
+/// What the platform can prove about ownership of one rollout file descriptor.
+///
+/// `Closed` is an observed result from a reliable scan. `Unavailable` means the platform
+/// cannot perform that scan, so it must not be treated as evidence that the process exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdSignal {
+    Held(RolloutOwner),
+    Closed,
+    Unavailable,
+}
+
 /// One sweep's worth of codex process facts: who holds which rollout open, and which threads
 /// somebody is currently sitting in.
 pub struct CodexProcessScan {
@@ -22,6 +33,20 @@ pub struct CodexProcessScan {
     /// Thread ids appearing in a codex process's argv. A TUI that joined a daemon-hosted thread
     /// runs `codex resume --remote unix://<sock> <thread-id>`, so its argv names the thread.
     pub attached_threads: HashSet<String>,
+    fd_evidence_available: bool,
+}
+
+impl CodexProcessScan {
+    fn fd_signal(&self, rollout_path: &Path) -> FdSignal {
+        if !self.fd_evidence_available {
+            return FdSignal::Unavailable;
+        }
+        self.open_rollouts
+            .get(rollout_path)
+            .copied()
+            .map(FdSignal::Held)
+            .unwrap_or(FdSignal::Closed)
+    }
 }
 
 /// IMPURE scanner (live-e2e-verified only, no unit tests): enumerate processes via
@@ -30,6 +55,7 @@ pub struct CodexProcessScan {
 /// " (deleted)" suffix. Unreadable /proc entries are skipped silently. The same pass collects
 /// the attached thread ids from argv, because this runs every refresh tick over thousands of
 /// threads and a second sweep (or a per-row daemon query) would land on the render path.
+#[cfg(target_os = "linux")]
 pub fn scan_codex_processes() -> CodexProcessScan {
     let mut sys = sysinfo::System::new();
     // The command line must be requested explicitly: `refresh_processes` refreshes memory,
@@ -44,6 +70,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
     let mut scan = CodexProcessScan {
         open_rollouts: HashMap::new(),
         attached_threads: HashSet::new(),
+        fd_evidence_available: true,
     };
     // The two host signals are a UNION, not a fallback chain. Neither is complete on its own:
     // the socket table misses an app-server on the `stdio://` transport (it holds no socket at
@@ -97,6 +124,17 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         }
     }
     scan
+}
+
+/// Platforms without Linux procfs cannot distinguish a closed rollout from one whose owning
+/// process is still live. Return explicit unavailable evidence and make no process claims.
+#[cfg(not(target_os = "linux"))]
+pub fn scan_codex_processes() -> CodexProcessScan {
+    CodexProcessScan {
+        open_rollouts: HashMap::new(),
+        attached_threads: HashSet::new(),
+        fd_evidence_available: false,
+    }
 }
 
 /// PURE: the inode of an fd whose /proc link target is `socket:[N]`, else None.
@@ -242,11 +280,11 @@ fn looks_like_thread_id(arg: &str) -> bool {
 ///   Complete + a client attached          -> Idle
 ///   Complete                              -> Done
 ///
-/// `Unknown` is NOT produced here: the codex resolver always has an open/closed signal and a
-/// tail to reason from, so it never needs the "backend cannot say" escape hatch. `Unknown` is
-/// reserved for a resolver that genuinely has no signal to reason from. Never panics.
-fn status_from(open: bool, daemon: bool, attached: bool, tail: Option<TailState>) -> Status {
-    if daemon {
+/// When fd inspection is unavailable, only a complete tail proves `Done`. Every other tail is
+/// `Unknown`; it must not be collapsed into the observed-closed `Error` rule or promoted to a
+/// live status. Never panics.
+fn status_from(fd: FdSignal, attached: bool, tail: Option<TailState>) -> Status {
+    if matches!(fd, FdSignal::Held(RolloutOwner { daemon: true, .. })) {
         return match tail {
             Some(TailState::AwaitingApproval) => Status::NeedsInput {
                 reason: Some("awaiting approval".into()),
@@ -256,41 +294,33 @@ fn status_from(open: bool, daemon: bool, attached: bool, tail: Option<TailState>
             _ => Status::Working,
         };
     }
-    match (open, tail) {
-        (true, Some(TailState::AwaitingApproval)) => Status::NeedsInput {
+    match (fd, tail) {
+        (FdSignal::Held(_), Some(TailState::AwaitingApproval)) => Status::NeedsInput {
             reason: Some("awaiting approval".into()),
         },
-        (true, Some(TailState::Complete)) => Status::Idle,
+        (FdSignal::Held(_), Some(TailState::Complete)) => Status::Idle,
         // MidTurn or an unreadable/empty file (spawn race) -> Working while held open.
-        (true, _) => Status::Working,
-        (false, Some(TailState::Complete)) => Status::Done,
+        (FdSignal::Held(_), _) => Status::Working,
+        (FdSignal::Closed, Some(TailState::Complete)) => Status::Done,
         // Closed and not cleanly complete (MidTurn, awaiting, or unreadable) -> Error.
-        (false, _) => Status::Error,
+        (FdSignal::Closed, _) => Status::Error,
+        // A complete tail proves the turn finished even when process inspection is
+        // unavailable. Every other tail remains unknown rather than fabricating liveness,
+        // approval state, or an observed crash.
+        (FdSignal::Unavailable, Some(TailState::Complete)) => Status::Done,
+        (FdSignal::Unavailable, _) => Status::Unknown,
     }
 }
 
-/// PURE six-state resolution given the open map and whether a client is attached to this
-/// thread (only consulted for a daemon-held rollout). Canonicalization exactly as v1.
-/// Never panics.
-pub fn resolve_status(
-    rollout_path: &Path,
-    open_paths: &HashMap<PathBuf, RolloutOwner>,
-    attached: bool,
-) -> Status {
-    let canonical =
-        std::fs::canonicalize(rollout_path).unwrap_or_else(|_| rollout_path.to_path_buf());
-    let owner = open_paths.get(&canonical).copied();
-    status_from(
-        owner.is_some(),
-        owner.is_some_and(|owner| owner.daemon),
-        attached,
-        super::rollout::tail_state(rollout_path).ok(),
-    )
+/// PURE six-state resolution given explicit process evidence and whether a client is attached
+/// to this thread. The attached signal is consulted only for a daemon-held rollout.
+pub fn resolve_status(rollout_path: &Path, fd: FdSignal, attached: bool) -> Status {
+    status_from(fd, attached, super::rollout::tail_state(rollout_path).ok())
 }
 
 /// Caching wrapper for the refresh loop. The cache holds the TAIL STATE (a pure function
 /// of the file) keyed by (mtime, len); the final status is recomputed every tick from
-/// (open?, cached tail) so a session that goes open -> closed with no file change still
+/// (fd signal, cached tail) so a session that goes held -> closed with no file change still
 /// re-resolves (Idle -> Done). Recompute the tail when the key changes or on first sight.
 pub struct StatusResolver {
     cache: HashMap<PathBuf, ((SystemTime, u64), Option<TailState>)>,
@@ -306,10 +336,8 @@ impl StatusResolver {
     }
 
     /// Resolve the status, the owning pid (if any), and whether the fd holder is the shared
-    /// app-server daemon. The owner is looked up in the same canonical-path cache the resolver
-    /// already maintains, so callers do not need to canonicalize a second time. `attached` says
-    /// whether a client is sitting in this thread and is only consulted for a daemon-held
-    /// rollout (see `status_from`).
+    /// app-server daemon. `attached` says whether a client is sitting in this thread and is
+    /// only consulted for a daemon-held rollout.
     ///
     /// A daemon-held rollout returns `(status, None, true)`: the daemon's pid is deliberately
     /// withheld, because it is the pid of every OTHER thread the daemon hosts too and `stop`
@@ -317,29 +345,18 @@ impl StatusResolver {
     pub fn resolve(
         &mut self,
         rollout_path: &Path,
-        open_paths: &HashMap<PathBuf, RolloutOwner>,
+        fd: FdSignal,
         attached: bool,
     ) -> (Status, Option<u32>, bool) {
-        // canonicalize once per distinct rollout_path, then reuse across ticks. Cache ONLY
-        // successful canonicalizations: an Err (path not present yet) uses the raw path for
-        // this tick without caching, so a later tick retries once the file appears.
-        let canonical = match self.canonical.get(rollout_path) {
-            Some(c) => c.clone(),
-            None => match std::fs::canonicalize(rollout_path) {
-                Ok(c) => {
-                    self.canonical.insert(rollout_path.to_path_buf(), c.clone());
-                    c
-                }
-                Err(_) => rollout_path.to_path_buf(),
-            },
+        let owner = match fd {
+            FdSignal::Held(owner) => Some(owner),
+            FdSignal::Closed | FdSignal::Unavailable => None,
         };
-        let owner = open_paths.get(&canonical).copied();
-        let open = owner.is_some();
         let daemon = owner.is_some_and(|owner| owner.daemon);
         let pid = owner.filter(|owner| !owner.daemon).map(|owner| owner.pid);
         // The (mtime, len) cache holds the TAIL STATE only — pure in the file. Reuse it
-        // whether or not the session is open (the tail cannot change without the key
-        // changing); status is always recomputed from (open?, daemon?, attached?, tail) below.
+        // for every fd signal (the tail cannot change without the key changing); status is
+        // always recomputed from process evidence, attached state, and the tail below.
         // This is the hot path this struct exists for (prior intent, commit 49a7c1b; 2,883
         // threads).
         let key = std::fs::metadata(rollout_path).ok().map(|meta| {
@@ -358,7 +375,31 @@ impl StatusResolver {
                 tail
             }
         };
-        (status_from(open, daemon, attached, tail), pid, daemon)
+        (status_from(fd, attached, tail), pid, daemon)
+    }
+
+    /// Resolve one row from a process scan while preserving the canonical path cache used by
+    /// the Linux hot path. Portable scans yield `Unavailable` without touching procfs.
+    pub fn resolve_scanned(
+        &mut self,
+        rollout_path: &Path,
+        scan: &CodexProcessScan,
+        attached: bool,
+    ) -> (Status, Option<u32>, bool) {
+        // Cache only successful canonicalizations. A registry row can appear before its
+        // rollout file, so a failed canonicalization must be retried on a later tick.
+        let canonical = match self.canonical.get(rollout_path) {
+            Some(canonical) => canonical.clone(),
+            None => match std::fs::canonicalize(rollout_path) {
+                Ok(canonical) => {
+                    self.canonical
+                        .insert(rollout_path.to_path_buf(), canonical.clone());
+                    canonical
+                }
+                Err(_) => rollout_path.to_path_buf(),
+            },
+        };
+        self.resolve(rollout_path, scan.fd_signal(&canonical), attached)
     }
 }
 
