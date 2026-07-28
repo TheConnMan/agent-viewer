@@ -1,6 +1,6 @@
 use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status};
 use crate::error::{AttachRefusal, Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -207,6 +207,10 @@ impl Backend for ClaudeBackend {
                     }
                 }
             }
+            if session.rollout_path.is_none() {
+                session.rollout_path =
+                    canonical_transcript_path(&self.jobs_root, &session.cwd, &session.id);
+            }
         }
         // Hide nested `claude -p` children. The entrypoint lives only in the per-process
         // registry, so this is a second (tiny, uncached) read per LIVE row; rows with no pid
@@ -229,7 +233,10 @@ impl Backend for ClaudeBackend {
         else {
             return Ok(Vec::new());
         };
-        read_claude_turn_activity(path, window)
+        let mut timestamps = read_claude_turn_activity(path, window)?;
+        extend_claude_descendant_activity(path, window, &mut timestamps);
+        timestamps.sort_unstable();
+        Ok(timestamps)
     }
     fn available_models(&self) -> Vec<String> {
         // opus[1m] (the non-pinned alias) first, then whatever ~/.claude.json advertises.
@@ -703,6 +710,20 @@ pub fn job_state_path_in(jobs_root: &std::path::Path, short_id: &str) -> PathBuf
     jobs_root.join(short_id).join("state.json")
 }
 
+fn canonical_transcript_path(
+    jobs_root: &std::path::Path,
+    cwd: &std::path::Path,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let config_root = jobs_root.parent()?;
+    let project_dir = cwd.to_string_lossy().replace(['/', '\\'], "-");
+    let path = config_root
+        .join("projects")
+        .join(project_dir)
+        .join(format!("{session_id}.jsonl"));
+    path.is_file().then_some(path)
+}
+
 /// Set `name`/`nameSource` on a parsed job state, preserving every other field. Split out
 /// from the filesystem so the merge itself is provable: a rename must never drop
 /// `respawnFlags`, `intent`, or anything else the job needs to respawn. `Err` when the file
@@ -946,6 +967,114 @@ fn read_claude_turn_activity(
     }
     timestamps.sort_unstable();
     Ok(timestamps)
+}
+
+fn extend_claude_descendant_activity(
+    path: &std::path::Path,
+    window: std::time::Duration,
+    timestamps: &mut Vec<i64>,
+) {
+    let Some(directory) = claude_subagents_directory(path) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut transcripts = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let transcript = entry.path();
+        if file_type.is_file()
+            && transcript
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            transcripts.push(transcript);
+        }
+    }
+
+    let agent_id = if path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("subagents")
+    {
+        claude_subagent_id(path)
+    } else {
+        None
+    };
+    let Some(agent_id) = agent_id else {
+        for transcript in transcripts {
+            if let Ok(child_activity) = read_claude_turn_activity(&transcript, window) {
+                timestamps.extend(child_activity);
+            }
+        }
+        return;
+    };
+
+    let mut children = HashMap::<String, Vec<(String, PathBuf)>>::new();
+    for transcript in transcripts {
+        let Some(child_id) = claude_subagent_id(&transcript) else {
+            continue;
+        };
+        let meta_path = transcript.with_extension("meta.json");
+        let Some((spawn_depth, parent_agent_id)) = claude_subagent_parent(&meta_path) else {
+            continue;
+        };
+        if spawn_depth < 2 {
+            continue;
+        }
+        children
+            .entry(parent_agent_id)
+            .or_default()
+            .push((child_id, transcript));
+    }
+
+    let mut pending = vec![agent_id.clone()];
+    let mut visited = HashSet::from([agent_id]);
+    while let Some(parent_agent_id) = pending.pop() {
+        let Some(descendants) = children.get(&parent_agent_id) else {
+            continue;
+        };
+        for (child_id, transcript) in descendants {
+            if !visited.insert(child_id.clone()) {
+                continue;
+            }
+            if let Ok(child_activity) = read_claude_turn_activity(transcript, window) {
+                timestamps.extend(child_activity);
+            }
+            pending.push(child_id.clone());
+        }
+    }
+}
+
+fn claude_subagents_directory(path: &std::path::Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("subagents") {
+        return Some(parent.to_path_buf());
+    }
+    let mut directory = path.to_path_buf();
+    directory.set_extension("");
+    directory.push("subagents");
+    Some(directory)
+}
+
+fn claude_subagent_id(path: &std::path::Path) -> Option<String> {
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("agent-")
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+}
+
+fn claude_subagent_parent(path: &std::path::Path) -> Option<(u64, String)> {
+    let meta = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&meta).ok()?;
+    let spawn_depth = value.get("spawnDepth")?.as_u64()?;
+    let parent_agent_id = value.get("parentAgentId")?.as_str()?.trim();
+    (!parent_agent_id.is_empty()).then(|| (spawn_depth, parent_agent_id.to_string()))
 }
 
 #[cfg(test)]

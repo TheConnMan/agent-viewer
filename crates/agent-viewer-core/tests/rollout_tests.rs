@@ -33,6 +33,42 @@ fn codex_session(rollout_path: Option<PathBuf>) -> Session {
     }
 }
 
+fn codex_activity_session(id: &str, rollout_path: PathBuf) -> Session {
+    let mut session = codex_session(Some(rollout_path));
+    session.id = id.to_string();
+    session
+}
+
+fn write_codex_activity(path: &std::path::Path, timestamp: i64) {
+    let mut file = std::fs::File::create(path).expect("create rollout");
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"activity"}}]}}}}"#,
+        rfc3339_at(timestamp)
+    )
+    .expect("write rollout");
+}
+
+fn insert_codex_activity_thread(
+    conn: &rusqlite::Connection,
+    id: &str,
+    rollout_path: &std::path::Path,
+    source: &str,
+    updated_at_ms: i64,
+) {
+    let rollout_path = rollout_path.to_string_lossy().into_owned();
+    conn.execute(
+        "INSERT INTO threads \
+         (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, \
+          sandbox_policy, approval_mode, archived, model, git_branch, first_user_message, \
+          preview, created_at_ms, updated_at_ms) \
+         VALUES (?1, ?2, 1, 1, ?3, 'openai', '/project', ?1, 'workspace-write', \
+                 'on-request', 0, NULL, NULL, 'message', 'preview', 1000, ?4)",
+        rusqlite::params![id, rollout_path, source, updated_at_ms],
+    )
+    .expect("insert activity thread");
+}
+
 // --- Preserved v1 tests (unchanged behavior) ---
 
 #[test]
@@ -266,6 +302,142 @@ fn codex_turn_activity_reads_full_history_and_meaningful_calls() {
             )
             .expect("missing transcript")
             .is_empty()
+    );
+}
+
+#[test]
+fn codex_turn_activity_includes_only_requested_subtree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let root_path = dir.path().join("root.jsonl");
+    let child_a_path = dir.path().join("child_a.jsonl");
+    let child_b_path = dir.path().join("child_b.jsonl");
+    let grandchild_path = dir.path().join("grandchild.jsonl");
+    let unrelated_path = dir.path().join("unrelated.jsonl");
+    let malformed_path = dir.path().join("malformed.jsonl");
+    let missing_path = dir.path().join("missing.jsonl");
+    let cycle_a_path = dir.path().join("cycle_a.jsonl");
+    let cycle_b_path = dir.path().join("cycle_b.jsonl");
+
+    write_codex_activity(&root_path, now - 6);
+    write_codex_activity(&child_a_path, now - 5);
+    write_codex_activity(&child_b_path, now - 4);
+    write_codex_activity(&grandchild_path, now - 3);
+    write_codex_activity(&unrelated_path, now - 2);
+    write_codex_activity(&malformed_path, now - 1);
+    write_codex_activity(&cycle_a_path, now - 8);
+    write_codex_activity(&cycle_b_path, now - 7);
+
+    let db_path = dir.path().join("state_5.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).expect("open registry");
+    conn.execute_batch(&common::read_fixture("threads_schema.sql"))
+        .expect("create registry schema");
+    insert_codex_activity_thread(&conn, "root", &root_path, "cli", (now - 6) * 1_000);
+    insert_codex_activity_thread(
+        &conn,
+        "child_a",
+        &child_a_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}"#,
+        (now - 5) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "child_b",
+        &child_b_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}"#,
+        (now - 4) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "grandchild",
+        &grandchild_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"child_a"}}}"#,
+        (now - 3) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "unrelated",
+        &unrelated_path,
+        "cli",
+        (now - 2) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "malformed",
+        &malformed_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}"#,
+        (now - 1) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "missing",
+        &missing_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}"#,
+        now * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "cycle_a",
+        &cycle_a_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"cycle_b"}}}"#,
+        (now - 8) * 1_000,
+    );
+    insert_codex_activity_thread(
+        &conn,
+        "cycle_b",
+        &cycle_b_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"cycle_a"}}}"#,
+        (now - 7) * 1_000,
+    );
+    conn.close().expect("close registry");
+
+    let backend = CodexBackend::new(dir.path().to_path_buf());
+    assert_eq!(
+        backend
+            .turn_activity(
+                &codex_activity_session("root", root_path.clone()),
+                Duration::from_secs(60)
+            )
+            .expect("root subtree activity"),
+        vec![
+            (now - 6) * 1_000,
+            (now - 5) * 1_000,
+            (now - 4) * 1_000,
+            (now - 3) * 1_000,
+        ]
+    );
+    assert_eq!(
+        backend
+            .turn_activity(
+                &codex_activity_session("child_a", child_a_path),
+                Duration::from_secs(60)
+            )
+            .expect("child subtree activity"),
+        vec![(now - 5) * 1_000, (now - 3) * 1_000]
+    );
+    assert_eq!(
+        backend
+            .turn_activity(
+                &codex_activity_session("cycle_a", cycle_a_path),
+                Duration::from_secs(60)
+            )
+            .expect("cycle activity"),
+        vec![(now - 8) * 1_000, (now - 7) * 1_000]
+    );
+
+    let no_registry = tempfile::TempDir::new().unwrap();
+    let backend_without_registry = CodexBackend::new(no_registry.path().to_path_buf());
+    assert_eq!(
+        backend_without_registry
+            .turn_activity(
+                &codex_activity_session("root", root_path),
+                Duration::from_secs(60)
+            )
+            .expect("root activity without registry"),
+        vec![(now - 6) * 1_000]
     );
 }
 

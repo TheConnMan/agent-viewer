@@ -121,7 +121,7 @@ fn activity_results(
             None => true,
             Some(entry) => {
                 entry.transcript_version != session.updated_at_ms
-                    && now_ms - entry.fetched_at_ms >= ACTIVITY_REFRESH_MS
+                    || now_ms - entry.fetched_at_ms >= ACTIVITY_REFRESH_MS
             }
         };
         if should_read {
@@ -1215,6 +1215,7 @@ mod tests {
     struct CountingActivityBackend {
         reads: TestArc<AtomicUsize>,
         timestamps: Vec<i64>,
+        refreshed_timestamps: Option<Vec<i64>>,
     }
 
     impl Backend for CountingActivityBackend {
@@ -1235,8 +1236,13 @@ mod tests {
             _session: &Session,
             _window: Duration,
         ) -> agent_viewer_core::Result<Vec<i64>> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(self.timestamps.clone())
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .refreshed_timestamps
+                .as_ref()
+                .filter(|_| read > 0)
+                .unwrap_or(&self.timestamps)
+                .clone())
         }
 
         fn spawn(
@@ -1263,6 +1269,7 @@ mod tests {
         let backends: Vec<Box<dyn Backend>> = vec![Box::new(CountingActivityBackend {
             reads: reads.clone(),
             timestamps: vec![3_100_000, 3_200_000, 3_300_000],
+            refreshed_timestamps: None,
         })];
         let session = session(BackendKind::Codex, "active", 1_000, false);
         let mut cache = HashMap::new();
@@ -1271,7 +1278,7 @@ mod tests {
             &backends,
             &mut cache,
             vec![session.clone()],
-            NOW_MS + ACTIVITY_REFRESH_MS,
+            NOW_MS + ACTIVITY_REFRESH_MS - 1,
         );
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(first[0].2, second[0].2);
@@ -1305,6 +1312,37 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn activity_cache_rereads_at_expiry_with_unchanged_parent() {
+        const NOW_MS: i64 = 3_600_000;
+        let reads = TestArc::new(AtomicUsize::new(0));
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(CountingActivityBackend {
+            reads: reads.clone(),
+            timestamps: vec![NOW_MS - 3_000_000],
+            refreshed_timestamps: Some(vec![NOW_MS + ACTIVITY_REFRESH_MS]),
+        })];
+        let session = session(BackendKind::Codex, "active", 1_000, false);
+        let mut cache = HashMap::new();
+        let first = activity_results(&backends, &mut cache, vec![session.clone()], NOW_MS);
+        let just_before_expiry = activity_results(
+            &backends,
+            &mut cache,
+            vec![session.clone()],
+            NOW_MS + ACTIVITY_REFRESH_MS - 1,
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(first[0].2, just_before_expiry[0].2);
+
+        let at_expiry = activity_results(
+            &backends,
+            &mut cache,
+            vec![session],
+            NOW_MS + ACTIVITY_REFRESH_MS,
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_ne!(just_before_expiry[0].2, at_expiry[0].2);
     }
 
     fn apply_listing(ui: &mut Ui, sessions: Vec<Session>) {

@@ -12,6 +12,7 @@ use crate::error::{AttachRefusal, Result};
 use crate::platform::Platform;
 use registry::Registry;
 use status::StatusResolver;
+use std::collections::HashSet;
 use std::path::Path;
 
 // Enumeration still reads the SQLite registry + rollout files directly; the `codex app-server`
@@ -358,7 +359,43 @@ impl Backend for CodexBackend {
         else {
             return Ok(Vec::new());
         };
-        rollout::read_turn_activity(path, window)
+        let mut timestamps = rollout::read_turn_activity(path, window)?;
+        let Ok(db_path) = registry::find_state_db(&self.codex_home) else {
+            return Ok(timestamps);
+        };
+        let Ok(registry) = Registry::open(&db_path) else {
+            return Ok(timestamps);
+        };
+        let Ok(threads) = registry.threads() else {
+            return Ok(timestamps);
+        };
+
+        let mut reachable = HashSet::from([session.id.clone()]);
+        loop {
+            let mut found_descendant = false;
+            for thread in &threads {
+                if reachable.contains(&thread.id)
+                    || !thread
+                        .parent_thread_id
+                        .as_ref()
+                        .is_some_and(|parent| reachable.contains(parent))
+                {
+                    continue;
+                }
+                reachable.insert(thread.id.clone());
+                found_descendant = true;
+                if let Ok(child_activity) =
+                    rollout::read_turn_activity(&thread.rollout_path, window)
+                {
+                    timestamps.extend(child_activity);
+                }
+            }
+            if !found_descendant {
+                break;
+            }
+        }
+        timestamps.sort_unstable();
+        Ok(timestamps)
     }
 
     fn available_models(&self) -> Vec<String> {
