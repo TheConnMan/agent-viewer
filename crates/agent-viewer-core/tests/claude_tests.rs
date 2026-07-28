@@ -8,9 +8,10 @@ use agent_viewer_core::claude::{
     sessions_root_from,
 };
 use agent_viewer_core::codex::rollout::TranscriptItem;
+use common::rfc3339_at;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Find the session whose title matches. parse_agents_json now returns `Vec<Session>`
 /// with the short id folded into `Session.short_id` (no more (Session, String) tuple).
@@ -475,6 +476,91 @@ fn claude_turn_activity_normalizes_filters_and_missing_is_empty() {
                 Duration::MAX
             )
             .expect("missing transcript")
+            .is_empty()
+    );
+}
+
+#[test]
+fn claude_turn_activity_reads_full_history_and_tool_use() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("large.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let early_tool = now - 10;
+    let later_text = now - 40;
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{}}}}]}}}}"#,
+        rfc3339_at(early_tool)
+    )
+    .unwrap();
+    writeln!(file, "{}", "x".repeat(128 * 1024)).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"after padding"}}]}}}}"#,
+        rfc3339_at(later_text)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"","input":{{}}}}]}}}}"#,
+        rfc3339_at(now - 35)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tool_1","content":"done"}}]}}}}"#,
+        rfc3339_at(now - 30)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"thinking","thinking":"considering"}}]}}}}"#,
+        rfc3339_at(now - 25)
+    )
+    .unwrap();
+    writeln!(file, "{{not json").unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"not-a-timestamp","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"bad time"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{}}}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{}}}}]}}}}"#,
+        rfc3339_at(now + 3_600)
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"expired"}}]}}}}"#,
+        rfc3339_at(now - 7_200)
+    )
+    .unwrap();
+    drop(file);
+
+    let backend = ClaudeBackend::with_binary("/unused/claude");
+    assert_eq!(
+        backend
+            .turn_activity(
+                &claude_session(Some(path.clone())),
+                Duration::from_secs(60 * 60)
+            )
+            .expect("full activity"),
+        vec![later_text * 1_000, early_tool * 1_000]
+    );
+    assert!(
+        backend
+            .turn_activity(&claude_session(Some(path)), Duration::ZERO)
+            .expect("old turns excluded")
             .is_empty()
     );
 }
