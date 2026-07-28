@@ -19,6 +19,7 @@ use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelectio
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
+use agent_viewer_tui::{StartupAction, startup_action};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -456,6 +457,11 @@ fn capture_terminal_palette() -> Option<TerminalPalette> {
 }
 
 fn main() -> io::Result<()> {
+    if startup_action(std::env::args_os().skip(1)) == StartupAction::PrintVersion {
+        writeln!(io::stdout(), "agent-viewer {}", env!("CARGO_PKG_VERSION"))?;
+        return Ok(());
+    }
+
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
     let glyph_marks = std::env::var("AGENT_VIEWER_GLYPH_MARKS").as_deref() == Ok("1");
     ui::set_glyph_marks(glyph_marks);

@@ -9,6 +9,7 @@ use crate::backend::{
     Backend, BackendKind, Capabilities, Session, SessionOrigin, SpawnResult, Status,
 };
 use crate::error::{AttachRefusal, Result};
+use crate::platform::Platform;
 use registry::Registry;
 use status::StatusResolver;
 use std::path::Path;
@@ -89,6 +90,9 @@ const LIVE_TURN_REFUSAL: &str = concat!(
     "showing a live read-only tail instead of forking it"
 );
 
+const PORTABLE_ATTACH_REFUSAL: &str =
+    "session completion is not proven, so resuming it could fork a live turn";
+
 /// PURE attach routing:
 ///   daemon-hosted + a reachable daemon                 -> Remote (a real live join)
 ///   foreign + mid-turn (Working|NeedsInput) + a pid    -> Refuse (a resume would fork it)
@@ -108,6 +112,28 @@ pub fn attach_route(session: &Session, daemon: Option<&app_server::Daemon>) -> A
         return AttachRoute::Refuse(LIVE_TURN_REFUSAL);
     }
     AttachRoute::Local
+}
+
+/// PURE attach routing with the platform's process evidence policy applied.
+///
+/// Linux retains the measured daemon and fd behavior above. Other platforms may locally
+/// resume only a row whose complete tail proved it done. An unknown row is refused because a
+/// plain resume of a live turn would append a fabricated interruption.
+pub fn attach_route_for_platform(
+    session: &Session,
+    daemon: Option<&app_server::Daemon>,
+    platform: Platform,
+) -> AttachRoute {
+    match platform {
+        Platform::Linux => attach_route(session, daemon),
+        Platform::Macos | Platform::Windows => {
+            if matches!(session.status, Status::Done) {
+                AttachRoute::Local
+            } else {
+                AttachRoute::Refuse(PORTABLE_ATTACH_REFUSAL)
+            }
+        }
+    }
 }
 
 /// How a row is stopped.
@@ -267,17 +293,7 @@ impl Backend for CodexBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            spawn: true,
-            attach: true,
-            rename: true,
-            archive: true,
-            delete: true,
-            stop: true,
-            needs_input: true,
-            pr_refs: true,
-            live_status: true,
-        }
+        capabilities_for_platform(crate::platform::current_platform())
     }
 
     fn capabilities_for(&self, session: &Session) -> Capabilities {
@@ -295,7 +311,7 @@ impl Backend for CodexBackend {
         // must never be signalled), and it is stopped with `turn/interrupt` over the socket
         // instead. Gating on the pid alone would gray Ctrl+C out on exactly the rows that are
         // interruptible.
-        capabilities.stop = session.pid.is_some() || session.daemon_hosted;
+        capabilities.stop &= session.pid.is_some() || session.daemon_hosted;
         capabilities
     }
 
@@ -311,7 +327,7 @@ impl Backend for CodexBackend {
             let attached = scan.attached_threads.contains(&thread.id);
             let (status, pid, daemon_hosted) =
                 self.resolver
-                    .resolve(&thread.rollout_path, &scan.open_rollouts, attached);
+                    .resolve_scanned(&thread.rollout_path, &scan, attached);
             let companion = thread.source.is_companion();
             let origin = if matches!(thread.source, source::Source::Exec) {
                 SessionOrigin::Exec
@@ -368,6 +384,9 @@ impl Backend for CodexBackend {
     }
 
     fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<SpawnResult> {
+        if crate::platform::current_platform() != Platform::Linux {
+            return Err(crate::error::Error::Unsupported(self.kind().name()));
+        }
         // Prefer the shared daemon: a thread it hosts is the only kind that can be joined
         // later, and it may be started here (never stopped, never restarted). Skip the probe
         // entirely when exec is forced, so an opt-in never starts a daemon it will not use.
@@ -424,6 +443,9 @@ impl Backend for CodexBackend {
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
+        if crate::platform::current_platform() != Platform::Linux {
+            return Err(crate::error::Error::Unsupported(self.kind().name()));
+        }
         match stop_route(session) {
             StopRoute::Interrupt => {
                 // Probe only, never start: if no daemon answers, this thread is not hosted by
@@ -452,21 +474,24 @@ impl Backend for CodexBackend {
         &self,
         session: &Session,
     ) -> std::result::Result<std::process::Command, AttachRefusal> {
+        let platform = crate::platform::current_platform();
         // Probe only, never start, and only for a row that claims a daemon host: the probe is
         // a shell-out and this runs on the attach keypress, so a Local or Refuse row must not
         // pay for it.
-        let daemon = session
-            .daemon_hosted
+        let daemon = (platform == Platform::Linux && session.daemon_hosted)
             .then(app_server::probe_daemon)
             .flatten();
-        let mut cmd = match attach_route(session, daemon.as_ref()) {
+        let mut cmd = match attach_route_for_platform(session, daemon.as_ref(), platform) {
             // A real live join: `thread/resume` inside the hosting process returns the history
             // and atomically subscribes to live updates.
             AttachRoute::Remote(endpoint) => cli::resume_remote_command(&endpoint, &session.id),
             AttachRoute::Local => cli::resume_command(&session.id),
             // Not an error the user must dismiss: the row IS running, it just cannot be
             // joined, so the caller falls back to watching it read-only.
-            AttachRoute::Refuse(reason) => return Err(AttachRefusal::tailable(reason)),
+            AttachRoute::Refuse(reason) if platform == Platform::Linux => {
+                return Err(AttachRefusal::tailable(reason));
+            }
+            AttachRoute::Refuse(reason) => return Err(AttachRefusal::new(reason)),
         };
         // `codex resume` inherits the viewer's cwd and otherwise prompts "Choose working
         // directory" on attach. Pin it to the session's own cwd when that directory still
@@ -475,6 +500,38 @@ impl Backend for CodexBackend {
             cmd.current_dir(&session.cwd);
         }
         Ok(cmd)
+    }
+}
+
+/// PURE capability policy for Codex on each supported release platform.
+///
+/// Portable builds retain read-only enumeration, transcript activity, and CLI mutations that
+/// do not depend on process ownership. They do not claim liveness, daemon hosting, safe spawn,
+/// attach, stop, or approval state.
+pub const fn capabilities_for_platform(platform: Platform) -> Capabilities {
+    match platform {
+        Platform::Linux => Capabilities {
+            spawn: true,
+            attach: true,
+            rename: true,
+            archive: true,
+            delete: true,
+            stop: true,
+            needs_input: true,
+            pr_refs: true,
+            live_status: true,
+        },
+        Platform::Macos | Platform::Windows => Capabilities {
+            spawn: false,
+            attach: false,
+            rename: true,
+            archive: true,
+            delete: true,
+            stop: false,
+            needs_input: false,
+            pr_refs: true,
+            live_status: false,
+        },
     }
 }
 

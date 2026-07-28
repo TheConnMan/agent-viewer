@@ -8,6 +8,7 @@
 use crate::backend::{BackendKind, Session};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 
@@ -94,6 +95,7 @@ fn is_unusable_file(error: &crate::error::Error) -> bool {
     )
 }
 
+#[cfg(unix)]
 fn create_state_parent(path: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut current = path;
@@ -114,6 +116,13 @@ fn create_state_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn create_state_parent(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn restrict_database_files(path: &Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let mut file = path.as_os_str().to_os_string();
@@ -123,6 +132,11 @@ fn restrict_database_files(path: &Path) -> Result<()> {
             std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))?;
         }
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_database_files(_path: &Path) -> Result<()> {
     Ok(())
 }
 

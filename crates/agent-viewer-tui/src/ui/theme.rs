@@ -163,10 +163,7 @@ impl ThemeState {
 }
 
 pub fn theme_directory() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".config/agent-viewer/themes")
+    agent_viewer_core::home_dir().join(".config/agent-viewer/themes")
 }
 
 pub fn persisted_theme(db: &ViewerDb) -> Option<String> {
