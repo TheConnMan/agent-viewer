@@ -200,13 +200,18 @@ struct SessionRow<'a> {
 
 fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     let word = status_display_word(row.status);
+    let status_field = if row.show_activity {
+        format!("{word:<width$}", width = "Needs input".len())
+    } else {
+        word.to_string()
+    };
     let activity_width = usize::from(row.show_activity) * 10;
     let (title, status, pr, summary, pad) = crate::app::row_layout(
         row.width.saturating_sub(activity_width + row.project_width),
         mark_width(row.mark),
         row.name,
         row.title_width,
-        word,
+        &status_field,
         row.pr,
         row.summary,
         display_width(row.elapsed),

@@ -182,4 +182,22 @@ mod tests {
         let traveling = rendered(&theme, false, 480);
         assert_ne!(traveling[(4, 2)].fg, traveling[(1, 2)].fg);
     }
+
+    #[test]
+    fn terminal_match_renders_blank_halves_with_an_opaque_background() {
+        let theme = theme::terminal(false);
+        let buffer = rendered(&theme, false, 0);
+        let blank = &buffer[(1, 1)];
+
+        assert_eq!(blank.symbol(), "▀");
+        assert_ne!(blank.fg, Color::Reset);
+        assert_eq!(blank.fg, blank.bg);
+    }
+
+    #[test]
+    fn mono16_lighthouse_changes_between_animation_phases() {
+        let theme = theme::mono16(false);
+
+        assert_ne!(rendered(&theme, false, 0), rendered(&theme, false, 1_400));
+    }
 }

@@ -14,7 +14,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LINES: u16 = 10;
-const INPUT_GUTTER: usize = 5;
+const MARK_FIELD: usize = 4;
+const INPUT_GUTTER: usize = MARK_FIELD + 1;
 pub(super) const COMPOSER_HINT: &str = "⇥ agent · ⇧⇥ model · ⏎ spawn";
 
 pub(super) fn input_inner_width(frame_width: u16) -> u16 {
@@ -148,7 +149,8 @@ fn metadata_layout(
     folder: &str,
     width: usize,
 ) -> MetadataLayout {
-    let fixed_width = display_width(mark).max(INPUT_GUTTER)
+    let fixed_width = display_width(mark).max(MARK_FIELD)
+        + 1
         + display_width(agent)
         + display_width(" · ")
         + display_width(model)
@@ -292,9 +294,10 @@ pub(super) fn draw(
     );
     let mut metadata = vec![
         Span::styled(
-            field(mark, INPUT_GUTTER),
+            field(mark, MARK_FIELD),
             fg(backend_mark_color(backend, theme)),
         ),
+        Span::raw(" "),
         Span::styled(backend.name().to_string(), fg(theme.text)),
         Span::styled(" · ", fg(theme.faint)),
         Span::styled(model.to_string(), fg(theme.muted)),
@@ -325,15 +328,16 @@ pub(super) fn draw(
         ..inner
     };
     if input.height > 0 {
-        let prefix = Span::styled(field("❯", INPUT_GUTTER), fg(theme.accent));
+        let prefix = vec![
+            Span::styled(field(" ❯", MARK_FIELD), fg(theme.accent)),
+            Span::raw(" "),
+        ];
         if composer.is_empty() {
-            let mut spans = vec![prefix, Span::styled("describe a task", fg(theme.muted))];
-            if show_cursor {
-                spans.push(Span::styled("▏", fg(theme.accent)));
-            }
+            let mut spans = prefix;
+            spans.push(Span::styled("describe a task", fg(theme.muted)));
             frame.render_widget(Paragraph::new(Line::from(spans)), input);
             if show_cursor {
-                let column = INPUT_GUTTER + display_width("describe a task");
+                let column = INPUT_GUTTER;
                 let x = input.x + (column as u16).min(input.width - 1);
                 frame.set_cursor_position((x, input.y));
             }
@@ -358,7 +362,7 @@ pub(super) fn draw(
                     let index = start + visible_index;
                     let mut spans = Vec::new();
                     if index == 0 {
-                        spans.push(prefix.clone());
+                        spans.extend(prefix.clone());
                     }
                     spans.push(Span::styled(segment.clone(), fg(theme.text)));
                     if show_cursor && index == last {
@@ -380,12 +384,12 @@ pub(super) fn draw(
 
     if let Some(logos) = logos
         && logo_marks()
-        && inner.width >= 2
+        && inner.width >= 3
     {
         frame.render_widget(
             Image::new(logos.image(backend)),
             Rect {
-                x: inner.x,
+                x: inner.x + 1,
                 y: inner.y,
                 width: 2,
                 height: 1,

@@ -8,7 +8,7 @@ use std::time::Duration;
 fn builtins_resolve_distinct_core_tokens() {
     let (themes, notices) = ThemeState::load(false, None, std::path::Path::new("/missing"));
     assert!(notices.is_empty());
-    assert_eq!(themes.themes().len(), 4);
+    assert_eq!(themes.themes().len(), 11);
 
     let accents = themes
         .themes()
@@ -26,9 +26,32 @@ fn builtins_resolve_distinct_core_tokens() {
         .map(|theme| theme.warn)
         .collect::<HashSet<Color>>();
 
-    assert_eq!(accents.len(), 4);
-    assert_eq!(backgrounds.len(), 4);
-    assert_eq!(warnings.len(), 4);
+    assert_eq!(accents.len(), 11);
+    assert_eq!(backgrounds.len(), 11);
+    assert_eq!(warnings.len(), 11);
+}
+
+#[test]
+fn builtin_catalog_includes_the_seven_polish_themes() {
+    let (themes, notices) = ThemeState::load(false, None, std::path::Path::new("/missing"));
+    assert!(notices.is_empty());
+    let ids = themes
+        .themes()
+        .iter()
+        .map(|theme| theme.id.as_str())
+        .collect::<HashSet<_>>();
+
+    for expected in [
+        "aubergine",
+        "hoth",
+        "catppuccin",
+        "tokyonight",
+        "gruvbox",
+        "rosepine",
+        "nord",
+    ] {
+        assert!(ids.contains(expected), "missing builtin theme {expected}");
+    }
 }
 
 #[test]
