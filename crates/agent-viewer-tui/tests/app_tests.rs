@@ -904,11 +904,21 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
         BackendKind::Claude,
         "done",
         "/synthetic/shared",
-        9_820_000,
+        9_100_000,
         Status::Done,
     );
     done.title = "Deploy".to_string();
     done.summary = "finished".to_string();
+    done.pr_refs = vec![
+        PrRef {
+            id: "41".to_string(),
+            href: None,
+        },
+        PrRef {
+            id: "42".to_string(),
+            href: None,
+        },
+    ];
 
     let app = App::new(vec![needs, done]);
     let mode = Mode::Normal;
@@ -969,8 +979,12 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     let needs_elapsed = column(needs_y, "2h").unwrap();
     let done_title = column(done_y, "Deploy").unwrap();
     let done_status = column(done_y, "Done").unwrap();
+    let done_pr = column(done_y, "2 PRs").unwrap();
     let done_summary = column(done_y, "finished").unwrap();
-    let done_elapsed = column(done_y, "3m").unwrap();
+    let done_elapsed = column(done_y, "15m").unwrap();
+    let needs_pr_right = needs_pr + "#315".len() as u16;
+    let done_pr_right = done_pr + "2 PRs".len() as u16;
+    let elapsed_column = done_elapsed;
 
     assert!(needs_title < needs_status);
     assert!(needs_status < needs_summary);
@@ -978,9 +992,14 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     assert!(needs_pr < needs_elapsed);
     assert!(done_title < done_status);
     assert!(done_status < done_summary);
-    assert!(done_summary < done_elapsed);
+    assert!(done_summary < done_pr);
+    assert!(done_pr < done_elapsed);
     assert_eq!(needs_status, done_status);
     assert_eq!(needs_status - needs_title - 1, 40);
+    assert_eq!(needs_pr_right, done_pr_right);
+    assert_eq!(needs_pr_right + 1, elapsed_column);
+    assert_eq!(needs_elapsed, elapsed_column + 1);
+    assert_eq!(buffer[(elapsed_column, needs_y)].symbol(), " ");
     assert_eq!(buffer[(needs_pr, needs_y)].fg, theme::amber(false).accent);
     assert_eq!(
         buffer[(needs_summary, needs_y)].fg,
@@ -992,8 +1011,8 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
     );
     assert_eq!(buffer[(done_summary, done_y)].fg, theme::amber(false).muted);
     assert_eq!(buffer[(done_elapsed, done_y)].fg, theme::amber(false).muted);
-    assert_eq!(needs_elapsed + 2, width);
-    assert_eq!(done_elapsed + 2, width);
+    assert_eq!(needs_elapsed + 2, done_elapsed + 3);
+    assert_eq!(done_elapsed + 3, width);
 }
 
 #[test]
