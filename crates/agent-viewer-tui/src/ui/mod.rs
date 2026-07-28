@@ -869,6 +869,63 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_an_attached_palette_recolors_only_default_cells() {
+        let old_palette = agent_viewer_core::pty::TerminalPalette {
+            foreground: [0x12, 0x34, 0x56],
+            background: [0x78, 0x9a, 0xbc],
+        };
+        let new_palette = agent_viewer_core::pty::TerminalPalette {
+            foreground: [0xfe, 0xdc, 0xba],
+            background: [0x65, 0x43, 0x21],
+        };
+        let mut pty = attached_pty_with_palette(
+            "printf 'P\\033[38;5;1;48;5;4mI\\033[0m\\033[38;2;1;2;3;48;2;4;5;6mR\\033[0m\\033[?25l'; sleep 30",
+            Some(old_palette),
+        );
+        wait_for_attached_screen(&pty, "PIR");
+        let session = attached_test_session();
+
+        let before = render_attached(&pty, &session);
+        pty.set_palette(Some(new_palette));
+        let after = render_attached(&pty, &session);
+
+        assert_eq!(before[(0, 1)].symbol(), "P");
+        assert_eq!(
+            before[(0, 1)].fg,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            before[(0, 1)].bg,
+            ratatui::style::Color::Rgb(0x78, 0x9a, 0xbc)
+        );
+        assert_eq!(after[(0, 1)].symbol(), "P");
+        assert_eq!(
+            after[(0, 1)].fg,
+            ratatui::style::Color::Rgb(0xfe, 0xdc, 0xba)
+        );
+        assert_eq!(
+            after[(0, 1)].bg,
+            ratatui::style::Color::Rgb(0x65, 0x43, 0x21)
+        );
+
+        assert_eq!(before[(1, 1)].symbol(), "I");
+        assert_eq!(after[(1, 1)].symbol(), "I");
+        assert_eq!(before[(1, 1)].fg, ratatui::style::Color::Indexed(1));
+        assert_eq!(before[(1, 1)].bg, ratatui::style::Color::Indexed(4));
+        assert_eq!(after[(1, 1)].fg, before[(1, 1)].fg);
+        assert_eq!(after[(1, 1)].bg, before[(1, 1)].bg);
+
+        assert_eq!(before[(2, 1)].symbol(), "R");
+        assert_eq!(after[(2, 1)].symbol(), "R");
+        assert_eq!(before[(2, 1)].fg, ratatui::style::Color::Rgb(1, 2, 3));
+        assert_eq!(before[(2, 1)].bg, ratatui::style::Color::Rgb(4, 5, 6));
+        assert_eq!(after[(2, 1)].fg, before[(2, 1)].fg);
+        assert_eq!(after[(2, 1)].bg, before[(2, 1)].bg);
+
+        pty.kill();
+    }
+
+    #[test]
     fn palette_free_attached_terminal_keeps_default_cells_and_empty_cursor_unstyled() {
         let mut pty = attached_pty("printf 'P'; sleep 30");
         wait_for_attached_screen(&pty, "P");

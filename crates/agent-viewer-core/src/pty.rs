@@ -129,7 +129,7 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     writer: SharedWriter,
     parser: Arc<Mutex<vt100::Parser>>,
-    palette: Option<TerminalPalette>,
+    palette: Arc<Mutex<Option<TerminalPalette>>>,
     reader_thread: Option<JoinHandle<()>>,
     /// True once the child has been reaped (via is_exited or kill). After reap the
     /// numeric pid may be recycled by an unrelated process, so NO signal path (group
@@ -145,7 +145,6 @@ impl PtySession {
     pub fn spawn(spec: PtySpec) -> Result<PtySession> {
         let rows = spec.rows.max(1);
         let cols = spec.cols.max(1);
-        let palette = spec.palette;
 
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -199,13 +198,15 @@ impl PtySession {
             cols,
             spec.scrollback_rows,
         )));
+        let palette = Arc::new(Mutex::new(spec.palette));
         let reader_parser = Arc::clone(&parser);
         let reader_writer = Arc::clone(&writer);
+        let reader_palette = Arc::clone(&palette);
         let reader_thread = std::thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
             let mut palette_queries = PaletteQueryDetector::default();
-            let mut replies_enabled = palette.is_some();
+            let mut palette_replies_enabled = true;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: slave closed
@@ -213,11 +214,12 @@ impl PtySession {
                         if let Ok(mut p) = reader_parser.lock() {
                             p.process(&buf[..n]);
                         }
-                        if replies_enabled {
+                        if palette_replies_enabled {
                             for slot in palette_queries.feed(&buf[..n]) {
+                                let palette =
+                                    *reader_palette.lock().unwrap_or_else(|e| e.into_inner());
                                 let Some(palette) = palette else {
-                                    replies_enabled = false;
-                                    break;
+                                    continue;
                                 };
                                 let color = match slot {
                                     10 => palette.foreground,
@@ -230,7 +232,7 @@ impl PtySession {
                                 )
                                 .is_err()
                                 {
-                                    replies_enabled = false;
+                                    palette_replies_enabled = false;
                                     break;
                                 }
                             }
@@ -285,7 +287,11 @@ impl PtySession {
     }
 
     pub fn palette(&self) -> Option<TerminalPalette> {
-        self.palette
+        *self.palette.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_palette(&self, palette: Option<TerminalPalette>) {
+        *self.palette.lock().unwrap_or_else(|e| e.into_inner()) = palette;
     }
 
     /// Move the normal grid viewport toward older history and return its clamped offset.
