@@ -3,8 +3,18 @@
 //! built, not run, so we assert via std::process::Command getters.
 
 use agent_viewer_core::backend::{Backend, BackendKind, Session, SessionOrigin, Status};
-use agent_viewer_core::claude::ClaudeBackend;
-use agent_viewer_core::opencode::OpencodeBackend;
+use agent_viewer_core::claude::{
+    ClaudeBackend, capabilities_for_platform as claude_capabilities_for_platform,
+    capabilities_for_session_on_platform as claude_capabilities_for_session_on_platform,
+};
+use agent_viewer_core::codex::{
+    AttachRoute, attach_route_for_platform,
+    capabilities_for_platform as codex_capabilities_for_platform,
+};
+use agent_viewer_core::opencode::{
+    OpencodeBackend, capabilities_for_platform as opencode_capabilities_for_platform,
+};
+use agent_viewer_core::platform::Platform;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -57,6 +67,28 @@ fn opencode_session(cwd: PathBuf) -> Session {
     }
 }
 
+fn codex_session(status: Status) -> Session {
+    Session {
+        backend: BackendKind::Codex,
+        id: "019fce12-3456-789a-bcde-f0123456789a".to_string(),
+        short_id: None,
+        origin: SessionOrigin::Interactive,
+        title: "portable codex session".to_string(),
+        cwd: PathBuf::from("/some/proj"),
+        git_branch: None,
+        status,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        hidden: false,
+        companion: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+        daemon_hosted: false,
+    }
+}
+
 /// The value set for an env key via Command::env (Some(v)), or None if never set.
 fn env_set(cmd: &std::process::Command, key: &str) -> Option<String> {
     for (k, v) in cmd.get_envs() {
@@ -88,6 +120,89 @@ fn claude_capabilities_advertise_native_remove() {
     assert!(caps.live_status);
     // Rename is a bg-job state.json write, gated per row on the short id (see rename_tests).
     assert!(caps.rename);
+}
+
+#[test]
+fn portable_codex_capabilities_disable_unsafe_process_actions() {
+    for platform in [Platform::Macos, Platform::Windows] {
+        let caps = codex_capabilities_for_platform(platform);
+        assert!(!caps.spawn, "{platform:?} cannot safely spawn Codex");
+        assert!(!caps.attach, "{platform:?} cannot safely attach Codex");
+        assert!(!caps.stop, "{platform:?} cannot safely stop Codex");
+        assert!(
+            !caps.needs_input,
+            "{platform:?} cannot prove live approval state"
+        );
+        assert!(
+            !caps.live_status,
+            "{platform:?} has no rollout process evidence"
+        );
+        assert!(caps.rename);
+        assert!(caps.archive);
+        assert!(caps.delete);
+    }
+}
+
+#[test]
+fn portable_opencode_capabilities_keep_only_compatibility_actions() {
+    for platform in [Platform::Macos, Platform::Windows] {
+        let caps = opencode_capabilities_for_platform(platform);
+        assert!(caps.spawn);
+        assert!(caps.attach);
+        assert!(caps.delete);
+        assert!(!caps.rename);
+        assert!(!caps.archive);
+        assert!(!caps.stop);
+        assert!(!caps.needs_input);
+        assert!(!caps.pr_refs);
+        assert!(!caps.live_status);
+    }
+}
+
+#[test]
+fn windows_claude_capabilities_refuse_rename() {
+    let caps = claude_capabilities_for_platform(Platform::Windows);
+    assert!(!caps.rename);
+    assert!(caps.spawn);
+    assert!(caps.attach);
+}
+
+#[test]
+fn portable_claude_delete_requires_a_completed_row() {
+    for platform in [Platform::Macos, Platform::Windows] {
+        let live = claude_session(
+            Some("abc12345"),
+            PathBuf::from("/some/proj"),
+            Some(111),
+            Status::Working,
+        );
+        let completed = claude_session(
+            Some("abc12345"),
+            PathBuf::from("/some/proj"),
+            None,
+            Status::Done,
+        );
+
+        assert!(
+            !claude_capabilities_for_session_on_platform(platform, &live).delete,
+            "{platform:?} must not delete a row whose process cannot be terminated safely"
+        );
+        assert!(
+            claude_capabilities_for_session_on_platform(platform, &completed).delete,
+            "{platform:?} may delete a completed row"
+        );
+    }
+}
+
+#[test]
+fn portable_codex_attach_refuses_when_completion_is_not_proven() {
+    let session = codex_session(Status::Unknown);
+    for platform in [Platform::Macos, Platform::Windows] {
+        assert!(matches!(
+            attach_route_for_platform(&session, None, platform),
+            AttachRoute::Refuse(_)
+        ));
+    }
 }
 
 // --- Claude: `claude attach <short_id>` resumes the SAME thread, live OR done ---
