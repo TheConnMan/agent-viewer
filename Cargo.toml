@@ -1,3 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
