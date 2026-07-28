@@ -1,11 +1,12 @@
-use agent_viewer_core::platform::home_from;
+use agent_viewer_core::platform::{Platform, home_from, opencode_db_from};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
 #[test]
-fn home_fallback_order_is_home_then_userprofile_then_drive_and_path() {
+fn linux_home_precedes_windows_fallbacks() {
     assert_eq!(
         home_from(
+            Platform::Linux,
             Some(OsStr::new("/home/Brian Work")),
             Some(OsStr::new(r"C:\Users\ignored")),
             Some(OsStr::new("D:")),
@@ -13,17 +14,27 @@ fn home_fallback_order_is_home_then_userprofile_then_drive_and_path() {
         ),
         PathBuf::from("/home/Brian Work")
     );
+}
+
+#[test]
+fn windows_userprofile_precedes_posix_home() {
     assert_eq!(
         home_from(
-            Some(OsStr::new("")),
+            Platform::Windows,
+            Some(OsStr::new("/home/brian")),
             Some(OsStr::new(r"C:\Users\Brían Work")),
             Some(OsStr::new("D:")),
             Some(OsStr::new(r"\ignored")),
         ),
         PathBuf::from(r"C:\Users\Brían Work")
     );
+}
+
+#[test]
+fn windows_home_drive_and_path_are_last_fallback() {
     assert_eq!(
         home_from(
+            Platform::Windows,
             None,
             Some(OsStr::new("")),
             Some(OsStr::new("D:")),
@@ -32,7 +43,18 @@ fn home_fallback_order_is_home_then_userprofile_then_drive_and_path() {
         PathBuf::from(r"D:\Users\Brian Work")
     );
     assert_eq!(
-        home_from(None, None, Some(OsStr::new("D:")), None),
+        home_from(Platform::Windows, None, None, Some(OsStr::new("D:")), None,),
         PathBuf::new()
+    );
+}
+
+#[test]
+fn opencode_db_honors_xdg_data_home() {
+    assert_eq!(
+        opencode_db_from(
+            Some(OsStr::new("/var/lib/brian data")),
+            PathBuf::from("/home/brian").as_path(),
+        ),
+        PathBuf::from("/var/lib/brian data/opencode/opencode.db")
     );
 }

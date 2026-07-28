@@ -110,7 +110,7 @@ pub const fn opencode_capabilities_for_platform(
             attach: true,
             rename: false,
             archive: false,
-            delete: true,
+            delete: false,
             stop: false,
             needs_input: false,
             pr_refs: false,

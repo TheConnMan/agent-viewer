@@ -67,6 +67,30 @@ impl ClaudeBackend {
             .insert(path.clone(), (key, detail.clone()));
         Some((key.0, detail))
     }
+
+    fn remove_for_platform(
+        &self,
+        platform: crate::platform::Platform,
+        session: &Session,
+    ) -> Result<()> {
+        if !capabilities_for_session_on_platform(platform, session).delete {
+            return Err(Error::Unsupported(self.kind().name()));
+        }
+        // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
+        // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
+        // bg job to remove, so it is Unsupported rather than a stray no-op.
+        let Some(short_id) = session
+            .short_id
+            .as_deref()
+            .filter(|short_id| !short_id.is_empty())
+        else {
+            return Err(Error::Unsupported(self.kind().name()));
+        };
+        crate::spawn::run_checked(&mut claude_rm_command(
+            std::path::Path::new(&self.binary),
+            short_id,
+        ))
+    }
 }
 
 impl Default for ClaudeBackend {
@@ -128,8 +152,9 @@ pub fn capabilities_for_session_on_platform(
         .as_deref()
         .is_some_and(|short_id| !short_id.is_empty());
     capabilities.rename &= has_short_id;
-    capabilities.delete =
-        has_short_id && (platform == crate::platform::Platform::Linux || session.pid.is_none());
+    capabilities.delete = has_short_id
+        && (platform == crate::platform::Platform::Linux
+            || (session.pid.is_none() && session.status.is_finished()));
     capabilities
 }
 
@@ -271,17 +296,7 @@ impl Backend for ClaudeBackend {
         )
     }
     fn remove(&self, session: &Session) -> Result<()> {
-        // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
-        // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
-        // bg job to remove, so it is Unsupported rather than a stray no-op.
-        let short_id = session.short_id.as_deref().unwrap_or_default();
-        if short_id.is_empty() {
-            return Err(Error::Unsupported(self.kind().name()));
-        }
-        crate::spawn::run_checked(&mut claude_rm_command(
-            std::path::Path::new(&self.binary),
-            short_id,
-        ))
+        self.remove_for_platform(crate::platform::current_platform(), session)
     }
     fn attach_command(
         &self,
@@ -919,10 +934,45 @@ fn read_claude_turn_activity(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_rm_command, claude_spawn_command};
-    use crate::backend::args;
+    use super::{ClaudeBackend, claude_rm_command, claude_spawn_command};
+    use crate::backend::{BackendKind, Session, SessionOrigin, Status, args};
+    use crate::error::Error;
+    use crate::platform::Platform;
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn portable_claude_remove_refuses_unresolved_session_before_cli() {
+        let backend = ClaudeBackend::with_binary("/definitely/not/a/real/claude");
+        let session = Session {
+            backend: BackendKind::Claude,
+            id: "session-uuid".to_string(),
+            short_id: Some("abc12345".to_string()),
+            origin: SessionOrigin::Background,
+            title: "unsafe unresolved session".to_string(),
+            cwd: PathBuf::from("/some/proj"),
+            git_branch: None,
+            status: Status::Unknown,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+
+        let error = backend
+            .remove_for_platform(Platform::Windows, &session)
+            .expect_err("portable remove must refuse before invoking the CLI");
+
+        match error {
+            Error::Unsupported(name) => assert_eq!(name, "claude"),
+            other => panic!("expected Unsupported(\"claude\"), got {other:?}"),
+        }
+    }
 
     #[test]
     fn claude_rm_command_builds_rm_subcommand() {

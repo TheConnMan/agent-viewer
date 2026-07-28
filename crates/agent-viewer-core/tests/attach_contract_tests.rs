@@ -109,7 +109,7 @@ fn args_of(cmd: &std::process::Command) -> Vec<&OsStr> {
 fn claude_capabilities_advertise_native_remove() {
     // `claude rm <short_id>` deletes a bg session (and its worktree), so remove is now a
     // real capability. The rest of the claude caps are unchanged by this.
-    let caps = ClaudeBackend::new().capabilities();
+    let caps = claude_capabilities_for_platform(Platform::Linux);
     assert!(caps.delete, "claude advertises native rm as delete");
     assert!(caps.spawn);
     assert!(caps.attach);
@@ -149,7 +149,7 @@ fn portable_opencode_capabilities_keep_only_compatibility_actions() {
         let caps = opencode_capabilities_for_platform(platform);
         assert!(caps.spawn);
         assert!(caps.attach);
-        assert!(caps.delete);
+        assert!(!caps.delete);
         assert!(!caps.rename);
         assert!(!caps.archive);
         assert!(!caps.stop);
@@ -168,29 +168,71 @@ fn windows_claude_capabilities_refuse_rename() {
 }
 
 #[test]
-fn portable_claude_delete_requires_a_completed_row() {
+fn portable_claude_delete_requires_a_finished_row_with_valid_short_id() {
     for platform in [Platform::Macos, Platform::Windows] {
-        let live = claude_session(
+        let live_with_pid = claude_session(
             Some("abc12345"),
             PathBuf::from("/some/proj"),
             Some(111),
             Status::Working,
         );
-        let completed = claude_session(
-            Some("abc12345"),
-            PathBuf::from("/some/proj"),
-            None,
-            Status::Done,
-        );
-
         assert!(
-            !claude_capabilities_for_session_on_platform(platform, &live).delete,
+            !claude_capabilities_for_session_on_platform(platform, &live_with_pid).delete,
             "{platform:?} must not delete a row whose process cannot be terminated safely"
         );
-        assert!(
-            claude_capabilities_for_session_on_platform(platform, &completed).delete,
-            "{platform:?} may delete a completed row"
-        );
+
+        for status in [
+            Status::Working,
+            Status::NeedsInput { reason: None },
+            Status::Idle,
+            Status::Unknown,
+        ] {
+            let unresolved = claude_session(
+                Some("abc12345"),
+                PathBuf::from("/some/proj"),
+                None,
+                status.clone(),
+            );
+            assert!(
+                !claude_capabilities_for_session_on_platform(platform, &unresolved).delete,
+                "{platform:?} must not delete a {status:?} row without process evidence"
+            );
+        }
+
+        for status in [Status::Done, Status::Error] {
+            let finished =
+                claude_session(Some("abc12345"), PathBuf::from("/some/proj"), None, status);
+            assert!(
+                claude_capabilities_for_session_on_platform(platform, &finished).delete,
+                "{platform:?} may delete a finished row with a valid short id"
+            );
+        }
+
+        for short_id in [None, Some("")] {
+            let missing_id =
+                claude_session(short_id, PathBuf::from("/some/proj"), None, Status::Done);
+            assert!(
+                !claude_capabilities_for_session_on_platform(platform, &missing_id).delete,
+                "{platform:?} must not delete a finished row without a valid short id"
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn portable_opencode_remove_is_unsupported_for_an_unknown_row() {
+    let session = Session {
+        status: Status::Unknown,
+        ..opencode_session(PathBuf::from("/some/proj"))
+    };
+    let error = OpencodeBackend::new()
+        .remove(&session)
+        .expect_err("portable OpenCode remove must refuse before invoking the CLI");
+
+    match error {
+        agent_viewer_core::Error::Unsupported(name) => assert_eq!(name, "opencode"),
+        other => panic!("expected Unsupported(\"opencode\"), got {other:?}"),
     }
 }
 

@@ -116,9 +116,8 @@ pub fn attach_route(session: &Session, daemon: Option<&app_server::Daemon>) -> A
 
 /// PURE attach routing with the platform's process evidence policy applied.
 ///
-/// Linux retains the measured daemon and fd behavior above. Other platforms may locally
-/// resume only a row whose complete tail proved it done. An unknown row is refused because a
-/// plain resume of a live turn would append a fabricated interruption.
+/// Linux retains the measured daemon and fd behavior above. Other platforms refuse attachment
+/// because process evidence is unavailable and a plain resume could fork a live turn.
 pub fn attach_route_for_platform(
     session: &Session,
     daemon: Option<&app_server::Daemon>,
@@ -126,13 +125,7 @@ pub fn attach_route_for_platform(
 ) -> AttachRoute {
     match platform {
         Platform::Linux => attach_route(session, daemon),
-        Platform::Macos | Platform::Windows => {
-            if matches!(session.status, Status::Done) {
-                AttachRoute::Local
-            } else {
-                AttachRoute::Refuse(PORTABLE_ATTACH_REFUSAL)
-            }
-        }
+        Platform::Macos | Platform::Windows => AttachRoute::Refuse(PORTABLE_ATTACH_REFUSAL),
     }
 }
 
