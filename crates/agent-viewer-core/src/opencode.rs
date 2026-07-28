@@ -2072,7 +2072,7 @@ impl OpencodeBackend {
         let now = crate::spawn::now_ms();
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, directory, title, time_created, time_updated, time_archived, \
-             permission FROM session ORDER BY time_updated DESC",
+             permission FROM session ORDER BY time_updated ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             let parent_id: Option<String> = row.get(1)?;
@@ -2281,7 +2281,7 @@ impl OpencodeBackend {
                 }
             })
             .collect::<Vec<_>>();
-        listed.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        listed.sort_by_key(|session| session.updated_at_ms);
         Ok(listed)
     }
 }

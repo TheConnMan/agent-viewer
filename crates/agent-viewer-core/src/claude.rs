@@ -181,6 +181,7 @@ impl Backend for ClaudeBackend {
                 .as_deref()
                 .and_then(parse_session_registry)
         });
+        sessions.sort_by_key(|session| session.updated_at_ms);
         Ok(sessions)
     }
     fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
