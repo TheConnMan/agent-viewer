@@ -1605,6 +1605,128 @@ fn opencode_turn_activity_normalizes_filters_and_missing_is_empty() {
     );
 }
 
+#[test]
+fn opencode_turn_activity_includes_only_requested_subtree() {
+    let schema = common::read_fixture("opencode_message_schema.sql");
+    let now = agent_viewer_core::spawn::now_ms();
+    let session_rows = [
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('root',NULL,'/project','Root',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('child_a','root','/project','Child A',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('child_b','root','/project','Child B',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('grandchild','child_a','/project','Grandchild',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('missing_activity','root','/project','Missing Activity',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('unrelated',NULL,'/project','Unrelated',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('cycle_a','cycle_b','/project','Cycle A',{now},{now},NULL)"
+        ),
+        format!(
+            "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
+             VALUES ('cycle_b','cycle_a','/project','Cycle B',{now},{now},NULL)"
+        ),
+    ];
+    let message_rows = [
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('root_message','root',{},{} ,'{{\"role\":\"user\"}}')",
+            now - 6_000,
+            now - 6_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('child_a_message','child_a',{},{} ,'{{\"role\":\"assistant\"}}')",
+            now - 5_000,
+            now - 5_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('child_b_message','child_b',{},{} ,'{{\"role\":\"user\"}}')",
+            now - 4_000,
+            now - 4_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('grandchild_message','grandchild',{},{} ,'{{\"role\":\"assistant\"}}')",
+            now - 3_000,
+            now - 3_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('unrelated_message','unrelated',{},{} ,'{{\"role\":\"assistant\"}}')",
+            now - 2_000,
+            now - 2_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('malformed_message','child_a',{},{} ,'{{not json')",
+            now - 1_000,
+            now - 1_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('cycle_a_message','cycle_a',{},{} ,'{{\"role\":\"user\"}}')",
+            now - 8_000,
+            now - 8_000
+        ),
+        format!(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('cycle_b_message','cycle_b',{},{} ,'{{\"role\":\"assistant\"}}')",
+            now - 7_000,
+            now - 7_000
+        ),
+    ];
+    let inserts = session_rows
+        .iter()
+        .chain(message_rows.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+    let backend = OpencodeBackend::with_db(path);
+
+    assert_eq!(
+        backend
+            .turn_activity(&opencode_activity_session("root"), Duration::from_secs(60))
+            .expect("root subtree activity"),
+        vec![now - 6_000, now - 5_000, now - 4_000, now - 3_000]
+    );
+    assert_eq!(
+        backend
+            .turn_activity(
+                &opencode_activity_session("child_a"),
+                Duration::from_secs(60)
+            )
+            .expect("child subtree activity"),
+        vec![now - 5_000, now - 3_000]
+    );
+    assert_eq!(
+        backend
+            .turn_activity(
+                &opencode_activity_session("cycle_a"),
+                Duration::from_secs(60)
+            )
+            .expect("cycle activity"),
+        vec![now - 8_000, now - 7_000]
+    );
+}
+
 // --- v2: `opencode models` stdout parse ---
 
 #[test]

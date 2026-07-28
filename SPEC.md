@@ -106,7 +106,9 @@ expose credentials. External rows use `opencode -s <session_id>`. External delet
 
 Rows come from `claude agents --json --all`. A non-zero exit or a missing binary is a quiet
 empty backend, never an error. Each row is enriched from `<jobs root>/<short>/state.json` for
-summary, transcript path, PR refs, and `updated_at`.
+summary, transcript path, PR refs, and `updated_at`. For activity, `linkScanPath` is
+authoritative when present. Otherwise, resolve an existing canonical projects transcript from
+the row `cwd` and `sessionId` under the same config root.
 
 **Companions.** Every live claude process registers itself at `~/.claude/sessions/<pid>.json`,
 and the agents list returns all of them. That includes a nested `claude -p`, the Agent SDK's
@@ -153,6 +155,14 @@ line-by-line (`BufReader`). For the list, read only the **first line** (`session
 `payload.cwd`, `payload.id`, `payload.originator`, `cli_version`) and the **last few lines**
 for the terminal marker. The core also exposes full-file transcript readers for the activity
 ribbon, which renders complete streamed Codex history including named tool activity.
+
+Activity ribbons cover one hour and aggregate a row with its recursive descendant subtree. Codex
+reads `parent_thread_id` from a subagent `thread_spawn` source. Claude treats the root's flat
+transcripts under its transcript stem `subagents` directory as descendants, then isolates child
+subtrees through sibling `.meta.json` `parentAgentId` links. OpenCode follows `session.parent_id`
+with a recursive read only SQLite query. A child row remains isolated to its own subtree. Missing
+or malformed child data is best effort and never removes readable root activity. The hierarchy
+cache rereads every thirty seconds.
 
 - Message content: `type:"response_item"`, `payload.role`, `payload.content[].text`
   (assistant text is `content[].type == "output_text"`).

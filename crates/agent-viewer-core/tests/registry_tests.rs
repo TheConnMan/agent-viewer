@@ -132,6 +132,62 @@ fn threads_maps_rows_and_orders_by_recency_ascending() {
 }
 
 #[test]
+fn threads_extract_only_valid_spawn_parent_ids() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let nested = format!(
+        "{INSERT_COLS}\
+         ('nested','/r/nested.jsonl',1,1,\
+          '{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"root\",\
+          \"agent_nickname\":\"Worker\"}}}}}}','openai','/p','Nested',\
+          'workspace-write','on-request',0,NULL,NULL,'msg','preview',1000,4000)"
+    );
+    let plain = format!(
+        "{INSERT_COLS}\
+         ('plain','/r/plain.jsonl',1,1,'cli','openai','/p','Plain',\
+          'workspace-write','on-request',0,NULL,NULL,'msg','preview',1000,3000)"
+    );
+    let wrong_type = format!(
+        "{INSERT_COLS}\
+         ('wrong_type','/r/wrong_type.jsonl',1,1,\
+          '{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":7}}}}}}',\
+          'openai','/p','Wrong Type','workspace-write','on-request',0,NULL,NULL,\
+          'msg','preview',1000,2000)"
+    );
+    let malformed = format!(
+        "{INSERT_COLS}\
+         ('malformed','/r/malformed.jsonl',1,1,\
+          '{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"root\"',\
+          'openai','/p','Malformed','workspace-write','on-request',0,NULL,NULL,\
+          'msg','preview',1000,1000)"
+    );
+    let inserts = [
+        nested.as_str(),
+        plain.as_str(),
+        wrong_type.as_str(),
+        malformed.as_str(),
+    ];
+    let (_dir, path) = common::temp_db(&schema, &inserts);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query threads");
+
+    let parent_for = |id: &str| {
+        threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .expect("fixture thread")
+            .parent_thread_id
+            .as_deref()
+    };
+    assert_eq!(parent_for("nested"), Some("root"));
+    assert_eq!(parent_for("plain"), None);
+    assert_eq!(parent_for("wrong_type"), None);
+    assert_eq!(parent_for("malformed"), None);
+}
+
+#[test]
 fn threads_overlay_uses_the_latest_valid_duplicate_name() {
     let schema = common::read_fixture("threads_schema.sql");
     let insert = thread_insert("fixture_thread_duplicate", "SQLite Original Name", 3000);
