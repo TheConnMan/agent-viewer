@@ -27,11 +27,16 @@ pub struct PtySpec {
     pub rows: u16,
     pub cols: u16,
     pub palette: Option<TerminalPalette>,
+    /// Normal grid history capacity. Zero disables retained history.
+    pub scrollback_rows: usize,
 }
+
+/// Retained normal grid rows for a locally scrollable attached viewport.
+pub const VIEWPORT_SCROLLBACK_ROWS: usize = 2_000;
 
 /// Read program/args/cwd/envs off a built `Command` via the stable getters
 /// (get_program/get_args/get_current_dir/get_envs). rows/cols clamped to >= 1. Env entries
-/// with a None value (an explicit unset) are dropped — only set-values carry over.
+/// with a None value (an explicit unset) are dropped. Retained history starts disabled.
 pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> PtySpec {
     PtySpec {
         program: cmd.get_program().to_string_lossy().into_owned(),
@@ -54,6 +59,7 @@ pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> P
         rows: rows.max(1),
         cols: cols.max(1),
         palette: None,
+        scrollback_rows: 0,
     }
 }
 
@@ -63,7 +69,6 @@ const PALETTE_QUERIES: [(&[u8], u8); 4] = [
     (b"\x1b]11;?\x07", 11),
     (b"\x1b]11;?\x1b\\", 11),
 ];
-
 #[derive(Default)]
 struct PaletteQueryDetector {
     pending: Vec<u8>,
@@ -134,7 +139,7 @@ pub struct PtySession {
 impl PtySession {
     /// Open a portable-pty at rows x cols (winsize set AT OPEN — a 0x0 pty renders
     /// nothing; see memory pty-tui-testing-needs-winsize), spawn the command on the
-    /// slave, detach a reader thread feeding vt100::Parser::new(rows, cols, 0). The
+    /// slave, detach a reader thread feeding a parser with bounded normal grid history. The
     /// child gets the pty as its controlling terminal (portable-pty default).
     pub fn spawn(spec: PtySpec) -> Result<PtySession> {
         let rows = spec.rows.max(1);
@@ -188,7 +193,11 @@ impl PtySession {
             }
         };
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            spec.scrollback_rows,
+        )));
         let reader_parser = Arc::clone(&parser);
         let reader_writer = Arc::clone(&writer);
         let reader_thread = std::thread::spawn(move || {
@@ -271,6 +280,22 @@ impl PtySession {
         // Recover from a poisoned lock rather than crash the render loop mid-alt-screen.
         let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         f(parser.screen())
+    }
+
+    /// Move the normal grid viewport toward older history and return its clamped offset.
+    pub fn scroll_viewport_up(&mut self, rows: usize) -> usize {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = parser.screen_mut();
+        screen.set_scrollback(screen.scrollback().saturating_add(rows));
+        screen.scrollback()
+    }
+
+    /// Move the normal grid viewport toward live output and return its resulting offset.
+    pub fn scroll_viewport_down(&mut self, rows: usize) -> usize {
+        let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = parser.screen_mut();
+        screen.set_scrollback(screen.scrollback().saturating_sub(rows));
+        screen.scrollback()
     }
 
     pub fn is_exited(&mut self) -> bool {

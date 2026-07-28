@@ -21,6 +21,8 @@ use crate::actions::{
 };
 use crate::{Refresher, Ui};
 
+const ATTACHED_CODEX_WHEEL_ROWS: usize = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MouseAction {
     None,
@@ -86,13 +88,11 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     Ok(false)
 }
 
-/// Route a mouse event. While attached, forward it to the focused child PTY as a native
-/// mouse report (the child, e.g. codex, has its own mouse tracking on and scrolls itself),
-/// so the wheel scrolls the transcript instead of the terminal's alternate-scroll turning it
-/// into arrow keys codex reads as prompt-history navigation. In the list, click or hover
-/// selects the row under the cursor and the wheel walks the selection (hit-testing reads the
-/// geometry `draw` recorded on the last frame). Modals own their surface, so mouse is a no-op
-/// there (the terminal's own text selection still works with Shift held).
+/// Route a mouse event. While attached, Codex wheel events scroll the local viewport because
+/// Codex discards native wheel reports. Other Codex pointer events and all Claude and external
+/// opencode events stay native. In the list, click or hover selects the row under the cursor
+/// and the wheel walks the selection using geometry recorded by the last draw. Modals own
+/// their surface, so mouse is inert there.
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     // Text-select mode: the terminal owns the mouse, so any report still in flight (or sent
     // by a terminal that ignored the disable sequence) must not steer the selection.
@@ -111,6 +111,19 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
             let Some(pty) = ui.attached.get_mut(&fkey) else {
                 return MouseAction::None;
             };
+            if fkey.0 == BackendKind::Codex {
+                match me.kind {
+                    MouseEventKind::ScrollUp => {
+                        pty.scroll_viewport_up(ATTACHED_CODEX_WHEEL_ROWS);
+                        return MouseAction::None;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        pty.scroll_viewport_down(ATTACHED_CODEX_WHEEL_ROWS);
+                        return MouseAction::None;
+                    }
+                    _ => {}
+                }
+            }
             let (mode, encoding) =
                 pty.with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()));
             // draw_attach draws a one-row header above the child screen, so offset by 1.
@@ -973,12 +986,12 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        MouseAction, MouseTarget, ensure_completions, handle_attached_key, handle_mouse_event,
-        handle_normal_key, handle_palette_key, handle_paste, handle_rename_key, is_quit_chord,
-        open_filter, open_palette,
+        ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
+        handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
+        handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette,
     };
     use crate::{NoticeState, Ui};
-    use agent_viewer_core::pty::{PtySession, PtySpec};
+    use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
@@ -1171,6 +1184,7 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("mouse recording child")
     }
@@ -1193,6 +1207,7 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("mouse forwarding child")
     }
@@ -1215,8 +1230,38 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("scroll forwarding child")
+    }
+
+    fn codex_viewport_mouse_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "index=0; ",
+                    "while [ \"$index\" -lt 12 ]; do ",
+                    "printf 'codex-history-%02d\\r\\n' \"$index\"; ",
+                    "index=$((index + 1)); ",
+                    "done; ",
+                    "printf '\\033[?1000h\\033[?1006hREADY'; ",
+                    "bytes=$(dd bs=1 count=9 2>/dev/null | od -An -tx1); ",
+                    "printf '\\r\\nBYTES:%s\\r\\n' \"$bytes\"; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 4,
+            cols: 80,
+            palette: None,
+            scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("codex viewport mouse child")
     }
 
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
@@ -1413,6 +1458,7 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("spawn real pty");
 
@@ -1480,6 +1526,7 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("spawn real pty");
 
@@ -1559,6 +1606,7 @@ pub(crate) mod tests {
             rows: 24,
             cols: 80,
             palette: None,
+            scrollback_rows: 0,
         })
         .expect("spawn real pty");
 
@@ -2891,7 +2939,82 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scroll_up_after_attach_reaches_the_child_as_an_xterm_wheel_report() {
+    fn codex_wheel_scrolls_the_local_viewport_but_later_pointer_input_reaches_the_child() {
+        let key = (BackendKind::Codex, "codex-scroll".to_string());
+        let mut ui = test_ui_with(Vec::new());
+        ui.attached.insert(key.clone(), codex_viewport_mouse_pty());
+        ui.focused = Some(key.clone());
+        ui.mode = Mode::Attached;
+        wait_for_pty_screen(&ui, &key, "READY");
+        let live_view = ui
+            .attached
+            .get(&key)
+            .expect("codex child")
+            .with_screen(|screen| screen.contents());
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+
+        handle_mouse_event(
+            mouse(MouseEventKind::ScrollUp, 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("scroll codex viewport");
+
+        let (offset, historical_view) = ui
+            .attached
+            .get(&key)
+            .expect("codex child")
+            .with_screen(|screen| (screen.scrollback(), screen.contents()));
+        assert_eq!(offset, ATTACHED_CODEX_WHEEL_ROWS);
+        assert_ne!(
+            historical_view, live_view,
+            "Codex wheel input must move the local viewport"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("forward later Codex pointer event");
+        ui.attached
+            .get_mut(&key)
+            .expect("codex child")
+            .scroll_viewport_down(usize::MAX);
+
+        wait_for_pty_screen(&ui, &key, "BYTES: 1b 5b 3c 30 3b 36 3b 35 4d");
+        assert!(matches!(ui.mode, Mode::Attached));
+    }
+
+    #[test]
+    fn claude_wheel_reaches_the_child_as_an_xterm_report() {
+        let key = (BackendKind::Claude, "claude-scroll".to_string());
+        let mut ui = test_ui_with(Vec::new());
+        ui.attached
+            .insert(key.clone(), mouse_scroll_forwarding_pty());
+        ui.focused = Some(key.clone());
+        ui.mode = Mode::Attached;
+        wait_for_pty_screen(&ui, &key, "READY");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+
+        handle_mouse_event(
+            mouse(MouseEventKind::ScrollUp, 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("forward Claude wheel event");
+
+        wait_for_pty_screen(&ui, &key, "1b 5b 3c 36 34 3b 36 3b 35 4d");
+        assert!(matches!(ui.mode, Mode::Attached));
+    }
+
+    #[test]
+    fn external_opencode_wheel_reaches_the_child_as_an_xterm_report() {
         let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
         session.backend = BackendKind::Opencode;
         let key = (BackendKind::Opencode, session.id.clone());

@@ -19,19 +19,24 @@ fn run_codex(args: &[&str]) -> Result<()> {
     crate::spawn::run_checked(std::process::Command::new("codex").args(args))
 }
 
-/// Build (do not run) `codex resume <id>` with inherited stdio.
+/// Build (do not run) `codex --no-alt-screen resume <id>` with inherited stdio.
 pub fn resume_command(id: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("codex");
-    cmd.arg("resume").arg(id);
+    cmd.arg("--no-alt-screen").arg("resume").arg(id);
     cmd
 }
 
-/// Build (do not run) `codex resume --remote <endpoint> <id>`: the TUI joins the app-server
+/// Build (do not run) `codex --no-alt-screen resume --remote <endpoint> <id>`: the TUI joins
+/// the app-server
 /// that HOSTS the thread instead of starting its own ThreadManager, which is what makes the
 /// join live rather than a replay that fabricates an interrupt.
 pub fn resume_remote_command(endpoint: &str, id: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("codex");
-    cmd.arg("resume").arg("--remote").arg(endpoint).arg(id);
+    cmd.arg("--no-alt-screen")
+        .arg("resume")
+        .arg("--remote")
+        .arg(endpoint)
+        .arg(id);
     cmd
 }
 
