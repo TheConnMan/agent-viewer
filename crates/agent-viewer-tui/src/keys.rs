@@ -995,7 +995,7 @@ pub(crate) mod tests {
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
-    use agent_viewer_tui::ui::{Mode, Pulses};
+    use agent_viewer_tui::ui::{AttachView, Draw, Mode, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -1091,6 +1091,50 @@ pub(crate) mod tests {
         const HEIGHT: u16 = 24;
         let backend = ratatui::backend::TestBackend::new(WIDTH, HEIGHT);
         ratatui::Terminal::new(backend).expect("test terminal")
+    }
+
+    fn render_attached_frame(
+        ui: &Ui,
+        key: &(BackendKind, String),
+        terminal: &mut TestTerminal,
+    ) -> String {
+        let session = ui.focused_session.as_ref().expect("focused session");
+        let pty = ui.attached.get(key).expect("attached child");
+        terminal
+            .draw(|frame| {
+                agent_viewer_tui::ui::draw(
+                    frame,
+                    Draw {
+                        app: &ui.app,
+                        workspace: &ui.workspace,
+                        mode: &ui.mode,
+                        notice: ui.notice.text(),
+                        composer: &ui.composer,
+                        pulses: &ui.pulses,
+                        now_ms: 0,
+                        attach: Some(AttachView {
+                            session,
+                            pty,
+                            exited: false,
+                        }),
+                        pr_status: &ui.pr_status,
+                        logos: None,
+                        list_hit: &ui.list_hit,
+                        themes: &ui.themes,
+                    },
+                );
+            })
+            .expect("draw attached frame");
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     fn point_for_visible_row(ui: &Ui, terminal: &mut TestTerminal, row_idx: usize) -> (u16, u16) {
@@ -1262,6 +1306,34 @@ pub(crate) mod tests {
             scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
         })
         .expect("codex viewport mouse child")
+    }
+
+    fn codex_restricted_viewport_mouse_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "printf '\\033[1;4r\\033[1;1H'; ",
+                    "index=0; ",
+                    "while [ \"$index\" -lt 8 ]; do ",
+                    "printf 'codex-region-%04d\\r\\n' \"$index\"; ",
+                    "index=$((index + 1)); ",
+                    "done; ",
+                    "printf 'READY'; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("Codex restricted viewport child")
     }
 
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
@@ -2987,6 +3059,42 @@ pub(crate) mod tests {
 
         wait_for_pty_screen(&ui, &key, "BYTES: 1b 5b 3c 30 3b 36 3b 35 4d");
         assert!(matches!(ui.mode, Mode::Attached));
+    }
+
+    #[test]
+    fn codex_wheel_renders_history_from_a_top_anchored_restricted_region() {
+        let key = (BackendKind::Codex, "codex-region-scroll".to_string());
+        let mut focused_session = sess("codex-region-scroll", "/tmp", 100);
+        focused_session.backend = BackendKind::Codex;
+        let mut ui = test_ui_with(vec![focused_session.clone()]);
+        ui.attached
+            .insert(key.clone(), codex_restricted_viewport_mouse_pty());
+        ui.focused = Some(key.clone());
+        ui.focused_session = Some(focused_session);
+        ui.mode = Mode::Attached;
+        wait_for_pty_screen(&ui, &key, "READY");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let mut terminal = test_terminal();
+
+        let live_frame = render_attached_frame(&ui, &key, &mut terminal);
+        assert!(
+            !live_frame.contains("codex-region-0002"),
+            "the older Codex row was already visible in the live frame: {live_frame:?}"
+        );
+
+        handle_mouse_event(
+            mouse(MouseEventKind::ScrollUp, 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("scroll Codex restricted viewport");
+
+        let historical_frame = render_attached_frame(&ui, &key, &mut terminal);
+        assert!(
+            historical_frame.contains("codex-region-0002"),
+            "the rendered frame did not reveal the older Codex row: {historical_frame:?}"
+        );
     }
 
     #[test]

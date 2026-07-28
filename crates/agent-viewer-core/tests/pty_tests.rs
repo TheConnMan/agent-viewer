@@ -227,6 +227,93 @@ fn pty_viewport_follows_live_output_and_preserves_a_scrolled_view() {
 }
 
 #[test]
+fn pty_codex_top_anchored_scroll_region_preserves_global_history() {
+    let sync_file = sync_file("codex-scroll-region");
+    let script = r#"
+        stty raw -echo
+        printf '\033[1;4r\033[1;1H'
+        for index in $(seq 0 7); do
+            printf 'codex-region-%04d\r\n' "$index"
+        done
+        printf ready > "$VIEWPORT_SYNC_FILE"
+        sleep 30
+    "#;
+    let mut session = PtySession::spawn(PtySpec {
+        scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        envs: vec![(
+            "VIEWPORT_SYNC_FILE".to_string(),
+            sync_file.to_string_lossy().into_owned(),
+        )],
+        ..spec("bash", &["-c", script], 6, 40)
+    })
+    .expect("spawn Codex scroll region probe");
+
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "ready"),
+        "the child did not finish writing the Codex scroll region"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "codex-region-0007"),
+        "the PTY reader did not parse the newest Codex row"
+    );
+    let live_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        live_view.contains("codex-region-0007"),
+        "the newest Codex row did not reach the live viewport: {live_view:?}"
+    );
+
+    let offset = session.scroll_viewport_up(usize::MAX);
+    let historical_view = session.with_screen(|screen| screen.contents());
+    assert!(
+        offset > 0 && historical_view.contains("codex-region-0000"),
+        "scrolling the viewport did not reveal the oldest Codex row: offset {offset}, view {historical_view:?}"
+    );
+
+    session.kill();
+    std::fs::remove_file(sync_file).expect("remove Codex scroll region synchronization file");
+}
+
+#[test]
+fn pty_scroll_region_below_top_does_not_create_global_history() {
+    let sync_file = sync_file("lower-scroll-region");
+    let script = r#"
+        stty raw -echo
+        printf '\033[2;4r\033[2;1H'
+        for index in $(seq 0 7); do
+            printf 'lower-region-%04d\r\n' "$index"
+        done
+        printf ready > "$VIEWPORT_SYNC_FILE"
+        sleep 30
+    "#;
+    let mut session = PtySession::spawn(PtySpec {
+        scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        envs: vec![(
+            "VIEWPORT_SYNC_FILE".to_string(),
+            sync_file.to_string_lossy().into_owned(),
+        )],
+        ..spec("bash", &["-c", script], 6, 40)
+    })
+    .expect("spawn lower scroll region probe");
+
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "ready"),
+        "the child did not finish writing the lower scroll region"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "lower-region-0007"),
+        "the PTY reader did not parse the newest lower region row"
+    );
+    assert_eq!(
+        session.scroll_viewport_up(usize::MAX),
+        0,
+        "a scroll region below the top row entered global history"
+    );
+
+    session.kill();
+    std::fs::remove_file(sync_file).expect("remove lower scroll region synchronization file");
+}
+
+#[test]
 fn pty_viewport_retains_exactly_two_thousand_history_rows() {
     let sync_file = sync_file("viewport-bounded");
     let script = r#"
