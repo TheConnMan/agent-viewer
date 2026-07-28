@@ -250,7 +250,8 @@ Each release has these archives and a sibling SHA256 file for each one:
 
 Verify an archive before unpacking it with `sha256sum --check <archive>.sha256` on Linux,
 `shasum -a 256 --check <archive>.sha256` on macOS, or
-`Get-FileHash -Algorithm SHA256 <archive>` on Windows. Unpack a `.tar.gz` with
+`$expected=((Get-Content <archive>.sha256 -Raw).Trim() -split '\s+')[0]; if ($expected -ine (Get-FileHash <archive> -Algorithm SHA256).Hash) { throw 'SHA256 mismatch' }`
+in PowerShell on Windows. Unpack a `.tar.gz` with
 `tar -xzf <archive>` and the Windows `.zip` with `Expand-Archive <archive>`.
 
 ## Run

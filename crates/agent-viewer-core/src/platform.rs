@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Linux,
     Macos,
@@ -24,26 +24,44 @@ pub const fn current_platform() -> Platform {
 }
 
 pub fn home_from(
+    platform: Platform,
     home: Option<&OsStr>,
     user_profile: Option<&OsStr>,
     home_drive: Option<&OsStr>,
     home_path: Option<&OsStr>,
 ) -> PathBuf {
-    if let Some(home) = home.filter(|value| !value.is_empty()) {
-        return PathBuf::from(home);
-    }
-    if let Some(user_profile) = user_profile.filter(|value| !value.is_empty()) {
-        return PathBuf::from(user_profile);
-    }
-    match (
+    let home = home.filter(|value| !value.is_empty());
+    let user_profile = user_profile.filter(|value| !value.is_empty());
+    let native_windows_home = match (
         home_drive.filter(|value| !value.is_empty()),
         home_path.filter(|value| !value.is_empty()),
     ) {
         (Some(drive), Some(path)) => {
             let mut combined = drive.to_os_string();
             combined.push(path);
-            PathBuf::from(combined)
+            Some(PathBuf::from(combined))
         }
-        _ => PathBuf::new(),
+        _ => None,
+    };
+
+    match platform {
+        Platform::Windows => user_profile
+            .map(PathBuf::from)
+            .or(native_windows_home)
+            .or_else(|| home.map(PathBuf::from))
+            .unwrap_or_default(),
+        Platform::Linux | Platform::Macos => home
+            .map(PathBuf::from)
+            .or_else(|| user_profile.map(PathBuf::from))
+            .or(native_windows_home)
+            .unwrap_or_default(),
     }
+}
+
+pub fn opencode_db_from(xdg_data_home: Option<&OsStr>, home: &Path) -> PathBuf {
+    xdg_data_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("opencode/opencode.db")
 }

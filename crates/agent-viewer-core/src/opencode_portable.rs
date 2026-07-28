@@ -122,13 +122,8 @@ impl Backend for OpencodeBackend {
         })
     }
 
-    fn remove(&self, session: &Session) -> Result<()> {
-        crate::spawn::run_checked(
-            Command::new("opencode")
-                .arg("session")
-                .arg("delete")
-                .arg(&session.id),
-        )
+    fn remove(&self, _session: &Session) -> Result<()> {
+        Err(crate::error::Error::Unsupported(self.kind().name()))
     }
 
     fn attach_command(&self, session: &Session) -> std::result::Result<Command, AttachRefusal> {
@@ -143,7 +138,10 @@ impl Backend for OpencodeBackend {
 
 /// Default OpenCode database path used by the read only compatibility backend.
 fn default_opencode_db() -> PathBuf {
-    crate::home_dir().join(".local/share/opencode/opencode.db")
+    crate::platform::opencode_db_from(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        &crate::home_dir(),
+    )
 }
 
 fn opencode_models_via_cli() -> Vec<String> {

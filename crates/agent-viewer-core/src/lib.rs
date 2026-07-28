@@ -56,6 +56,7 @@ pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
 /// The current user's home directory, or an empty path when no supported variable is set.
 pub fn home_dir() -> std::path::PathBuf {
     platform::home_from(
+        platform::current_platform(),
         std::env::var_os("HOME").as_deref(),
         std::env::var_os("USERPROFILE").as_deref(),
         std::env::var_os("HOMEDRIVE").as_deref(),
