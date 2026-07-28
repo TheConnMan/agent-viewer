@@ -58,6 +58,7 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     logos: None,
                     list_hit: &list_hit,
                     themes: &themes,
+                    sprite: Default::default(),
                 },
             );
         })
