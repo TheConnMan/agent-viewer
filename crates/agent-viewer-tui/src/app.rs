@@ -98,6 +98,7 @@ pub enum Row {
         id: String,
         title: String,
         summary: String,
+        project: Option<String>,
         activity: Option<String>,
         status: Status,
         hidden: bool,
@@ -611,12 +612,13 @@ impl App {
     }
 
     /// The Session row for a session index (real summary plus creation and update times).
-    fn session_row(s: &Session) -> Row {
+    fn session_row(s: &Session, project: Option<String>) -> Row {
         Row::Session {
             backend: s.backend,
             id: s.id.clone(),
             title: s.title.clone(),
             summary: s.summary.clone(),
+            project,
             activity: None,
             status: s.status.clone(),
             hidden: s.hidden,
@@ -708,7 +710,11 @@ impl App {
             });
             if !collapsed {
                 for &i in &members {
-                    rows.push(Self::session_row(&self.sessions[i]));
+                    let root = self.cached_root(&self.sessions[i].cwd);
+                    rows.push(Self::session_row(
+                        &self.sessions[i],
+                        Some(project_label(&root)),
+                    ));
                 }
             }
         }
@@ -762,7 +768,7 @@ impl App {
             });
             if !collapsed {
                 for &i in members {
-                    rows.push(Self::session_row(&self.sessions[i]));
+                    rows.push(Self::session_row(&self.sessions[i], None));
                 }
             }
         }
@@ -804,6 +810,16 @@ fn section_of(status: &Status) -> Section {
         Status::Idle | Status::Unknown => Section::Idle,
         Status::Done | Status::Error => Section::Done,
     }
+}
+
+fn project_label(root: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let git_root = PathBuf::from(home).join("git");
+        if let Ok(relative) = root.strip_prefix(git_root) {
+            return relative.to_string_lossy().into_owned();
+        }
+    }
+    root.to_string_lossy().into_owned()
 }
 
 /// Truncate `s` to at most `width` terminal columns. At `width == 0` this yields the empty
