@@ -413,11 +413,12 @@ tested without a daemon):
   `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
   a no-op success); else a pid -> SIGTERM as before; else unsupported.
 
-**Host terminal palette forwarding.** Before entering the alternate screen, the TUI captures
-the host terminal foreground and background once and passes the cached pair to attached PTYs.
-An attached child that queries OSC 10 or OSC 11 receives the matching cached color. Capture is
-best effort: if either color is unavailable, no palette is forwarded and neither query receives
-a fabricated reply. Never use hard coded fallback colors.
+**Attached terminal palette.** The TUI captures the host terminal foreground and background
+once. Concrete RGB themes choose their text and background first; the terminal match theme falls
+back to the captured host colors. The chosen palette is stored on `PtySession`, and OSC 10, OSC
+11, and default cell rendering use that same stored palette. Explicit indexed and RGB child
+colors remain untouched. When no palette is available, OSC queries receive no reply and default
+cells use Reset rendering. Never fabricate unavailable host colors.
 
 Transport: the control socket is a Unix socket that upgrades to RFC6455 WebSocket at `/rpc`
 (handshake URL `ws://localhost/rpc`), driven by blocking `tungstenite` over

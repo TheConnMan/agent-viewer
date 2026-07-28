@@ -129,6 +129,7 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     writer: SharedWriter,
     parser: Arc<Mutex<vt100::Parser>>,
+    palette: Option<TerminalPalette>,
     reader_thread: Option<JoinHandle<()>>,
     /// True once the child has been reaped (via is_exited or kill). After reap the
     /// numeric pid may be recycled by an unrelated process, so NO signal path (group
@@ -245,6 +246,7 @@ impl PtySession {
             child,
             writer,
             parser,
+            palette,
             reader_thread: Some(reader_thread),
             exited: false,
         })
@@ -280,6 +282,10 @@ impl PtySession {
         // Recover from a poisoned lock rather than crash the render loop mid-alt-screen.
         let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
         f(parser.screen())
+    }
+
+    pub fn palette(&self) -> Option<TerminalPalette> {
+        self.palette
     }
 
     /// Move the normal grid viewport toward older history and return its clamped offset.
