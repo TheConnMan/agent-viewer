@@ -329,7 +329,7 @@ pub(super) fn draw(
     };
     if input.height > 0 {
         let prefix = vec![
-            Span::styled(field("  ❯", MARK_FIELD), fg(theme.accent)),
+            Span::styled(field(" ❯", MARK_FIELD), fg(theme.accent)),
             Span::raw(" "),
         ];
         if composer.is_empty() {
@@ -386,12 +386,14 @@ pub(super) fn draw(
         && logo_marks()
         && inner.width >= 3
     {
+        let image = logos.composer_image(backend);
+        let width = image.size().width;
         frame.render_widget(
-            Image::new(logos.image(backend)),
+            Image::new(image),
             Rect {
-                x: inner.x + 1,
+                x: inner.x + u16::from(width == 2),
                 y: inner.y,
-                width: 2,
+                width,
                 height: 1,
             },
         );

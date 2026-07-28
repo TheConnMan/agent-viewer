@@ -1,12 +1,13 @@
-//! Optional brand-logo marks: the three backend SVGs rasterized once at startup into
-//! fixed 2x1-cell graphics protocols (Kitty/iTerm2/Sixel, else Unicode half-blocks), drawn
-//! over the reserved 2-column mark slot on list rows and in the composer. Always attempted at
-//! startup; any failure here (non-tty, no graphics protocol) leaves the textual marks in place.
+//! Optional brand logo marks rasterized once at startup from the three backend SVGs.
+//! List rows use fixed two cell protocols. Kitty, iTerm2, and Sixel composers use separate
+//! three cell protocols whose artwork is offset by half a cell. Halfblocks composers reuse
+//! the two cell list protocols because that fallback cannot represent a horizontal half cell.
+//! Startup always attempts construction. Any failure leaves the textual marks in place.
 
 use agent_viewer_core::BackendKind;
 use ratatui::layout::Size;
 use ratatui_image::Resize;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 
 /// Favicon-style SVGs (white glyph on a brand-colored rounded square), embedded at build
@@ -16,38 +17,48 @@ const CODEX_SVG: &str = include_str!("../assets/logos/codex.svg");
 const OPENCODE_SVG: &str = include_str!("../assets/logos/opencode.svg");
 
 /// Pixel size the SVGs are rasterized to before `new_protocol` downsizes them into the
-/// 2x1 cell slot; oversampling keeps the half-blocks fallback from looking chunky.
+/// two cell slot; oversampling keeps the half blocks fallback from looking chunky.
 const RASTER_PX: u32 = 64;
 
-/// The three fixed protocols (one per backend), sized to a 2-column, 1-row cell. The
-/// non-stateful `Image` widget borrows these immutably, so a single set serves every frame.
+/// Fixed two cell list protocols for each backend, plus separate three cell composer protocols
+/// when the graphics format supports a half cell offset. Halfblocks composers reuse the list
+/// protocols. The `Image` widget borrows these immutably, so one set serves every frame.
 pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
     opencode: Protocol,
+    composer_claude: Option<Protocol>,
+    composer_codex: Option<Protocol>,
+    composer_opencode: Option<Protocol>,
 }
 
 impl LogoMarks {
-    /// Query the terminal for its graphics protocol + font size, then build the three fixed
-    /// protocols. `from_query_stdio` does terminal I/O (raw-mode toggle on stdin), so call
-    /// this before crossterm takes the alt screen; on a non-tty it errors and the caller
-    /// keeps the textual marks.
+    /// Query the terminal for its graphics protocol and font size, then build the list and
+    /// supported composer protocols. `from_query_stdio` performs terminal I/O and temporarily
+    /// toggles raw mode on stdin, so call this before crossterm takes the alternate screen.
+    /// When stdin is not a terminal, it errors and the caller keeps the textual marks.
     pub fn build() -> anyhow::Result<LogoMarks> {
         let picker = Picker::from_query_stdio().map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(LogoMarks {
-            claude: build_protocol(&picker, CLAUDE_SVG)?,
-            codex: build_protocol(&picker, CODEX_SVG)?,
-            opencode: build_protocol(&picker, OPENCODE_SVG)?,
-        })
+        Self::from_picker(&picker)
     }
 
     #[cfg(test)]
     pub(crate) fn halfblocks_for_test() -> anyhow::Result<LogoMarks> {
         let picker = Picker::halfblocks();
+        Self::from_picker(&picker)
+    }
+
+    fn from_picker(picker: &Picker) -> anyhow::Result<LogoMarks> {
+        let (claude, composer_claude) = build_protocols(picker, CLAUDE_SVG)?;
+        let (codex, composer_codex) = build_protocols(picker, CODEX_SVG)?;
+        let (opencode, composer_opencode) = build_protocols(picker, OPENCODE_SVG)?;
         Ok(LogoMarks {
-            claude: build_protocol(&picker, CLAUDE_SVG)?,
-            codex: build_protocol(&picker, CODEX_SVG)?,
-            opencode: build_protocol(&picker, OPENCODE_SVG)?,
+            claude,
+            codex,
+            opencode,
+            composer_claude,
+            composer_codex,
+            composer_opencode,
         })
     }
 
@@ -59,15 +70,66 @@ impl LogoMarks {
             BackendKind::Opencode => &self.opencode,
         }
     }
+
+    /// The composer protocol for a backend's mark. Graphics protocols use a three cell
+    /// canvas; halfblocks reuse the fixed two cell list protocol.
+    pub fn composer_image(&self, backend: BackendKind) -> &Protocol {
+        match backend {
+            BackendKind::Claude => self.composer_claude.as_ref().unwrap_or(&self.claude),
+            BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
+            BackendKind::Opencode => self.composer_opencode.as_ref().unwrap_or(&self.opencode),
+        }
+    }
 }
 
-/// Rasterize one SVG with resvg and hand it to the picker as a 2x1-cell fixed protocol.
-fn build_protocol(picker: &Picker, svg: &str) -> anyhow::Result<Protocol> {
+fn build_protocols(picker: &Picker, svg: &str) -> anyhow::Result<(Protocol, Option<Protocol>)> {
     let image = rasterize(svg)?;
+    let composer = match picker.protocol_type() {
+        ProtocolType::Halfblocks => None,
+        ProtocolType::Kitty | ProtocolType::Sixel | ProtocolType::Iterm2 => {
+            Some(build_composer_protocol(picker, &image)?)
+        }
+    };
+
+    Ok((build_protocol(picker, image)?, composer))
+}
+
+/// Hand a rasterized mark to the picker as a fixed two cell protocol.
+fn build_protocol(picker: &Picker, image: image::DynamicImage) -> anyhow::Result<Protocol> {
     // Fit the oversampled bitmap into exactly the 2x1 mark slot; Resize::Fit downscales.
     picker
         .new_protocol(image, Size::new(2, 1), Resize::Fit(None))
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_composer_protocol(
+    picker: &Picker,
+    image: &image::DynamicImage,
+) -> anyhow::Result<Protocol> {
+    let canvas = build_composer_canvas(image, picker.font_size());
+
+    picker
+        .new_protocol(canvas, Size::new(3, 1), Resize::Fit(None))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_composer_canvas(
+    image: &image::DynamicImage,
+    font_size: ratatui_image::FontSize,
+) -> image::DynamicImage {
+    use image::imageops::overlay;
+
+    let logo = Resize::Fit(None).resize(image, font_size, Size::new(2, 1), None);
+    let mut canvas =
+        image::DynamicImage::new_rgba8(u32::from(font_size.width) * 3, u32::from(font_size.height));
+    overlay(
+        &mut canvas,
+        &logo,
+        i64::from(font_size.width.div_ceil(2)),
+        0,
+    );
+
+    canvas
 }
 
 /// SVG bytes -> an `RGBA` `DynamicImage` at `RASTER_PX` square. Assets are pure paths, so no
@@ -91,4 +153,60 @@ fn rasterize(svg: &str) -> anyhow::Result<image::DynamicImage> {
     let rgba = image::RgbaImage::from_raw(RASTER_PX, RASTER_PX, pixmap.data().to_vec())
         .ok_or_else(|| anyhow::anyhow!("rgba buffer mismatch"))?;
     Ok(image::DynamicImage::ImageRgba8(rgba))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogoMarks, build_composer_canvas};
+    use agent_viewer_core::BackendKind;
+    use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+    use ratatui::layout::Size;
+    use ratatui_image::picker::{Picker, ProtocolType};
+    use ratatui_image::{FontSize, Resize};
+
+    #[test]
+    fn graphics_composer_image_uses_its_own_three_cell_canvas() {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let logos = LogoMarks::from_picker(&picker).unwrap();
+
+        assert_eq!(logos.image(BackendKind::Codex).size(), Size::new(2, 1));
+        assert_eq!(
+            logos.composer_image(BackendKind::Codex).size(),
+            Size::new(3, 1)
+        );
+    }
+
+    #[test]
+    fn composer_canvas_matches_list_bitmap_at_half_cell_offset() {
+        let logo = DynamicImage::ImageRgba8(RgbaImage::from_fn(3, 3, |x, y| {
+            Rgba([(x * 70) as u8, (y * 80) as u8, ((x + y) * 40) as u8, 255])
+        }));
+
+        for font_width in [10, 9] {
+            let font_size = FontSize {
+                width: font_width,
+                height: 20,
+            };
+            let fitted = Resize::Fit(None).resize(&logo, font_size, Size::new(2, 1), None);
+            let canvas = build_composer_canvas(&logo, font_size);
+            let offset = u32::from(font_width).div_ceil(2);
+
+            assert_eq!(canvas.dimensions(), (u32::from(font_width) * 3, 20));
+            for y in 0..canvas.height() {
+                for x in 0..canvas.width() {
+                    let expected = if (offset..offset + fitted.width()).contains(&x) {
+                        fitted.get_pixel(x - offset, y)
+                    } else {
+                        Rgba([0, 0, 0, 0])
+                    };
+                    assert_eq!(
+                        canvas.get_pixel(x, y),
+                        expected,
+                        "unexpected pixel at font width {font_width}, x {x}, y {y}"
+                    );
+                }
+            }
+        }
+    }
 }
