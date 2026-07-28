@@ -57,6 +57,7 @@ pub(super) fn row_to_item(
     project_width: usize,
     width: usize,
     title_width: usize,
+    elapsed_width: usize,
     theme: &Theme,
 ) -> ListItem<'static> {
     match row {
@@ -127,6 +128,7 @@ pub(super) fn row_to_item(
                     project_width,
                     width,
                     title_width,
+                    elapsed_width,
                 },
                 theme,
             );
@@ -196,6 +198,7 @@ struct SessionRow<'a> {
     project_width: usize,
     width: usize,
     title_width: usize,
+    elapsed_width: usize,
 }
 
 fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
@@ -214,7 +217,7 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         &status_field,
         row.pr,
         row.summary,
-        display_width(row.elapsed),
+        row.elapsed_width,
     );
     let mut spans = vec![
         Span::styled(row.glyph.to_string(), fg(row.glyph_color)),
@@ -251,11 +254,15 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         if has_pr && has_summary {
             spans.push(Span::raw(" "));
         }
-        if has_pr {
-            spans.push(Span::styled(pr, fg(row.pr_color)));
-        }
     }
     spans.push(Span::raw(" ".repeat(pad)));
+    if has_pr {
+        spans.push(Span::styled(pr, fg(row.pr_color)));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(" ".repeat(
+        row.elapsed_width.saturating_sub(display_width(row.elapsed)),
+    )));
     spans.push(Span::styled(row.elapsed.to_string(), fg(theme.muted)));
     Line::from(spans)
 }
@@ -375,6 +382,7 @@ mod activity_ribbon_tests {
                 pr: "#42",
                 pr_color: theme.ok,
                 elapsed: "3m",
+                elapsed_width: 2,
                 show_activity,
                 project_width: 0,
                 width,
@@ -419,6 +427,7 @@ mod activity_ribbon_tests {
                 pr: "",
                 pr_color: theme.ok,
                 elapsed: "3m",
+                elapsed_width: 2,
                 show_activity: true,
                 project_width: 0,
                 width: 140,
@@ -452,6 +461,7 @@ mod activity_ribbon_tests {
                 pr: "#42",
                 pr_color: theme.ok,
                 elapsed: "3m",
+                elapsed_width: 2,
                 show_activity: true,
                 project_width: 26,
                 width: 140,
