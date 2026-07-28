@@ -51,8 +51,8 @@ pub fn glyph_marks() -> bool {
     *GLYPH_MARKS.get().unwrap_or(&false)
 }
 
-/// Startup-read (once): when true, the mark slot is left blank (two reserved columns) and a
-/// brand-logo image is overlaid there by the render path. Set after the terminal-graphics
+/// Startup-read (once): when true, the mark slot is left blank with one cell around the
+/// two cell brand-logo image overlaid by the render path. Set after the terminal-graphics
 /// probe (`LogoMarks::build`) succeeds — so it being on implies a live `LogoMarks`. Takes
 /// precedence over the glyph marks.
 static LOGO_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -70,10 +70,9 @@ pub fn logo_marks() -> bool {
 /// mark call site): by DEFAULT the textual `[cc]`/`[cx]`/`[oc]` tag, or the brand glyph when
 /// `AGENT_VIEWER_GLYPH_MARKS=1`. `BackendKind::tag()` is also used directly for help/notices.
 fn backend_mark(backend: BackendKind, theme: &Theme) -> &'static str {
-    // Logo mode blanks the slot (two reserved columns) for the image overlay; it wins over
-    // glyph mode. Two spaces keep `mark_width` == 2 so every row/composer layout math holds.
+    // Logo mode blanks the slot for the image overlay; it wins over glyph mode.
     if logo_marks() {
-        return "  ";
+        return "    ";
     }
     mark_for(backend, theme.mark_set == theme::MarkSet::Glyph)
 }
@@ -605,8 +604,8 @@ fn draw_list(
         blocked: None,
     };
 
-    // Logo overlay: for each on-screen session item, draw its brand image over the two blank
-    // mark columns (x+1 = immediately after the status glyph). Only the visible
+    // Logo overlay: for each on-screen session item, draw its brand image over the middle two
+    // mark columns. Only the visible
     // window [offset, offset+height) is drawn; y is clamped inside the list area.
     if let Some(logos) = logos
         && logo_marks()
@@ -619,13 +618,13 @@ fn draw_list(
                 continue;
             }
             let y = area.y + (j - offset) as u16;
-            if y >= area.y + area.height || area.width < 3 {
+            if y >= area.y + area.height || area.width < 4 {
                 continue;
             }
             frame.render_widget(
                 Image::new(logos.image(*backend)),
                 Rect {
-                    x: area.x + 1,
+                    x: area.x + 2,
                     y,
                     width: 2,
                     height: 1,
@@ -729,9 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn logo_marks_blank_the_mark_slot_to_two_columns() {
-        // Logo mode wins over glyph/tag and reserves exactly two blank columns for the image
-        // overlay, keeping mark_width == 2 so all row/composer layout math is unchanged.
+    fn logo_marks_reserve_one_cell_of_breathing_room_on_each_side() {
         set_logo_marks(true);
         assert!(logo_marks());
         let theme = theme::amber(false);
@@ -740,8 +737,8 @@ mod tests {
             BackendKind::Codex,
             BackendKind::Opencode,
         ] {
-            assert_eq!(backend_mark(b, &theme), "  ");
-            assert_eq!(mark_width(backend_mark(b, &theme)), 2);
+            assert_eq!(backend_mark(b, &theme), "    ");
+            assert_eq!(mark_width(backend_mark(b, &theme)), 4);
         }
     }
 
@@ -799,27 +796,66 @@ mod tests {
     #[test]
     fn rename_truncates_wide_input_by_display_width() {
         set_logo_marks(true);
-        let mut terminal = draw_rename("a界bc", 8, None);
+        let mut terminal = draw_rename("a界bc", 10, None);
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(buffer[(3, 0)].symbol(), "a");
-        assert_eq!(buffer[(4, 0)].symbol(), "界");
-        assert_eq!(buffer[(6, 0)].symbol(), "b");
-        assert_eq!(buffer[(7, 0)].symbol(), " ");
-        terminal.backend_mut().assert_cursor_position((7, 0));
+        assert_eq!(buffer[(5, 0)].symbol(), "a");
+        assert_eq!(buffer[(6, 0)].symbol(), "界");
+        assert_eq!(buffer[(8, 0)].symbol(), "b");
+        assert_eq!(buffer[(9, 0)].symbol(), " ");
+        terminal.backend_mut().assert_cursor_position((9, 0));
     }
 
     #[test]
-    fn rename_logo_overlay_uses_compact_mark_slot() {
+    fn session_logo_has_a_blank_cell_before_and_after_its_image() {
         set_logo_marks(true);
         let logos = LogoMarks::halfblocks_for_test().unwrap();
-        let terminal = draw_rename("abcde", 8, Some(&logos));
+        let terminal = draw_rename("abcde", 10, Some(&logos));
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(0, 0)].symbol(), "✎");
-        assert_ne!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
         assert_ne!(buffer[(2, 0)].symbol(), " ");
-        assert_eq!(buffer[(3, 0)].symbol(), "a");
+        assert_ne!(buffer[(3, 0)].symbol(), " ");
+        assert_eq!(buffer[(4, 0)].symbol(), " ");
+        assert_eq!(buffer[(5, 0)].symbol(), "a");
+    }
+
+    #[test]
+    fn composer_logo_and_prompt_share_the_same_padded_start_cell() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        set_logo_marks(true);
+        let app = App::new(Vec::new());
+        let composer = Composer::new();
+        let logos = LogoMarks::halfblocks_for_test().unwrap();
+        let theme = theme::amber(false);
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                composer::draw(
+                    frame,
+                    &app,
+                    &composer,
+                    Some(&logos),
+                    &theme,
+                    Rect::new(0, 0, 30, 4),
+                    true,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(1, 1)].symbol(), " ");
+        assert_ne!(buffer[(2, 1)].symbol(), " ");
+        assert_ne!(buffer[(3, 1)].symbol(), " ");
+        assert_eq!(buffer[(4, 1)].symbol(), " ");
+        assert_eq!(buffer[(5, 1)].symbol(), " ");
+        assert_eq!(buffer[(6, 1)].symbol(), "c");
+        assert_eq!(buffer[(1, 2)].symbol(), " ");
+        assert_eq!(buffer[(2, 2)].symbol(), "❯");
+        assert_eq!(buffer[(6, 2)].symbol(), "d");
     }
 
     #[test]
@@ -944,6 +980,63 @@ mod tests {
         terminal
     }
 
+    fn render_mixed_status_activity_rows(
+        group_by_state: bool,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let session = |id: &str, title: &str, status: Status, created_at_ms: i64| Session {
+            backend: BackendKind::Codex,
+            id: id.into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: title.into(),
+            cwd: "/tmp/agent-viewer-status-alignment".into(),
+            git_branch: None,
+            status,
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+        let mut app = App::new(vec![
+            session("working-row", "Working row", Status::Working, 2),
+            session("done-row", "Done row", Status::Done, 1),
+        ]);
+        if group_by_state {
+            app.toggle_group_mode();
+        }
+        for id in ["working-row", "done-row"] {
+            app.set_activity_ribbon(BackendKind::Codex, id, Some("█▆▃▂▁▁▁▁".into()));
+        }
+        let width = 160;
+        let height = app.visible().len() as u16;
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::default();
+        let theme = theme::amber(false);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    &app,
+                    &pulses,
+                    0,
+                    &pr_status,
+                    ListDeco { rename: None },
+                    None,
+                    &theme,
+                    Rect::new(0, 0, width, height),
+                );
+            })
+            .unwrap();
+        terminal
+    }
+
     #[test]
     fn activity_ribbon_renders_at_140_and_drops_before_pr_at_100() {
         let wide = render_activity_row(140, false);
@@ -968,6 +1061,86 @@ mod tests {
         let project = text.find("/tmp/agent-viewer").unwrap();
         let ribbon = text.find("█▆▃▂▁▁▁▁").unwrap();
         assert!(project < ribbon);
+    }
+
+    #[test]
+    fn mixed_status_rows_share_one_activity_column_in_both_group_modes() {
+        for group_by_state in [false, true] {
+            let terminal = render_mixed_status_activity_rows(group_by_state);
+            let buffer = terminal.backend().buffer();
+            let ribbon_cells = (0..buffer.area.height)
+                .filter_map(|y| {
+                    (0..buffer.area.width)
+                        .find(|&x| buffer[(x, y)].symbol() == "█")
+                        .map(|x| (x, y))
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(ribbon_cells.len(), 2);
+            assert_eq!(ribbon_cells[0].0, ribbon_cells[1].0);
+            if group_by_state {
+                for (_, y) in ribbon_cells {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    let project = row.find("agent-viewer-status").unwrap();
+                    let ribbon = row.find('█').unwrap();
+                    assert!(project < ribbon);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mono16_working_glyph_moves_without_changing_its_color() {
+        let app = App::new(vec![Session {
+            backend: BackendKind::Codex,
+            id: "mono-motion".into(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "Mono motion".into(),
+            cwd: "/tmp/agent-viewer-mono-motion".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }]);
+        let render = |now_ms| {
+            let pulses = Pulses::new();
+            let pr_status = crate::pr_cache::PrStatusCache::default();
+            let theme = theme::mono16(false);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_list(
+                        frame,
+                        &app,
+                        &pulses,
+                        now_ms,
+                        &pr_status,
+                        ListDeco { rename: None },
+                        None,
+                        &theme,
+                        Rect::new(0, 0, 80, 2),
+                    );
+                })
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(0, 1)];
+            (cell.symbol().to_string(), cell.fg)
+        };
+
+        let first = render(0);
+        let second = render(120);
+        assert_ne!(first.0, second.0);
+        assert_eq!(first.1, second.1);
     }
 
     #[test]
@@ -1451,8 +1624,17 @@ mod tests {
         assert!(metadata.contains(target));
         assert!(!metadata.contains("hello"));
         assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
-        assert_eq!(&rows[top + 2], &format!("│❯    hello▏{}│", " ".repeat(37)));
+        assert_eq!(&rows[top + 2], &format!("│ ❯   hello▏{}│", " ".repeat(37)));
         assert_eq!((cursor.x, cursor.y), (11, (top + 2) as u16));
+    }
+
+    #[test]
+    fn empty_composer_keeps_placeholder_but_places_cursor_at_input_start() {
+        let (rows, cursor) = render_viewer(40, 16, "", Mode::Normal);
+        let (top, _) = composer_bounds(&rows);
+
+        assert!(rows[top + 2].contains("describe a task"));
+        assert_eq!(cursor, (6, (top + 2) as u16));
     }
 
     #[test]
@@ -1463,7 +1645,7 @@ mod tests {
         let (top, bottom) = composer_bounds(&rows);
 
         assert_eq!(bottom - top + 1, 5);
-        assert_eq!(&rows[top + 2], "│❯    01234│");
+        assert_eq!(&rows[top + 2], "│ ❯   01234│");
         assert_eq!(&rows[top + 3], "│56789▏    │");
         assert_eq!(cursor, (6, (top + 3) as u16));
     }
@@ -1483,10 +1665,8 @@ mod tests {
     }
 
     #[test]
-    fn composer_content_starts_in_the_compact_list_mark_column() {
-        // A list row is `<status glyph><backend mark><title>`, so the mark slot opens at
-        // column 1. Composer metadata and input use that same column immediately inside their
-        // border. Marks are process-global mode, so this asserts measured columns, not glyphs.
+    fn composer_content_uses_the_padded_list_mark_column() {
+        // Marks are process-global mode, so this asserts measured columns, not glyphs.
         let app = App::new(vec![Session {
             backend: BackendKind::Claude,
             id: "aligned".into(),
@@ -1553,7 +1733,8 @@ mod tests {
         assert_eq!(buf[(1 + mark_width, list_y as u16)].symbol(), "a");
         // Metadata uses a five cell mark field. The input uses the same gutter.
         assert_eq!(buf[(6, (top + 1) as u16)].symbol(), "c");
-        assert_eq!(buf[(1, (top + 2) as u16)].symbol(), "❯");
+        assert_eq!(buf[(1, (top + 2) as u16)].symbol(), " ");
+        assert_eq!(buf[(2, (top + 2) as u16)].symbol(), "❯");
         assert_eq!(buf[(6, (top + 2) as u16)].symbol(), "t");
     }
 
@@ -1563,7 +1744,7 @@ mod tests {
         let (rows, _) = render_viewer(20, 24, "wrap at word boundaries here", Mode::Normal);
         let (top, _) = composer_bounds(&rows);
 
-        assert_eq!(&rows[top + 2], "│❯    wrap at word │");
+        assert_eq!(&rows[top + 2], "│ ❯   wrap at word │");
         assert_eq!(&rows[top + 3], "│boundaries here▏  │");
     }
 
