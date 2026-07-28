@@ -381,9 +381,8 @@ fn attach_session<B: ratatui::backend::Backend>(
     ui.focused = Some(key);
     ui.focused_session = Some(session.clone());
     ui.mode = Mode::Attached;
-    // Attached transcripts default to native terminal selection. The run loop applies the
-    // matching terminal mode sequence after this action returns.
-    set_mouse_capture(ui, false);
+    // Keep capture active so wheel input is forwarded to the attached child terminal.
+    set_mouse_capture(ui, true);
     Ok(true)
 }
 

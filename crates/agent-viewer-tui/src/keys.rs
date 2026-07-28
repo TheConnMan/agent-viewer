@@ -1197,6 +1197,28 @@ pub(crate) mod tests {
         .expect("mouse forwarding child")
     }
 
+    fn mouse_scroll_forwarding_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
+                    "dd bs=1 count=10 2>/dev/null | od -An -tx1; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+            palette: None,
+        })
+        .expect("scroll forwarding child")
+    }
+
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         Session {
             backend: BackendKind::Claude,
@@ -2016,7 +2038,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_backend_attach_starts_in_terminal_text_selection_mode() {
+    fn every_attachable_backend_keeps_mouse_capture_enabled_after_attach() {
+        let mut capture_states = Vec::new();
         for backend in [
             BackendKind::Codex,
             BackendKind::Claude,
@@ -2037,11 +2060,20 @@ pub(crate) mod tests {
                 .expect("attach selected session");
 
             assert!(matches!(ui.mode, Mode::Attached), "{backend:?} must attach");
-            assert!(
-                !ui.mouse_capture,
-                "{backend:?} attach must hand drag selection to the terminal"
-            );
+            capture_states.push((backend, ui.mouse_capture));
         }
+
+        // `sess` is interactive, so the Opencode row represents the external attachable
+        // path. Managed Opencode is deliberately absent because it is not attachable.
+        assert_eq!(
+            capture_states,
+            vec![
+                (BackendKind::Codex, true),
+                (BackendKind::Claude, true),
+                (BackendKind::Opencode, true),
+            ],
+            "attaching must retain mouse reports so the attached child receives wheel events"
+        );
     }
 
     #[test]
@@ -2855,6 +2887,39 @@ pub(crate) mod tests {
         .expect("forward attached mouse event");
 
         wait_for_pty_screen(&ui, &key, "1b 5b 3c 30 3b 36 3b 35 4d");
+        assert!(matches!(ui.mode, Mode::Attached));
+    }
+
+    #[test]
+    fn scroll_up_after_attach_reaches_the_child_as_an_xterm_wheel_report() {
+        let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
+        session.backend = BackendKind::Opencode;
+        let key = (BackendKind::Opencode, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        select_session_row(&mut ui, "a");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(AnyAttachingBackend(BackendKind::Opencode))];
+        let mut terminal = test_terminal();
+
+        crate::actions::attach_selected(&backends, &mut ui, &mut terminal)
+            .expect("attach external opencode session");
+        assert!(matches!(ui.mode, Mode::Attached));
+
+        // Replace the inert fake attach command with a raw child that advertises SGR mouse
+        // tracking and prints the exact bytes it receives.
+        ui.attached.insert(key.clone(), mouse_scroll_forwarding_pty());
+        wait_for_pty_screen(&ui, &key, "READY");
+
+        handle_mouse_event(
+            mouse(MouseEventKind::ScrollUp, 5, 5),
+            &backends,
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("forward attached wheel event");
+
+        // The child must receive SGR wheel-up (button 64), not ESC [ A prompt-history input.
+        wait_for_pty_screen(&ui, &key, "1b 5b 3c 36 34 3b 36 3b 35 4d");
         assert!(matches!(ui.mode, Mode::Attached));
     }
 
