@@ -15,6 +15,17 @@ use unicode_width::UnicodeWidthStr;
 /// Synthetic session with a nonexistent cwd so project_root falls back to cwd
 /// (no filesystem, no subprocess).
 fn sess(backend: BackendKind, id: &str, cwd: &str, updated_at_ms: i64, status: Status) -> Session {
+    sess_with_times(backend, id, cwd, updated_at_ms, updated_at_ms, status)
+}
+
+fn sess_with_times(
+    backend: BackendKind,
+    id: &str,
+    cwd: &str,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    status: Status,
+) -> Session {
     Session {
         backend,
         id: id.to_string(),
@@ -24,7 +35,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, updated_at_ms: i64, status: S
         cwd: PathBuf::from(cwd),
         git_branch: None,
         status,
-        created_at_ms: updated_at_ms,
+        created_at_ms,
         updated_at_ms,
         hidden: false,
         companion: false,
@@ -340,6 +351,67 @@ fn state_sections_order_and_fold() {
 }
 
 #[test]
+fn state_sections_keep_fixed_order_and_sort_members_by_oldest_update() {
+    let sessions = vec![
+        sess_with_times(
+            BackendKind::Codex,
+            "idle_tie_first",
+            "/p",
+            300,
+            200,
+            Status::Idle,
+        ),
+        sess_with_times(BackendKind::Codex, "idle_new", "/p", 100, 300, Status::Idle),
+        sess_with_times(BackendKind::Codex, "idle_old", "/p", 400, 100, Status::Idle),
+        sess_with_times(
+            BackendKind::Codex,
+            "idle_tie_second",
+            "/p",
+            200,
+            200,
+            Status::Idle,
+        ),
+        sess(BackendKind::Codex, "done", "/p", 400, Status::Done),
+        sess(BackendKind::Codex, "working", "/p", 500, Status::Working),
+        sess(
+            BackendKind::Codex,
+            "needs",
+            "/p",
+            600,
+            Status::needs_input(),
+        ),
+    ];
+    let mut app = App::new(sessions);
+    app.toggle_group_mode();
+
+    assert_eq!(
+        section_headers(app.visible()),
+        vec![
+            Section::NeedsInput,
+            Section::Working,
+            Section::Idle,
+            Section::Done
+        ]
+    );
+    let idle_ids = app
+        .visible()
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session {
+                id,
+                status: Status::Idle,
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        idle_ids,
+        vec!["idle_old", "idle_tie_first", "idle_tie_second", "idle_new"]
+    );
+}
+
+#[test]
 fn done_section_is_uncapped() {
     let sessions: Vec<Session> = (0..20)
         .map(|i| {
@@ -405,6 +477,81 @@ fn toggle_group_mode_project_rows() {
     assert_eq!(app.group_mode(), GroupMode::ByProject);
     assert!(!project_headers(app.visible()).is_empty());
     assert!(section_headers(app.visible()).is_empty());
+}
+
+#[test]
+fn project_groups_stay_alphabetic_and_sort_members_by_oldest_creation() {
+    let sessions = vec![
+        sess_with_times(
+            BackendKind::Codex,
+            "project_old",
+            "/synthetic/zeta",
+            100,
+            400,
+            Status::Idle,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "project_tie_first",
+            "/synthetic/zeta",
+            200,
+            300,
+            Status::Idle,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "project_tie_second",
+            "/synthetic/zeta",
+            200,
+            200,
+            Status::Idle,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "project_new",
+            "/synthetic/zeta",
+            300,
+            100,
+            Status::Idle,
+        ),
+        sess(
+            BackendKind::Codex,
+            "alpha_only",
+            "/synthetic/alpha",
+            500,
+            Status::Idle,
+        ),
+    ];
+    let app = App::new(sessions);
+
+    let roots = project_headers(app.visible())
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::ProjectHeader { root, .. } => Some(root.as_path()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots,
+        vec![Path::new("/synthetic/alpha"), Path::new("/synthetic/zeta")]
+    );
+    let ids = session_rows(app.visible())
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Session { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "alpha_only",
+            "project_old",
+            "project_tie_first",
+            "project_tie_second",
+            "project_new"
+        ]
+    );
 }
 
 #[test]

@@ -57,7 +57,7 @@ impl Registry {
         })
     }
 
-    /// All rows including archived, recency DESC. COALESCE bridges the nullable *_ms
+    /// All rows including archived, updated_at_ms ascending. COALESCE bridges the nullable *_ms
     /// columns (backfilled by triggers in the live schema) to the *_at * 1000 fallback.
     pub fn threads(&self) -> Result<Vec<Thread>> {
         let mut stmt = self.conn.prepare(
@@ -66,7 +66,7 @@ impl Registry {
                     COALESCE(updated_at_ms, updated_at * 1000), \
                     source, cwd, git_branch, title, archived, preview \
              FROM threads \
-             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC, id DESC",
+             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) ASC, id DESC",
         )?;
         let mut threads = stmt
             .query_map([], |row| {

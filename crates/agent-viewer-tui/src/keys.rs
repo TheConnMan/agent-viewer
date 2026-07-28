@@ -2373,8 +2373,8 @@ pub(crate) mod tests {
     #[test]
     fn left_click_activates_the_pressed_row_when_the_list_reflows_between_button_events() {
         let mut sessions = vec![
-            sess("a", "/tmp/agentviewer-mouse-reflow", 300),
-            sess("b", "/tmp/agentviewer-mouse-reflow", 100),
+            sess("a", "/tmp/agentviewer-mouse-reflow", 100),
+            sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut sessions {
             session.backend = BackendKind::Opencode;
@@ -2406,9 +2406,9 @@ pub(crate) mod tests {
 
         // A refresh lands a newer session between "a" and "b", pushing "b" one row down.
         let mut refreshed = vec![
-            sess("a", "/tmp/agentviewer-mouse-reflow", 300),
+            sess("a", "/tmp/agentviewer-mouse-reflow", 100),
             sess("c", "/tmp/agentviewer-mouse-reflow", 200),
-            sess("b", "/tmp/agentviewer-mouse-reflow", 100),
+            sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut refreshed {
             session.backend = BackendKind::Opencode;

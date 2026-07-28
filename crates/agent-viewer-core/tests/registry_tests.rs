@@ -48,42 +48,61 @@ fn find_state_db_errors_when_none() {
 }
 
 #[test]
-fn threads_maps_rows_and_orders_by_recency() {
+fn threads_maps_rows_and_orders_by_recency_ascending() {
     let schema = common::read_fixture("threads_schema.sql");
-    // active exec, recency 3000
+    // Creation order is the reverse of update order, so this proves update time is the key.
     let s_exec = format!(
         "{INSERT_COLS}\
          ('t_exec','/home/user/proj/sessions/r1.jsonl',1,3,'exec','openai',\
           '/home/user/proj','Exec Title','workspace-write','on-request',0,\
           'gpt-5','main','first exec msg','preview exec',1000,3000)"
     );
-    // archived cli, recency 2000
     let s_cli = format!(
         "{INSERT_COLS}\
          ('t_cli','/home/user/proj/archived_sessions/r2.jsonl',1,2,'cli','openai',\
           '/home/user/proj','Cli Title','workspace-write','on-request',1,\
-          NULL,NULL,'first cli msg','preview cli',1000,2000)"
+          NULL,NULL,'first cli msg','preview cli',4000,2000)"
     );
-    // vscode row with NULL updated_at_ms -> COALESCE(updated_at*1000)=1000
     let s_vscode = format!(
         "{INSERT_COLS}\
-         ('t_vscode','/home/user/proj/sessions/r3.jsonl',1,1,'vscode','openai',\
+         ('t_vscode','/home/user/proj/sessions/r3.jsonl',5,1,'vscode','openai',\
           '/home/user/proj','Vscode Title','workspace-write','on-request',0,\
           NULL,NULL,'first vscode msg','preview vscode',NULL,NULL)"
     );
-    let inserts = [s_exec.as_str(), s_cli.as_str(), s_vscode.as_str()];
+    let s_tie_z = format!(
+        "{INSERT_COLS}\
+         ('t_tie_z','/home/user/proj/sessions/r4.jsonl',1,2,'cli','openai',\
+          '/home/user/proj','Tie Z','workspace-write','on-request',0,\
+          NULL,NULL,'first tie z msg','preview tie z',2000,2500)"
+    );
+    let s_tie_a = format!(
+        "{INSERT_COLS}\
+         ('t_tie_a','/home/user/proj/sessions/r5.jsonl',1,2,'cli','openai',\
+          '/home/user/proj','Tie A','workspace-write','on-request',0,\
+          NULL,NULL,'first tie a msg','preview tie a',3000,2500)"
+    );
+    let inserts = [
+        s_exec.as_str(),
+        s_cli.as_str(),
+        s_vscode.as_str(),
+        s_tie_z.as_str(),
+        s_tie_a.as_str(),
+    ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
 
     let reg = Registry::open(&path).expect("open read-only");
     let threads = reg.threads().expect("query threads");
-    assert_eq!(threads.len(), 3);
+    assert_eq!(threads.len(), 5);
 
-    // recency DESC: t_exec (3000), t_cli (2000), t_vscode (1000 via COALESCE)
-    assert_eq!(threads[0].id, "t_exec");
-    assert_eq!(threads[1].id, "t_cli");
-    assert_eq!(threads[2].id, "t_vscode");
+    assert_eq!(
+        threads
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t_vscode", "t_cli", "t_tie_z", "t_tie_a", "t_exec"]
+    );
 
-    let exec = &threads[0];
+    let exec = threads.iter().find(|thread| thread.id == "t_exec").unwrap();
     assert_eq!(
         exec.rollout_path,
         PathBuf::from("/home/user/proj/sessions/r1.jsonl")
@@ -97,16 +116,19 @@ fn threads_maps_rows_and_orders_by_recency() {
     assert_eq!(exec.created_at_ms, 1000);
     assert_eq!(exec.updated_at_ms, 3000);
 
-    let cli = &threads[1];
+    let cli = threads.iter().find(|thread| thread.id == "t_cli").unwrap();
     assert_eq!(cli.source, Source::Cli);
     assert!(cli.archived);
 
-    let vscode = &threads[2];
+    let vscode = threads
+        .iter()
+        .find(|thread| thread.id == "t_vscode")
+        .unwrap();
     assert_eq!(vscode.source, Source::VsCode);
     assert!(!vscode.archived);
     // NULL *_ms columns fall back through COALESCE to *_at * 1000.
     assert_eq!(vscode.updated_at_ms, 1000);
-    assert_eq!(vscode.created_at_ms, 1000);
+    assert_eq!(vscode.created_at_ms, 5000);
 }
 
 #[test]
