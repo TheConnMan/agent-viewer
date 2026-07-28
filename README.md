@@ -201,6 +201,10 @@ job and a finished one (waking it in place); a row with no background-job id fal
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
 The attached PTY stays alive in the background so re-attaching is instant.
+New attached PTYs use the active viewer theme's text and background as their terminal defaults;
+explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
+uses the captured host foreground and background. Because attached PTYs are reused, changing
+the theme affects a newly created attach PTY, not one that is already alive.
 While attached, the mouse wheel scrolls session content. Codex scrolls the viewer's retained
 transcript, while Claude and external opencode sessions receive the wheel in their attached
 terminal. Returning to the list restores its mouse behavior; `Ctrl+T` toggles either mode
