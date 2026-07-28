@@ -1,11 +1,16 @@
 use super::{AttachView, fg, status_glyph, truncate};
 use crate::ui::theme::Theme;
+use agent_viewer_core::pty::TerminalPalette;
+use ratatui::buffer::Buffer;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use tui_term::widget::PseudoTerminal;
+use ratatui::widgets::{Paragraph, Widget};
+use tui_term::{
+    vt100,
+    widget::{PseudoTerminal, Screen},
+};
 
 pub(super) fn draw(frame: &mut Frame, av: AttachView, now_ms: i64, theme: &Theme) {
     let area = frame.area();
@@ -16,8 +21,64 @@ pub(super) fn draw(frame: &mut Frame, av: AttachView, now_ms: i64, theme: &Theme
 
     draw_header(frame, av.session, av.exited, now_ms, theme, chunks[0]);
     av.pty.with_screen(|screen| {
-        frame.render_widget(PseudoTerminal::new(screen), chunks[1]);
+        frame.render_widget(
+            ThemedPseudoTerminal {
+                screen,
+                palette: av.pty.palette(),
+            },
+            chunks[1],
+        );
     });
+}
+
+struct ThemedPseudoTerminal<'a> {
+    screen: &'a vt100::Screen,
+    palette: Option<TerminalPalette>,
+}
+
+impl Widget for ThemedPseudoTerminal<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        PseudoTerminal::new(self.screen).render(area, buf);
+        let Some(palette) = self.palette else {
+            return;
+        };
+
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let Some(screen_cell) = self.screen.cell(row, col) else {
+                    continue;
+                };
+                let cell = &mut buf[(area.x + col, area.y + row)];
+                if screen_cell.fgcolor() == vt100::Color::Default {
+                    cell.set_fg(Color::Rgb(
+                        palette.foreground[0],
+                        palette.foreground[1],
+                        palette.foreground[2],
+                    ));
+                }
+                if screen_cell.bgcolor() == vt100::Color::Default {
+                    cell.set_bg(Color::Rgb(
+                        palette.background[0],
+                        palette.background[1],
+                        palette.background[2],
+                    ));
+                }
+            }
+        }
+
+        if !self.screen.hide_cursor() {
+            let (row, col) = Screen::cursor_position(self.screen);
+            if row < area.height
+                && col < area.width
+                && self
+                    .screen
+                    .cell(row, col)
+                    .is_some_and(|cell| !cell.has_contents())
+            {
+                buf[(area.x + col, area.y + row)].set_fg(Color::Gray);
+            }
+        }
+    }
 }
 
 fn draw_header(

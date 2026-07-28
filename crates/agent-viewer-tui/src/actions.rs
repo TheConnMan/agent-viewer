@@ -363,7 +363,11 @@ fn attach_session<B: ratatui::backend::Backend>(
             }
         };
         let mut spec = spec_from_command(&command, rows, cols);
-        spec.palette = ui.terminal_palette;
+        spec.palette = ui
+            .themes
+            .active()
+            .terminal_palette()
+            .or(ui.terminal_palette);
         if session.backend == BackendKind::Codex {
             spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
         }
@@ -447,11 +451,12 @@ pub(crate) fn spawn_from_composer(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_attach_refusal, spawn_from_composer};
+    use super::{apply_attach_refusal, attach_session, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{sess, test_ui_with};
     use crate::ops::Mutation;
+    use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session};
     use agent_viewer_tui::mutations::MutationOutcome;
     use std::sync::{Arc, Mutex, mpsc::channel};
@@ -489,6 +494,83 @@ mod tests {
             _session: &Session,
         ) -> Result<std::process::Command, AttachRefusal> {
             unreachable!("attach is not exercised by composer submission")
+        }
+    }
+
+    struct PaletteQueryBackend;
+
+    impl agent_viewer_core::Backend for PaletteQueryBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                attach: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("listing is not exercised by palette attach")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by palette attach")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            let script = concat!(
+                "stty raw -echo; ",
+                "printf '\\033]10;?\\007\\033]11;?\\007'; ",
+                "bytes=$(dd bs=1 count=50 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); ",
+                "printf 'OSC:%s\\r\\n' \"$bytes\"; ",
+                "sleep 30"
+            );
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            Ok(command)
+        }
+    }
+
+    fn osc_reply_hex(slot: u8, color: [u8; 3]) -> String {
+        let [red, green, blue] = color;
+        format!(
+            "\x1b]{slot};rgb:{red:02X}{red:02X}/{green:02X}{green:02X}/{blue:02X}{blue:02X}\x1b\\"
+        )
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+    }
+
+    fn osc_replies(palette: TerminalPalette) -> String {
+        format!(
+            "OSC:{}{}",
+            osc_reply_hex(10, palette.foreground),
+            osc_reply_hex(11, palette.background),
+        )
+    }
+
+    fn wait_for_attached_screen(ui: &crate::Ui, key: &(BackendKind, String), needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ui
+            .attached
+            .get(key)
+            .is_some_and(|pty| pty.with_screen(|screen| screen.contents().contains(needle)))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "attached child screen did not contain {needle:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -539,6 +621,116 @@ mod tests {
         }
         assert_eq!(*calls.lock().unwrap(), vec![payload.to_string()]);
         assert!(ui.mutations.poll().is_none());
+    }
+
+    #[test]
+    fn new_attach_answers_osc_palette_queries_with_the_active_amber_theme() {
+        let mut session = sess("palette", "/tmp/agentviewer-palette", 100);
+        session.short_id = Some("palette".into());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        ui.terminal_palette = Some(TerminalPalette {
+            foreground: [0x01, 0x02, 0x03],
+            background: [0x04, 0x05, 0x06],
+        });
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(PaletteQueryBackend)];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(
+            attach_session(&backends, &mut ui, &mut terminal, &session)
+                .expect("attach palette query child")
+        );
+
+        let theme = agent_viewer_tui::ui::theme::amber(false);
+        let ratatui::style::Color::Rgb(red, green, blue) = theme.text else {
+            panic!("amber text must be RGB");
+        };
+        let ratatui::style::Color::Rgb(bg_red, bg_green, bg_blue) = theme.bg else {
+            panic!("amber background must be RGB");
+        };
+        let expected = format!(
+            "OSC:{}{}",
+            osc_reply_hex(10, [red, green, blue]),
+            osc_reply_hex(11, [bg_red, bg_green, bg_blue]),
+        );
+        let key = (BackendKind::Claude, session.id.clone());
+
+        wait_for_attached_screen(&ui, &key, &expected);
+
+        ui.attached.get_mut(&key).expect("attached child").kill();
+    }
+
+    #[test]
+    fn terminal_match_attach_answers_osc_palette_queries_with_the_captured_host_palette() {
+        let mut session = sess("terminal-palette", "/tmp/agentviewer-terminal-palette", 100);
+        session.short_id = Some("terminal-palette".into());
+        let host_palette = TerminalPalette {
+            foreground: [0x11, 0x22, 0x33],
+            background: [0x44, 0x55, 0x66],
+        };
+        let mut ui = test_ui_with(vec![session.clone()]);
+        ui.terminal_palette = Some(host_palette);
+        ui.themes.move_preview(1);
+        assert_eq!(ui.themes.active().id, "terminal");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(PaletteQueryBackend)];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(
+            attach_session(&backends, &mut ui, &mut terminal, &session)
+                .expect("attach palette query child")
+        );
+
+        let key = (BackendKind::Claude, session.id.clone());
+        wait_for_attached_screen(&ui, &key, &osc_replies(host_palette));
+
+        ui.attached.get_mut(&key).expect("attached child").kill();
+    }
+
+    #[test]
+    fn rgb_theme_named_terminal_answers_osc_queries_with_its_own_palette() {
+        let theme_dir = tempfile::tempdir().expect("theme directory");
+        std::fs::write(
+            theme_dir.path().join("terminal.theme"),
+            "text=#010203\nbg=#040506\n",
+        )
+        .expect("user theme");
+        let (mut themes, notices) =
+            agent_viewer_tui::ui::ThemeState::load(false, None, theme_dir.path());
+        assert!(notices.is_empty());
+        let user_theme_index = themes.themes().len() - 1;
+        themes.move_preview(user_theme_index as i32);
+        assert_eq!(themes.active_index(), user_theme_index);
+        assert_eq!(themes.active().id, "terminal");
+        let expected_palette = themes
+            .active()
+            .terminal_palette()
+            .expect("user theme palette");
+
+        let mut session = sess("rgb-terminal", "/tmp/agentviewer-rgb-terminal", 100);
+        session.short_id = Some("rgb-terminal".into());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        ui.themes = themes;
+        ui.terminal_palette = Some(TerminalPalette {
+            foreground: [0xa1, 0xb2, 0xc3],
+            background: [0xd4, 0xe5, 0xf6],
+        });
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(PaletteQueryBackend)];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(
+            attach_session(&backends, &mut ui, &mut terminal, &session)
+                .expect("attach palette query child")
+        );
+
+        let key = (BackendKind::Claude, session.id.clone());
+        wait_for_attached_screen(&ui, &key, &osc_replies(expected_palette));
+
+        ui.attached.get_mut(&key).expect("attached child").kill();
     }
 
     #[test]
