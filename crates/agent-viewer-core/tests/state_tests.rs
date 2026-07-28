@@ -7,6 +7,7 @@ use agent_viewer_core::state::{
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -39,6 +40,7 @@ fn temp_db_path() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+#[cfg(unix)]
 fn mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path)
         .expect("path metadata")
@@ -123,6 +125,7 @@ fn opencode_server_secrets_are_distinct_across_independent_databases() {
 }
 
 #[test]
+#[cfg(unix)]
 fn viewer_db_open_preserves_an_existing_parent_directory_mode() {
     let root = tempfile::TempDir::new().unwrap();
     let state_dir = root.path().join("state");
@@ -135,6 +138,7 @@ fn viewer_db_open_preserves_an_existing_parent_directory_mode() {
 }
 
 #[test]
+#[cfg(unix)]
 fn viewer_db_open_creates_a_new_state_leaf_with_owner_only_mode() {
     let root = tempfile::TempDir::new().unwrap();
     let state_parent = root.path().join("state");
@@ -149,6 +153,7 @@ fn viewer_db_open_creates_a_new_state_leaf_with_owner_only_mode() {
 }
 
 #[test]
+#[cfg(unix)]
 fn viewer_db_open_keeps_database_and_sqlite_sidecars_owner_only() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");

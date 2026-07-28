@@ -436,8 +436,9 @@ pub(super) fn draw_reply(
 
 fn abbreviate_dir(directory: &Path) -> String {
     let shown = directory.display().to_string();
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
+    let home = agent_viewer_core::home_dir();
+    let home = home.display().to_string();
+    if !home.is_empty()
         && let Some(rest) = shown.strip_prefix(&home)
     {
         return format!("~{rest}");

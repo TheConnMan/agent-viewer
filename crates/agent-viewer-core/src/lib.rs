@@ -3,7 +3,17 @@ pub mod claude;
 pub mod codex;
 pub mod error;
 pub mod group;
-pub mod opencode;
+#[cfg(target_os = "linux")]
+#[path = "opencode.rs"]
+mod opencode_impl;
+#[cfg(not(target_os = "linux"))]
+#[path = "opencode_portable.rs"]
+mod opencode_impl;
+pub mod opencode {
+    pub use crate::backend::opencode_capabilities_for_platform as capabilities_for_platform;
+    pub use crate::opencode_impl::*;
+}
+pub mod platform;
 pub mod pr_status;
 pub mod pty;
 pub mod spawn;
@@ -43,9 +53,15 @@ pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
     Ok(conn)
 }
 
-/// $HOME as a PathBuf (empty if unset — never panics; downstream opens just fail).
+/// The current user's home directory, or an empty path when no supported variable is set.
 pub fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    platform::home_from(
+        platform::current_platform(),
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+        std::env::var_os("HOMEDRIVE").as_deref(),
+        std::env::var_os("HOMEPATH").as_deref(),
+    )
 }
 
 /// $CODEX_HOME if set, else $HOME/.codex.

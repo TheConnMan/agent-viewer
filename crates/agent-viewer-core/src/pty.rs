@@ -321,6 +321,7 @@ impl PtySession {
         // and child.kill() below would target a stranger — skip all of it and just clean up
         // the reader thread.
         if !self.exited {
+            #[cfg(unix)]
             // SIGKILL the child's whole process group first: a backgrounded grandchild in
             // the same group can keep the pty slave open after the direct child is reaped,
             // leaving the master reader blocked on read() forever. portable-pty spawns the

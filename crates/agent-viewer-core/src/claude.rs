@@ -67,6 +67,30 @@ impl ClaudeBackend {
             .insert(path.clone(), (key, detail.clone()));
         Some((key.0, detail))
     }
+
+    fn remove_for_platform(
+        &self,
+        platform: crate::platform::Platform,
+        session: &Session,
+    ) -> Result<()> {
+        if !capabilities_for_session_on_platform(platform, session).delete {
+            return Err(Error::Unsupported(self.kind().name()));
+        }
+        // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
+        // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
+        // bg job to remove, so it is Unsupported rather than a stray no-op.
+        let Some(short_id) = session
+            .short_id
+            .as_deref()
+            .filter(|short_id| !short_id.is_empty())
+        else {
+            return Err(Error::Unsupported(self.kind().name()));
+        };
+        crate::spawn::run_checked(&mut claude_rm_command(
+            std::path::Path::new(&self.binary),
+            short_id,
+        ))
+    }
 }
 
 impl Default for ClaudeBackend {
@@ -104,6 +128,36 @@ fn claude_rm_command(binary: &std::path::Path, short_id: &str) -> std::process::
     cmd
 }
 
+pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabilities {
+    Capabilities {
+        spawn: true,
+        attach: true,
+        rename: platform != crate::platform::Platform::Windows,
+        archive: false,
+        delete: true,
+        stop: false,
+        needs_input: true,
+        pr_refs: true,
+        live_status: true,
+    }
+}
+
+pub fn capabilities_for_session_on_platform(
+    platform: crate::platform::Platform,
+    session: &Session,
+) -> Capabilities {
+    let mut capabilities = capabilities_for_platform(platform);
+    let has_short_id = session
+        .short_id
+        .as_deref()
+        .is_some_and(|short_id| !short_id.is_empty());
+    capabilities.rename &= has_short_id;
+    capabilities.delete = has_short_id
+        && (platform == crate::platform::Platform::Linux
+            || (session.pid.is_none() && session.status.is_finished()));
+    capabilities
+}
+
 impl Backend for ClaudeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Claude
@@ -117,31 +171,14 @@ impl Backend for ClaudeBackend {
         // advertised and then fails at press time is worse than one advertised as
         // unsupported, which is exactly what the footer notice exists to signal. Keep the
         // gate; the table is the coarser statement.
-        Capabilities {
-            spawn: true,
-            attach: true,
-            rename: true,
-            archive: false,
-            delete: true,
-            stop: false,
-            needs_input: true,
-            pr_refs: true,
-            live_status: true,
-        }
+        capabilities_for_platform(crate::platform::current_platform())
     }
     fn capabilities_for(&self, session: &Session) -> Capabilities {
         // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
         // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
         // Rename rides the same gate for the same reason - the short id names the job dir
         // whose state.json holds the name, and an interactive row has no job dir at all.
-        let mut capabilities = self.capabilities();
-        let has_short_id = session
-            .short_id
-            .as_deref()
-            .is_some_and(|short_id| !short_id.is_empty());
-        capabilities.delete = has_short_id;
-        capabilities.rename = has_short_id;
-        capabilities
+        capabilities_for_session_on_platform(crate::platform::current_platform(), session)
     }
     fn list(&mut self) -> Result<Vec<Session>> {
         // A missing/failing binary or non-zero exit is a quiet empty backend, not an error.
@@ -240,6 +277,9 @@ impl Backend for ClaudeBackend {
     /// the file immediately before each write, so it merges this name rather than reverting
     /// it, which is the same race claude's own fleet view runs.
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
+        if !capabilities_for_platform(crate::platform::current_platform()).rename {
+            return Err(Error::Unsupported(BackendKind::Claude.name()));
+        }
         let Some(short_id) = session
             .short_id
             .as_deref()
@@ -257,17 +297,7 @@ impl Backend for ClaudeBackend {
         )
     }
     fn remove(&self, session: &Session) -> Result<()> {
-        // `claude rm <short_id>` deletes the bg session (and its worktree). Blocking, headless,
-        // and delegated to the CLI (never a raw jobs-dir delete). A row with no short id has no
-        // bg job to remove, so it is Unsupported rather than a stray no-op.
-        let short_id = session.short_id.as_deref().unwrap_or_default();
-        if short_id.is_empty() {
-            return Err(Error::Unsupported(self.kind().name()));
-        }
-        crate::spawn::run_checked(&mut claude_rm_command(
-            std::path::Path::new(&self.binary),
-            short_id,
-        ))
+        self.remove_for_platform(crate::platform::current_platform(), session)
     }
     fn attach_command(
         &self,
@@ -729,12 +759,21 @@ pub fn iso8601_utc_millis(time: SystemTime) -> String {
 /// NEVER group/other readable, not even for the instant between creation and a later chmod,
 /// and a test that watches for the temp from another thread can only observe that by luck.
 /// umask can only clear bits, so 0600 is an upper bound, never a floor.
+#[cfg(unix)]
 pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::os::unix::fs::OpenOptionsExt::mode(
         std::fs::OpenOptions::new().write(true).create_new(true),
         0o600,
     )
     .open(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Replace `path`'s contents with `body` atomically: write a temp file beside it, then
@@ -751,6 +790,7 @@ pub fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 /// between the caller's read and this write (the mutation runner keys rename and remove
 /// separately, so they can overlap), and resurrecting the file there would leave a ghost job
 /// behind the removal.
+#[cfg(unix)]
 pub fn replace_atomic(path: &std::path::Path, body: &str) -> Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let tmp = dir.join(format!(
@@ -782,6 +822,11 @@ pub fn replace_atomic(path: &std::path::Path, body: &str) -> Result<()> {
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn replace_atomic(_path: &std::path::Path, _body: &str) -> Result<()> {
+    Err(Error::Unsupported(BackendKind::Claude.name()))
 }
 
 /// Peek parser for the claude session JSONL (verified record shapes 2026-07-11):
@@ -905,10 +950,45 @@ fn read_claude_turn_activity(
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_rm_command, claude_spawn_command};
-    use crate::backend::args;
+    use super::{ClaudeBackend, claude_rm_command, claude_spawn_command};
+    use crate::backend::{BackendKind, Session, SessionOrigin, Status, args};
+    use crate::error::Error;
+    use crate::platform::Platform;
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn portable_claude_remove_refuses_unresolved_session_before_cli() {
+        let backend = ClaudeBackend::with_binary("/definitely/not/a/real/claude");
+        let session = Session {
+            backend: BackendKind::Claude,
+            id: "session-uuid".to_string(),
+            short_id: Some("abc12345".to_string()),
+            origin: SessionOrigin::Background,
+            title: "unsafe unresolved session".to_string(),
+            cwd: PathBuf::from("/some/proj"),
+            git_branch: None,
+            status: Status::Unknown,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+
+        let error = backend
+            .remove_for_platform(Platform::Windows, &session)
+            .expect_err("portable remove must refuse before invoking the CLI");
+
+        match error {
+            Error::Unsupported(name) => assert_eq!(name, "claude"),
+            other => panic!("expected Unsupported(\"claude\"), got {other:?}"),
+        }
+    }
 
     #[test]
     fn claude_rm_command_builds_rm_subcommand() {

@@ -17,8 +17,11 @@ config surfaces, or features not requested.
 ## Scope
 
 - **v1 (this build): a Rust TUI** (`ratatui`) plus a `-core` library crate. The TUI is the
-  primary deliverable because the killer feature (one-keystroke attach/resume into a session)
-  is inherently terminal. This runs on a headless Linux remote-dev box over SSH.
+  primary deliverable because the killer feature (one keystroke attach/resume into a session)
+  is inherently terminal. Linux is the fully measured runtime platform. Native release archives
+  also target macOS Intel, macOS Apple Silicon, and Windows x64; those platforms enumerate and
+  render sessions but do not claim Linux process status, Codex daemon controls, or secure
+  managed OpenCode behavior.
 - **Out of scope for v1:** a web/Tailscale surface. It is a natural v2 (an `axum` binary
   sharing `-core`, deployed like the `bonus-drain`/`bg-schedule` viewers with token-guarded
   write routes) but do NOT build it now. Leave `-core` cleanly separable so v2 can reuse it.
@@ -161,13 +164,18 @@ ribbon, which renders complete streamed Codex history including named tool activ
 The file signal alone is insufficient: during research 66/383 rollouts lacked `task_complete`
 yet **zero** `codex` processes were running, i.e. those are crashed/abandoned, not live.
 
-Resolve per thread:
+Resolve per thread on Linux:
 1. **running** — a live `codex`/`codex exec` PID holds this thread's `rollout_path` open.
    Enumerate PIDs (`sysinfo`), then read `/proc/<pid>/fd/*` (readable for same-user procs;
    use `procfs` or `std::fs::read_link`) and match an open path to `threads.rollout_path`.
 2. **done** — not running AND `task_complete` in the tail.
 3. **errored/abandoned** — not running AND no `task_complete` (ends mid-turn).
 4. **hidden** — `archived=1` (orthogonal; applies on top of 1-3).
+
+On macOS and Windows, `/proc` file descriptor evidence is unavailable. A `task_complete` tail
+proves `Done`; every other tail is `Unknown`, never inferred as live, idle, or errored. Actions
+that need unavailable runtime evidence are capability gated and retain the existing footer
+notice behavior.
 
 > LIVE VERIFICATION REQUIRED: the PID→rollout `/proc/fd` correlation was NOT tested against a
 > running Codex process (none were running during research). The build MUST verify it
@@ -537,6 +545,21 @@ viewer-local name override is involved, so the list can never disagree with `cla
 - `agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`.
 
 Cargo workspace. Live-refresh the registry every ~1-2s.
+
+## Release artifacts
+
+A pushed `v*` tag builds native binaries on GitHub hosted runners and publishes a GitHub Release.
+The release contains these four archives, each with a sibling `.sha256` file:
+
+- `agent-viewer-x86_64-unknown-linux-gnu.tar.gz`
+- `agent-viewer-x86_64-apple-darwin.tar.gz`
+- `agent-viewer-aarch64-apple-darwin.tar.gz`
+- `agent-viewer-x86_64-pc-windows-msvc.zip`
+
+The archive contains `agent-viewer` on Unix and `agent-viewer.exe` on Windows. Build jobs run
+`agent-viewer --version` or `agent-viewer.exe --version` before packaging. `--version` and `-V`
+must print the package version and exit before terminal, filesystem, or backend startup, so they
+remain safe cross platform smoke paths.
 
 ## TUI behavior
 
