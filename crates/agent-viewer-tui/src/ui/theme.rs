@@ -1,3 +1,4 @@
+use agent_viewer_core::pty::TerminalPalette;
 use agent_viewer_core::state::ViewerDb;
 use ratatui::style::Color;
 use std::fs;
@@ -46,6 +47,22 @@ pub struct Theme {
     pub animation: bool,
     source_path: Option<PathBuf>,
     modified: Option<SystemTime>,
+}
+
+impl Theme {
+    pub fn terminal_palette(&self) -> Option<TerminalPalette> {
+        let (
+            Color::Rgb(foreground_red, foreground_green, foreground_blue),
+            Color::Rgb(background_red, background_green, background_blue),
+        ) = (self.text, self.bg)
+        else {
+            return None;
+        };
+        Some(TerminalPalette {
+            foreground: [foreground_red, foreground_green, foreground_blue],
+            background: [background_red, background_green, background_blue],
+        })
+    }
 }
 
 #[derive(Clone, Debug)]

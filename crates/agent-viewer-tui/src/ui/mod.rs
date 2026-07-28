@@ -729,6 +729,211 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn attached_test_session() -> Session {
+        Session {
+            backend: BackendKind::Claude,
+            id: "attached-theme".into(),
+            short_id: Some("attached-theme".into()),
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "attached theme".into(),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    fn attached_pty(script: &str) -> PtySession {
+        attached_pty_with_palette(script, None)
+    }
+
+    fn attached_pty_with_palette(
+        script: &str,
+        palette: Option<agent_viewer_core::pty::TerminalPalette>,
+    ) -> PtySession {
+        PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette,
+            scrollback_rows: 0,
+        })
+        .expect("attached child")
+    }
+
+    fn wait_for_attached_screen(pty: &PtySession, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pty.with_screen(|screen| screen.contents().contains(needle)) {
+            assert!(
+                Instant::now() < deadline,
+                "attached child screen did not contain {needle:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn render_attached(pty: &PtySession, session: &Session) -> ratatui::buffer::Buffer {
+        let themes = ThemeState::default();
+        render_attached_with_themes(pty, session, &themes)
+    }
+
+    fn render_attached_with_themes(
+        pty: &PtySession,
+        session: &Session,
+        themes: &ThemeState,
+    ) -> ratatui::buffer::Buffer {
+        let app = App::new(vec![session.clone()]);
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    Draw {
+                        app: &app,
+                        workspace: std::path::Path::new("/tmp"),
+                        mode: &Mode::Attached,
+                        notice: "",
+                        composer: &composer,
+                        pulses: &pulses,
+                        now_ms: 0,
+                        attach: Some(AttachView {
+                            session,
+                            pty,
+                            exited: false,
+                        }),
+                        pr_status: &pr_status,
+                        logos: None,
+                        list_hit: &list_hit,
+                        themes,
+                    },
+                );
+            })
+            .expect("draw attached child");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn attached_plain_cells_use_the_stored_amber_palette_without_recoloring_explicit_ansi() {
+        let theme = theme::amber(false);
+        let mut pty = attached_pty_with_palette(
+            "printf 'P\\033[31mI\\033[0m\\033[38;2;1;2;3;48;2;4;5;6mR\\033[0m\\033[?25l'; sleep 30",
+            theme.terminal_palette(),
+        );
+        wait_for_attached_screen(&pty, "PIR");
+
+        let session = attached_test_session();
+        let buffer = render_attached(&pty, &session);
+
+        assert_eq!(buffer[(0, 1)].symbol(), "P");
+        assert_eq!(buffer[(0, 1)].fg, theme.text);
+        assert_eq!(buffer[(0, 1)].bg, theme.bg);
+        assert_eq!(buffer[(1, 1)].symbol(), "I");
+        assert_eq!(buffer[(1, 1)].fg, ratatui::style::Color::Indexed(1));
+        assert_eq!(buffer[(2, 1)].symbol(), "R");
+        assert_eq!(buffer[(2, 1)].fg, ratatui::style::Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(2, 1)].bg, ratatui::style::Color::Rgb(4, 5, 6));
+
+        pty.kill();
+    }
+
+    #[test]
+    fn palette_free_attached_terminal_keeps_default_cells_and_empty_cursor_unstyled() {
+        let mut pty = attached_pty("printf 'P'; sleep 30");
+        wait_for_attached_screen(&pty, "P");
+
+        let session = attached_test_session();
+        let buffer = render_attached(&pty, &session);
+
+        assert_eq!(buffer[(0, 1)].symbol(), "P");
+        assert_eq!(buffer[(0, 1)].fg, ratatui::style::Color::Reset);
+        assert_eq!(buffer[(0, 1)].bg, ratatui::style::Color::Reset);
+        assert_eq!(buffer[(1, 1)].symbol(), "█");
+        assert_eq!(buffer[(1, 1)].fg, ratatui::style::Color::Gray);
+        assert_eq!(buffer[(1, 1)].bg, ratatui::style::Color::Reset);
+
+        pty.kill();
+    }
+
+    #[test]
+    fn attached_terminal_uses_its_stored_palette_without_recoloring_empty_cursor() {
+        let palette = agent_viewer_core::pty::TerminalPalette {
+            foreground: [0x12, 0x34, 0x56],
+            background: [0x78, 0x9a, 0xbc],
+        };
+        let mut pty = attached_pty_with_palette("printf 'P'; sleep 30", Some(palette));
+        wait_for_attached_screen(&pty, "P");
+
+        let session = attached_test_session();
+        let buffer = render_attached(&pty, &session);
+
+        assert_eq!(buffer[(0, 1)].symbol(), "P");
+        assert_eq!(
+            buffer[(0, 1)].fg,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            buffer[(0, 1)].bg,
+            ratatui::style::Color::Rgb(0x78, 0x9a, 0xbc)
+        );
+        assert_eq!(buffer[(1, 1)].symbol(), "█");
+        assert_eq!(buffer[(1, 1)].fg, ratatui::style::Color::Gray);
+        assert_eq!(
+            buffer[(1, 1)].bg,
+            ratatui::style::Color::Rgb(0x78, 0x9a, 0xbc)
+        );
+
+        pty.kill();
+    }
+
+    #[test]
+    fn terminal_match_renders_default_cells_with_the_stored_host_palette() {
+        let host_palette = agent_viewer_core::pty::TerminalPalette {
+            foreground: [0xab, 0xcd, 0xef],
+            background: [0x10, 0x20, 0x30],
+        };
+        let mut pty = attached_pty_with_palette(
+            "printf 'P\\033[?25l'; sleep 30",
+            Some(host_palette),
+        );
+        wait_for_attached_screen(&pty, "P");
+        let mut themes = ThemeState::default();
+        themes.move_preview(1);
+        assert_eq!(themes.active().id, "terminal");
+
+        let session = attached_test_session();
+        let buffer = render_attached_with_themes(&pty, &session, &themes);
+
+        assert_eq!(buffer[(0, 1)].symbol(), "P");
+        assert_eq!(
+            buffer[(0, 1)].fg,
+            ratatui::style::Color::Rgb(0xab, 0xcd, 0xef)
+        );
+        assert_eq!(
+            buffer[(0, 1)].bg,
+            ratatui::style::Color::Rgb(0x10, 0x20, 0x30)
+        );
+
+        pty.kill();
+    }
 
     #[test]
     fn mark_for_defaults_to_tags_and_opts_into_glyphs() {
