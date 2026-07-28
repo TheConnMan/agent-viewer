@@ -238,6 +238,21 @@ Built in Rust. See `SPEC.md` for the full architecture and the evidence behind i
 cargo build --workspace
 ```
 
+## Releases
+
+Pushing a tag that matches `v*` builds native release binaries and publishes a GitHub Release.
+Each release has these archives and a sibling SHA256 file for each one:
+
+- `agent-viewer-x86_64-unknown-linux-gnu.tar.gz`
+- `agent-viewer-x86_64-apple-darwin.tar.gz`
+- `agent-viewer-aarch64-apple-darwin.tar.gz`
+- `agent-viewer-x86_64-pc-windows-msvc.zip`
+
+Verify an archive before unpacking it with `sha256sum --check <archive>.sha256` on Linux,
+`shasum -a 256 --check <archive>.sha256` on macOS, or
+`Get-FileHash -Algorithm SHA256 <archive>` on Windows. Unpack a `.tar.gz` with
+`tar -xzf <archive>` and the Windows `.zip` with `Expand-Archive <archive>`.
+
 ## Run
 
 ```
@@ -247,6 +262,14 @@ cargo run -p agent-viewer-tui
 The binary is named `agent-viewer`. It expects a `~/.codex/state_*.sqlite` on the box
 (the Codex backend's source of truth); the Claude and opencode backends appear
 automatically when their CLIs and data exist and silently list empty otherwise.
+
+Linux retains the full measured runtime behavior. macOS and Windows can enumerate and render
+sessions, but do not claim Linux process status, Codex daemon controls, or secure managed
+opencode behavior. On those platforms, a rollout is `Done` only when its transcript proves
+completion; every other process dependent state is `Unknown`. Unsupported actions remain
+no ops with the existing footer notice. `agent-viewer --version` and `agent-viewer -V` print
+the version before terminal, filesystem, or backend startup, making them safe release smoke
+paths.
 
 ## Test
 
