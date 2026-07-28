@@ -110,6 +110,17 @@ the blast radius of the change:
 Run `cargo clippy --workspace` and the relevant tests before every commit; every commit must
 build clean with clippy and tests passing.
 
+**Always close a change with the command Brian runs to see it.** Anything with a visible
+surface (a sprite, a key, a layout, a row, a popup) ends the report with the literal line to
+paste, plus the keys to press:
+
+```bash
+cd <repo-or-worktree> && cargo run -p agent-viewer-tui
+```
+
+He judges this tool by running it, not by reading a diff, so a report that omits the line only
+costs a round trip. Name the worktree path when the work has not merged to `main` yet.
+
 ## Project invariants - do not violate
 
 - **Read the Codex registry read-only.** Open `~/.codex/state_*.sqlite` with
@@ -165,3 +176,14 @@ The remote is `git@github.com:TheConnMan/agent-viewer.git`. Never push without e
 approval. Follow the global commit format (`Ref` linkage only when the branch carries a ticket
 ID, no AI mentions, no Co-Authored-By AI lines). Docs-only or internal changes merge to `main`
 locally; feature work destined for review opens a PR only after the diff is shown and approved.
+
+**A mechanical bugfix merges itself.** When the work is a bug with one obviously correct fix and
+no design or UX decision in it, do the whole loop without asking: worktree, fix, clippy and tests
+green, commit, `git merge --no-ff` to `main`, remove the worktree. Say what landed afterward. The
+approval gate above still holds for anything that decides how something looks or behaves, adds a
+surface, or changes an invariant in this file. Merging locally is never pushing; pushing still
+needs Brian.
+
+Run `cargo clippy --workspace` and the tests on `main` after every merge, not only on the branch:
+a textually clean merge still hits semantic conflicts (a `Draw` literal gaining a field on one
+branch while another branch adds a new call site) that only the compiler catches.
