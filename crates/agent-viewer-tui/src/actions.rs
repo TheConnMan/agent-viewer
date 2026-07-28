@@ -338,10 +338,16 @@ fn attach_session<B: ratatui::backend::Backend>(
         .map_err(|error| io::Error::other(error.to_string()))?;
     let rows = size.height.saturating_sub(1).max(1);
     let cols = size.width.max(1);
+    let palette = ui
+        .themes
+        .active()
+        .terminal_palette()
+        .or(ui.terminal_palette);
 
     if let Some(pty) = ui.attached.get_mut(&key) {
         // Re-attach: reuse the live PTY, resizing it to the current content area. The
         // per-PTY detach tracker is preserved so a half-typed input line still gates Left.
+        pty.set_palette(palette);
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();
     } else {
@@ -363,11 +369,7 @@ fn attach_session<B: ratatui::backend::Backend>(
             }
         };
         let mut spec = spec_from_command(&command, rows, cols);
-        spec.palette = ui
-            .themes
-            .active()
-            .terminal_palette()
-            .or(ui.terminal_palette);
+        spec.palette = palette;
         if session.backend == BackendKind::Codex {
             spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
         }
@@ -659,6 +661,69 @@ mod tests {
         wait_for_attached_screen(&ui, &key, &expected);
 
         ui.attached.get_mut(&key).expect("attached child").kill();
+    }
+
+    #[test]
+    fn reattaching_a_retained_pty_refreshes_its_palette_for_the_new_active_theme() {
+        let mut session = sess("palette_refresh", "/tmp/agentviewer_palette_refresh", 100);
+        session.short_id = Some("palette_refresh".into());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let old_palette = ui
+            .themes
+            .active()
+            .terminal_palette()
+            .expect("default amber palette");
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(PaletteQueryBackend)];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+        let key = (BackendKind::Claude, session.id.clone());
+
+        assert!(
+            attach_session(&backends, &mut ui, &mut terminal, &session)
+                .expect("initial palette attach")
+        );
+        let first_pty = ui.attached.get(&key).expect("initial retained pty") as *const _;
+        let first_pid = ui
+            .attached
+            .get(&key)
+            .expect("initial retained pty")
+            .pid()
+            .expect("initial retained pty pid");
+        assert_eq!(
+            ui.attached.get(&key).expect("initial retained pty").palette(),
+            Some(old_palette)
+        );
+
+        ui.themes.move_preview(2);
+        let new_palette = ui
+            .themes
+            .active()
+            .terminal_palette()
+            .expect("new active RGB theme palette");
+        assert_ne!(old_palette, new_palette);
+
+        assert!(
+            attach_session(&backends, &mut ui, &mut terminal, &session)
+                .expect("reattach retained pty")
+        );
+        let retained_pty = ui.attached.get(&key).expect("retained pty after reattach");
+        assert_eq!(
+            first_pty, retained_pty as *const _,
+            "reattach must preserve the original PtySession instance"
+        );
+        assert_eq!(
+            retained_pty.pid(),
+            Some(first_pid),
+            "reattach must preserve the original PTY child"
+        );
+        assert_eq!(
+            retained_pty.palette(),
+            Some(new_palette),
+            "reattach must replace the retained PTY palette with the active theme"
+        );
+
+        ui.attached.get_mut(&key).expect("retained child").kill();
     }
 
     #[test]

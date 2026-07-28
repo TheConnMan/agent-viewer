@@ -415,10 +415,11 @@ tested without a daemon):
 
 **Attached terminal palette.** The TUI captures the host terminal foreground and background
 once. Concrete RGB themes choose their text and background first; the terminal match theme falls
-back to the captured host colors. The chosen palette is stored on `PtySession`, and OSC 10, OSC
-11, and default cell rendering use that same stored palette. Explicit indexed and RGB child
-colors remain untouched. When no palette is available, OSC queries receive no reply and default
-cells use Reset rendering. Never fabricate unavailable host colors.
+back to the captured host colors. The chosen palette is mutable on `PtySession` and refreshes
+when the user reenters a retained session after changing theme. OSC 10, OSC 11, and default cell
+rendering use that same current palette. Explicit indexed and RGB child colors remain untouched.
+When no palette is available, OSC queries receive no reply and default cells use Reset rendering.
+Never fabricate unavailable host colors.
 
 Transport: the control socket is a Unix socket that upgrades to RFC6455 WebSocket at `/rpc`
 (handshake URL `ws://localhost/rpc`), driven by blocking `tungstenite` over

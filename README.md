@@ -206,7 +206,8 @@ The attached PTY stays alive in the background so re-attaching is instant.
 New attached PTYs use the active viewer theme's text and background as their terminal defaults;
 explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
 uses the captured host foreground and background. Because attached PTYs are reused, changing
-the theme affects a newly created attach PTY, not one that is already alive.
+the theme then reentering a retained session refreshes its default foreground and background
+without restarting the child.
 Codex, Claude, and external opencode attached transcripts are immediately selectable in the host
 terminal. While attached, press `Ctrl+T` to enable capture for session scrolling. Codex scrolls
 the viewer's retained transcript, while Claude and external opencode sessions receive the wheel

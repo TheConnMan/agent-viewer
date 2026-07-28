@@ -658,6 +658,74 @@ fn pty_answers_fragmented_palette_queries_with_configured_colors() {
 }
 
 #[test]
+fn pty_refreshes_palette_replies_for_queries_after_a_palette_change() {
+    // The child holds between complete query pairs so the driver can replace the retained
+    // session palette before it sends the second pair. Each expected pair contains both
+    // slots, which catches a stale or only partially refreshed palette snapshot.
+    let sync_file = sync_file("palette_refresh");
+    let old_palette = palette([0x12, 0x34, 0x56], [0xab, 0xcd, 0xef]);
+    let new_palette = palette([0xfe, 0xdc, 0xba], [0x65, 0x43, 0x21]);
+    let script = r#"
+        stty raw -echo
+        old_foreground=$'\033]10;rgb:1212/3434/5656\033\\'
+        old_background=$'\033]11;rgb:ABAB/CDCD/EFEF\033\\'
+        new_foreground=$'\033]10;rgb:FEFE/DCDC/BABA\033\\'
+        new_background=$'\033]11;rgb:6565/4343/2121\033\\'
+
+        printf '%s%s' $'\033]10;?\a' $'\033]11;?\a'
+        first=$(dd bs=1 count=50 status=none)
+        [ "$first" = "$old_foreground$old_background" ] || {
+            printf 'palette_refresh_first_bad\n'
+            exit 1
+        }
+        printf ready > "$PALETTE_SYNC_FILE"
+        acknowledgement=$(dd bs=1 count=1 status=none)
+        [ "$acknowledgement" = r ] || exit 1
+
+        printf '%s%s' $'\033]10;?\a' $'\033]11;?\a'
+        second=$(dd bs=1 count=50 status=none)
+        [ "$second" = "$new_foreground$new_background" ] || {
+            printf 'palette_refresh_second_bad\n'
+            exit 1
+        }
+        printf 'palette_refresh_ok\n'
+        sleep 30
+    "#;
+    let mut session = PtySession::spawn(PtySpec {
+        palette: Some(old_palette),
+        envs: vec![(
+            "PALETTE_SYNC_FILE".to_string(),
+            sync_file.to_string_lossy().into_owned(),
+        )],
+        ..spec("bash", &["-c", script], 24, 80)
+    })
+    .expect("spawn palette refresh probe");
+
+    assert!(
+        wait_for_sync(&sync_file, Duration::from_secs(5), "ready"),
+        "the child did not verify the original complete palette reply pair"
+    );
+    session.set_palette(Some(new_palette));
+    session
+        .write_input(b"r")
+        .expect("release refreshed palette query pair");
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "palette_refresh_ok"),
+        "the child did not receive the refreshed complete palette reply pair: {}",
+        session.with_screen(|screen| screen.contents())
+    );
+    assert!(
+        !session
+            .with_screen(|screen| screen.contents())
+            .contains("palette_refresh_second_bad"),
+        "the second palette reply pair retained an old or mixed color"
+    );
+
+    session.kill();
+    std::fs::remove_file(sync_file).expect("remove palette refresh synchronization file");
+}
+
+#[test]
 fn pty_keeps_palette_replies_and_concurrent_input_frames_intact() {
     // A separate parent writer starts each input frame immediately after the acknowledgement
     // that lets the child complete its fragmented query. The child accepts either whole-frame
