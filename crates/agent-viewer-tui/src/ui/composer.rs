@@ -329,7 +329,7 @@ pub(super) fn draw(
     };
     if input.height > 0 {
         let prefix = vec![
-            Span::styled(field(" ❯", MARK_FIELD), fg(theme.accent)),
+            Span::styled(field("  ❯", MARK_FIELD), fg(theme.accent)),
             Span::raw(" "),
         ];
         if composer.is_empty() {
