@@ -10,6 +10,7 @@ use agent_viewer_core::claude::{
 use agent_viewer_core::codex::rollout::TranscriptItem;
 use common::rfc3339_at;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -566,6 +567,78 @@ fn claude_turn_activity_reads_full_history_and_tool_use() {
 }
 
 // --- Preserved v1 test ---
+
+#[test]
+fn claude_list_orders_enriched_updates_ascending_with_stable_ties() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    let agents = serde_json::json!([
+        {
+            "id": "tie_z",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 3000,
+            "sessionId": "session_tie_z",
+            "name": "Tie Z",
+            "state": "done"
+        },
+        {
+            "id": "oldest",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": "session_oldest",
+            "name": "Oldest Update",
+            "state": "done"
+        },
+        {
+            "id": "tie_a",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 2000,
+            "sessionId": "session_tie_a",
+            "name": "Tie A",
+            "state": "done"
+        }
+    ]);
+    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", agents)).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let jobs_root = dir.path().join("jobs");
+    for (short_id, updated_at_ms) in [("tie_z", 2000), ("oldest", 1000), ("tie_a", 2000)] {
+        let state_path = jobs_root.join(short_id).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, "{}").unwrap();
+        std::fs::File::open(&state_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_millis(updated_at_ms)),
+            )
+            .unwrap();
+    }
+
+    let mut backend = ClaudeBackend::with_roots(
+        binary.to_str().unwrap(),
+        jobs_root,
+        dir.path().join("sessions"),
+    );
+    let sessions = backend.list().expect("list claude sessions");
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session_oldest", "session_tie_z", "session_tie_a"]
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| (session.created_at_ms, session.updated_at_ms))
+            .collect::<Vec<_>>(),
+        vec![(1000, 1000), (3000, 2000), (2000, 2000)]
+    );
+}
 
 #[test]
 fn claude_missing_binary_lists_empty() {

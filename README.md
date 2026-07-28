@@ -71,9 +71,8 @@ unresolvable.
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
 `✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
 
-The default list groups by project directory; `Ctrl+S` regroups by state (needs-input,
-working, idle, done, with error folding into done and unknown folding into idle). Every row renders — the
-list is uncapped and scrolls with the selection to fill the terminal height. A blank line
+The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by update time. Every row renders.
+The list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
 Working rows shimmer their glyph, needs-input rows breathe between muted and bright, and a

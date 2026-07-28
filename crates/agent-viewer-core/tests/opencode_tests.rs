@@ -801,7 +801,7 @@ fn opencode_spawn_readiness_deadline_is_one_bounded_budget() {
 // --- Preserved v1 listing shape (order / labels / hidden) ---
 
 #[test]
-fn opencode_lists_rows_hidden_and_order() {
+fn opencode_lists_rows_hidden_and_update_order_ascending() {
     let schema = common::read_fixture("opencode_session_schema.sql");
     let inserts = [
         "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
@@ -817,12 +817,18 @@ fn opencode_lists_rows_hidden_and_order() {
     let sessions = backend.list().expect("list opencode sessions");
     assert_eq!(sessions.len(), 3);
 
-    // time_updated DESC: parent (3000), child (2000), arch (1000).
-    assert_eq!(sessions[0].id, "ses_parent");
-    assert_eq!(sessions[1].id, "ses_child");
-    assert_eq!(sessions[2].id, "ses_arch");
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_arch", "ses_child", "ses_parent"]
+    );
 
-    let parent = &sessions[0];
+    let parent = sessions
+        .iter()
+        .find(|session| session.id == "ses_parent")
+        .unwrap();
     assert_eq!(parent.backend, BackendKind::Opencode);
     assert_eq!(parent.cwd, PathBuf::from("/home/user/oc-proj"));
     assert_eq!(parent.title, "Parent");
@@ -832,9 +838,17 @@ fn opencode_lists_rows_hidden_and_order() {
     assert!(!parent.hidden);
     assert_eq!(parent.short_id, None); // opencode sessions carry no claude short id
 
-    assert!(sessions[1].companion); // parent_id non-NULL
-    assert!(!sessions[1].hidden);
-    assert!(sessions[2].hidden); // time_archived IS NOT NULL
+    let child = sessions
+        .iter()
+        .find(|session| session.id == "ses_child")
+        .unwrap();
+    assert!(child.companion); // parent_id non-NULL
+    assert!(!child.hidden);
+    let archived = sessions
+        .iter()
+        .find(|session| session.id == "ses_arch")
+        .unwrap();
+    assert!(archived.hidden); // time_archived IS NOT NULL
 }
 
 #[test]
@@ -867,7 +881,12 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
     for row in &mut rows[5..] {
         row["permission"] = Value::Null;
     }
+    for (index, row) in rows.iter_mut().enumerate() {
+        row["time"]["created"] = json!((index as i64 + 1) * 1000);
+        row["time"]["updated"] = json!([8000, 2000, 2000, 7000, 6000, 5000, 4000, 3000][index]);
+    }
     let directory = rows[1]["directory"].as_str().unwrap().to_string();
+    rows.swap(1, 2);
     let mut status = common::fixture_json("opencode/session_status_idle_busy_retry.json");
     status
         .as_object_mut()
@@ -923,10 +942,19 @@ fn opencode_server_list_maps_status_input_companions_archive_and_hosting() {
                 .iter()
                 .map(|session| session.updated_at_ms)
                 .collect::<Vec<_>>();
-            values.sort_by(|left, right| right.cmp(left));
+            values.sort();
             values
         },
-        "server rows remain newest first"
+        "server rows remain oldest first"
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|session| session.updated_at_ms == 2000)
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![run_mode_id.as_str(), busy_id.as_str()],
+        "equal update values retain input order"
     );
     let row = |id: &str| listed.iter().find(|session| session.id == id).unwrap();
     let archived = row(&archived_id);
