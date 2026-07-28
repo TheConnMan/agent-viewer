@@ -6,7 +6,7 @@ use std::io;
 
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
 use agent_viewer_core::claude::ensure_trusted;
-use agent_viewer_core::pty::{PtySession, spec_from_command};
+use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::{AttachRefusal, Session};
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
@@ -365,6 +365,9 @@ fn attach_session<B: ratatui::backend::Backend>(
         };
         let mut spec = spec_from_command(&command, rows, cols);
         spec.palette = ui.terminal_palette;
+        if session.backend == BackendKind::Codex {
+            spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
+        }
         match PtySession::spawn(spec) {
             Ok(pty) => {
                 ui.attached.insert(key.clone(), pty);

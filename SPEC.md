@@ -243,6 +243,12 @@ false interruption.
 clients on one app-server received byte-identical live streams with no interrupt marker. The
 TUI reaches that with `codex resume --remote unix://<socketPath> <id>`.
 
+**Codex attaches use inline terminal mode.** The viewer adds `--no-alt-screen` to each Codex
+resume command and retains a bounded 2,000 row PTY scrollback. Codex discards mouse reports,
+so the viewer consumes each Codex wheel event as local viewport movement of three rows. Inline
+mode is required because Codex's alternate screen leaves the terminal emulator with no history
+for the viewer to scroll.
+
 **A daemon-hosted turn survives its client disconnecting.** A turn started with `thread/start`
 plus `turn/start` kept running after the initiating client closed the socket: the rollout grew
 3778 bytes post-disconnect, thread status stayed "active" and the turn "inProgress". So a spawn
@@ -546,9 +552,10 @@ Cargo workspace. Live-refresh the registry every ~1-2s.
 ### Mouse capture must be escapable (`Ctrl+T`)
 
 The viewer enables mouse capture at startup, for two real reasons: click/hover row selection
-on the list, and forwarding wheel events to an attached child so the wheel scrolls the child's
-transcript instead of the terminal's alternate-scroll emitting arrow keys that codex reads as
-prompt-history navigation.
+on the list, and attached session content scrolling. Codex wheel reports move the viewer's
+local PTY viewport by three rows, using its bounded 2,000 row scrollback. Claude and external
+opencode attached terminals receive native wheel forwarding. External opencode behavior is
+described as its supported attach path, not as a live verification claim.
 
 The cost is that **capture swallows the terminal's own drag-select**, so text cannot be copied
 out of the viewer. This spec previously waved that away with "the terminal's native text

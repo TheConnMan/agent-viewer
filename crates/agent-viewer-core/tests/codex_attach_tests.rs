@@ -9,6 +9,7 @@ use agent_viewer_core::backend::{
     Backend, BackendKind, Capabilities, Session, SessionOrigin, Status,
 };
 use agent_viewer_core::codex::app_server::{Daemon, remote_endpoint};
+use agent_viewer_core::codex::cli::{resume_command, resume_remote_command};
 use agent_viewer_core::codex::{
     AttachRoute, CodexBackend, SpawnRoute, StopRoute, attach_route, no_daemon_spawn_refusal,
     spawn_route, stop_route,
@@ -57,6 +58,55 @@ fn attach_command_leaves_cwd_unset_when_dir_missing() {
         .expect("codex supports attach");
     // A deleted cwd must not be set, otherwise spawning the pty command would fail.
     assert_eq!(cmd.get_current_dir(), None);
+}
+
+#[test]
+fn local_resume_uses_inline_mode_as_a_global_option() {
+    let command = resume_command("thread-local");
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(args, ["--no-alt-screen", "resume", "thread-local"]);
+}
+
+#[test]
+fn remote_resume_uses_inline_mode_before_resume_and_remote_options() {
+    let command = resume_remote_command("unix:///tmp/codex.sock", "thread-remote");
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(
+        args,
+        [
+            "--no-alt-screen",
+            "resume",
+            "--remote",
+            "unix:///tmp/codex.sock",
+            "thread-remote",
+        ]
+    );
+}
+
+#[test]
+fn installed_codex_accepts_inline_mode_before_resume() {
+    let output = match std::process::Command::new("codex")
+        .args(["--no-alt-screen", "resume", "--help"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("failed to inspect the installed codex command: {error}"),
+    };
+
+    assert!(
+        output.status.success(),
+        "codex rejected global inline mode ordering: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // --- source -> SessionOrigin mapping ---
