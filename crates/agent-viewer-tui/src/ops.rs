@@ -272,12 +272,13 @@ pub(crate) fn run_mutation_with_opencode(
 
 #[cfg(test)]
 mod tests {
-    use super::{Mutation, run_remove, spawn_selection_from_mutation};
+    use super::{Mutation, run_remove, run_spawn_with_backend, spawn_selection_from_mutation};
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::{Session, SpawnResult};
     use agent_viewer_tui::app::{App, Row};
-    use agent_viewer_tui::shared_listing::TargetRequest;
-    use std::path::PathBuf;
+    use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     fn session(backend: BackendKind, id: &str, hidden: bool) -> Session {
@@ -317,7 +318,7 @@ mod tests {
         Mutation::spawn(
             &app,
             BackendKind::Codex,
-            PathBuf::from("/tmp/spawn_selection"),
+            SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/spawn_selection")),
             "new task".to_string(),
             None,
             42,
@@ -365,6 +366,172 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    struct RecordingSpawnBackend {
+        sessions: Vec<Session>,
+        list_calls: usize,
+        spawn_directories: RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingSpawnBackend {
+        fn with_sessions(sessions: Vec<Session>) -> Self {
+            Self {
+                sessions,
+                list_calls: 0,
+                spawn_directories: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for RecordingSpawnBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Codex
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                spawn: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.list_calls += 1;
+            Ok(self.sessions.clone())
+        }
+
+        fn spawn(
+            &self,
+            dir: &Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            self.spawn_directories.borrow_mut().push(dir.to_path_buf());
+            Ok(SpawnResult {
+                pid: None,
+                session_id: Some("spawned_session".to_string()),
+            })
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by spawn")
+        }
+    }
+
+    fn session_at(id: &str, cwd: impl Into<PathBuf>) -> Session {
+        let mut session = session(BackendKind::Codex, id, false);
+        session.cwd = cwd.into();
+        session
+    }
+
+    fn spawn_mutation(target: SpawnTarget) -> Mutation {
+        Mutation::Spawn {
+            backend: BackendKind::Codex,
+            target,
+            task: "new task".to_string(),
+            model: None,
+            spawned_at_ms: 42,
+            preexisting_ids: ["displayed_other_session".to_string()]
+                .into_iter()
+                .collect(),
+            notice: "spawned on codex".to_string(),
+        }
+    }
+
+    #[test]
+    fn session_working_directory_spawn_uses_fresh_authoritative_cwd() {
+        let displayed = session_at("target", "/displayed/stale");
+        let fresh = session_at("target", "/authority/fresh");
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(vec![fresh]);
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![PathBuf::from("/authority/fresh")]
+        );
+        assert_eq!(
+            outcome.spawned.expect("spawn selection").cwd,
+            PathBuf::from("/authority/fresh")
+        );
+    }
+
+    #[test]
+    fn session_project_spawn_recomputes_project_root_from_fresh_cwd() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("fresh_repository");
+        std::fs::create_dir_all(repository.join(".git")).expect("git marker");
+        let fresh_cwd = repository.join("new").join("nested");
+        std::fs::create_dir_all(&fresh_cwd).expect("fresh working directory");
+        let displayed = session_at("target", "/displayed/old_repository");
+        let fresh = session_at("target", fresh_cwd);
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::ProjectRoot,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(vec![fresh]);
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![repository.clone()]
+        );
+        assert_eq!(outcome.spawned.expect("spawn selection").cwd, repository);
+    }
+
+    #[test]
+    fn missing_session_identity_refuses_spawn() {
+        let displayed = session_at("missing", "/displayed/stale");
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(Vec::new());
+
+        let result = run_spawn_with_backend(&mut backend, None, &mutation);
+
+        assert_eq!(
+            result,
+            Err("codex session is no longer available".to_string())
+        );
+        assert_eq!(backend.list_calls, 1);
+        assert!(backend.spawn_directories.into_inner().is_empty());
+    }
+
+    #[test]
+    fn explicit_directory_spawn_does_not_list_authority() {
+        let directory = PathBuf::from("/explicit/project/header");
+        let mutation = spawn_mutation(SpawnTarget::ExplicitDirectory(directory.clone()));
+        let mut backend = RecordingSpawnBackend::with_sessions(Vec::new());
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 0);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![directory.clone()]
+        );
+        assert_eq!(outcome.spawned.expect("spawn selection").cwd, directory);
     }
 
     /// A live process whose `/proc/<pid>/comm` starts with "claude", which is the only shape
