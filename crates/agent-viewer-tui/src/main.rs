@@ -1154,8 +1154,8 @@ mod tests {
     fn cold_lease_is_pending_without_calling_source_or_ending_startup() {
         let directory = tempfile::tempdir().expect("temporary viewer database directory");
         let path = directory.path().join("viewer.sqlite");
-        let lease_holder = ViewerDb::open_at(&path).expect("lease holder database");
-        let follower = ViewerDb::open_at(&path).expect("follower database");
+        let lease_holder = ViewerDb::open(&path).expect("lease holder database");
+        let follower = ViewerDb::open(&path).expect("follower database");
         let scope =
             ListingCacheScope::new(BackendKind::Codex, "cold cache").expect("valid cache scope");
         let lease_now = now_ms();
@@ -1189,9 +1189,9 @@ mod tests {
     fn cached_error_rows_become_last_good_and_survive_a_following_lease() {
         let directory = tempfile::tempdir().expect("temporary viewer database directory");
         let path = directory.path().join("viewer.sqlite");
-        let publisher = ViewerDb::open_at(&path).expect("publisher database");
-        let local = ViewerDb::open_at(&path).expect("local database");
-        let lease_holder = ViewerDb::open_at(&path).expect("lease holder database");
+        let publisher = ViewerDb::open(&path).expect("publisher database");
+        let local = ViewerDb::open(&path).expect("local database");
+        let lease_holder = ViewerDb::open(&path).expect("lease holder database");
         let scope =
             ListingCacheScope::new(BackendKind::Codex, "stale cache").expect("valid cache scope");
         let cached = session(BackendKind::Codex, "cached", 1_000, false);
