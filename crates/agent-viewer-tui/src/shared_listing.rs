@@ -6,6 +6,11 @@ use agent_viewer_core::{
 const LISTING_FRESHNESS_MS: i64 = 2_000;
 const LISTING_LEASE_MS: i64 = 2_000;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshCursor {
+    published_generation: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefreshOutcome {
     Authoritative {
@@ -21,26 +26,7 @@ pub enum RefreshOutcome {
         sessions: Vec<Session>,
         notice: String,
     },
-}
-
-impl RefreshOutcome {
-    pub fn sessions(&self) -> &[Session] {
-        match self {
-            Self::Authoritative { sessions }
-            | Self::Shared { sessions }
-            | Self::Stale { sessions }
-            | Self::SourceError { sessions, .. } => sessions,
-        }
-    }
-
-    pub fn into_sessions(self) -> Vec<Session> {
-        match self {
-            Self::Authoritative { sessions }
-            | Self::Shared { sessions }
-            | Self::Stale { sessions }
-            | Self::SourceError { sessions, .. } => sessions,
-        }
-    }
+    Unchanged,
 }
 
 fn source_error(backend: BackendKind, error: agent_viewer_core::Error) -> String {
@@ -63,9 +49,15 @@ where
     }
 }
 
-fn cached_fallback(db: &ViewerDb, scope: &ListingCacheScope, now_ms: i64) -> Option<Vec<Session>> {
+fn cached_fallback(
+    db: &ViewerDb,
+    scope: &ListingCacheScope,
+    cursor: &mut RefreshCursor,
+    now_ms: i64,
+) -> Option<Vec<Session>> {
     match db.read_listing_snapshot(scope, now_ms).ok()? {
         ListingCacheRead::Fresh(snapshot) | ListingCacheRead::Stale(snapshot) => {
+            cursor.published_generation = Some(snapshot.published_generation());
             Some(snapshot.sessions().to_vec())
         }
         ListingCacheRead::Miss => None,
@@ -76,6 +68,7 @@ fn refresh_scoped_inner<F>(
     db: &ViewerDb,
     scope: Option<&ListingCacheScope>,
     backend: BackendKind,
+    cursor: &mut RefreshCursor,
     now_ms: i64,
     source: F,
 ) -> (RefreshOutcome, bool)
@@ -86,22 +79,30 @@ where
         return source_only(backend, source);
     };
 
-    let claim =
-        match db.claim_listing_refresh(Some(scope), now_ms, LISTING_FRESHNESS_MS, LISTING_LEASE_MS)
-        {
-            Ok(claim) => claim,
-            Err(_) => return source_only(backend, source),
-        };
+    let claim = match db.claim_listing_refresh(
+        Some(scope),
+        cursor.published_generation,
+        now_ms,
+        LISTING_FRESHNESS_MS,
+        LISTING_LEASE_MS,
+    ) {
+        Ok(claim) => claim,
+        Err(_) => return source_only(backend, source),
+    };
 
     match claim {
-        ListingCacheClaim::Fresh(snapshot) => (
-            RefreshOutcome::Shared {
-                sessions: snapshot.sessions().to_vec(),
-            },
-            true,
-        ),
+        ListingCacheClaim::Fresh(snapshot) => {
+            cursor.published_generation = Some(snapshot.published_generation());
+            (
+                RefreshOutcome::Shared {
+                    sessions: snapshot.sessions().to_vec(),
+                },
+                true,
+            )
+        }
+        ListingCacheClaim::Unchanged => (RefreshOutcome::Unchanged, true),
         ListingCacheClaim::LeaseHeld => {
-            if let Some(sessions) = cached_fallback(db, scope, now_ms) {
+            if let Some(sessions) = cached_fallback(db, scope, cursor, now_ms) {
                 return (RefreshOutcome::Stale { sessions }, true);
             }
             source_only(backend, source)
@@ -110,10 +111,16 @@ where
         ListingCacheClaim::Claimed(lease) => match source() {
             Ok(sessions) => {
                 match ListingCacheSnapshot::from_sessions(sessions.clone()) {
-                    Ok(snapshot) => {
-                        let _ = db.publish_listing(&lease, snapshot, now_ms);
-                    }
+                    Ok(snapshot) => match db.publish_listing(&lease, snapshot, now_ms) {
+                        Ok(agent_viewer_core::ListingCacheWrite::Published) => {
+                            cursor.published_generation = Some(lease.next_published_generation());
+                        }
+                        Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
+                            cursor.published_generation = None;
+                        }
+                    },
                     Err(_) => {
+                        cursor.published_generation = None;
                         let _ = db.fail_listing_refresh(&lease);
                     }
                 }
@@ -121,7 +128,7 @@ where
             }
             Err(error) => {
                 let _ = db.fail_listing_refresh(&lease);
-                let fallback = cached_fallback(db, scope, now_ms);
+                let fallback = cached_fallback(db, scope, cursor, now_ms);
                 let has_fallback = fallback.is_some();
                 (
                     RefreshOutcome::SourceError {
@@ -138,6 +145,7 @@ where
 pub fn refresh_scoped<F>(
     db: &ViewerDb,
     scope: Option<&ListingCacheScope>,
+    cursor: &mut RefreshCursor,
     now_ms: i64,
     source: F,
 ) -> RefreshOutcome
@@ -147,19 +155,22 @@ where
     let backend = scope
         .map(ListingCacheScope::backend)
         .unwrap_or(BackendKind::Codex);
-    refresh_scoped_inner(db, scope, backend, now_ms, source).0
+    refresh_scoped_inner(db, scope, backend, cursor, now_ms, source).0
 }
 
 pub fn refresh_backend(
     db: Option<&ViewerDb>,
     backend: &mut dyn Backend,
     last_good: &[Session],
+    cursor: &mut RefreshCursor,
     now_ms: i64,
 ) -> RefreshOutcome {
     let kind = backend.kind();
     let scope = backend.listing_scope();
     let (mut outcome, has_shared_fallback) = match db {
-        Some(db) => refresh_scoped_inner(db, scope.as_ref(), kind, now_ms, || backend.list()),
+        Some(db) => {
+            refresh_scoped_inner(db, scope.as_ref(), kind, cursor, now_ms, || backend.list())
+        }
         None => source_only(kind, || backend.list()),
     };
     if !has_shared_fallback && let RefreshOutcome::SourceError { sessions, .. } = &mut outcome {

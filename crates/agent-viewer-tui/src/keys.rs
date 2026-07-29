@@ -850,12 +850,12 @@ fn execute_cached_palette_action<B: ratatui::backend::Backend>(
         CachedPaletteAction::Attach => match attach_request(backends, ui, terminal, request) {
             Ok(true) => TargetResolution::permitted(),
             Ok(false) => TargetResolution::refused(
-                ui.notice
-                    .text()
-                    .is_empty()
-                    .then_some("attach refused")
-                    .unwrap_or(ui.notice.text())
-                    .to_string(),
+                if ui.notice.text().is_empty() {
+                    "attach refused"
+                } else {
+                    ui.notice.text()
+                }
+                .to_string(),
             ),
             Err(error) => {
                 attach_error = Some(error);

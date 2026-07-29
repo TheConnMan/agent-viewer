@@ -84,6 +84,7 @@ pub struct ListingCacheSnapshot {
     sessions: Vec<Session>,
     snapshot_json: String,
     published_at_ms: i64,
+    published_generation: i64,
 }
 
 impl ListingCacheSnapshot {
@@ -93,6 +94,7 @@ impl ListingCacheSnapshot {
             sessions,
             snapshot_json,
             published_at_ms: 0,
+            published_generation: 0,
         })
     }
 
@@ -108,12 +110,17 @@ impl ListingCacheSnapshot {
         self.published_at_ms
     }
 
+    pub const fn published_generation(&self) -> i64 {
+        self.published_generation
+    }
+
     fn decode(
         scope: &ListingCacheScope,
-        snapshot_json: String,
+        snapshot_json: &str,
         published_at_ms: i64,
+        published_generation: i64,
     ) -> Option<ListingCacheSnapshot> {
-        let sessions = serde_json::from_str::<Vec<Session>>(&snapshot_json).ok()?;
+        let sessions = serde_json::from_str::<Vec<Session>>(snapshot_json).ok()?;
         if sessions
             .iter()
             .any(|session| session.backend != scope.backend())
@@ -122,8 +129,9 @@ impl ListingCacheSnapshot {
         }
         Some(ListingCacheSnapshot {
             sessions,
-            snapshot_json,
+            snapshot_json: String::new(),
             published_at_ms,
+            published_generation,
         })
     }
 }
@@ -134,6 +142,12 @@ pub struct ListingCacheLease {
     scope: ListingCacheScope,
     owner: String,
     generation: i64,
+}
+
+impl ListingCacheLease {
+    pub const fn next_published_generation(&self) -> i64 {
+        self.generation.saturating_add(1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +161,7 @@ pub enum ListingCacheRead {
 pub enum ListingCacheClaim {
     Bypass,
     Fresh(ListingCacheSnapshot),
+    Unchanged,
     LeaseHeld,
     Claimed(ListingCacheLease),
 }
@@ -158,7 +173,6 @@ pub enum ListingCacheWrite {
 }
 
 struct ListingCacheRow {
-    snapshot_json: Option<String>,
     refreshed_at_ms: i64,
     generation: i64,
     lease_owner: Option<String>,
@@ -170,16 +184,15 @@ fn listing_cache_row(
     scope: &ListingCacheScope,
 ) -> rusqlite::Result<Option<ListingCacheRow>> {
     let row = connection.query_row(
-        "SELECT snapshot_json, refreshed_at_ms, generation, lease_owner, lease_until_ms \
+        "SELECT refreshed_at_ms, generation, lease_owner, lease_until_ms \
          FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
         rusqlite::params![scope.backend().name(), scope.as_str()],
         |row| {
             Ok(ListingCacheRow {
-                snapshot_json: row.get(0)?,
-                refreshed_at_ms: row.get(1)?,
-                generation: row.get(2)?,
-                lease_owner: row.get(3)?,
-                lease_until_ms: row.get(4)?,
+                refreshed_at_ms: row.get(0)?,
+                generation: row.get(1)?,
+                lease_owner: row.get(2)?,
+                lease_until_ms: row.get(3)?,
             })
         },
     );
@@ -191,10 +204,29 @@ fn listing_cache_row(
 }
 
 fn listing_snapshot(
+    connection: &rusqlite::Connection,
     scope: &ListingCacheScope,
     row: &ListingCacheRow,
-) -> Option<ListingCacheSnapshot> {
-    ListingCacheSnapshot::decode(scope, row.snapshot_json.clone()?, row.refreshed_at_ms)
+) -> rusqlite::Result<Option<ListingCacheSnapshot>> {
+    connection.query_row(
+        "SELECT snapshot_json FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+        rusqlite::params![scope.backend().name(), scope.as_str()],
+        |sqlite_row| {
+            let rusqlite::types::ValueRef::Text(snapshot_json) = sqlite_row.get_ref(0)? else {
+                return Ok(None);
+            };
+            Ok(std::str::from_utf8(snapshot_json)
+                .ok()
+                .and_then(|snapshot_json| {
+                    ListingCacheSnapshot::decode(
+                        scope,
+                        snapshot_json,
+                        row.refreshed_at_ms,
+                        row.generation,
+                    )
+                }))
+        },
+    )
 }
 
 fn listing_snapshot_is_fresh(refreshed_at_ms: i64, now_ms: i64, freshness_ms: i64) -> bool {
@@ -372,7 +404,7 @@ impl ViewerDb {
         let Some(row) = listing_cache_row(&self.conn, scope)? else {
             return Ok(ListingCacheRead::Miss);
         };
-        let Some(snapshot) = listing_snapshot(scope, &row) else {
+        let Some(snapshot) = listing_snapshot(&self.conn, scope, &row)? else {
             return Ok(ListingCacheRead::Miss);
         };
         if listing_snapshot_is_fresh(row.refreshed_at_ms, now_ms, LISTING_CACHE_FRESHNESS_MS) {
@@ -386,6 +418,7 @@ impl ViewerDb {
     pub fn claim_listing_refresh(
         &self,
         scope: Option<&ListingCacheScope>,
+        known_generation: Option<i64>,
         now_ms: i64,
         freshness_ms: i64,
         lease_ms: i64,
@@ -399,30 +432,35 @@ impl ViewerDb {
         )?;
         let row = listing_cache_row(&transaction, scope)?;
         if let Some(row) = row.as_ref() {
-            if listing_snapshot_is_fresh(row.refreshed_at_ms, now_ms, freshness_ms)
-                && let Some(snapshot) = listing_snapshot(scope, row)
-            {
-                transaction.commit()?;
-                return Ok(ListingCacheClaim::Fresh(snapshot));
+            if listing_snapshot_is_fresh(row.refreshed_at_ms, now_ms, freshness_ms) {
+                if known_generation == Some(row.generation) {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Unchanged);
+                }
+                if let Some(snapshot) = listing_snapshot(&transaction, scope, row)? {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Fresh(snapshot));
+                }
             }
             if row.lease_owner.is_some() && row.lease_until_ms > now_ms {
+                if known_generation == Some(row.generation) {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Unchanged);
+                }
                 transaction.commit()?;
                 return Ok(ListingCacheClaim::LeaseHeld);
             }
         }
 
         let owner = listing_lease_owner(now_ms);
-        let generation = row
-            .as_ref()
-            .map_or(1, |row| row.generation.saturating_add(1));
+        let generation = row.as_ref().map_or(0, |row| row.generation);
         let lease_until_ms = now_ms.saturating_add(lease_ms.max(0));
         if row.is_some() {
             transaction.execute(
                 "UPDATE backend_listing_cache \
-                 SET generation = ?1, lease_owner = ?2, lease_until_ms = ?3 \
-                 WHERE backend = ?4 AND scope = ?5",
+                 SET lease_owner = ?1, lease_until_ms = ?2 \
+                 WHERE backend = ?3 AND scope = ?4",
                 rusqlite::params![
-                    generation,
                     owner,
                     lease_until_ms,
                     scope.backend().name(),
@@ -460,11 +498,13 @@ impl ViewerDb {
     ) -> Result<ListingCacheWrite> {
         let changed = self.conn.execute(
             "UPDATE backend_listing_cache \
-             SET snapshot_json = ?1, refreshed_at_ms = ?2, lease_owner = NULL, lease_until_ms = 0 \
-             WHERE backend = ?3 AND scope = ?4 AND generation = ?5 AND lease_owner = ?6",
+             SET snapshot_json = ?1, refreshed_at_ms = ?2, generation = ?3, \
+                 lease_owner = NULL, lease_until_ms = 0 \
+             WHERE backend = ?4 AND scope = ?5 AND generation = ?6 AND lease_owner = ?7",
             rusqlite::params![
                 snapshot.snapshot_json,
                 now_ms,
+                lease.next_published_generation(),
                 lease.scope.backend().name(),
                 lease.scope.as_str(),
                 lease.generation,

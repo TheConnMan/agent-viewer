@@ -88,33 +88,19 @@ fn unchanged_shared_generation_skips_json_decode_and_authoritative_source() {
             Ok(vec![expected.clone()])
         },
     );
-    let loaded = refresh_scoped(
-        &follower,
-        Some(&scope),
-        &mut follower_cursor,
-        2_000,
-        || {
-            calls.set(calls.get() + 1);
-            Ok(Vec::<Session>::new())
-        },
-    );
-    let unchanged = refresh_scoped(
-        &follower,
-        Some(&scope),
-        &mut follower_cursor,
-        2_001,
-        || {
-            calls.set(calls.get() + 1);
-            Ok(Vec::<Session>::new())
-        },
-    );
+    let loaded = refresh_scoped(&follower, Some(&scope), &mut follower_cursor, 2_000, || {
+        calls.set(calls.get() + 1);
+        Ok(Vec::<Session>::new())
+    });
+    let unchanged = refresh_scoped(&follower, Some(&scope), &mut follower_cursor, 2_001, || {
+        calls.set(calls.get() + 1);
+        Ok(Vec::<Session>::new())
+    });
 
     assert!(
         matches!(published, RefreshOutcome::Authoritative { sessions } if sessions == vec![expected.clone()])
     );
-    assert!(
-        matches!(loaded, RefreshOutcome::Shared { sessions } if sessions == vec![expected])
-    );
+    assert!(matches!(loaded, RefreshOutcome::Shared { sessions } if sessions == vec![expected]));
     assert!(matches!(unchanged, RefreshOutcome::Unchanged));
     assert_eq!(calls.get(), 1);
 }
@@ -129,13 +115,9 @@ fn expired_snapshot_lists_once_then_the_second_viewer_uses_the_publication() {
     let mut first_cursor = RefreshCursor::default();
     let mut second_cursor = RefreshCursor::default();
 
-    refresh_scoped(
-        &first,
-        Some(&scope),
-        &mut first_cursor,
-        1_000,
-        || Ok(vec![before_expiry]),
-    );
+    refresh_scoped(&first, Some(&scope), &mut first_cursor, 1_000, || {
+        Ok(vec![before_expiry])
+    });
     let refreshed = refresh_scoped(&second, Some(&scope), &mut second_cursor, 3_000, || {
         calls.set(calls.get() + 1);
         Ok(vec![after_expiry.clone()])
@@ -192,27 +174,15 @@ fn successful_empty_listing_replaces_rows_and_source_error_keeps_last_good_notic
     let mut first_cursor = RefreshCursor::default();
     let mut second_cursor = RefreshCursor::default();
 
-    refresh_scoped(
-        &first,
-        Some(&scope),
-        &mut first_cursor,
-        1_000,
-        || Ok(vec![stale_row]),
-    );
-    let empty = refresh_scoped(
-        &second,
-        Some(&scope),
-        &mut second_cursor,
-        3_000,
-        || Ok(Vec::<Session>::new()),
-    );
-    let failed = refresh_scoped(
-        &first,
-        Some(&scope),
-        &mut first_cursor,
-        5_000,
-        || Err(Error::Command("source unavailable".to_string())),
-    );
+    refresh_scoped(&first, Some(&scope), &mut first_cursor, 1_000, || {
+        Ok(vec![stale_row])
+    });
+    let empty = refresh_scoped(&second, Some(&scope), &mut second_cursor, 3_000, || {
+        Ok(Vec::<Session>::new())
+    });
+    let failed = refresh_scoped(&first, Some(&scope), &mut first_cursor, 5_000, || {
+        Err(Error::Command("source unavailable".to_string()))
+    });
 
     assert!(matches!(empty, RefreshOutcome::Authoritative { sessions } if sessions.is_empty()));
     assert!(
