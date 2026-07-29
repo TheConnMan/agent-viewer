@@ -184,8 +184,9 @@ pub struct Session {
     /// Some for codex — the rollout JSONL, OR the claude session JSONL (state.json
     /// linkScanPath) for peek. None for opencode.
     pub rollout_path: Option<std::path::PathBuf>,
-    /// Associated PR references (claude jobs `state.json` children where kind=="pr");
-    /// rendered as a right-aligned badge. Empty for codex/opencode.
+    /// Associated PR references, rendered as a right-aligned badge. Claude: jobs
+    /// `state.json` children where kind=="pr". Codex: github PR links scanned out of the
+    /// rollout transcript, since its registry records none. Empty for opencode.
     pub pr_refs: Vec<PrRef>,
     /// True when this session lives inside a shared backend runtime whose process hosts
     /// multiple sessions. Such a row carries no `pid` because that process belongs to every
