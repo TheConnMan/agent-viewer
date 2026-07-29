@@ -10,7 +10,7 @@ use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS spawned (\
@@ -75,8 +75,9 @@ pub struct CachedModels {
     pub fetched_at_ms: i64,
 }
 
-pub const LISTING_CACHE_FRESHNESS_MS: i64 = 1_000;
-pub const LISTING_CACHE_LEASE_MS: i64 = 2_000;
+pub const LISTING_CACHE_FRESHNESS_MS: i64 = 2_000;
+pub const LISTING_CACHE_LEASE_MS: i64 = 5_000;
+const VIEWER_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A decoded raw backend listing plus the publication time stored by the coordinator.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +148,20 @@ pub struct ListingCacheLease {
 impl ListingCacheLease {
     pub const fn next_published_generation(&self) -> i64 {
         self.generation.saturating_add(1)
+    }
+}
+
+pub struct ListingRefreshGuard {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ListingRefreshGuard {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -252,6 +267,7 @@ fn backend_from_str(s: &str) -> Option<BackendKind> {
 /// Handle to `~/.local/state/agent-viewer/viewer.db` (read-write).
 pub struct ViewerDb {
     conn: rusqlite::Connection,
+    path: PathBuf,
 }
 
 /// Does this open failure mean the FILE ITSELF is unusable, so that a fresh empty DB is
@@ -388,11 +404,14 @@ impl ViewerDb {
 
     fn try_open(path: &std::path::Path) -> Result<ViewerDb> {
         let conn = rusqlite::Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        conn.busy_timeout(VIEWER_DB_BUSY_TIMEOUT)?;
         // WAL so two concurrent viewers coexist (last-writer-wins on advisory state).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(ViewerDb { conn })
+        Ok(ViewerDb {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Read a display snapshot without changing its freshness or lease.
@@ -487,6 +506,53 @@ impl ViewerDb {
             owner,
             generation,
         }))
+    }
+
+    /// Keep an owned listing lease alive while its authoritative source is still running.
+    pub fn guard_listing_refresh(
+        &self,
+        lease: &ListingCacheLease,
+        lease_ms: i64,
+    ) -> Result<ListingRefreshGuard> {
+        let connection = rusqlite::Connection::open(&self.path)?;
+        connection.busy_timeout(VIEWER_DB_BUSY_TIMEOUT)?;
+        let scope = lease.scope.clone();
+        let owner = lease.owner.clone();
+        let generation = lease.generation;
+        let lease_ms = lease_ms.max(1);
+        let renewal_interval = std::time::Duration::from_millis((lease_ms / 3).max(1) as u64);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("listing_lease_renewal".to_string())
+            .spawn(move || {
+                loop {
+                    match stopped.recv_timeout(renewal_interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let lease_until_ms = crate::spawn::now_ms().saturating_add(lease_ms);
+                    match connection.execute(
+                        "UPDATE backend_listing_cache SET lease_until_ms = ?1 \
+                         WHERE backend = ?2 AND scope = ?3 AND generation = ?4 \
+                         AND lease_owner = ?5",
+                        rusqlite::params![
+                            lease_until_ms,
+                            scope.backend().name(),
+                            scope.as_str(),
+                            generation,
+                            owner
+                        ],
+                    ) {
+                        Ok(1) => {}
+                        Ok(_) => break,
+                        Err(_) => {}
+                    }
+                }
+            })?;
+        Ok(ListingRefreshGuard {
+            stop,
+            worker: Some(worker),
+        })
     }
 
     /// Publish only if this caller still owns the generation it claimed.
