@@ -57,8 +57,9 @@ fn cached_fallback(
 ) -> Option<Vec<Session>> {
     match db.read_listing_snapshot(scope, now_ms).ok()? {
         ListingCacheRead::Fresh(snapshot) | ListingCacheRead::Stale(snapshot) => {
-            cursor.published_generation = Some(snapshot.published_generation());
-            Some(snapshot.sessions().to_vec())
+            let published_generation = snapshot.published_generation();
+            cursor.published_generation = Some(published_generation);
+            Some(snapshot.into_sessions())
         }
         ListingCacheRead::Miss => None,
     }
@@ -92,10 +93,11 @@ where
 
     match claim {
         ListingCacheClaim::Fresh(snapshot) => {
-            cursor.published_generation = Some(snapshot.published_generation());
+            let published_generation = snapshot.published_generation();
+            cursor.published_generation = Some(published_generation);
             (
                 RefreshOutcome::Shared {
-                    sessions: snapshot.sessions().to_vec(),
+                    sessions: snapshot.into_sessions(),
                 },
                 true,
             )
