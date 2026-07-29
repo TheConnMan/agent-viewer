@@ -4,17 +4,15 @@
 
 use std::io;
 
-use agent_viewer_core::AttachRefusal;
 use agent_viewer_core::backend::{Backend, BackendKind};
-use agent_viewer_core::claude::ensure_trusted;
 use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
-use agent_viewer_tui::shared_listing::{TargetRequest, authoritative_target};
+use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
 use crate::keys::set_mouse_capture;
-use crate::ops::Mutation;
+use crate::ops::{AttachPlan, Mutation};
 use crate::{Key, Refresher, Ui};
 
 /// Enter/Space on a header toggles and persists the collapse. Returns true when a header was
@@ -29,15 +27,10 @@ pub(crate) fn toggle_group_if_header(ui: &mut Ui) -> bool {
     true
 }
 
-pub(crate) fn activate_selected<B: ratatui::backend::Backend>(
-    backends: &mut [Box<dyn Backend>],
-    ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
-) -> io::Result<()> {
+pub(crate) fn activate_selected(ui: &mut Ui) {
     if !toggle_group_if_header(ui) {
-        attach_selected(backends, ui, terminal)?;
+        attach_selected(ui);
     }
-    Ok(())
 }
 
 /// Ctrl+F — enter filter mode with a fresh, empty query.
@@ -252,79 +245,33 @@ fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn B
         .map(|b| b.as_ref())
 }
 
-fn backend_of_mut(
-    backends: &mut [Box<dyn Backend>],
-    kind: BackendKind,
-) -> Option<&mut dyn Backend> {
-    for backend in backends {
-        if backend.kind() == kind {
-            return Some(backend.as_mut());
-        }
-    }
-    None
-}
-
-pub(crate) fn attach_selected<B: ratatui::backend::Backend>(
-    backends: &mut [Box<dyn Backend>],
-    ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
-) -> io::Result<()> {
+pub(crate) fn attach_selected(ui: &mut Ui) -> bool {
     let Some(session) = ui.app.selected().cloned() else {
-        return Ok(());
+        return false;
     };
-    attach_request(backends, ui, terminal, TargetRequest::from(&session))?;
-    Ok(())
+    submit_attach(ui, TargetRequest::from(&session))
 }
 
-pub(crate) fn attach_request<B: ratatui::backend::Backend>(
-    backends: &mut [Box<dyn Backend>],
-    ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
-    request: TargetRequest,
-) -> io::Result<bool> {
-    attach_session(backends, ui, terminal, request)
-}
-
-/// What a refused attach does to the UI.
-///
-/// A `tail` refusal means the session IS running and watchable but cannot be JOINED: a
-/// `codex exec` thread hosts its app-server in process, so nothing outside it can subscribe to
-/// the live turn, the ChatGPT app included. A plain resume of a live thread must never happen
-/// because it forks the thread and appends a synthesized interrupt to its rollout.
-fn apply_attach_refusal(ui: &mut Ui, refusal: AttachRefusal) {
-    ui.set_notice(refusal.reason);
-}
-
-/// Attach a GIVEN session (shared by `attach_selected` and the reply delivery path): reuse a
-/// live PTY (resize) or spawn one, and focus it. Returns true when it ended attached
-/// (Mode::Attached), false when it bailed with a notice.
-fn attach_session<B: ratatui::backend::Backend>(
-    backends: &mut [Box<dyn Backend>],
-    ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
-    request: TargetRequest,
-) -> io::Result<bool> {
-    let Some(backend) = backend_of_mut(backends, request.backend()) else {
-        ui.set_notice(format!(
-            "{} backend is no longer available",
-            request.backend().name()
-        ));
-        return Ok(false);
-    };
-    let session = match authoritative_target(backend, &request) {
-        Ok(session) => session,
-        Err(resolution) => {
-            if let Some(notice) = resolution.notice() {
-                ui.set_notice(notice.to_string());
-            }
-            return Ok(false);
-        }
-    };
-    if !backend.capabilities_for(&session).attach {
-        ui.set_notice(format!("{} does not support attach", backend.kind().name()));
-        return Ok(false);
+pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
+    let id = request.id().to_string();
+    let executor = ui.attach_executor.clone();
+    if !ui
+        .attaches
+        .submit("attach".to_string(), move || executor(request))
+    {
+        return false;
     }
+    ui.set_notice(format!("attaching… {id}"));
+    true
+}
 
+/// Install a fresh authoritative attach plan on the UI thread.
+pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    plan: AttachPlan,
+) -> io::Result<bool> {
+    let AttachPlan { session, command } = plan;
     let key: Key = (session.backend, session.id.clone());
     let size = terminal
         .size()
@@ -344,23 +291,6 @@ fn attach_session<B: ratatui::backend::Backend>(
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();
     } else {
-        // Pre-accept the trust dialog before a claude `-r` RESUME attach into a fresh project
-        // (best-effort; only the no-short-id fallback resumes by full id and can hit the trust
-        // prompt, since `claude attach <short_id>` resolves the trusted jobs cwd itself and
-        // other backends never need it).
-        let claude_fallback = session.backend == BackendKind::Claude
-            && session.short_id.as_deref().unwrap_or_default().is_empty();
-        if claude_fallback {
-            let config = agent_viewer_core::home_dir().join(".claude.json");
-            let _ = ensure_trusted(&config, &session.cwd);
-        }
-        let command = match backend.attach_command(&session) {
-            Ok(command) => command,
-            Err(refusal) => {
-                apply_attach_refusal(ui, refusal);
-                return Ok(false);
-            }
-        };
         let mut spec = spec_from_command(&command, rows, cols);
         spec.palette = palette;
         if session.backend == BackendKind::Codex {
@@ -446,15 +376,16 @@ pub(crate) fn spawn_from_composer(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_attach_refusal, attach_session, spawn_from_composer};
+    use super::{install_attach_plan, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{sess, test_ui_with};
-    use crate::ops::Mutation;
+    use crate::ops::{Mutation, resolve_attach_with_backend};
     use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session};
     use agent_viewer_tui::mutations::MutationOutcome;
     use agent_viewer_tui::shared_listing::TargetRequest;
+    use agent_viewer_tui::ui::Mode;
     use std::sync::{Arc, Mutex, mpsc::channel};
     use std::time::{Duration, Instant};
 
@@ -536,6 +467,44 @@ mod tests {
             let mut command = std::process::Command::new("sh");
             command.args(["-c", script]);
             Ok(command)
+        }
+    }
+
+    struct RefusingAttachBackend {
+        session: Session,
+        refusal: AttachRefusal,
+    }
+
+    impl agent_viewer_core::Backend for RefusingAttachBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                attach: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.session.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by refused attach")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            Err(self.refusal.clone())
         }
     }
 
@@ -630,21 +599,16 @@ mod tests {
             foreground: [0x01, 0x02, 0x03],
             background: [0x04, 0x05, 0x06],
         });
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(PaletteQueryBackend {
-                session: session.clone(),
-            })];
+        let mut backend = PaletteQueryBackend {
+            session: session.clone(),
+        };
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
             .expect("test terminal");
 
+        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
+            .expect("resolve palette query child");
         assert!(
-            attach_session(
-                &mut backends,
-                &mut ui,
-                &mut terminal,
-                TargetRequest::from(&session),
-            )
-            .expect("attach palette query child")
+            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
         );
 
         let theme = agent_viewer_tui::ui::theme::amber(false);
@@ -676,22 +640,18 @@ mod tests {
             .active()
             .terminal_palette()
             .expect("default amber palette");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(PaletteQueryBackend {
-                session: session.clone(),
-            })];
+        let mut backend = PaletteQueryBackend {
+            session: session.clone(),
+        };
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
             .expect("test terminal");
         let key = (BackendKind::Claude, session.id.clone());
 
+        let initial_plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
+            .expect("resolve initial palette attach");
         assert!(
-            attach_session(
-                &mut backends,
-                &mut ui,
-                &mut terminal,
-                TargetRequest::from(&session),
-            )
-            .expect("initial palette attach")
+            install_attach_plan(&mut ui, &mut terminal, initial_plan)
+                .expect("initial palette attach")
         );
         let first_pty = ui.attached.get(&key).expect("initial retained pty") as *const _;
         let first_pid = ui
@@ -716,14 +676,12 @@ mod tests {
             .expect("new active RGB theme palette");
         assert_ne!(old_palette, new_palette);
 
+        let retained_plan =
+            resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
+                .expect("resolve retained palette attach");
         assert!(
-            attach_session(
-                &mut backends,
-                &mut ui,
-                &mut terminal,
-                TargetRequest::from(&session),
-            )
-            .expect("reattach retained pty")
+            install_attach_plan(&mut ui, &mut terminal, retained_plan)
+                .expect("reattach retained pty")
         );
         let retained_pty = ui.attached.get(&key).expect("retained pty after reattach");
         assert_eq!(
@@ -756,21 +714,16 @@ mod tests {
         ui.terminal_palette = Some(host_palette);
         ui.themes.move_preview(1);
         assert_eq!(ui.themes.active().id, "terminal");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(PaletteQueryBackend {
-                session: session.clone(),
-            })];
+        let mut backend = PaletteQueryBackend {
+            session: session.clone(),
+        };
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
             .expect("test terminal");
 
+        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
+            .expect("resolve host palette attach");
         assert!(
-            attach_session(
-                &mut backends,
-                &mut ui,
-                &mut terminal,
-                TargetRequest::from(&session),
-            )
-            .expect("attach palette query child")
+            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
         );
 
         let key = (BackendKind::Claude, session.id.clone());
@@ -807,21 +760,16 @@ mod tests {
             foreground: [0xa1, 0xb2, 0xc3],
             background: [0xd4, 0xe5, 0xf6],
         });
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(PaletteQueryBackend {
-                session: session.clone(),
-            })];
+        let mut backend = PaletteQueryBackend {
+            session: session.clone(),
+        };
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
             .expect("test terminal");
 
+        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
+            .expect("resolve RGB palette attach");
         assert!(
-            attach_session(
-                &mut backends,
-                &mut ui,
-                &mut terminal,
-                TargetRequest::from(&session),
-            )
-            .expect("attach palette query child")
+            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
         );
 
         let key = (BackendKind::Claude, session.id.clone());
@@ -831,23 +779,41 @@ mod tests {
     }
 
     #[test]
-    fn a_tailable_refusal_stays_a_notice() {
+    fn a_tailable_refusal_returns_its_reason_without_changing_ui() {
         // A live `codex exec` thread cannot be joined because its app server runs in process.
-        // The refusal reason must remain visible without attempting a plain resume.
-        let mut ui = test_ui_with(Vec::new());
+        // The resolver must return its reason without attempting a plain resume or mutating UI.
+        let session = sess("refused_tail", "/tmp/agentviewer_refused_tail", 100);
+        let mut backend = RefusingAttachBackend {
+            session: session.clone(),
+            refusal: AttachRefusal::tailable("cannot be joined"),
+        };
+        let ui = test_ui_with(vec![session.clone()]);
 
-        apply_attach_refusal(&mut ui, AttachRefusal::tailable("cannot be joined"));
+        let result = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session));
 
-        assert_eq!(ui.notice.text, "cannot be joined");
+        assert_eq!(result.err().as_deref(), Some("cannot be joined"));
+        assert!(ui.notice.text.is_empty());
+        assert!(ui.attached.is_empty());
+        assert!(ui.focused.is_none());
+        assert!(matches!(ui.mode, Mode::Normal));
     }
 
     #[test]
-    fn a_plain_refusal_stays_a_notice() {
-        let mut ui = test_ui_with(Vec::new());
+    fn a_plain_refusal_returns_its_reason_without_changing_ui() {
+        let session = sess("refused_plain", "/tmp/agentviewer_refused_plain", 100);
+        let mut backend = RefusingAttachBackend {
+            session: session.clone(),
+            refusal: AttachRefusal::new("no attach here"),
+        };
+        let ui = test_ui_with(vec![session.clone()]);
 
-        apply_attach_refusal(&mut ui, AttachRefusal::new("no attach here"));
+        let result = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session));
 
-        assert_eq!(ui.notice.text, "no attach here");
+        assert_eq!(result.err().as_deref(), Some("no attach here"));
+        assert!(ui.notice.text.is_empty());
+        assert!(ui.attached.is_empty());
+        assert!(ui.focused.is_none());
+        assert!(matches!(ui.mode, Mode::Normal));
     }
 }
 
@@ -917,7 +883,10 @@ mod async_attach_tests {
             thread::yield_now();
         };
 
-        assert_eq!(*calls.lock().expect("recorded calls"), vec![request]);
+        assert_eq!(
+            *calls.lock().expect("recorded calls"),
+            vec![request.clone()]
+        );
         assert_eq!(
             result.err().as_deref(),
             Some("fresh authority refused attach")
@@ -925,8 +894,7 @@ mod async_attach_tests {
         assert!(ui.attached.is_empty());
         assert!(ui.focused.is_none());
 
-        ui.attach_executor =
-            Arc::new(|_| Err("claude session is no longer available".to_string()));
+        ui.attach_executor = Arc::new(|_| Err("claude session is no longer available".to_string()));
         assert!(submit_attach(&mut ui, request));
         let deadline = Instant::now() + Duration::from_secs(1);
         let missing = loop {
