@@ -66,7 +66,7 @@ fn claimed(
     now_ms: i64,
 ) -> agent_viewer_core::ListingCacheLease {
     match db
-        .claim_listing_refresh(Some(scope), now_ms, FRESHNESS_MS, LEASE_MS)
+        .claim_listing_refresh(Some(scope), None, now_ms, FRESHNESS_MS, LEASE_MS)
         .expect("claim listing refresh")
     {
         ListingCacheClaim::Claimed(lease) => lease,
@@ -211,7 +211,7 @@ fn missing_scope_bypasses_every_shared_cache_operation() {
 
     assert_eq!(
         first
-            .claim_listing_refresh(None, 10, FRESHNESS_MS, LEASE_MS)
+            .claim_listing_refresh(None, None, 10, FRESHNESS_MS, LEASE_MS)
             .expect("scope less refresh"),
         ListingCacheClaim::Bypass
     );
@@ -237,13 +237,13 @@ fn one_scoped_lease_wins_while_an_independent_scope_can_refresh() {
     let _codex_lease = claimed(&first, &codex, 10);
     assert_eq!(
         second
-            .claim_listing_refresh(Some(&codex), 11, FRESHNESS_MS, LEASE_MS)
+            .claim_listing_refresh(Some(&codex), None, 11, FRESHNESS_MS, LEASE_MS)
             .expect("second Codex claim"),
         ListingCacheClaim::LeaseHeld
     );
     assert!(matches!(
         second
-            .claim_listing_refresh(Some(&claude), 11, FRESHNESS_MS, LEASE_MS)
+            .claim_listing_refresh(Some(&claude), None, 11, FRESHNESS_MS, LEASE_MS)
             .expect("Claude claim"),
         ListingCacheClaim::Claimed(_)
     ));
@@ -271,7 +271,7 @@ fn locked_claim_rereads_a_snapshot_published_by_another_viewer() {
     );
 
     match first
-        .claim_listing_refresh(Some(&codex), 13, FRESHNESS_MS, LEASE_MS)
+        .claim_listing_refresh(Some(&codex), None, 13, FRESHNESS_MS, LEASE_MS)
         .expect("locked reread claim")
     {
         ListingCacheClaim::Fresh(snapshot) => assert_eq!(snapshot.sessions(), &[row]),
@@ -288,7 +288,13 @@ fn expired_lease_takeover_and_generation_fencing_reject_stale_publishers() {
 
     assert_eq!(
         second
-            .claim_listing_refresh(Some(&codex), 10 + LEASE_MS - 1, FRESHNESS_MS, LEASE_MS)
+            .claim_listing_refresh(
+                Some(&codex),
+                None,
+                10 + LEASE_MS - 1,
+                FRESHNESS_MS,
+                LEASE_MS,
+            )
             .expect("unexpired lease"),
         ListingCacheClaim::LeaseHeld
     );
@@ -387,5 +393,180 @@ fn successful_empty_snapshot_survives_a_later_source_error() {
             assert_eq!(snapshot.published_at_ms(), 11);
         }
         other => panic!("source errors must preserve the prior empty snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn matching_published_generation_returns_unchanged_without_decoding_json() {
+    let (_directory, path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let lease = claimed(&first, &codex, 10);
+    first
+        .publish_listing(
+            &lease,
+            snapshot(vec![complete_session(BackendKind::Codex)]),
+            11,
+        )
+        .expect("publish initial snapshot");
+
+    let published_generation = match first
+        .claim_listing_refresh(Some(&codex), None, 12, FRESHNESS_MS, LEASE_MS)
+        .expect("read fresh snapshot and generation")
+    {
+        ListingCacheClaim::Fresh(snapshot) => snapshot.published_generation(),
+        other => panic!("expected fresh snapshot, got {other:?}"),
+    };
+    Connection::open(path)
+        .expect("open cache for malformed payload")
+        .execute(
+            "UPDATE backend_listing_cache SET snapshot_json = ?1 \
+             WHERE backend = ?2 AND scope = ?3",
+            params!["{malformed", BackendKind::Codex.name(), codex.as_str()],
+        )
+        .expect("replace payload without changing generation");
+
+    assert_eq!(
+        first
+            .claim_listing_refresh(
+                Some(&codex),
+                Some(published_generation),
+                13,
+                FRESHNESS_MS,
+                LEASE_MS,
+            )
+            .expect("matching generation lookup"),
+        ListingCacheClaim::Unchanged
+    );
+}
+
+#[test]
+fn absent_or_different_generation_returns_snapshot_and_published_generation() {
+    let (_directory, _path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let row = complete_session(BackendKind::Codex);
+    let lease = claimed(&first, &codex, 10);
+    first
+        .publish_listing(&lease, snapshot(vec![row.clone()]), 11)
+        .expect("publish initial snapshot");
+
+    let published_generation = match first
+        .claim_listing_refresh(Some(&codex), None, 12, FRESHNESS_MS, LEASE_MS)
+        .expect("lookup without a known generation")
+    {
+        ListingCacheClaim::Fresh(snapshot) => {
+            assert_eq!(snapshot.sessions(), &[row.clone()]);
+            snapshot.published_generation()
+        }
+        other => panic!("expected decoded snapshot, got {other:?}"),
+    };
+
+    match first
+        .claim_listing_refresh(
+            Some(&codex),
+            Some(published_generation.saturating_add(1)),
+            13,
+            FRESHNESS_MS,
+            LEASE_MS,
+        )
+        .expect("lookup with a different generation")
+    {
+        ListingCacheClaim::Fresh(snapshot) => {
+            assert_eq!(snapshot.sessions(), &[row]);
+            assert_eq!(snapshot.published_generation(), published_generation);
+        }
+        other => panic!("different generation must return the snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn refresh_lease_preserves_published_generation_until_successful_publication() {
+    let (_directory, _path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let initial_lease = claimed(&first, &codex, 10);
+    first
+        .publish_listing(&initial_lease, snapshot(Vec::new()), 11)
+        .expect("publish initial snapshot");
+    let initial_generation = match first
+        .read_listing_snapshot(&codex, 12)
+        .expect("read initial generation")
+    {
+        ListingCacheRead::Fresh(snapshot) => snapshot.published_generation(),
+        other => panic!("expected fresh initial snapshot, got {other:?}"),
+    };
+
+    let refresh_lease = match first
+        .claim_listing_refresh(
+            Some(&codex),
+            Some(initial_generation),
+            11 + FRESHNESS_MS,
+            FRESHNESS_MS,
+            LEASE_MS,
+        )
+        .expect("claim stale refresh")
+    {
+        ListingCacheClaim::Claimed(lease) => lease,
+        other => panic!("expected refresh lease, got {other:?}"),
+    };
+    match first
+        .read_listing_snapshot(&codex, 11 + FRESHNESS_MS)
+        .expect("read while refresh lease is held")
+    {
+        ListingCacheRead::Stale(snapshot) => {
+            assert_eq!(snapshot.published_generation(), initial_generation);
+        }
+        other => panic!("lease claim must preserve the published snapshot, got {other:?}"),
+    }
+
+    first
+        .publish_listing(
+            &refresh_lease,
+            snapshot(vec![complete_session(BackendKind::Codex)]),
+            11 + FRESHNESS_MS,
+        )
+        .expect("publish refreshed snapshot");
+    match first
+        .read_listing_snapshot(&codex, 12 + FRESHNESS_MS)
+        .expect("read refreshed generation")
+    {
+        ListingCacheRead::Fresh(snapshot) => {
+            assert_ne!(snapshot.published_generation(), initial_generation);
+        }
+        other => panic!("expected refreshed snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalidation_changes_the_published_generation() {
+    let (_directory, _path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let lease = claimed(&first, &codex, 10);
+    first
+        .publish_listing(&lease, snapshot(Vec::new()), 11)
+        .expect("publish initial snapshot");
+    let initial_generation = match first
+        .read_listing_snapshot(&codex, 12)
+        .expect("read initial generation")
+    {
+        ListingCacheRead::Fresh(snapshot) => snapshot.published_generation(),
+        other => panic!("expected fresh initial snapshot, got {other:?}"),
+    };
+
+    assert!(
+        first
+            .invalidate_listing_scope(Some(&codex))
+            .expect("invalidate listing scope")
+    );
+    match first
+        .read_listing_snapshot(&codex, 13)
+        .expect("read invalidated snapshot")
+    {
+        ListingCacheRead::Stale(snapshot) => {
+            assert_ne!(snapshot.published_generation(), initial_generation);
+        }
+        other => panic!("invalidation must preserve a stale snapshot, got {other:?}"),
     }
 }
