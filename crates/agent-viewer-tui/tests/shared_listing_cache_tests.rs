@@ -7,8 +7,8 @@ use agent_viewer_core::{
     BackendKind, Error, ListingCacheScope, Session, SessionOrigin, Status, ViewerDb,
 };
 use agent_viewer_tui::shared_listing::{
-    CachedPaletteAction, RefreshOutcome, TargetRequest, TargetResolution, dispatch_cached_palette,
-    refresh_scoped, resolve_target,
+    CachedPaletteAction, RefreshCursor, RefreshOutcome, TargetRequest, TargetResolution,
+    dispatch_cached_palette, refresh_scoped, resolve_target,
 };
 use tempfile::TempDir;
 
@@ -52,12 +52,14 @@ fn fresh_shared_snapshot_skips_the_authoritative_source_across_viewers() {
     let scope = scope(BackendKind::Codex);
     let expected = session(BackendKind::Codex, "thread_123", Some(101), false);
     let calls = Cell::new(0);
+    let mut first_cursor = RefreshCursor::default();
+    let mut second_cursor = RefreshCursor::default();
 
-    let initial = refresh_scoped(&first, Some(&scope), 1_000, || {
+    let initial = refresh_scoped(&first, Some(&scope), &mut first_cursor, 1_000, || {
         calls.set(calls.get() + 1);
         Ok(vec![expected.clone()])
     });
-    let shared = refresh_scoped(&second, Some(&scope), 2_999, || {
+    let shared = refresh_scoped(&second, Some(&scope), &mut second_cursor, 2_999, || {
         calls.set(calls.get() + 1);
         Ok(Vec::<Session>::new())
     });
@@ -68,19 +70,77 @@ fn fresh_shared_snapshot_skips_the_authoritative_source_across_viewers() {
 }
 
 #[test]
+fn unchanged_shared_generation_skips_json_decode_and_authoritative_source() {
+    let (_directory, publisher, follower) = open_viewers();
+    let scope = scope(BackendKind::Codex);
+    let expected = session(BackendKind::Codex, "thread_123", Some(101), false);
+    let calls = Cell::new(0);
+    let mut publisher_cursor = RefreshCursor::default();
+    let mut follower_cursor = RefreshCursor::default();
+
+    let published = refresh_scoped(
+        &publisher,
+        Some(&scope),
+        &mut publisher_cursor,
+        1_000,
+        || {
+            calls.set(calls.get() + 1);
+            Ok(vec![expected.clone()])
+        },
+    );
+    let loaded = refresh_scoped(
+        &follower,
+        Some(&scope),
+        &mut follower_cursor,
+        2_000,
+        || {
+            calls.set(calls.get() + 1);
+            Ok(Vec::<Session>::new())
+        },
+    );
+    let unchanged = refresh_scoped(
+        &follower,
+        Some(&scope),
+        &mut follower_cursor,
+        2_001,
+        || {
+            calls.set(calls.get() + 1);
+            Ok(Vec::<Session>::new())
+        },
+    );
+
+    assert!(
+        matches!(published, RefreshOutcome::Authoritative { sessions } if sessions == vec![expected.clone()])
+    );
+    assert!(
+        matches!(loaded, RefreshOutcome::Shared { sessions } if sessions == vec![expected])
+    );
+    assert!(matches!(unchanged, RefreshOutcome::Unchanged));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
 fn expired_snapshot_lists_once_then_the_second_viewer_uses_the_publication() {
     let (_directory, first, second) = open_viewers();
     let scope = scope(BackendKind::Claude);
     let before_expiry = session(BackendKind::Claude, "agent_123", Some(201), false);
     let after_expiry = session(BackendKind::Claude, "agent_123", Some(202), false);
     let calls = Cell::new(0);
+    let mut first_cursor = RefreshCursor::default();
+    let mut second_cursor = RefreshCursor::default();
 
-    refresh_scoped(&first, Some(&scope), 1_000, || Ok(vec![before_expiry]));
-    let refreshed = refresh_scoped(&second, Some(&scope), 3_000, || {
+    refresh_scoped(
+        &first,
+        Some(&scope),
+        &mut first_cursor,
+        1_000,
+        || Ok(vec![before_expiry]),
+    );
+    let refreshed = refresh_scoped(&second, Some(&scope), &mut second_cursor, 3_000, || {
         calls.set(calls.get() + 1);
         Ok(vec![after_expiry.clone()])
     });
-    let shared = refresh_scoped(&first, Some(&scope), 3_001, || {
+    let shared = refresh_scoped(&first, Some(&scope), &mut first_cursor, 3_001, || {
         calls.set(calls.get() + 1);
         Ok(Vec::<Session>::new())
     });
@@ -100,15 +160,17 @@ fn missing_or_corrupt_cache_falls_back_to_the_authoritative_source() {
     let scope = scope(BackendKind::Opencode);
     let calls = Cell::new(0);
     let expected = session(BackendKind::Opencode, "ses_123", None, true);
+    let mut first_cursor = RefreshCursor::default();
+    let mut second_cursor = RefreshCursor::default();
 
-    let missing = refresh_scoped(&first, Some(&scope), 1_000, || {
+    let missing = refresh_scoped(&first, Some(&scope), &mut first_cursor, 1_000, || {
         calls.set(calls.get() + 1);
         Ok(vec![expected.clone()])
     });
     second
         .overwrite_listing_snapshot_json(&scope, "not valid json", 1_001)
         .expect("corrupt cached snapshot");
-    let corrupt = refresh_scoped(&second, Some(&scope), 2_001, || {
+    let corrupt = refresh_scoped(&second, Some(&scope), &mut second_cursor, 2_001, || {
         calls.set(calls.get() + 1);
         Ok(vec![expected.clone()])
     });
@@ -127,12 +189,30 @@ fn successful_empty_listing_replaces_rows_and_source_error_keeps_last_good_notic
     let (_directory, first, second) = open_viewers();
     let scope = scope(BackendKind::Codex);
     let stale_row = session(BackendKind::Codex, "thread_123", Some(101), false);
+    let mut first_cursor = RefreshCursor::default();
+    let mut second_cursor = RefreshCursor::default();
 
-    refresh_scoped(&first, Some(&scope), 1_000, || Ok(vec![stale_row]));
-    let empty = refresh_scoped(&second, Some(&scope), 3_000, || Ok(Vec::<Session>::new()));
-    let failed = refresh_scoped(&first, Some(&scope), 5_000, || {
-        Err(Error::Command("source unavailable".to_string()))
-    });
+    refresh_scoped(
+        &first,
+        Some(&scope),
+        &mut first_cursor,
+        1_000,
+        || Ok(vec![stale_row]),
+    );
+    let empty = refresh_scoped(
+        &second,
+        Some(&scope),
+        &mut second_cursor,
+        3_000,
+        || Ok(Vec::<Session>::new()),
+    );
+    let failed = refresh_scoped(
+        &first,
+        Some(&scope),
+        &mut first_cursor,
+        5_000,
+        || Err(Error::Command("source unavailable".to_string())),
+    );
 
     assert!(matches!(empty, RefreshOutcome::Authoritative { sessions } if sessions.is_empty()));
     assert!(
