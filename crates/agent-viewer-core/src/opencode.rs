@@ -2297,6 +2297,35 @@ impl Backend for OpencodeBackend {
         BackendKind::Opencode
     }
 
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let key = if let Some(secure) = &self.runtime.inner.secure {
+            if secure
+                .password_override
+                .as_deref()
+                .is_some_and(|password| !password.trim().is_empty())
+                || std::env::var_os("OPENCODE_SERVER_PASSWORD")
+                    .is_some_and(|password| !password.is_empty())
+            {
+                return None;
+            }
+            crate::backend::listing_scope_key(&[
+                crate::backend::listing_scope_path(&self.db_path),
+                crate::backend::listing_scope_path(&secure.viewer_db_path),
+                self.runtime.inner.candidates[0].to_string(),
+                self.runtime.inner.candidates[1].to_string(),
+                "secure".to_string(),
+            ])
+        } else {
+            crate::backend::listing_scope_key(&[
+                crate::backend::listing_scope_path(&self.db_path),
+                self.runtime.inner.candidates[0].to_string(),
+                self.runtime.inner.candidates[1].to_string(),
+                "compatibility".to_string(),
+            ])
+        };
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
+    }
+
     fn capabilities(&self) -> Capabilities {
         if self.runtime.healthy_tier() {
             server_capabilities()

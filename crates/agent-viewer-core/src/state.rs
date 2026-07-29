@@ -5,12 +5,12 @@
 //! viewer recorded at spawn time for rows the backend could not supply one for. Titles,
 //! statuses, and hidden flags come from the backend unchanged.
 
-use crate::backend::{BackendKind, Session};
+use crate::backend::{BackendKind, ListingCacheScope, Session};
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS spawned (\
@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS model_cache (\
   backend TEXT PRIMARY KEY,\
   models TEXT NOT NULL,\
   fetched_at_ms INTEGER NOT NULL\
+);\
+CREATE TABLE IF NOT EXISTS backend_listing_cache (\
+  backend TEXT NOT NULL,\
+  scope TEXT NOT NULL,\
+  snapshot_json TEXT,\
+  refreshed_at_ms INTEGER NOT NULL DEFAULT 0,\
+  generation INTEGER NOT NULL DEFAULT 0,\
+  lease_owner TEXT,\
+  lease_until_ms INTEGER NOT NULL DEFAULT 0,\
+  PRIMARY KEY (backend, scope)\
 );";
 
 /// Legacy shadow-state tables the viewer no longer owns. Dropped once after a successful
@@ -65,6 +75,185 @@ pub struct CachedModels {
     pub fetched_at_ms: i64,
 }
 
+pub const LISTING_CACHE_FRESHNESS_MS: i64 = 2_000;
+pub const LISTING_CACHE_LEASE_MS: i64 = 5_000;
+const VIEWER_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A decoded raw backend listing plus the publication time stored by the coordinator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListingCacheSnapshot {
+    sessions: Vec<Session>,
+    snapshot_json: Option<String>,
+    published_at_ms: i64,
+    published_generation: i64,
+}
+
+impl ListingCacheSnapshot {
+    pub fn from_sessions(sessions: Vec<Session>) -> Result<ListingCacheSnapshot> {
+        let snapshot_json = serde_json::to_string(&sessions)?;
+        Ok(ListingCacheSnapshot {
+            sessions,
+            snapshot_json: Some(snapshot_json),
+            published_at_ms: 0,
+            published_generation: 0,
+        })
+    }
+
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    pub fn into_sessions(self) -> Vec<Session> {
+        self.sessions
+    }
+
+    pub const fn published_at_ms(&self) -> i64 {
+        self.published_at_ms
+    }
+
+    pub const fn published_generation(&self) -> i64 {
+        self.published_generation
+    }
+
+    fn decode(
+        scope: &ListingCacheScope,
+        snapshot_json: &str,
+        published_at_ms: i64,
+        published_generation: i64,
+    ) -> Option<ListingCacheSnapshot> {
+        let sessions = serde_json::from_str::<Vec<Session>>(snapshot_json).ok()?;
+        if sessions
+            .iter()
+            .any(|session| session.backend != scope.backend())
+        {
+            return None;
+        }
+        Some(ListingCacheSnapshot {
+            sessions,
+            snapshot_json: None,
+            published_at_ms,
+            published_generation,
+        })
+    }
+}
+
+/// A generation fenced right to perform one authoritative backend listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingCacheLease {
+    scope: ListingCacheScope,
+    owner: String,
+    generation: i64,
+}
+
+impl ListingCacheLease {
+    pub const fn next_published_generation(&self) -> i64 {
+        self.generation.saturating_add(1)
+    }
+}
+
+pub struct ListingRefreshGuard {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ListingRefreshGuard {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListingCacheRead {
+    Fresh(ListingCacheSnapshot),
+    Stale(ListingCacheSnapshot),
+    Miss,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListingCacheClaim {
+    Bypass,
+    Fresh(ListingCacheSnapshot),
+    Unchanged,
+    LeaseHeld,
+    Claimed(ListingCacheLease),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingCacheWrite {
+    Published,
+    Fenced,
+}
+
+struct ListingCacheRow {
+    refreshed_at_ms: i64,
+    generation: i64,
+    lease_owner: Option<String>,
+    lease_until_ms: i64,
+}
+
+fn listing_cache_row(
+    connection: &rusqlite::Connection,
+    scope: &ListingCacheScope,
+) -> rusqlite::Result<Option<ListingCacheRow>> {
+    let row = connection.query_row(
+        "SELECT refreshed_at_ms, generation, lease_owner, lease_until_ms \
+         FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+        rusqlite::params![scope.backend().name(), scope.as_str()],
+        |row| {
+            Ok(ListingCacheRow {
+                refreshed_at_ms: row.get(0)?,
+                generation: row.get(1)?,
+                lease_owner: row.get(2)?,
+                lease_until_ms: row.get(3)?,
+            })
+        },
+    );
+    match row {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn listing_snapshot(
+    connection: &rusqlite::Connection,
+    scope: &ListingCacheScope,
+    row: &ListingCacheRow,
+) -> rusqlite::Result<Option<ListingCacheSnapshot>> {
+    connection.query_row(
+        "SELECT snapshot_json FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+        rusqlite::params![scope.backend().name(), scope.as_str()],
+        |sqlite_row| {
+            let rusqlite::types::ValueRef::Text(snapshot_json) = sqlite_row.get_ref(0)? else {
+                return Ok(None);
+            };
+            Ok(std::str::from_utf8(snapshot_json)
+                .ok()
+                .and_then(|snapshot_json| {
+                    ListingCacheSnapshot::decode(
+                        scope,
+                        snapshot_json,
+                        row.refreshed_at_ms,
+                        row.generation,
+                    )
+                }))
+        },
+    )
+}
+
+fn listing_snapshot_is_fresh(refreshed_at_ms: i64, now_ms: i64, freshness_ms: i64) -> bool {
+    refreshed_at_ms > 0 && freshness_ms > 0 && now_ms.saturating_sub(refreshed_at_ms) < freshness_ms
+}
+
+fn listing_lease_owner(now_ms: i64) -> String {
+    static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let sequence = NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}:{now_ms}:{sequence}", std::process::id())
+}
+
 /// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
     match s {
@@ -78,6 +267,7 @@ fn backend_from_str(s: &str) -> Option<BackendKind> {
 /// Handle to `~/.local/state/agent-viewer/viewer.db` (read-write).
 pub struct ViewerDb {
     conn: rusqlite::Connection,
+    path: PathBuf,
 }
 
 /// Does this open failure mean the FILE ITSELF is unusable, so that a fresh empty DB is
@@ -210,11 +400,219 @@ impl ViewerDb {
 
     fn try_open(path: &std::path::Path) -> Result<ViewerDb> {
         let conn = rusqlite::Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        conn.busy_timeout(VIEWER_DB_BUSY_TIMEOUT)?;
         // WAL so two concurrent viewers coexist (last-writer-wins on advisory state).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(ViewerDb { conn })
+        Ok(ViewerDb {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Read a display snapshot without changing its freshness or lease.
+    pub fn read_listing_snapshot(
+        &self,
+        scope: &ListingCacheScope,
+        now_ms: i64,
+    ) -> Result<ListingCacheRead> {
+        let Some(row) = listing_cache_row(&self.conn, scope)? else {
+            return Ok(ListingCacheRead::Miss);
+        };
+        let Some(snapshot) = listing_snapshot(&self.conn, scope, &row)? else {
+            return Ok(ListingCacheRead::Miss);
+        };
+        if listing_snapshot_is_fresh(row.refreshed_at_ms, now_ms, LISTING_CACHE_FRESHNESS_MS) {
+            Ok(ListingCacheRead::Fresh(snapshot))
+        } else {
+            Ok(ListingCacheRead::Stale(snapshot))
+        }
+    }
+
+    /// Atomically reread one scope and either reuse it, observe its live lease, or claim it.
+    pub fn claim_listing_refresh(
+        &self,
+        scope: Option<&ListingCacheScope>,
+        known_generation: Option<i64>,
+        now_ms: i64,
+        freshness_ms: i64,
+        lease_ms: i64,
+    ) -> Result<ListingCacheClaim> {
+        let Some(scope) = scope else {
+            return Ok(ListingCacheClaim::Bypass);
+        };
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let row = listing_cache_row(&transaction, scope)?;
+        if let Some(row) = row.as_ref() {
+            if listing_snapshot_is_fresh(row.refreshed_at_ms, now_ms, freshness_ms) {
+                if known_generation == Some(row.generation) {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Unchanged);
+                }
+                if let Some(snapshot) = listing_snapshot(&transaction, scope, row)? {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Fresh(snapshot));
+                }
+            }
+            if row.lease_owner.is_some() && row.lease_until_ms > now_ms {
+                if known_generation == Some(row.generation) {
+                    transaction.commit()?;
+                    return Ok(ListingCacheClaim::Unchanged);
+                }
+                transaction.commit()?;
+                return Ok(ListingCacheClaim::LeaseHeld);
+            }
+        }
+
+        let owner = listing_lease_owner(now_ms);
+        let generation = row.as_ref().map_or(0, |row| row.generation);
+        let lease_until_ms = now_ms.saturating_add(lease_ms.max(0));
+        if row.is_some() {
+            transaction.execute(
+                "UPDATE backend_listing_cache \
+                 SET lease_owner = ?1, lease_until_ms = ?2 \
+                 WHERE backend = ?3 AND scope = ?4",
+                rusqlite::params![
+                    owner,
+                    lease_until_ms,
+                    scope.backend().name(),
+                    scope.as_str()
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO backend_listing_cache \
+                 (backend, scope, snapshot_json, refreshed_at_ms, generation, lease_owner, lease_until_ms) \
+                 VALUES (?1, ?2, NULL, 0, ?3, ?4, ?5)",
+                rusqlite::params![
+                    scope.backend().name(),
+                    scope.as_str(),
+                    generation,
+                    owner,
+                    lease_until_ms
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(ListingCacheClaim::Claimed(ListingCacheLease {
+            scope: scope.clone(),
+            owner,
+            generation,
+        }))
+    }
+
+    /// Keep an owned listing lease alive while its authoritative source is still running.
+    pub fn guard_listing_refresh(
+        &self,
+        lease: &ListingCacheLease,
+        lease_ms: i64,
+    ) -> Result<ListingRefreshGuard> {
+        let connection = rusqlite::Connection::open(&self.path)?;
+        connection.busy_timeout(VIEWER_DB_BUSY_TIMEOUT)?;
+        let scope = lease.scope.clone();
+        let owner = lease.owner.clone();
+        let generation = lease.generation;
+        let lease_ms = lease_ms.max(1);
+        let renewal_interval = std::time::Duration::from_millis((lease_ms / 3).max(1) as u64);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("listing_lease_renewal".to_string())
+            .spawn(move || {
+                loop {
+                    match stopped.recv_timeout(renewal_interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let lease_until_ms = crate::spawn::now_ms().saturating_add(lease_ms);
+                    match connection.execute(
+                        "UPDATE backend_listing_cache SET lease_until_ms = ?1 \
+                         WHERE backend = ?2 AND scope = ?3 AND generation = ?4 \
+                         AND lease_owner = ?5",
+                        rusqlite::params![
+                            lease_until_ms,
+                            scope.backend().name(),
+                            scope.as_str(),
+                            generation,
+                            owner
+                        ],
+                    ) {
+                        Ok(1) => {}
+                        Ok(_) => break,
+                        Err(_) => {}
+                    }
+                }
+            })?;
+        Ok(ListingRefreshGuard {
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    /// Publish only if this caller still owns the generation it claimed.
+    pub fn publish_listing(
+        &self,
+        lease: &ListingCacheLease,
+        snapshot: ListingCacheSnapshot,
+        now_ms: i64,
+    ) -> Result<ListingCacheWrite> {
+        let Some(snapshot_json) = snapshot.snapshot_json else {
+            return Err(crate::error::Error::Command(
+                "decoded listing snapshot cannot be published".to_string(),
+            ));
+        };
+        let changed = self.conn.execute(
+            "UPDATE backend_listing_cache \
+             SET snapshot_json = ?1, refreshed_at_ms = ?2, generation = ?3, \
+                 lease_owner = NULL, lease_until_ms = 0 \
+             WHERE backend = ?4 AND scope = ?5 AND generation = ?6 AND lease_owner = ?7",
+            rusqlite::params![
+                snapshot_json,
+                now_ms,
+                lease.next_published_generation(),
+                lease.scope.backend().name(),
+                lease.scope.as_str(),
+                lease.generation,
+                lease.owner
+            ],
+        )?;
+        Ok(if changed == 1 {
+            ListingCacheWrite::Published
+        } else {
+            ListingCacheWrite::Fenced
+        })
+    }
+
+    /// Release a failed authoritative refresh without changing the last good snapshot.
+    pub fn fail_listing_refresh(&self, lease: &ListingCacheLease) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE backend_listing_cache SET lease_owner = NULL, lease_until_ms = 0 \
+             WHERE backend = ?1 AND scope = ?2 AND generation = ?3 AND lease_owner = ?4",
+            rusqlite::params![
+                lease.scope.backend().name(),
+                lease.scope.as_str(),
+                lease.generation,
+                lease.owner
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Fence an in flight writer and make the current display snapshot explicitly stale.
+    pub fn invalidate_listing_scope(&self, scope: Option<&ListingCacheScope>) -> Result<bool> {
+        let Some(scope) = scope else {
+            return Ok(false);
+        };
+        let changed = self.conn.execute(
+            "UPDATE backend_listing_cache \
+             SET refreshed_at_ms = 0, generation = generation + 1, \
+                 lease_owner = NULL, lease_until_ms = 0 \
+             WHERE backend = ?1 AND scope = ?2",
+            rusqlite::params![scope.backend().name(), scope.as_str()],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Prune resolved spawn rows older than 7 days whose (backend, session_id) is NOT in

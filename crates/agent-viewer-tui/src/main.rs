@@ -15,8 +15,11 @@ use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
-use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
+use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
+use agent_viewer_tui::shared_listing::{
+    RefreshCursor, RefreshOutcome, TargetRequest, refresh_backend,
+};
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 use agent_viewer_tui::{StartupAction, startup_action};
@@ -37,7 +40,7 @@ mod pending_reply;
 use pending_reply::PendingReply;
 
 /// How often the refresh worker re-lists the backends (off the UI thread).
-const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 /// How long a footer notice stays up (age-based, independent of loop phase).
 const NOTICE_MS: i64 = 4000;
 /// Base event-poll cadence; drops to `FAST_POLL` while the list is animating.
@@ -259,13 +262,17 @@ impl Refresher {
 /// `REFRESH_INTERVAL` (or immediately on a wake) and streams snapshots to the UI. The
 /// backends here are the ONLY set that calls `list()`; the UI keeps a separate cheap set
 /// for attach/spawn/mutation so a slow `list()` never blocks input or render.
-fn spawn_refresh_worker(mut backends: Vec<Box<dyn Backend>>) -> Refresher {
+fn spawn_refresh_worker(
+    mut backends: Vec<Box<dyn Backend>>,
+    mut last: Vec<Vec<Session>>,
+    mut cursors: Vec<RefreshCursor>,
+) -> Refresher {
     let (snap_tx, snap_rx) = channel::<Snapshot>();
     let (wake_tx, wake_rx) = channel::<()>();
+    let db = ViewerDb::open_default().ok();
     thread::spawn(move || {
-        let mut last: Vec<Vec<Session>> = vec![Vec::new(); backends.len()];
         loop {
-            let snapshot = refresh(&mut backends, &mut last);
+            let snapshot = refresh(&mut backends, &mut last, &mut cursors, db.as_ref());
             if snap_tx.send(snapshot).is_err() {
                 return; // UI gone — stop listing.
             }
@@ -335,6 +342,10 @@ struct Ui {
     mutations: MutationRunner,
     /// Backend mutation boundary used by every submission on the runner thread.
     mutation_executor: Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>,
+    /// Authoritative attach resolution runs off the render thread.
+    attaches: AttachRunner<ops::AttachPlan>,
+    /// Fresh backend attach boundary used by every attach worker.
+    attach_executor: Arc<dyn Fn(TargetRequest) -> Result<ops::AttachPlan, String> + Send + Sync>,
     /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
     models: ModelCache,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
@@ -506,7 +517,9 @@ fn main() -> io::Result<()> {
     // Startup refresh BEFORE entering the alt screen so the first paint is not empty. If
     // every backend fails to list, print the errors to stderr and exit without a UI.
     let mut last: Vec<Vec<Session>> = vec![Vec::new(); list_backends.len()];
-    let (mut sessions, notice, ok_count) = refresh(&mut list_backends, &mut last);
+    let mut cursors = vec![RefreshCursor::default(); list_backends.len()];
+    let (mut sessions, notice, ok_count) =
+        refresh(&mut list_backends, &mut last, &mut cursors, db.as_ref());
     if ok_count == 0 {
         eprintln!("agent-viewer: no backend could be listed");
         if !notice.is_empty() {
@@ -566,6 +579,7 @@ fn main() -> io::Result<()> {
     }
 
     let mutation_runtime = opencode_runtime.clone();
+    let attach_runtime = opencode_runtime.clone();
     let mut ui = Ui {
         app,
         workspace,
@@ -579,6 +593,10 @@ fn main() -> io::Result<()> {
         mutations: MutationRunner::new(),
         mutation_executor: Arc::new(move |mutation| {
             ops::run_mutation_with_opencode(mutation, mutation_runtime.clone())
+        }),
+        attaches: AttachRunner::new(),
+        attach_executor: Arc::new(move |request| {
+            ops::resolve_attach_with_opencode(request, attach_runtime.clone())
         }),
         models,
         pulses: Pulses::new(),
@@ -597,15 +615,12 @@ fn main() -> io::Result<()> {
         sprite: startup_sprite,
     };
 
-    // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
-    // non-list calls: attach_command and capabilities. Only the worker set ever calls the slow
-    // list(). These are no longer all cheap stateless builders: `attach_command` shells out to
-    // `codex app-server daemon version` for a daemon-hosted row (about 34ms, and only for
-    // those rows). Spawn used to be here too and is now a `Mutation::Spawn` on the runner,
-    // because a codex spawn dials the daemon and may start one.
+    // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
+    // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
+    // a mutation because either operation can dial the backend runtime.
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
-    let refresher = spawn_refresh_worker(list_backends);
+    let refresher = spawn_refresh_worker(list_backends, last, cursors);
     let action_backends = all_backends_with_opencode(opencode_runtime);
 
     let mut terminal = ratatui::init();
@@ -673,6 +688,15 @@ fn run(
         }
         if mutation_completed {
             refresher.force();
+        }
+
+        while let Some(result) = ui.attaches.poll() {
+            match result {
+                Ok(plan) => {
+                    actions::install_attach_plan(ui, terminal, plan)?;
+                }
+                Err(notice) => ui.set_notice(notice),
+            }
         }
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
@@ -980,20 +1004,35 @@ fn overlay(db: &ViewerDb, sessions: &mut [Session]) -> Vec<Key> {
 fn refresh(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
+    cursors: &mut [RefreshCursor],
+    db: Option<&ViewerDb>,
 ) -> (Vec<Session>, String, usize) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
     let mut ok_count = 0;
+    let now = now_ms();
     for (i, backend) in backends.iter_mut().enumerate() {
-        match backend.list() {
-            Ok(sessions) => {
+        match refresh_backend(db, backend.as_mut(), &last[i], &mut cursors[i], now) {
+            RefreshOutcome::Authoritative { sessions }
+            | RefreshOutcome::Shared { sessions }
+            | RefreshOutcome::Stale { sessions } => {
                 ok_count += 1;
                 last[i] = sessions.clone();
                 all.extend(sessions);
             }
-            Err(e) => {
-                errors.push(format!("{}: {e}", backend.kind().name()));
-                all.extend(last[i].clone());
+            RefreshOutcome::SourceError { sessions, notice } => {
+                errors.push(notice);
+                all.extend(sessions);
+            }
+            RefreshOutcome::CachedError { sessions, notice } => {
+                errors.push(notice);
+                ok_count += 1;
+                last[i] = sessions.clone();
+                all.extend(sessions);
+            }
+            RefreshOutcome::Waiting | RefreshOutcome::Unchanged => {
+                ok_count += 1;
+                all.extend_from_slice(&last[i]);
             }
         }
     }
@@ -1003,7 +1042,9 @@ fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_viewer_core::SessionOrigin;
+    use agent_viewer_core::{
+        ListingCacheClaim, ListingCacheScope, ListingCacheSnapshot, SessionOrigin,
+    };
     use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
     use std::{
         io as test_io,
@@ -1068,6 +1109,150 @@ mod tests {
         }
     }
 
+    struct CountedListingBackend {
+        scope: ListingCacheScope,
+        calls: TestArc<AtomicUsize>,
+        error: String,
+    }
+
+    impl Backend for CountedListingBackend {
+        fn kind(&self) -> BackendKind {
+            self.scope.backend()
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+
+        fn listing_scope(&self) -> Option<ListingCacheScope> {
+            Some(self.scope.clone())
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(agent_viewer_core::Error::Command(self.error.clone()))
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by listing refresh tests")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attaching is not exercised by listing refresh tests")
+        }
+    }
+
+    #[test]
+    fn cold_lease_is_pending_without_calling_source_or_ending_startup() {
+        let directory = tempfile::tempdir().expect("temporary viewer database directory");
+        let path = directory.path().join("viewer.sqlite");
+        let lease_holder = ViewerDb::open(&path).expect("lease holder database");
+        let follower = ViewerDb::open(&path).expect("follower database");
+        let scope =
+            ListingCacheScope::new(BackendKind::Codex, "cold cache").expect("valid cache scope");
+        let lease_now = now_ms();
+        let _lease = match lease_holder
+            .claim_listing_refresh(Some(&scope), None, lease_now, 2_000, 60_000)
+            .expect("claim cold cache lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected cold cache lease, got {other:?}"),
+        };
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(CountedListingBackend {
+            scope,
+            calls: TestArc::clone(&calls),
+            error: "source must stay idle".to_string(),
+        })];
+        let mut last = vec![Vec::new()];
+        let mut cursors = vec![RefreshCursor::default()];
+
+        let (sessions, notice, ok_count) =
+            refresh(&mut backends, &mut last, &mut cursors, Some(&follower));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sessions.is_empty());
+        assert!(notice.is_empty());
+        assert_eq!(ok_count, 1, "a pending backend keeps startup usable");
+        assert!(last[0].is_empty());
+    }
+
+    #[test]
+    fn cached_error_rows_become_last_good_and_survive_a_following_lease() {
+        let directory = tempfile::tempdir().expect("temporary viewer database directory");
+        let path = directory.path().join("viewer.sqlite");
+        let publisher = ViewerDb::open(&path).expect("publisher database");
+        let local = ViewerDb::open(&path).expect("local database");
+        let lease_holder = ViewerDb::open(&path).expect("lease holder database");
+        let scope =
+            ListingCacheScope::new(BackendKind::Codex, "stale cache").expect("valid cache scope");
+        let cached = session(BackendKind::Codex, "cached", 1_000, false);
+        let previous_local = session(BackendKind::Codex, "previous local", 500, false);
+        let published_at = now_ms().saturating_sub(10_000);
+        let lease = match publisher
+            .claim_listing_refresh(Some(&scope), None, published_at, 2_000, 2_000)
+            .expect("claim publication lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected publication lease, got {other:?}"),
+        };
+        publisher
+            .publish_listing(
+                &lease,
+                ListingCacheSnapshot::from_sessions(vec![cached.clone()])
+                    .expect("serialize cached rows"),
+                published_at,
+            )
+            .expect("publish cached rows");
+
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(CountedListingBackend {
+            scope: scope.clone(),
+            calls: TestArc::clone(&calls),
+            error: "source unavailable".to_string(),
+        })];
+        let mut last = vec![vec![previous_local]];
+        let mut cursors = vec![RefreshCursor::default()];
+
+        let first = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+
+        let lease_now = now_ms();
+        let _lease = match lease_holder
+            .claim_listing_refresh(Some(&scope), None, lease_now, 2_000, 60_000)
+            .expect("claim following refresh lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected following refresh lease, got {other:?}"),
+        };
+        let second = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+
+        let plain_local = session(BackendKind::Codex, "plain local", 250, false);
+        let mut plain_last = vec![vec![plain_local.clone()]];
+        let mut plain_cursors = vec![RefreshCursor::default()];
+        let plain_error = refresh(&mut backends, &mut plain_last, &mut plain_cursors, None);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first.0, vec![cached.clone()]);
+        assert_eq!(first.1, "codex: command failed: source unavailable");
+        assert_eq!(first.2, 1, "a cached source error keeps the backend usable");
+        assert_eq!(last[0], vec![cached.clone()]);
+        assert_eq!(second.0, vec![cached]);
+        assert!(second.1.is_empty());
+        assert_eq!(second.2, 1);
+        assert_eq!(plain_error.0, vec![plain_local.clone()]);
+        assert_eq!(plain_error.1, "codex: command failed: source unavailable");
+        assert_eq!(plain_error.2, 0);
+        assert_eq!(plain_last[0], vec![plain_local]);
+    }
+
     fn test_ui(sessions: Vec<Session>) -> Ui {
         Ui {
             app: App::new(sessions),
@@ -1081,6 +1266,8 @@ mod tests {
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
             mutation_executor: Arc::new(ops::run_mutation),
+            attaches: AttachRunner::new(),
+            attach_executor: Arc::new(|_| Err("attach is not configured in this test".to_string())),
             models: ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: PrStatusCache::new(),
@@ -1139,7 +1326,16 @@ mod tests {
         let current_model = ui.composer.model().to_string();
         ui.models
             .seed(BackendKind::Claude, vec![current_model], true);
-        let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend)];
+        let authority_session = session(BackendKind::Opencode, "attached", 1_000, false);
+        ui.attach_executor = Arc::new(move |request| {
+            let mut authority = AttachingBackend {
+                session: authority_session.clone(),
+            };
+            ops::resolve_attach_with_backend(&mut authority, request)
+        });
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
+            session: session(BackendKind::Opencode, "attached", 1_000, false),
+        })];
         let (_snapshots_tx, snapshots) = channel();
         let (wake, _wake_rx) = channel();
         let refresher = Refresher { snapshots, wake };
@@ -1164,12 +1360,28 @@ mod tests {
             .expect("attach event"),
             "attach must not quit the viewer"
         );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve event bridge attach");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "event bridge attach did not resolve"
+            );
+            thread::yield_now();
+        };
+        assert!(
+            actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install event bridge attach")
+        );
+        sync_mouse_capture(&mut output, &mut applied, ui.mouse_capture)
+            .expect("apply attach mouse capture");
         assert!(matches!(ui.mode, Mode::Attached));
         assert!(!ui.mouse_capture);
         assert!(!applied);
         assert_eq!(
-            output,
-            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+            output, b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
             "successful attach must disable terminal mouse capture for native selection"
         );
 
@@ -1200,7 +1412,9 @@ mod tests {
         );
     }
 
-    struct AttachingBackend;
+    struct AttachingBackend {
+        session: Session,
+    }
 
     impl Backend for AttachingBackend {
         fn kind(&self) -> BackendKind {
@@ -1215,7 +1429,7 @@ mod tests {
         }
 
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("listing is not exercised by the event bridge")
+            Ok(vec![self.session.clone()])
         }
 
         fn spawn(
@@ -1331,7 +1545,7 @@ mod tests {
                             logos: None,
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
-                    sprite: ui.sprite,
+                            sprite: ui.sprite,
                         },
                     );
                 })

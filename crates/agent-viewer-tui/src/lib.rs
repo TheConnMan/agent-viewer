@@ -6,6 +6,7 @@ pub mod model_cache;
 pub mod mouse;
 pub mod mutations;
 pub mod pr_cache;
+pub mod shared_listing;
 pub mod terminal_title;
 pub mod ui;
 

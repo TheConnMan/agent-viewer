@@ -83,6 +83,14 @@ impl Backend for OpencodeBackend {
         BackendKind::Opencode
     }
 
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let key = crate::backend::listing_scope_key(&[
+            crate::backend::listing_scope_path(&self.db_path),
+            "compatibility".to_string(),
+        ]);
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
+    }
+
     fn capabilities(&self) -> Capabilities {
         crate::backend::opencode_capabilities_for_platform(crate::platform::current_platform())
     }

@@ -1,3 +1,4 @@
+use crate::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::{BackendKind, PrRef, Session, Status};
 use std::collections::{HashMap, HashSet};
@@ -565,16 +566,29 @@ impl App {
     ///
     /// On a selected header: a ProjectHeader spawns into its own root (a sensible dir); a
     /// SectionHeader has no spawn dir (None -> the caller shows the "no target" footer notice).
-    pub fn spawn_target(&self) -> Option<PathBuf> {
+    pub fn spawn_target(&self) -> Option<SpawnTarget> {
         match self.rows.get(self.selected) {
-            Some(Row::ProjectHeader { root, .. }) => return Some(root.clone()),
-            Some(Row::SectionHeader { .. }) => return None,
-            _ => {}
-        }
-        let session = self.selected()?;
-        match self.group_mode {
-            GroupMode::ByProject => Some(self.cached_root(&session.cwd)),
-            GroupMode::ByState => Some(session.cwd.clone()),
+            Some(Row::ProjectHeader { root, .. }) => {
+                Some(SpawnTarget::ExplicitDirectory(root.clone()))
+            }
+            Some(Row::Session { backend, id, .. }) => {
+                let session = self.find_session(*backend, id)?;
+                let (mode, displayed_directory) = match self.group_mode {
+                    GroupMode::ByProject => (
+                        SpawnDirectoryMode::ProjectRoot,
+                        self.cached_root(&session.cwd),
+                    ),
+                    GroupMode::ByState => {
+                        (SpawnDirectoryMode::WorkingDirectory, session.cwd.clone())
+                    }
+                };
+                Some(SpawnTarget::Session {
+                    request: TargetRequest::new(*backend, id.clone()),
+                    mode,
+                    displayed_directory,
+                })
+            }
+            Some(Row::SectionHeader { .. }) | Some(Row::Spacer) | None => None,
         }
     }
 
