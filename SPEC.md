@@ -623,13 +623,15 @@ remain safe cross platform smoke paths.
 
 ### Mouse capture must be escapable (`Ctrl+T`)
 
-The viewer enables mouse capture at startup for list click and hover row selection. A successful
-attach requests capture off, so Codex, Claude, and external opencode transcripts are immediately
-selectable in the host terminal. While attached, `Ctrl+T` requests capture on for session
-scrolling. Codex wheel reports move the viewer's local PTY viewport by three rows, using its
-bounded 2,000 row scrollback. Claude and external opencode attached terminals receive native
-wheel forwarding. Detaching requests capture on to restore list mouse controls. External
-opencode behavior is described as its supported attach path, not as a live verification claim.
+The viewer enables mouse capture at startup for list click and hover row selection. Every
+successful Codex or Claude attach or reattach requests capture on, so those transcripts scroll
+immediately. While attached, `Ctrl+T` requests capture off for host terminal text selection.
+Press it again to restore session scrolling. Codex wheel reports move the viewer's local PTY
+viewport by three rows, using its bounded 2,000 row scrollback. Claude attached terminals receive
+native wheel forwarding. External opencode attaches with capture off for host selection and
+requires `Ctrl+T` to opt into native wheel forwarding. Detaching requests capture on to restore
+list mouse controls. External opencode behavior is described as its supported attach path, not as
+a live verification claim.
 
 The cost is that **capture swallows the terminal's own drag-select**, so text cannot be copied
 out of the viewer. This spec previously waved that away with "the terminal's native text
@@ -644,10 +646,12 @@ screen is simply uncopyable.
   deliberate theft as `Ctrl+]` for detach).
 - `handle_mouse` early-returns while capture is off, so a report still in flight — or one from
   a terminal that ignored the disable sequence — cannot steer the selection.
-- Each toggle sets a footer notice naming the new mode and the way back, because the state is
-  otherwise invisible.
-- List capture starts **on**. A successful attach requests capture **off**. Attached `Ctrl+T`
-  requests capture **on**, and every detach requests capture **on**.
+- Each toggle sets a footer notice naming scrolling or selection and the way back, because the
+  state is otherwise invisible.
+- List capture starts **on**. Every successful Codex or Claude attach or reattach requests
+  capture **on**. External opencode attach requests capture **off** until `Ctrl+T` opts into
+  scrolling. Attached `Ctrl+T` toggles between selection and scrolling. Every detach requests
+  capture **on**.
 
 ## Testing
 
