@@ -8,12 +8,13 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
 
 const FRESHNESS_MS: i64 = 1_000;
 const LEASE_MS: i64 = 2_000;
+const RENEWABLE_LEASE_MS: i64 = 600;
 
 fn open_viewers() -> (TempDir, PathBuf, ViewerDb, ViewerDb) {
     let directory = tempfile::tempdir().expect("temporary viewer database directory");
@@ -65,13 +66,43 @@ fn claimed(
     scope: &ListingCacheScope,
     now_ms: i64,
 ) -> agent_viewer_core::ListingCacheLease {
+    claimed_for(db, scope, now_ms, LEASE_MS)
+}
+
+fn claimed_for(
+    db: &ViewerDb,
+    scope: &ListingCacheScope,
+    now_ms: i64,
+    lease_ms: i64,
+) -> agent_viewer_core::ListingCacheLease {
     match db
-        .claim_listing_refresh(Some(scope), None, now_ms, FRESHNESS_MS, LEASE_MS)
+        .claim_listing_refresh(Some(scope), None, now_ms, FRESHNESS_MS, lease_ms)
         .expect("claim listing refresh")
     {
         ListingCacheClaim::Claimed(lease) => lease,
         other => panic!("expected a lease claim, got {other:?}"),
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis()
+        .try_into()
+        .expect("epoch milliseconds fit i64")
+}
+
+fn stored_lease(path: &Path, scope: &ListingCacheScope) -> (i64, Option<String>, i64) {
+    Connection::open(path)
+        .expect("inspect viewer database")
+        .query_row(
+            "SELECT generation, lease_owner, lease_until_ms \
+             FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+            params![scope.backend().name(), scope.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("stored listing lease")
 }
 
 fn secure_runtime(root: &Path, candidates: [SocketAddr; 2], password: &str) -> OpencodeRuntime {
@@ -101,7 +132,7 @@ fn complete_session_json_round_trip_preserves_every_field() {
 }
 
 #[test]
-fn backend_advertised_scopes_change_only_with_namespace_fields_and_exclude_passwords() {
+fn backend_advertised_scopes_change_with_compatibility_namespace_fields() {
     let root = tempfile::tempdir().expect("backend scope directory");
     let binary_a = root.path().join("claude-a");
     let binary_b = root.path().join("claude-b");
@@ -146,63 +177,34 @@ fn backend_advertised_scopes_change_only_with_namespace_fields_and_exclude_passw
 
     let db_a = root.path().join("opencode-a.sqlite");
     let db_b = root.path().join("opencode-b.sqlite");
-    let compatibility_a = OpencodeBackend::with_db(db_a.clone());
-    let compatibility_b = OpencodeBackend::with_db(db_b.clone());
-    let ordered = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
-    let reversed = [ordered[1], ordered[0]];
-    let secure_one = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), ordered, "first generated password"),
-    );
-    let secure_other_password = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), ordered, "second generated password"),
-    );
-    let secure_reordered = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), reversed, "first generated password"),
-    );
-
+    let compatibility_a = OpencodeBackend::with_db(db_a);
+    let compatibility_b = OpencodeBackend::with_db(db_b);
     assert_ne!(
         advertised_scope(&compatibility_a),
         advertised_scope(&compatibility_b)
     );
-    assert_ne!(
-        advertised_scope(&compatibility_a),
-        advertised_scope(&secure_one)
-    );
-    assert_ne!(
-        advertised_scope(&secure_one),
-        advertised_scope(&secure_reordered)
-    );
-    assert_eq!(
-        advertised_scope(&secure_one),
-        advertised_scope(&secure_other_password)
-    );
+}
 
-    let (_directory, path, viewer, _other) = open_viewers();
-    let scope = advertised_scope(&secure_one);
-    let lease = claimed(&viewer, &scope, 10);
-    assert_eq!(
-        viewer
-            .publish_listing(
-                &lease,
-                snapshot(vec![complete_session(BackendKind::Opencode)]),
-                11
-            )
-            .expect("publish OpenCode snapshot"),
-        ListingCacheWrite::Published
+#[cfg(target_os = "linux")]
+#[test]
+fn secure_opencode_bypasses_shared_listing_cache() {
+    let root = tempfile::tempdir().expect("OpenCode runtime directory");
+    let db = root.path().join("opencode.sqlite");
+    let candidates = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
+    let secure = OpencodeBackend::with_db_and_runtime(
+        db.clone(),
+        secure_runtime(root.path(), candidates, "private test credential"),
     );
-    let connection = Connection::open(path).expect("inspect viewer database");
-    let stored: (String, String) = connection
-        .query_row(
-            "SELECT scope, snapshot_json FROM backend_listing_cache WHERE scope = ?1",
-            params![scope.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("stored OpenCode cache row");
-    assert!(!stored.0.contains("generated password"));
-    assert!(!stored.1.contains("generated password"));
+    let compatibility = OpencodeBackend::with_db(db);
+
+    assert!(
+        secure.listing_scope().is_none(),
+        "secure server listings must never enter the shared cache"
+    );
+    assert!(
+        compatibility.listing_scope().is_some(),
+        "compatibility SQLite listings remain safe to share"
+    );
 }
 
 #[test]
@@ -315,6 +317,119 @@ fn expired_lease_takeover_and_generation_fencing_reject_stale_publishers() {
             .expect("replacement publish"),
         ListingCacheWrite::Published
     );
+}
+
+#[test]
+fn refresh_guard_renews_the_same_owner_and_generation_past_the_initial_deadline() {
+    let (_directory, path, first, second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let claimed_at_ms = now_ms();
+    let lease = claimed_for(&first, &codex, claimed_at_ms, RENEWABLE_LEASE_MS);
+    let initial = stored_lease(&path, &codex);
+    let guard = first
+        .guard_listing_refresh(&lease, RENEWABLE_LEASE_MS)
+        .expect("start listing lease renewal");
+
+    std::thread::sleep(Duration::from_millis(900));
+
+    let renewed = stored_lease(&path, &codex);
+    assert_eq!(renewed.0, initial.0, "renewal must not advance generation");
+    assert_eq!(renewed.1, initial.1, "renewal must preserve lease owner");
+    assert!(
+        renewed.2 > initial.2,
+        "renewal must extend the lease deadline"
+    );
+    assert_eq!(
+        second
+            .claim_listing_refresh(
+                Some(&codex),
+                None,
+                now_ms(),
+                FRESHNESS_MS,
+                RENEWABLE_LEASE_MS,
+            )
+            .expect("second viewer claim after initial deadline"),
+        ListingCacheClaim::LeaseHeld
+    );
+
+    drop(guard);
+}
+
+#[test]
+fn dropping_refresh_guard_allows_takeover_after_the_renewed_deadline() {
+    let (_directory, path, first, second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let lease = claimed_for(&first, &codex, now_ms(), RENEWABLE_LEASE_MS);
+    let guard = first
+        .guard_listing_refresh(&lease, RENEWABLE_LEASE_MS)
+        .expect("start listing lease renewal");
+
+    std::thread::sleep(Duration::from_millis(900));
+    drop(guard);
+
+    let (_, _, renewed_until_ms) = stored_lease(&path, &codex);
+    let wait_ms = renewed_until_ms
+        .saturating_sub(now_ms())
+        .saturating_add(150)
+        .max(150);
+    std::thread::sleep(Duration::from_millis(wait_ms as u64));
+
+    assert!(matches!(
+        second
+            .claim_listing_refresh(
+                Some(&codex),
+                None,
+                now_ms(),
+                FRESHNESS_MS,
+                RENEWABLE_LEASE_MS,
+            )
+            .expect("take over released renewal lease"),
+        ListingCacheClaim::Claimed(_)
+    ));
+}
+
+#[test]
+fn publication_fences_guard_renewal_and_advances_generation() {
+    let (_directory, path, first, second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let lease = claimed_for(&first, &codex, now_ms(), RENEWABLE_LEASE_MS);
+    let initial_generation = stored_lease(&path, &codex).0;
+    let guard = first
+        .guard_listing_refresh(&lease, RENEWABLE_LEASE_MS)
+        .expect("start listing lease renewal");
+
+    assert_eq!(
+        first
+            .publish_listing(
+                &lease,
+                snapshot(vec![complete_session(BackendKind::Codex)]),
+                now_ms(),
+            )
+            .expect("publish guarded listing"),
+        ListingCacheWrite::Published
+    );
+    std::thread::sleep(Duration::from_millis(800));
+
+    let published = stored_lease(&path, &codex);
+    assert_eq!(published.0, initial_generation.saturating_add(1));
+    assert_eq!(published.1, None);
+    assert_eq!(published.2, 0);
+    let replacement = match second
+        .claim_listing_refresh(Some(&codex), None, now_ms(), 0, RENEWABLE_LEASE_MS)
+        .expect("claim after guarded publication")
+    {
+        ListingCacheClaim::Claimed(lease) => lease,
+        other => panic!("published lease must remain released, got {other:?}"),
+    };
+    assert_eq!(
+        replacement.next_published_generation(),
+        initial_generation.saturating_add(2)
+    );
+
+    drop(guard);
 }
 
 #[test]
