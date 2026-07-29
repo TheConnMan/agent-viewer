@@ -17,6 +17,7 @@ use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
 use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
+use agent_viewer_tui::shared_listing::{RefreshOutcome, refresh_backend};
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 use agent_viewer_tui::{StartupAction, startup_action};
@@ -193,7 +194,7 @@ fn sync_mouse_capture<W: io::Write>(
 /// writing control sequences to the invoking terminal.
 fn process_event<B: ratatui::backend::Backend, W: io::Write>(
     event: Event,
-    backends: &[Box<dyn Backend>],
+    backends: &mut [Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
     terminal: &mut ratatui::Terminal<B>,
@@ -262,10 +263,11 @@ impl Refresher {
 fn spawn_refresh_worker(mut backends: Vec<Box<dyn Backend>>) -> Refresher {
     let (snap_tx, snap_rx) = channel::<Snapshot>();
     let (wake_tx, wake_rx) = channel::<()>();
+    let db = ViewerDb::open_default().ok();
     thread::spawn(move || {
         let mut last: Vec<Vec<Session>> = vec![Vec::new(); backends.len()];
         loop {
-            let snapshot = refresh(&mut backends, &mut last);
+            let snapshot = refresh(&mut backends, &mut last, db.as_ref());
             if snap_tx.send(snapshot).is_err() {
                 return; // UI gone — stop listing.
             }
@@ -506,7 +508,7 @@ fn main() -> io::Result<()> {
     // Startup refresh BEFORE entering the alt screen so the first paint is not empty. If
     // every backend fails to list, print the errors to stderr and exit without a UI.
     let mut last: Vec<Vec<Session>> = vec![Vec::new(); list_backends.len()];
-    let (mut sessions, notice, ok_count) = refresh(&mut list_backends, &mut last);
+    let (mut sessions, notice, ok_count) = refresh(&mut list_backends, &mut last, db.as_ref());
     if ok_count == 0 {
         eprintln!("agent-viewer: no backend could be listed");
         if !notice.is_empty() {
@@ -606,7 +608,7 @@ fn main() -> io::Result<()> {
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
     let refresher = spawn_refresh_worker(list_backends);
-    let action_backends = all_backends_with_opencode(opencode_runtime);
+    let mut action_backends = all_backends_with_opencode(opencode_runtime);
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
@@ -619,7 +621,7 @@ fn main() -> io::Result<()> {
         let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
         run(
             &mut terminal,
-            &action_backends,
+            &mut action_backends,
             &refresher,
             &activity,
             &mut ui,
@@ -633,7 +635,7 @@ fn main() -> io::Result<()> {
 
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    backends: &[Box<dyn Backend>],
+    backends: &mut [Box<dyn Backend>],
     refresher: &Refresher,
     activity: &ActivityWorker,
     ui: &mut Ui,
@@ -980,20 +982,24 @@ fn overlay(db: &ViewerDb, sessions: &mut [Session]) -> Vec<Key> {
 fn refresh(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
+    db: Option<&ViewerDb>,
 ) -> (Vec<Session>, String, usize) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
     let mut ok_count = 0;
+    let now = now_ms();
     for (i, backend) in backends.iter_mut().enumerate() {
-        match backend.list() {
-            Ok(sessions) => {
+        match refresh_backend(db, backend.as_mut(), &last[i], now) {
+            RefreshOutcome::Authoritative { sessions }
+            | RefreshOutcome::Shared { sessions }
+            | RefreshOutcome::Stale { sessions } => {
                 ok_count += 1;
                 last[i] = sessions.clone();
                 all.extend(sessions);
             }
-            Err(e) => {
-                errors.push(format!("{}: {e}", backend.kind().name()));
-                all.extend(last[i].clone());
+            RefreshOutcome::SourceError { sessions, notice } => {
+                errors.push(notice);
+                all.extend(sessions);
             }
         }
     }
@@ -1139,7 +1145,9 @@ mod tests {
         let current_model = ui.composer.model().to_string();
         ui.models
             .seed(BackendKind::Claude, vec![current_model], true);
-        let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend)];
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
+            session: session(BackendKind::Opencode, "attached", 1_000, false),
+        })];
         let (_snapshots_tx, snapshots) = channel();
         let (wake, _wake_rx) = channel();
         let refresher = Refresher { snapshots, wake };
@@ -1154,7 +1162,7 @@ mod tests {
                     crossterm::event::KeyCode::Right,
                     crossterm::event::KeyModifiers::NONE,
                 )),
-                &backends,
+                &mut backends,
                 &refresher,
                 &mut ui,
                 &mut terminal,
@@ -1168,8 +1176,7 @@ mod tests {
         assert!(!ui.mouse_capture);
         assert!(!applied);
         assert_eq!(
-            output,
-            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+            output, b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
             "successful attach must disable terminal mouse capture for native selection"
         );
 
@@ -1179,7 +1186,7 @@ mod tests {
                     crossterm::event::KeyCode::Char(']'),
                     crossterm::event::KeyModifiers::CONTROL,
                 )),
-                &backends,
+                &mut backends,
                 &refresher,
                 &mut ui,
                 &mut terminal,
@@ -1200,7 +1207,9 @@ mod tests {
         );
     }
 
-    struct AttachingBackend;
+    struct AttachingBackend {
+        session: Session,
+    }
 
     impl Backend for AttachingBackend {
         fn kind(&self) -> BackendKind {
@@ -1215,7 +1224,7 @@ mod tests {
         }
 
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("listing is not exercised by the event bridge")
+            Ok(vec![self.session.clone()])
         }
 
         fn spawn(
@@ -1331,7 +1340,7 @@ mod tests {
                             logos: None,
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
-                    sprite: ui.sprite,
+                            sprite: ui.sprite,
                         },
                     );
                 })

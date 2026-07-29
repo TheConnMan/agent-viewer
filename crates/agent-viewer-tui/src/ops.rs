@@ -7,17 +7,20 @@ use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
-use agent_viewer_core::{Session, SpawnResult, default_codex_home};
+use agent_viewer_core::{Session, SpawnResult, ViewerDb, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
+use agent_viewer_tui::shared_listing::{
+    TargetRequest, authoritative_target, invalidate_backend_scope,
+};
 
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
 pub(crate) enum Mutation {
-    Stop(Session),
-    Remove(Session),
-    Rename(Session, String),
-    Hide(Session),
-    Unhide(Session),
+    Stop(TargetRequest),
+    Remove(TargetRequest),
+    Rename(TargetRequest, String),
+    Hide(TargetRequest),
+    Unhide(TargetRequest),
     /// Spawn a new session. On the runner, not the key path: a codex spawn now talks to the
     /// app-server daemon and may start one, so it is a multi-second blocking call on a bad day
     /// and would freeze the composer if it ran inline like it used to.
@@ -77,15 +80,78 @@ fn spawn_selection_from_mutation(
     })
 }
 
-/// A fresh backend instance for a worker thread. The mutating methods (stop/remove/
-/// rename/hide) depend only on the passed id/session, never on cached list state, so a
-/// fresh instance behaves identically to the one in the main `backends` slice.
+/// A fresh backend instance for a worker thread.
 fn fresh_backend(kind: BackendKind, opencode_runtime: &OpencodeRuntime) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
         BackendKind::Opencode => Box::new(OpencodeBackend::with_runtime(opencode_runtime.clone())),
     }
+}
+
+fn target_failure(resolution: agent_viewer_tui::shared_listing::TargetResolution) -> String {
+    resolution
+        .notice()
+        .unwrap_or("target resolution failed")
+        .to_string()
+}
+
+fn run_targeted<F>(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    request: &TargetRequest,
+    action: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+{
+    let result = match authoritative_target(backend, request) {
+        Ok(session) => action(backend, &session),
+        Err(resolution) => Err(target_failure(resolution)),
+    };
+    invalidate_backend_scope(db, backend);
+    result
+}
+
+fn run_with_fresh_backend<F>(
+    request: TargetRequest,
+    opencode_runtime: &OpencodeRuntime,
+    action: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+{
+    let mut backend = fresh_backend(request.backend(), opencode_runtime);
+    let db = ViewerDb::open_default().ok();
+    run_targeted(backend.as_mut(), db.as_ref(), &request, action)
+}
+
+fn run_remove(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    request: &TargetRequest,
+) -> Result<MutationOutcome, String> {
+    run_targeted(backend, db, request, |backend, session| {
+        if !backend.capabilities_for(session).delete {
+            return Err(format!(
+                "{} does not support remove",
+                session.backend.name()
+            ));
+        }
+        if let Some(pid) = session.pid.filter(|_| !session.daemon_hosted) {
+            let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
+        }
+        match backend.remove(session) {
+            Ok(()) => Ok(MutationOutcome {
+                notice: format!("removed: {}", session.title),
+                spawned: None,
+            }),
+            Err(agent_viewer_core::error::Error::Unsupported(name)) => {
+                Err(format!("{name} does not support remove"))
+            }
+            Err(error) => Err(format!("remove failed: {error}")),
+        }
+    })
 }
 
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
@@ -102,64 +168,73 @@ pub(crate) fn run_mutation_with_opencode(
     opencode_runtime: OpencodeRuntime,
 ) -> Result<MutationOutcome, String> {
     match m {
-        Mutation::Stop(s) => match fresh_backend(s.backend, &opencode_runtime).stop(&s) {
-            Ok(()) => Ok(MutationOutcome {
-                notice: format!("stopped: {}", s.title),
-                spawned: None,
-            }),
-            Err(e) => Err(format!("stop failed: {e}")),
-        },
-        Mutation::Remove(s) => {
-            let backend = fresh_backend(s.backend, &opencode_runtime);
-            // Refuse BEFORE the terminate below. `remove` is advertised per backend but gated
-            // per row (claude needs a short id), so an idless row used to be SIGTERMed and
-            // only then declined, killing a live session that stayed in the list.
-            if !backend.capabilities_for(&s).delete {
-                return Err(format!("{} does not support remove", s.backend.name()));
-            }
-            // Terminate the live process FIRST, inside this same thread, before archiving or
-            // deleting. Two-stage Ctrl+X submits `stop` then `remove` on different dedup keys,
-            // so the two race; killing here guarantees ordering within the remove op and makes
-            // a concurrent `stop` harmless. Terminate is idempotent (ESRCH/gone -> Ok) and
-            // pid guarded by comm prefix, so it never signals a recycled pid.
-            //
-            // NEVER for a shared runtime row. Any pid would belong to the host process and
-            // every session inside it. `stop` handles these through the backend runtime, and
-            // `remove` performs only the backend mutation.
-            if let Some(pid) = s.pid.filter(|_| !s.daemon_hosted) {
-                let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
-            }
-            match backend.remove(&s) {
-                Ok(()) => Ok(MutationOutcome {
-                    notice: format!("removed: {}", s.title),
-                    spawned: None,
-                }),
-                // A row with no bg job to remove (idless) is a capability miss, not a
-                // failure: surface it as the invariant's benign "not supported" notice, the
-                // same shape as the stop/rename unsupported messaging. Genuine CLI failures
-                // (Error::Command) stay a "remove failed" error.
-                Err(agent_viewer_core::error::Error::Unsupported(name)) => {
-                    Err(format!("{name} does not support remove"))
+        Mutation::Stop(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).stop {
+                    return Err(format!("{} does not support stop", session.backend.name()));
                 }
-                Err(e) => Err(format!("remove failed: {e}")),
-            }
-        }
-        Mutation::Rename(s, name) => {
-            match fresh_backend(s.backend, &opencode_runtime).rename(&s, &name) {
-                Ok(()) => Ok(MutationOutcome {
-                    notice: format!("renamed {}", s.backend.name()),
-                    spawned: None,
-                }),
-                Err(e) => Err(format!("rename failed: {e}")),
-            }
-        }
-        Mutation::Hide(s) => fresh_backend(s.backend, &opencode_runtime)
-            .hide(&s.id)
-            .map(|()| MutationOutcome {
-                notice: format!("archived: {}", s.title),
-                spawned: None,
+                backend
+                    .stop(session)
+                    .map(|()| MutationOutcome {
+                        notice: format!("stopped: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("stop failed: {error}"))
             })
-            .map_err(|e| format!("{}: {e}", s.backend.name())),
+        }
+        Mutation::Remove(request) => {
+            let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+            let db = ViewerDb::open_default().ok();
+            run_remove(backend.as_mut(), db.as_ref(), &request)
+        }
+        Mutation::Rename(request, name) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).rename {
+                    return Err(format!(
+                        "{} does not support rename",
+                        session.backend.name()
+                    ));
+                }
+                backend
+                    .rename(session, &name)
+                    .map(|()| MutationOutcome {
+                        notice: format!("renamed {}", session.backend.name()),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("rename failed: {error}"))
+            })
+        }
+        Mutation::Hide(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).archive {
+                    return Err(format!("{} does not support hide", session.backend.name()));
+                }
+                backend
+                    .hide(&session.id)
+                    .map(|()| MutationOutcome {
+                        notice: format!("archived: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("{}: {error}", session.backend.name()))
+            })
+        }
+        Mutation::Unhide(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).archive {
+                    return Err(format!(
+                        "{} does not support unhide",
+                        session.backend.name()
+                    ));
+                }
+                backend
+                    .unhide(&session.id)
+                    .map(|()| MutationOutcome {
+                        notice: format!("unarchived: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("{}: {error}", session.backend.name()))
+            })
+        }
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
                 backend,
@@ -173,14 +248,12 @@ pub(crate) fn run_mutation_with_opencode(
             else {
                 unreachable!();
             };
-            match fresh_backend(*backend, &opencode_runtime).spawn(dir, task, model.as_deref()) {
-                // A pid means the viewer forked the worker itself, so record the spawn for the
-                // pin/stop overlay against a fresh connection, like every other viewer-DB
-                // follow-up here. Every successful spawn also carries enough metadata for the
-                // UI to select its row when it first appears.
+            let action_backend = fresh_backend(*backend, &opencode_runtime);
+            let db = ViewerDb::open_default().ok();
+            let result = match action_backend.spawn(dir, task, model.as_deref()) {
                 Ok(spawned) => {
                     if let Some(pid) = spawned.pid
-                        && let Ok(db) = agent_viewer_core::state::ViewerDb::open_default()
+                        && let Some(db) = &db
                     {
                         let _ = db.record_spawn(*backend, dir, pid, *spawned_at_ms);
                     }
@@ -189,25 +262,21 @@ pub(crate) fn run_mutation_with_opencode(
                         spawned: spawn_selection_from_mutation(&mutation, &spawned),
                     })
                 }
-                Err(e) => Err(format!("spawn failed: {e}")),
-            }
+                Err(error) => Err(format!("spawn failed: {error}")),
+            };
+            invalidate_backend_scope(db.as_ref(), action_backend.as_ref());
+            result
         }
-        Mutation::Unhide(s) => fresh_backend(s.backend, &opencode_runtime)
-            .unhide(&s.id)
-            .map(|()| MutationOutcome {
-                notice: format!("unarchived: {}", s.title),
-                spawned: None,
-            })
-            .map_err(|e| format!("{}: {e}", s.backend.name())),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mutation, run_mutation, spawn_selection_from_mutation};
-    use agent_viewer_core::backend::{BackendKind, Status};
+    use super::{Mutation, run_remove, spawn_selection_from_mutation};
+    use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::{Session, SpawnResult};
     use agent_viewer_tui::app::{App, Row};
+    use agent_viewer_tui::shared_listing::TargetRequest;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -336,6 +405,50 @@ mod tests {
         }
     }
 
+    struct RefusingRemoveBackend {
+        session: Session,
+    }
+
+    impl Backend for RefusingRemoveBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                delete: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn capabilities_for(&self, session: &Session) -> Capabilities {
+            Capabilities {
+                delete: session.short_id.is_some(),
+                ..self.capabilities()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.session.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by remove")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by remove")
+        }
+    }
+
     // The defect: `remove` is advertised backend-wide for claude but gated per row on the
     // short id, so an interactive row passed the capability gate, got its process group
     // SIGTERMed, and only then was declined. The session died and stayed in the list.
@@ -343,8 +456,10 @@ mod tests {
     fn unsupported_remove_never_terminates_the_live_process() {
         let (dir, mut victim) = claude_named_victim("unsupported");
         let session = claude_session(None, victim.id());
+        let request = TargetRequest::from(&session);
+        let mut backend = RefusingRemoveBackend { session };
 
-        let result = run_mutation(Mutation::Remove(session));
+        let result = run_remove(&mut backend, None, &request);
 
         // Give a stray SIGTERM time to land before asserting the process survived.
         std::thread::sleep(Duration::from_millis(250));

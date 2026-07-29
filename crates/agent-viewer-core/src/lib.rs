@@ -20,11 +20,20 @@ pub mod spawn;
 pub mod state;
 
 pub use backend::{
-    Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, SpawnResult, Status,
-    StatusEvent, StatusSink, Subscription,
+    Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session, SessionOrigin,
+    SpawnResult, Status, StatusEvent, StatusSink, Subscription,
 };
+pub use claude::ClaudeBackend;
+pub use codex::CodexBackend;
 pub use error::{AttachRefusal, Error, Result};
+#[cfg(target_os = "linux")]
+pub use opencode::OpencodeRuntimeTestConfig;
+pub use opencode::{OpencodeBackend, OpencodeRuntime};
 pub use pr_status::PrBadgeColor;
+pub use state::{
+    ListingCacheClaim, ListingCacheLease, ListingCacheRead, ListingCacheSnapshot,
+    ListingCacheWrite, ViewerDb,
+};
 
 /// Flag any session whose cwd is a non-empty path that no longer exists on disk as a
 /// companion, so the default view hides deleted-dir noise (e.g. agentos /tmp sessions).

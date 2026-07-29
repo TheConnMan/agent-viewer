@@ -2297,6 +2297,21 @@ impl Backend for OpencodeBackend {
         BackendKind::Opencode
     }
 
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let mode = if self.runtime.inner.secure.is_some() {
+            "secure"
+        } else {
+            "compatibility"
+        };
+        let key = crate::backend::listing_scope_key(&[
+            crate::backend::listing_scope_path(&self.db_path),
+            self.runtime.inner.candidates[0].to_string(),
+            self.runtime.inner.candidates[1].to_string(),
+            mode.to_string(),
+        ]);
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
+    }
+
     fn capabilities(&self) -> Capabilities {
         if self.runtime.healthy_tier() {
             server_capabilities()

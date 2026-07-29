@@ -1,8 +1,100 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BackendKind {
     Codex,
     Claude,
     Opencode,
+}
+
+/// A nonsecret namespace for one concrete backend listing source.
+///
+/// The backend identity is kept separately from the opaque instance key so SQLite can
+/// validate both before returning a shared snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ListingCacheScope {
+    backend: BackendKind,
+    key: String,
+}
+
+impl ListingCacheScope {
+    pub fn new(
+        backend: BackendKind,
+        key: impl Into<String>,
+    ) -> crate::error::Result<ListingCacheScope> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err(crate::error::Error::Command(
+                "listing cache scope cannot be empty".to_string(),
+            ));
+        }
+        Ok(ListingCacheScope { backend, key })
+    }
+
+    pub const fn backend(&self) -> BackendKind {
+        self.backend
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.key
+    }
+}
+
+pub(crate) fn listing_scope_key(parts: &[String]) -> String {
+    serde_json::to_string(parts).expect("serializing strings cannot fail")
+}
+
+pub(crate) fn listing_scope_path(path: &std::path::Path) -> String {
+    let effective = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    });
+    scope_os_identity(effective.as_os_str())
+}
+
+#[cfg(unix)]
+fn scope_os_identity(value: &std::ffi::OsStr) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = value.as_bytes();
+    let mut identity = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(identity, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    identity
+}
+
+#[cfg(windows)]
+fn scope_os_identity(value: &std::ffi::OsStr) -> String {
+    use std::fmt::Write as _;
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut identity = String::new();
+    for unit in value.encode_wide() {
+        write!(identity, "{unit:04x}").expect("writing to a String cannot fail");
+    }
+    identity
+}
+
+pub(crate) fn listing_scope_executable(binary: &str) -> String {
+    let path = std::path::Path::new(binary);
+    if path.is_absolute() || path.components().count() > 1 {
+        return listing_scope_path(path);
+    }
+    if let Some(candidate) = std::env::var_os("PATH")
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join(path))
+        .find(|candidate| candidate.is_file())
+    {
+        return listing_scope_path(&candidate);
+    }
+    binary.to_string()
 }
 
 /// Identities produced by a successful backend spawn.
@@ -46,7 +138,7 @@ impl BackendKind {
 
 /// How a session was started, independent of backend — used to decide attachability and
 /// short-id expectations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionOrigin {
     /// Daemon or job managed, carries a short id, and is attachable.
     Background,
@@ -124,7 +216,7 @@ pub const fn opencode_capabilities_for_platform(
 /// say": a resolver that cannot determine status MUST return `Unknown` rather than
 /// fabricating `Idle` — a false idle reads as a live session with nothing happening, which is
 /// worse than an honest "we don't know".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Working,
     NeedsInput { reason: Option<String> },
@@ -147,13 +239,13 @@ impl Status {
 /// A pull request associated with a session, from a claude jobs state.json child
 /// (kind=="pr"). `id` is the display ref (e.g. "315"); `href` is the full GitHub URL
 /// when present, used to resolve owner/repo/number for a live status lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrRef {
     pub id: String,
     pub href: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub backend: BackendKind,
     pub id: String,
@@ -249,6 +341,11 @@ impl Drop for Subscription {
 pub trait Backend: Send {
     fn kind(&self) -> BackendKind;
     fn capabilities(&self) -> Capabilities;
+    /// The concrete, nonsecret namespace whose raw display listings may be shared.
+    /// `None` requires an authoritative list on every refresh.
+    fn listing_scope(&self) -> Option<ListingCacheScope> {
+        None
+    }
     /// Per-row capability override. Most rows just get the backend-wide `capabilities()`,
     /// but some actions are only valid for particular rows (e.g. a row lacking the short id
     /// a destructive action needs). This exists because a capability advertised and then

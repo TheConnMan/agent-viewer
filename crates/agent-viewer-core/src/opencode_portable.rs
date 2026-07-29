@@ -35,6 +35,14 @@ impl OpencodeBackend {
         }
     }
 
+    pub fn with_db(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            _runtime: OpencodeRuntime::new(),
+            models_cache: OnceLock::new(),
+        }
+    }
+
     fn list_from_sqlite(&self) -> Result<Vec<Session>> {
         if !self.db_path.exists() {
             return Ok(Vec::new());
@@ -81,6 +89,14 @@ impl Default for OpencodeBackend {
 impl Backend for OpencodeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Opencode
+    }
+
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let key = crate::backend::listing_scope_key(&[
+            crate::backend::listing_scope_path(&self.db_path),
+            "compatibility".to_string(),
+        ]);
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
     }
 
     fn capabilities(&self) -> Capabilities {
