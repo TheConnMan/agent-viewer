@@ -167,22 +167,6 @@ where
     }
 }
 
-pub fn refresh_scoped<F>(
-    db: &ViewerDb,
-    scope: Option<&ListingCacheScope>,
-    cursor: &mut RefreshCursor,
-    now_ms: i64,
-    source: F,
-) -> RefreshOutcome
-where
-    F: FnOnce() -> agent_viewer_core::Result<Vec<Session>>,
-{
-    let backend = scope
-        .map(ListingCacheScope::backend)
-        .unwrap_or(BackendKind::Codex);
-    refresh_scoped_inner(db, scope, backend, cursor, now_ms, source).0
-}
-
 pub fn refresh_backend(
     db: Option<&ViewerDb>,
     backend: &mut dyn Backend,
@@ -331,43 +315,4 @@ pub fn authoritative_target(
             notice: source_error(request.backend, error),
         })?;
     target_from_listing(request, sessions)
-}
-
-pub fn resolve_target<L, A>(request: TargetRequest, list: L, action: A) -> TargetResolution
-where
-    L: FnOnce() -> agent_viewer_core::Result<Vec<Session>>,
-    A: FnOnce(&Session) -> TargetResolution,
-{
-    let sessions = match list() {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            return TargetResolution::SourceError {
-                notice: source_error(request.backend, error),
-            };
-        }
-    };
-    match target_from_listing(&request, sessions) {
-        Ok(session) => action(&session),
-        Err(resolution) => resolution,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CachedPaletteAction {
-    Attach,
-    Archive,
-    Unarchive,
-    Rename,
-    StopOrRemove,
-}
-
-pub fn dispatch_cached_palette<F>(
-    target: TargetRequest,
-    action: CachedPaletteAction,
-    dispatch: F,
-) -> TargetResolution
-where
-    F: FnOnce(TargetRequest, CachedPaletteAction) -> TargetResolution,
-{
-    dispatch(target, action)
 }

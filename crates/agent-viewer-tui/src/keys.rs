@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
 use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
-use agent_viewer_tui::shared_listing::{
-    CachedPaletteAction, TargetRequest, TargetResolution, dispatch_cached_palette,
-};
+use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
 };
@@ -818,16 +816,16 @@ fn handle_palette_key<B: ratatui::backend::Backend>(
 fn cached_palette_target(
     ui: &Ui,
     target: &PaletteTarget,
-) -> Option<(TargetRequest, String, CachedPaletteAction)> {
+) -> Option<(TargetRequest, String, PaletteAction)> {
     match target {
         PaletteTarget::Action(action) => {
             let session = ui.app.selected()?;
             let action = match action {
-                PaletteAction::Attach => CachedPaletteAction::Attach,
-                PaletteAction::Archive => CachedPaletteAction::Archive,
-                PaletteAction::Unarchive => CachedPaletteAction::Unarchive,
-                PaletteAction::Rename => CachedPaletteAction::Rename,
-                PaletteAction::StopOrRemove => CachedPaletteAction::StopOrRemove,
+                PaletteAction::Attach
+                | PaletteAction::Archive
+                | PaletteAction::Unarchive
+                | PaletteAction::Rename
+                | PaletteAction::StopOrRemove => *action,
                 _ => return None,
             };
             Some((TargetRequest::from(session), session.title.clone(), action))
@@ -841,7 +839,7 @@ fn cached_palette_target(
             Some((
                 TargetRequest::new(*backend, id.clone()),
                 title,
-                CachedPaletteAction::Attach,
+                PaletteAction::Attach,
             ))
         }
         _ => None,
@@ -852,35 +850,27 @@ fn execute_cached_palette_action(
     ui: &mut Ui,
     request: TargetRequest,
     title: String,
-    action: CachedPaletteAction,
-) -> io::Result<()> {
-    let resolution = dispatch_cached_palette(request, action, |request, action| match action {
-        CachedPaletteAction::Attach => {
+    action: PaletteAction,
+) {
+    match action {
+        PaletteAction::Attach => {
             submit_attach(ui, request);
-            TargetResolution::permitted()
         }
-        CachedPaletteAction::Archive => {
+        PaletteAction::Archive => {
             hide_request(ui, request, title, true);
-            TargetResolution::permitted()
         }
-        CachedPaletteAction::Unarchive => {
+        PaletteAction::Unarchive => {
             hide_request(ui, request, title, false);
-            TargetResolution::permitted()
         }
-        CachedPaletteAction::Rename => {
+        PaletteAction::Rename => {
             open_rename_request(ui, request);
-            TargetResolution::permitted()
         }
-        CachedPaletteAction::StopOrRemove => {
+        PaletteAction::StopOrRemove => {
             let stage = ui.app.kill_stage(agent_viewer_core::spawn::now_ms());
             kill_request(ui, request, title, stage);
-            TargetResolution::permitted()
         }
-    });
-    if let Some(notice) = resolution.notice() {
-        ui.set_notice(notice.to_string());
+        _ => {}
     }
-    Ok(())
 }
 
 fn execute_palette_selection<B: ratatui::backend::Backend>(
@@ -899,7 +889,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             let _ = ui.app.select_by_key(&(*backend, id.clone()));
         }
         ui.mode = Mode::Normal;
-        return execute_cached_palette_action(ui, request, title, action);
+        execute_cached_palette_action(ui, request, title, action);
+        return Ok(());
     }
     if !item.enabled {
         if let Some(reason) = item.disabled_reason {
