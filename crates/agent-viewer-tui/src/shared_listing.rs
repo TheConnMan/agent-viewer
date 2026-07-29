@@ -3,7 +3,7 @@ use agent_viewer_core::{
     ListingCacheSnapshot, Session, ViewerDb,
 };
 
-const LISTING_FRESHNESS_MS: i64 = 1_000;
+const LISTING_FRESHNESS_MS: i64 = 2_000;
 const LISTING_LEASE_MS: i64 = 2_000;
 
 #[derive(Debug, Clone, PartialEq)]
