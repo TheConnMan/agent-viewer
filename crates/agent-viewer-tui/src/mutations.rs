@@ -81,3 +81,52 @@ impl MutationRunner {
         self.in_flight.contains(key)
     }
 }
+
+#[cfg(test)]
+mod attach_runner_tests {
+    use super::AttachRunner;
+    use std::sync::mpsc::channel;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn attach_runner_executes_off_thread_and_deduplicates_pending_keys() {
+        let caller = thread::current().id();
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let mut runner = AttachRunner::<thread::ThreadId>::new();
+
+        assert!(runner.submit("claude:target:attach".to_string(), move || {
+            let worker = thread::current().id();
+            started_tx.send(worker).expect("report worker");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release worker");
+            Ok(worker)
+        }));
+
+        let worker = started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("attach worker started");
+        assert_ne!(worker, caller);
+        assert!(!runner.submit("claude:target:attach".to_string(), || {
+            panic!("duplicate attach must not start")
+        }));
+        assert!(runner.poll().is_none());
+
+        release_tx.send(()).expect("release attach worker");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let completed = loop {
+            if let Some(result) = runner.poll() {
+                break result.expect("attach worker result");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attach worker did not finish"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(completed, worker);
+        assert!(!runner.in_flight("claude:target:attach"));
+    }
+}

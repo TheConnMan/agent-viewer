@@ -647,3 +647,137 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod attach_resolution_tests {
+    use super::resolve_attach_with_backend;
+    use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
+    use agent_viewer_core::{AttachRefusal, Session, SpawnResult};
+    use agent_viewer_tui::shared_listing::TargetRequest;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    fn session(id: &str, title: &str) -> Session {
+        Session {
+            backend: BackendKind::Claude,
+            id: id.to_string(),
+            short_id: Some(id.to_string()),
+            origin: agent_viewer_core::SessionOrigin::Background,
+            title: title.to_string(),
+            cwd: PathBuf::from(format!("/tmp/{title}")),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    struct RecordingAttachBackend {
+        sessions: Vec<Session>,
+        attach_allowed: bool,
+        list_calls: usize,
+        command_sessions: RefCell<Vec<Session>>,
+    }
+
+    impl RecordingAttachBackend {
+        fn new(sessions: Vec<Session>, attach_allowed: bool) -> Self {
+            Self {
+                sessions,
+                attach_allowed,
+                list_calls: 0,
+                command_sessions: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for RecordingAttachBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                attach: self.attach_allowed,
+                ..Capabilities::none()
+            }
+        }
+
+        fn capabilities_for(&self, _session: &Session) -> Capabilities {
+            self.capabilities()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.list_calls += 1;
+            Ok(self.sessions.clone())
+        }
+
+        fn spawn(
+            &self,
+            _dir: &Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by attach resolution")
+        }
+
+        fn attach_command(
+            &self,
+            session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            self.command_sessions.borrow_mut().push(session.clone());
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            Ok(command)
+        }
+    }
+
+    #[test]
+    fn attach_resolution_builds_the_plan_from_the_fresh_authoritative_session() {
+        let displayed = session("target", "displayed_stale");
+        let fresh = session("target", "authority_fresh");
+        let request = TargetRequest::from(&displayed);
+        let mut backend = RecordingAttachBackend::new(vec![fresh.clone()], true);
+
+        let plan =
+            resolve_attach_with_backend(&mut backend, request).expect("attach plan resolves");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(*backend.command_sessions.borrow(), vec![fresh.clone()]);
+        assert_eq!(plan.session, fresh);
+    }
+
+    #[test]
+    fn missing_or_freshly_refused_attach_never_builds_a_command() {
+        let displayed = session("target", "displayed");
+        let request = TargetRequest::from(&displayed);
+        let mut missing = RecordingAttachBackend::new(Vec::new(), true);
+
+        let missing_result = resolve_attach_with_backend(&mut missing, request.clone());
+
+        assert_eq!(
+            missing_result.err().as_deref(),
+            Some("claude session is no longer available")
+        );
+        assert_eq!(missing.list_calls, 1);
+        assert!(missing.command_sessions.borrow().is_empty());
+
+        let fresh = session("target", "authority_refused");
+        let mut refused = RecordingAttachBackend::new(vec![fresh], false);
+
+        let refused_result = resolve_attach_with_backend(&mut refused, request);
+
+        assert_eq!(
+            refused_result.err().as_deref(),
+            Some("claude does not support attach")
+        );
+        assert_eq!(refused.list_calls, 1);
+        assert!(refused.command_sessions.borrow().is_empty());
+    }
+}
