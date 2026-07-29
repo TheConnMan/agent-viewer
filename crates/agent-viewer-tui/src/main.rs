@@ -38,7 +38,7 @@ mod pending_reply;
 use pending_reply::PendingReply;
 
 /// How often the refresh worker re-lists the backends (off the UI thread).
-const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 /// How long a footer notice stays up (age-based, independent of loop phase).
 const NOTICE_MS: i64 = 4000;
 /// Base event-poll cadence; drops to `FAST_POLL` while the list is animating.
