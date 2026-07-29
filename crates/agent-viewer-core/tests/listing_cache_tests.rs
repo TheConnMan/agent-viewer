@@ -512,6 +512,67 @@ fn successful_empty_snapshot_survives_a_later_source_error() {
 }
 
 #[test]
+fn decoded_cache_snapshot_cannot_be_republished_as_an_empty_payload() {
+    let (_directory, path, first, second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let row = complete_session(BackendKind::Codex);
+    let initial = claimed(&first, &codex, 10);
+    first
+        .publish_listing(&initial, snapshot(vec![row.clone()]), 11)
+        .expect("publish initial snapshot");
+    let decoded = match second
+        .read_listing_snapshot(&codex, 12)
+        .expect("read decoded snapshot")
+    {
+        ListingCacheRead::Fresh(snapshot) => {
+            assert_eq!(snapshot.sessions(), std::slice::from_ref(&row));
+            snapshot
+        }
+        other => panic!("expected fresh decoded snapshot, got {other:?}"),
+    };
+    let stale_at_ms = 11 + FRESHNESS_MS;
+    let later_lease = claimed(&second, &codex, stale_at_ms);
+
+    let publish_result = second.publish_listing(&later_lease, decoded, stale_at_ms + 1);
+    let raw_payload: Option<String> = Connection::open(path)
+        .expect("inspect viewer database")
+        .query_row(
+            "SELECT snapshot_json FROM backend_listing_cache \
+             WHERE backend = ?1 AND scope = ?2",
+            params![BackendKind::Codex.name(), codex.as_str()],
+            |sqlite_row| sqlite_row.get(0),
+        )
+        .expect("stored snapshot payload");
+    let raw_payload_is_valid_or_absent = raw_payload.as_deref().is_none_or(|json| {
+        serde_json::from_str::<Vec<Session>>(json)
+            .is_ok_and(|sessions| sessions == std::slice::from_ref(&row))
+    });
+    let subsequent_read_is_valid_or_absent = match first
+        .read_listing_snapshot(&codex, stale_at_ms + 2)
+        .expect("read after rejected decoded publication")
+    {
+        ListingCacheRead::Fresh(snapshot) | ListingCacheRead::Stale(snapshot) => {
+            snapshot.sessions() == std::slice::from_ref(&row)
+        }
+        ListingCacheRead::Miss => raw_payload.is_none(),
+    };
+
+    assert!(
+        publish_result.is_err(),
+        "publishing a decoded cache snapshot must return an error"
+    );
+    assert!(
+        raw_payload_is_valid_or_absent,
+        "rejected publication must not commit malformed empty JSON"
+    );
+    assert!(
+        subsequent_read_is_valid_or_absent,
+        "subsequent reads must retain the valid prior snapshot or miss"
+    );
+}
+
+#[test]
 fn matching_published_generation_returns_unchanged_without_decoding_json() {
     let (_directory, path, first, _second) = open_viewers();
     let root = tempfile::tempdir().expect("Codex home");
