@@ -1211,7 +1211,12 @@ mod tests {
         };
         let second = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let plain_local = session(BackendKind::Codex, "plain local", 250, false);
+        let mut plain_last = vec![vec![plain_local.clone()]];
+        let mut plain_cursors = vec![RefreshCursor::default()];
+        let plain_error = refresh(&mut backends, &mut plain_last, &mut plain_cursors, None);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(first.0, vec![cached.clone()]);
         assert_eq!(first.1, "codex: command failed: source unavailable");
         assert_eq!(first.2, 1, "a cached source error keeps the backend usable");
@@ -1219,6 +1224,10 @@ mod tests {
         assert_eq!(second.0, vec![cached]);
         assert!(second.1.is_empty());
         assert_eq!(second.2, 1);
+        assert_eq!(plain_error.0, vec![plain_local.clone()]);
+        assert_eq!(plain_error.1, "codex: command failed: source unavailable");
+        assert_eq!(plain_error.2, 0);
+        assert_eq!(plain_last[0], vec![plain_local]);
     }
 
     fn test_ui(sessions: Vec<Session>) -> Ui {
