@@ -1,5 +1,6 @@
 pub mod app_server;
 pub mod cli;
+pub mod pr_scan;
 pub mod registry;
 pub mod rollout;
 pub mod source;
@@ -249,6 +250,9 @@ pub struct CodexBackend {
     /// Discovered model catalog, computed once and reused (best-effort; degrades to the
     /// default when both the CLI probe and the registry fallback come up empty).
     models_cache: std::sync::OnceLock<Vec<String>>,
+    /// Per-rollout PR refs, held across ticks so each transcript is read once and then only
+    /// where it grew.
+    pr_scan: pr_scan::PrScanner,
 }
 
 impl CodexBackend {
@@ -258,6 +262,7 @@ impl CodexBackend {
             registry: None,
             resolver: StatusResolver::new(),
             models_cache: std::sync::OnceLock::new(),
+            pr_scan: pr_scan::PrScanner::new(),
         }
     }
 
@@ -314,8 +319,26 @@ impl Backend for CodexBackend {
         // ONE process sweep per tick, giving both the open-rollout map and the set of threads a
         // client is sitting in (the liveness signal a daemon-held fd cannot provide).
         let scan = status::scan_codex_processes();
+        // PR refs come out of the rollout transcripts (the registry has no PR column), and
+        // ONE byte budget is shared across the tick so a first listing cannot read every
+        // rollout on the box at once (1.8 GB here). Order decides which rows badge first:
+        // live threads before archived ones, newest before oldest. Archived rollouts are 1.3
+        // GB of that 1.8 and are hidden from the default view, so scanning them first would
+        // delay the badge on every row the user can actually see.
+        let mut budget = pr_scan::SCAN_BUDGET_BYTES;
+        let mut pr_refs: Vec<Vec<crate::backend::PrRef>> = vec![Vec::new(); threads.len()];
+        let mut scan_order: Vec<usize> = (0..threads.len()).collect();
+        scan_order.sort_unstable_by_key(|&idx| {
+            let thread = &threads[idx];
+            (thread.archived, std::cmp::Reverse(thread.updated_at_ms))
+        });
+        for idx in scan_order {
+            pr_refs[idx] = self
+                .pr_scan
+                .refs_for(&threads[idx].rollout_path, &mut budget);
+        }
         let mut sessions = Vec::with_capacity(threads.len());
-        for thread in threads {
+        for (idx, thread) in threads.into_iter().enumerate() {
             // The resolver canonicalizes once (cached) and returns the owning pid from the
             // same open map, so no per-tick canonicalize is needed here.
             let attached = scan.attached_threads.contains(&thread.id);
@@ -344,7 +367,7 @@ impl Backend for CodexBackend {
                 summary: thread.preview,
                 pid,
                 rollout_path: Some(thread.rollout_path),
-                pr_refs: Vec::new(),
+                pr_refs: std::mem::take(&mut pr_refs[idx]),
                 daemon_hosted,
             });
         }
