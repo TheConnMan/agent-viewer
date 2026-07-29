@@ -847,3 +847,128 @@ mod tests {
         assert_eq!(ui.notice.text, "no attach here");
     }
 }
+
+#[cfg(test)]
+mod async_attach_tests {
+    use super::{install_attach_plan, submit_attach};
+    use crate::keys::tests::{sess, test_ui_with};
+    use crate::ops::AttachPlan;
+    use agent_viewer_core::BackendKind;
+    use agent_viewer_tui::shared_listing::TargetRequest;
+    use agent_viewer_tui::ui::Mode;
+    use std::sync::{Arc, Mutex, mpsc::channel};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn attach_submission_returns_before_authority_finishes_and_deduplicates_the_target() {
+        let displayed = sess(
+            "blocked_authority",
+            "/tmp/agentviewer_blocked_authority",
+            100,
+        );
+        let request = TargetRequest::from(&displayed);
+        let mut ui = test_ui_with(vec![displayed]);
+        let caller = thread::current().id();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        ui.attach_executor = Arc::new(move |request| {
+            recorded.lock().expect("record calls").push(request);
+            started_tx
+                .send(thread::current().id())
+                .expect("report authority worker");
+            release_rx
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release blocked authority");
+            Err("fresh authority refused attach".to_string())
+        });
+
+        let started = Instant::now();
+        assert!(submit_attach(&mut ui, request.clone()));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "attach submission blocked on authoritative listing"
+        );
+        let worker = started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("authority worker started");
+        assert_ne!(worker, caller);
+        assert!(!submit_attach(&mut ui, request.clone()));
+        assert_eq!(
+            ui.notice.text, "attaching… blocked_authority",
+            "duplicate submission must preserve the first pending attach"
+        );
+
+        release_tx.send(()).expect("release authority worker");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "authority worker did not finish");
+            thread::yield_now();
+        };
+
+        assert_eq!(*calls.lock().expect("recorded calls"), vec![request]);
+        assert_eq!(
+            result.err().as_deref(),
+            Some("fresh authority refused attach")
+        );
+        assert!(ui.attached.is_empty());
+        assert!(ui.focused.is_none());
+
+        ui.attach_executor =
+            Arc::new(|_| Err("claude session is no longer available".to_string()));
+        assert!(submit_attach(&mut ui, request));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let missing = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "missing result did not finish");
+            thread::yield_now();
+        };
+        assert_eq!(
+            missing.err().as_deref(),
+            Some("claude session is no longer available")
+        );
+        assert!(ui.attached.is_empty());
+        assert!(ui.focused.is_none());
+    }
+
+    #[test]
+    fn completed_attach_plan_focuses_the_fresh_authoritative_session() {
+        let displayed = sess("fresh_focus", "/tmp/agentviewer_displayed_attach", 100);
+        let mut fresh = displayed.clone();
+        fresh.title = "fresh authoritative title".to_string();
+        fresh.cwd = "/tmp/agentviewer_fresh_attach".into();
+        fresh.updated_at_ms = 200;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let plan = AttachPlan {
+            session: fresh.clone(),
+            command,
+        };
+        let mut ui = test_ui_with(vec![displayed]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
+
+        let key = (BackendKind::Claude, fresh.id.clone());
+        assert_eq!(ui.focused.as_ref(), Some(&key));
+        assert_eq!(ui.focused_session.as_ref(), Some(&fresh));
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert!(ui.attached.contains_key(&key));
+
+        ui.attached
+            .get_mut(&key)
+            .expect("fresh attached child")
+            .kill();
+    }
+}
