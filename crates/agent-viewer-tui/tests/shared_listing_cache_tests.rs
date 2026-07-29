@@ -57,7 +57,7 @@ fn fresh_shared_snapshot_skips_the_authoritative_source_across_viewers() {
         calls.set(calls.get() + 1);
         Ok(vec![expected.clone()])
     });
-    let shared = refresh_scoped(&second, Some(&scope), 1_999, || {
+    let shared = refresh_scoped(&second, Some(&scope), 2_999, || {
         calls.set(calls.get() + 1);
         Ok(Vec::<Session>::new())
     });
@@ -76,11 +76,11 @@ fn expired_snapshot_lists_once_then_the_second_viewer_uses_the_publication() {
     let calls = Cell::new(0);
 
     refresh_scoped(&first, Some(&scope), 1_000, || Ok(vec![before_expiry]));
-    let refreshed = refresh_scoped(&second, Some(&scope), 2_000, || {
+    let refreshed = refresh_scoped(&second, Some(&scope), 3_000, || {
         calls.set(calls.get() + 1);
         Ok(vec![after_expiry.clone()])
     });
-    let shared = refresh_scoped(&first, Some(&scope), 2_001, || {
+    let shared = refresh_scoped(&first, Some(&scope), 3_001, || {
         calls.set(calls.get() + 1);
         Ok(Vec::<Session>::new())
     });
@@ -129,8 +129,8 @@ fn successful_empty_listing_replaces_rows_and_source_error_keeps_last_good_notic
     let stale_row = session(BackendKind::Codex, "thread_123", Some(101), false);
 
     refresh_scoped(&first, Some(&scope), 1_000, || Ok(vec![stale_row]));
-    let empty = refresh_scoped(&second, Some(&scope), 2_000, || Ok(Vec::<Session>::new()));
-    let failed = refresh_scoped(&first, Some(&scope), 3_000, || {
+    let empty = refresh_scoped(&second, Some(&scope), 3_000, || Ok(Vec::<Session>::new()));
+    let failed = refresh_scoped(&first, Some(&scope), 5_000, || {
         Err(Error::Command("source unavailable".to_string()))
     });
 
