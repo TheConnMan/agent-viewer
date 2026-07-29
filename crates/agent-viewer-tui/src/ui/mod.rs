@@ -127,16 +127,6 @@ pub fn shimmer_glyph(elapsed_ms: i64) -> &'static str {
     SHIMMER[i]
 }
 
-/// PURE needs-input breath phase: a 0..3 triangle wave over a ~1.2s period.
-pub fn breath_phase(elapsed_ms: i64) -> usize {
-    let period = 1200_i64;
-    let t = elapsed_ms.rem_euclid(period);
-    let half = period / 2;
-    let up = t < half;
-    let pos = if up { t } else { period - t };
-    (pos * 4 / (half + 1)) as usize % 4
-}
-
 /// PURE spawn bloom: the one-shot glyph for `elapsed_ms` since the row appeared, or None
 /// once the ~400ms bloom has finished.
 pub fn bloom_glyph(elapsed_ms: i64) -> Option<&'static str> {
@@ -147,8 +137,7 @@ pub fn bloom_glyph(elapsed_ms: i64) -> Option<&'static str> {
     Some(BLOOM[i.min(BLOOM.len() - 1)])
 }
 
-/// Six-state glyph + color. Working shimmers its glyph (~120ms/frame); needs-input
-/// breathes its color (muted <-> accent-bright, ~1.2s). Both derive from `now_ms`.
+/// Six-state glyph + color. Working shimmers its glyph (~120ms/frame).
 fn status_glyph(
     status: &Status,
     now_ms: i64,
@@ -163,22 +152,7 @@ fn status_glyph(
             },
             theme.accent,
         ),
-        Status::NeedsInput { .. } => {
-            let steps = [
-                theme.muted,
-                theme.pulse_start,
-                theme.accent,
-                theme.pulse_end,
-            ];
-            (
-                "◐",
-                if theme.animation {
-                    steps[breath_phase(now_ms)]
-                } else {
-                    theme.warn
-                },
-            )
-        }
+        Status::NeedsInput { .. } => ("◐", theme.warn),
         Status::Idle => ("∙", theme.muted),
         Status::Done => ("●", theme.ok),
         Status::Error => ("✗", theme.err),
@@ -1434,6 +1408,17 @@ mod tests {
     }
 
     #[test]
+    fn needs_input_glyph_is_static_with_animation_enabled() {
+        let theme = theme::terminal(false);
+        assert!(theme.animation);
+        let status = Status::needs_input();
+
+        for now_ms in [0, 300, 600, 900] {
+            assert_eq!(status_glyph(&status, now_ms, &theme), ("◐", theme.warn));
+        }
+    }
+
+    #[test]
     fn activity_request_range_is_viewport_plus_lookahead_not_full_list() {
         let hit = ListHit {
             area: Rect::new(0, 0, 140, 20),
@@ -1617,17 +1602,6 @@ mod tests {
         assert_eq!(shimmer_glyph(119), SHIMMER[0]);
         assert_eq!(shimmer_glyph(120 * 8), SHIMMER[0]); // wraps
         assert_eq!(shimmer_glyph(-500), SHIMMER[0]); // negative clamps to frame 0
-    }
-
-    #[test]
-    fn breath_phase_is_a_bounded_triangle() {
-        // Always in range, rises then falls across the 1.2s period.
-        for ms in [0, 150, 300, 450, 600, 750, 900, 1050, 1200, 5321] {
-            assert!(breath_phase(ms) < 4);
-        }
-        // Trough at the start, near the peak mid-period.
-        assert_eq!(breath_phase(0), 0);
-        assert!(breath_phase(600) >= breath_phase(0));
     }
 
     #[test]
