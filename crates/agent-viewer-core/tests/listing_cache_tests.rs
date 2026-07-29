@@ -217,11 +217,10 @@ fn missing_scope_bypasses_every_shared_cache_operation() {
             .expect("scope less refresh"),
         ListingCacheClaim::Bypass
     );
-    assert_eq!(
-        first
+    assert!(
+        !first
             .invalidate_listing_scope(None)
-            .expect("scope less invalidation"),
-        false
+            .expect("scope less invalidation")
     );
 }
 
@@ -632,7 +631,7 @@ fn absent_or_different_generation_returns_snapshot_and_published_generation() {
         .expect("lookup without a known generation")
     {
         ListingCacheClaim::Fresh(snapshot) => {
-            assert_eq!(snapshot.sessions(), &[row.clone()]);
+            assert_eq!(snapshot.sessions(), std::slice::from_ref(&row));
             snapshot.published_generation()
         }
         other => panic!("expected decoded snapshot, got {other:?}"),
