@@ -1,10 +1,8 @@
 use agent_viewer_core::{
     Backend, BackendKind, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
     ListingCacheSnapshot, Session, ViewerDb,
+    state::{LISTING_CACHE_FRESHNESS_MS, LISTING_CACHE_LEASE_MS},
 };
-
-const LISTING_FRESHNESS_MS: i64 = 2_000;
-const LISTING_LEASE_MS: i64 = 2_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshCursor {
@@ -26,6 +24,11 @@ pub enum RefreshOutcome {
         sessions: Vec<Session>,
         notice: String,
     },
+    CachedError {
+        sessions: Vec<Session>,
+        notice: String,
+    },
+    Waiting,
     Unchanged,
 }
 
@@ -84,8 +87,8 @@ where
         Some(scope),
         cursor.published_generation,
         now_ms,
-        LISTING_FRESHNESS_MS,
-        LISTING_LEASE_MS,
+        LISTING_CACHE_FRESHNESS_MS,
+        LISTING_CACHE_LEASE_MS,
     ) {
         Ok(claim) => claim,
         Err(_) => return source_only(backend, source),
@@ -107,40 +110,60 @@ where
             if let Some(sessions) = cached_fallback(db, scope, cursor, now_ms) {
                 return (RefreshOutcome::Stale { sessions }, true);
             }
-            source_only(backend, source)
+            (RefreshOutcome::Waiting, false)
         }
         ListingCacheClaim::Bypass => source_only(backend, source),
-        ListingCacheClaim::Claimed(lease) => match source() {
-            Ok(sessions) => {
-                match ListingCacheSnapshot::from_sessions(sessions.clone()) {
-                    Ok(snapshot) => match db.publish_listing(&lease, snapshot, now_ms) {
-                        Ok(agent_viewer_core::ListingCacheWrite::Published) => {
-                            cursor.published_generation = Some(lease.next_published_generation());
-                        }
-                        Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
-                            cursor.published_generation = None;
-                        }
-                    },
-                    Err(_) => {
-                        cursor.published_generation = None;
-                        let _ = db.fail_listing_refresh(&lease);
-                    }
+        ListingCacheClaim::Claimed(lease) => {
+            let guard = match db.guard_listing_refresh(&lease, LISTING_CACHE_LEASE_MS) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = db.fail_listing_refresh(&lease);
+                    let fallback = cached_fallback(db, scope, cursor, now_ms);
+                    let has_fallback = fallback.is_some();
+                    return (
+                        RefreshOutcome::SourceError {
+                            sessions: fallback.unwrap_or_default(),
+                            notice: source_error(backend, error),
+                        },
+                        has_fallback,
+                    );
                 }
-                (RefreshOutcome::Authoritative { sessions }, false)
-            }
-            Err(error) => {
-                let _ = db.fail_listing_refresh(&lease);
-                let fallback = cached_fallback(db, scope, cursor, now_ms);
-                let has_fallback = fallback.is_some();
-                (
-                    RefreshOutcome::SourceError {
-                        sessions: fallback.unwrap_or_default(),
-                        notice: source_error(backend, error),
-                    },
-                    has_fallback,
-                )
-            }
-        },
+            };
+            let outcome = match source() {
+                Ok(sessions) => {
+                    match ListingCacheSnapshot::from_sessions(sessions.clone()) {
+                        Ok(snapshot) => match db.publish_listing(&lease, snapshot, now_ms) {
+                            Ok(agent_viewer_core::ListingCacheWrite::Published) => {
+                                cursor.published_generation =
+                                    Some(lease.next_published_generation());
+                            }
+                            Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
+                                cursor.published_generation = None;
+                            }
+                        },
+                        Err(_) => {
+                            cursor.published_generation = None;
+                            let _ = db.fail_listing_refresh(&lease);
+                        }
+                    }
+                    (RefreshOutcome::Authoritative { sessions }, false)
+                }
+                Err(error) => {
+                    let _ = db.fail_listing_refresh(&lease);
+                    let fallback = cached_fallback(db, scope, cursor, now_ms);
+                    let has_fallback = fallback.is_some();
+                    (
+                        RefreshOutcome::SourceError {
+                            sessions: fallback.unwrap_or_default(),
+                            notice: source_error(backend, error),
+                        },
+                        has_fallback,
+                    )
+                }
+            };
+            drop(guard);
+            outcome
+        }
     }
 }
 
@@ -169,16 +192,22 @@ pub fn refresh_backend(
 ) -> RefreshOutcome {
     let kind = backend.kind();
     let scope = backend.listing_scope();
-    let (mut outcome, has_shared_fallback) = match db {
+    let (outcome, has_shared_fallback) = match db {
         Some(db) => {
             refresh_scoped_inner(db, scope.as_ref(), kind, cursor, now_ms, || backend.list())
         }
         None => source_only(kind, || backend.list()),
     };
-    if !has_shared_fallback && let RefreshOutcome::SourceError { sessions, .. } = &mut outcome {
-        *sessions = last_good.to_vec();
+    match outcome {
+        RefreshOutcome::SourceError { sessions, notice } if has_shared_fallback => {
+            RefreshOutcome::CachedError { sessions, notice }
+        }
+        RefreshOutcome::SourceError { notice, .. } => RefreshOutcome::SourceError {
+            sessions: last_good.to_vec(),
+            notice,
+        },
+        other => other,
     }
-    outcome
 }
 
 pub fn invalidate_backend_scope(db: Option<&ViewerDb>, backend: &dyn Backend) {
