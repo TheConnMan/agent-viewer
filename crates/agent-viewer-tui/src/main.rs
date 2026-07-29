@@ -1007,7 +1007,13 @@ fn refresh(
                 errors.push(notice);
                 all.extend(sessions);
             }
-            RefreshOutcome::Unchanged => {
+            RefreshOutcome::CachedError { sessions, notice } => {
+                errors.push(notice);
+                ok_count += 1;
+                last[i] = sessions.clone();
+                all.extend(sessions);
+            }
+            RefreshOutcome::Waiting | RefreshOutcome::Unchanged => {
                 ok_count += 1;
                 all.extend_from_slice(&last[i]);
             }
