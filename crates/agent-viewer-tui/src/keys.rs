@@ -569,21 +569,27 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
         }));
     }
 
+    let spawn_target = ui.app.spawn_target();
     items.extend(
-        palette_commands(ui.composer.backend(), ui.app.spawn_target().as_deref())
-            .into_iter()
-            .map(|command| {
-                PaletteItem::new(
-                    PaletteGroup::Commands,
-                    "/",
-                    format!("/{command}"),
-                    format!("{} slash command", ui.composer.backend().name()),
-                    None,
-                    true,
-                    None,
-                    PaletteTarget::Command(command),
-                )
-            }),
+        palette_commands(
+            ui.composer.backend(),
+            spawn_target
+                .as_ref()
+                .map(|target| target.displayed_directory()),
+        )
+        .into_iter()
+        .map(|command| {
+            PaletteItem::new(
+                PaletteGroup::Commands,
+                "/",
+                format!("/{command}"),
+                format!("{} slash command", ui.composer.backend().name()),
+                None,
+                true,
+                None,
+                PaletteTarget::Command(command),
+            )
+        }),
     );
     items
 }

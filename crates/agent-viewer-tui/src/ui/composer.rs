@@ -274,7 +274,7 @@ pub(super) fn draw(
     let mark = backend_mark(backend, theme);
     let directory = app
         .spawn_target()
-        .map(|directory| abbreviate_dir(&directory))
+        .map(|target| abbreviate_dir(target.displayed_directory()))
         .unwrap_or_default();
     let model = composer.model();
 
