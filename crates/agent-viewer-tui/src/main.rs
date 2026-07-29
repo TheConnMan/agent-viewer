@@ -1019,7 +1019,9 @@ fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_viewer_core::SessionOrigin;
+    use agent_viewer_core::{
+        ListingCacheClaim, ListingCacheScope, ListingCacheSnapshot, SessionOrigin,
+    };
     use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
     use std::{
         io as test_io,
@@ -1082,6 +1084,141 @@ mod tests {
             spawned_at_ms,
             preexisting_ids: preexisting_ids.iter().map(|id| (*id).to_string()).collect(),
         }
+    }
+
+    struct CountedListingBackend {
+        scope: ListingCacheScope,
+        calls: TestArc<AtomicUsize>,
+        error: String,
+    }
+
+    impl Backend for CountedListingBackend {
+        fn kind(&self) -> BackendKind {
+            self.scope.backend()
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+
+        fn listing_scope(&self) -> Option<ListingCacheScope> {
+            Some(self.scope.clone())
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(agent_viewer_core::Error::Command(self.error.clone()))
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by listing refresh tests")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attaching is not exercised by listing refresh tests")
+        }
+    }
+
+    #[test]
+    fn cold_lease_is_pending_without_calling_source_or_ending_startup() {
+        let directory = tempfile::tempdir().expect("temporary viewer database directory");
+        let path = directory.path().join("viewer.sqlite");
+        let lease_holder = ViewerDb::open_at(&path).expect("lease holder database");
+        let follower = ViewerDb::open_at(&path).expect("follower database");
+        let scope =
+            ListingCacheScope::new(BackendKind::Codex, "cold cache").expect("valid cache scope");
+        let lease_now = now_ms();
+        let _lease = match lease_holder
+            .claim_listing_refresh(Some(&scope), None, lease_now, 2_000, 60_000)
+            .expect("claim cold cache lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected cold cache lease, got {other:?}"),
+        };
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(CountedListingBackend {
+            scope,
+            calls: TestArc::clone(&calls),
+            error: "source must stay idle".to_string(),
+        })];
+        let mut last = vec![Vec::new()];
+        let mut cursors = vec![RefreshCursor::default()];
+
+        let (sessions, notice, ok_count) =
+            refresh(&mut backends, &mut last, &mut cursors, Some(&follower));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sessions.is_empty());
+        assert!(notice.is_empty());
+        assert_eq!(ok_count, 1, "a pending backend keeps startup usable");
+        assert!(last[0].is_empty());
+    }
+
+    #[test]
+    fn cached_error_rows_become_last_good_and_survive_a_following_lease() {
+        let directory = tempfile::tempdir().expect("temporary viewer database directory");
+        let path = directory.path().join("viewer.sqlite");
+        let publisher = ViewerDb::open_at(&path).expect("publisher database");
+        let local = ViewerDb::open_at(&path).expect("local database");
+        let lease_holder = ViewerDb::open_at(&path).expect("lease holder database");
+        let scope =
+            ListingCacheScope::new(BackendKind::Codex, "stale cache").expect("valid cache scope");
+        let cached = session(BackendKind::Codex, "cached", 1_000, false);
+        let previous_local = session(BackendKind::Codex, "previous local", 500, false);
+        let published_at = now_ms().saturating_sub(10_000);
+        let lease = match publisher
+            .claim_listing_refresh(Some(&scope), None, published_at, 2_000, 2_000)
+            .expect("claim publication lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected publication lease, got {other:?}"),
+        };
+        publisher
+            .publish_listing(
+                &lease,
+                ListingCacheSnapshot::from_sessions(vec![cached.clone()])
+                    .expect("serialize cached rows"),
+                published_at,
+            )
+            .expect("publish cached rows");
+
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(CountedListingBackend {
+            scope: scope.clone(),
+            calls: TestArc::clone(&calls),
+            error: "source unavailable".to_string(),
+        })];
+        let mut last = vec![vec![previous_local]];
+        let mut cursors = vec![RefreshCursor::default()];
+
+        let first = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+
+        let lease_now = now_ms();
+        let _lease = match lease_holder
+            .claim_listing_refresh(Some(&scope), None, lease_now, 2_000, 60_000)
+            .expect("claim following refresh lease")
+        {
+            ListingCacheClaim::Claimed(lease) => lease,
+            other => panic!("expected following refresh lease, got {other:?}"),
+        };
+        let second = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.0, vec![cached.clone()]);
+        assert_eq!(first.1, "codex: command failed: source unavailable");
+        assert_eq!(first.2, 1, "a cached source error keeps the backend usable");
+        assert_eq!(last[0], vec![cached.clone()]);
+        assert_eq!(second.0, vec![cached]);
+        assert!(second.1.is_empty());
+        assert_eq!(second.2, 1);
     }
 
     fn test_ui(sessions: Vec<Session>) -> Ui {
