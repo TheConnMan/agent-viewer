@@ -17,7 +17,7 @@ use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
 use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
-use agent_viewer_tui::shared_listing::{RefreshOutcome, refresh_backend};
+use agent_viewer_tui::shared_listing::{RefreshCursor, RefreshOutcome, refresh_backend};
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 use agent_viewer_tui::{StartupAction, startup_action};
@@ -260,14 +260,17 @@ impl Refresher {
 /// `REFRESH_INTERVAL` (or immediately on a wake) and streams snapshots to the UI. The
 /// backends here are the ONLY set that calls `list()`; the UI keeps a separate cheap set
 /// for attach/spawn/mutation so a slow `list()` never blocks input or render.
-fn spawn_refresh_worker(mut backends: Vec<Box<dyn Backend>>) -> Refresher {
+fn spawn_refresh_worker(
+    mut backends: Vec<Box<dyn Backend>>,
+    mut last: Vec<Vec<Session>>,
+    mut cursors: Vec<RefreshCursor>,
+) -> Refresher {
     let (snap_tx, snap_rx) = channel::<Snapshot>();
     let (wake_tx, wake_rx) = channel::<()>();
     let db = ViewerDb::open_default().ok();
     thread::spawn(move || {
-        let mut last: Vec<Vec<Session>> = vec![Vec::new(); backends.len()];
         loop {
-            let snapshot = refresh(&mut backends, &mut last, db.as_ref());
+            let snapshot = refresh(&mut backends, &mut last, &mut cursors, db.as_ref());
             if snap_tx.send(snapshot).is_err() {
                 return; // UI gone — stop listing.
             }
@@ -508,7 +511,9 @@ fn main() -> io::Result<()> {
     // Startup refresh BEFORE entering the alt screen so the first paint is not empty. If
     // every backend fails to list, print the errors to stderr and exit without a UI.
     let mut last: Vec<Vec<Session>> = vec![Vec::new(); list_backends.len()];
-    let (mut sessions, notice, ok_count) = refresh(&mut list_backends, &mut last, db.as_ref());
+    let mut cursors = vec![RefreshCursor::default(); list_backends.len()];
+    let (mut sessions, notice, ok_count) =
+        refresh(&mut list_backends, &mut last, &mut cursors, db.as_ref());
     if ok_count == 0 {
         eprintln!("agent-viewer: no backend could be listed");
         if !notice.is_empty() {
@@ -607,7 +612,7 @@ fn main() -> io::Result<()> {
     // because a codex spawn dials the daemon and may start one.
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
-    let refresher = spawn_refresh_worker(list_backends);
+    let refresher = spawn_refresh_worker(list_backends, last, cursors);
     let mut action_backends = all_backends_with_opencode(opencode_runtime);
 
     let mut terminal = ratatui::init();
@@ -982,6 +987,7 @@ fn overlay(db: &ViewerDb, sessions: &mut [Session]) -> Vec<Key> {
 fn refresh(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
+    cursors: &mut [RefreshCursor],
     db: Option<&ViewerDb>,
 ) -> (Vec<Session>, String, usize) {
     let mut all = Vec::new();
@@ -989,7 +995,7 @@ fn refresh(
     let mut ok_count = 0;
     let now = now_ms();
     for (i, backend) in backends.iter_mut().enumerate() {
-        match refresh_backend(db, backend.as_mut(), &last[i], now) {
+        match refresh_backend(db, backend.as_mut(), &last[i], &mut cursors[i], now) {
             RefreshOutcome::Authoritative { sessions }
             | RefreshOutcome::Shared { sessions }
             | RefreshOutcome::Stale { sessions } => {
@@ -1000,6 +1006,10 @@ fn refresh(
             RefreshOutcome::SourceError { sessions, notice } => {
                 errors.push(notice);
                 all.extend(sessions);
+            }
+            RefreshOutcome::Unchanged => {
+                ok_count += 1;
+                all.extend_from_slice(&last[i]);
             }
         }
     }
