@@ -6,12 +6,13 @@ use std::collections::HashSet;
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::group::project_root;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
 use agent_viewer_core::{Session, SpawnResult, ViewerDb, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
 use agent_viewer_tui::shared_listing::{
-    TargetRequest, authoritative_target, invalidate_backend_scope,
+    SpawnDirectoryMode, SpawnTarget, TargetRequest, authoritative_target, invalidate_backend_scope,
 };
 
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
@@ -26,7 +27,7 @@ pub(crate) enum Mutation {
     /// and would freeze the composer if it ran inline like it used to.
     Spawn {
         backend: BackendKind,
-        dir: std::path::PathBuf,
+        target: SpawnTarget,
         task: String,
         model: Option<String>,
         spawned_at_ms: i64,
@@ -39,7 +40,7 @@ impl Mutation {
     pub(crate) fn spawn(
         app: &App,
         backend: BackendKind,
-        dir: std::path::PathBuf,
+        target: SpawnTarget,
         task: String,
         model: Option<String>,
         spawned_at_ms: i64,
@@ -47,7 +48,7 @@ impl Mutation {
     ) -> Self {
         Self::Spawn {
             backend,
-            dir,
+            target,
             task,
             model,
             spawned_at_ms,
@@ -63,7 +64,7 @@ fn spawn_selection_from_mutation(
 ) -> Option<SpawnSelection> {
     let Mutation::Spawn {
         backend,
-        dir,
+        target,
         spawned_at_ms,
         preexisting_ids,
         ..
@@ -74,7 +75,7 @@ fn spawn_selection_from_mutation(
     Some(SpawnSelection {
         backend: *backend,
         session_id: spawned.session_id.clone(),
-        cwd: dir.clone(),
+        cwd: target.displayed_directory().to_path_buf(),
         spawned_at_ms: *spawned_at_ms,
         preexisting_ids: preexisting_ids.clone(),
     })
@@ -152,6 +153,66 @@ fn run_remove(
             Err(error) => Err(format!("remove failed: {error}")),
         }
     })
+}
+
+fn run_spawn_at_directory(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+    directory: std::path::PathBuf,
+) -> Result<MutationOutcome, String> {
+    let Mutation::Spawn {
+        backend: backend_kind,
+        task,
+        model,
+        spawned_at_ms,
+        notice,
+        ..
+    } = mutation
+    else {
+        unreachable!();
+    };
+    let result = match backend.spawn(&directory, task, model.as_deref()) {
+        Ok(spawned) => {
+            if let Some(pid) = spawned.pid
+                && let Some(db) = db
+            {
+                let _ = db.record_spawn(*backend_kind, &directory, pid, *spawned_at_ms);
+            }
+            let mut selection = spawn_selection_from_mutation(mutation, &spawned);
+            if let Some(selection) = &mut selection {
+                selection.cwd = directory;
+            }
+            Ok(MutationOutcome {
+                notice: notice.clone(),
+                spawned: selection,
+            })
+        }
+        Err(error) => Err(format!("spawn failed: {error}")),
+    };
+    invalidate_backend_scope(db, backend);
+    result
+}
+
+fn run_spawn_with_backend(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+) -> Result<MutationOutcome, String> {
+    let Mutation::Spawn { target, .. } = mutation else {
+        unreachable!();
+    };
+    let directory = match target {
+        SpawnTarget::Session { request, mode, .. } => {
+            let session = authoritative_target(backend, request).map_err(target_failure)?;
+            match mode {
+                SpawnDirectoryMode::WorkingDirectory => session.cwd,
+                SpawnDirectoryMode::ProjectRoot => project_root(&session.cwd),
+            }
+        }
+        SpawnTarget::ExplicitDirectory(directory) => directory.clone(),
+    };
+    run_spawn_at_directory(backend, db, mutation, directory)
 }
 
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
@@ -237,35 +298,28 @@ pub(crate) fn run_mutation_with_opencode(
         }
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
-                backend,
-                dir,
-                task,
-                model,
-                spawned_at_ms,
-                notice,
-                ..
+                backend, target, ..
             } = &mutation
             else {
                 unreachable!();
             };
-            let action_backend = fresh_backend(*backend, &opencode_runtime);
+            let mut action_backend = fresh_backend(*backend, &opencode_runtime);
             let db = ViewerDb::open_default().ok();
-            let result = match action_backend.spawn(dir, task, model.as_deref()) {
-                Ok(spawned) => {
-                    if let Some(pid) = spawned.pid
-                        && let Some(db) = &db
-                    {
-                        let _ = db.record_spawn(*backend, dir, pid, *spawned_at_ms);
-                    }
-                    Ok(MutationOutcome {
-                        notice: notice.clone(),
-                        spawned: spawn_selection_from_mutation(&mutation, &spawned),
-                    })
-                }
-                Err(error) => Err(format!("spawn failed: {error}")),
-            };
-            invalidate_backend_scope(db.as_ref(), action_backend.as_ref());
-            result
+            if let SpawnTarget::Session { request, mode, .. } = target
+                && request.backend() != *backend
+            {
+                let mut authority_backend = fresh_backend(request.backend(), &opencode_runtime);
+                let directory = match authoritative_target(authority_backend.as_mut(), request) {
+                    Ok(session) => match mode {
+                        SpawnDirectoryMode::WorkingDirectory => session.cwd,
+                        SpawnDirectoryMode::ProjectRoot => project_root(&session.cwd),
+                    },
+                    Err(resolution) => return Err(target_failure(resolution)),
+                };
+                run_spawn_at_directory(action_backend.as_mut(), db.as_ref(), &mutation, directory)
+            } else {
+                run_spawn_with_backend(action_backend.as_mut(), db.as_ref(), &mutation)
+            }
         }
     }
 }

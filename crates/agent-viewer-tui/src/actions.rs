@@ -75,10 +75,13 @@ pub(crate) fn ensure_completions(ui: &mut Ui) {
     if !ui.composer.text().starts_with('/') {
         return;
     }
-    let target = ui.app.spawn_target();
-    let key = (ui.composer.backend(), target.clone());
+    let directory = ui
+        .app
+        .spawn_target()
+        .map(|target| target.displayed_directory().to_path_buf());
+    let key = (ui.composer.backend(), directory);
     if ui.composer.commands_key() != Some(&key) {
-        let cmds = scan_commands(key.0, target.as_deref());
+        let cmds = scan_commands(key.0, key.1.as_deref());
         ui.composer.set_commands(cmds, key);
     }
 }

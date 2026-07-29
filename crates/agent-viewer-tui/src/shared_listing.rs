@@ -247,6 +247,34 @@ impl From<&Session> for TargetRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnDirectoryMode {
+    WorkingDirectory,
+    ProjectRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SpawnTarget {
+    Session {
+        request: TargetRequest,
+        mode: SpawnDirectoryMode,
+        displayed_directory: std::path::PathBuf,
+    },
+    ExplicitDirectory(std::path::PathBuf),
+}
+
+impl SpawnTarget {
+    pub fn displayed_directory(&self) -> &std::path::Path {
+        match self {
+            Self::Session {
+                displayed_directory,
+                ..
+            }
+            | Self::ExplicitDirectory(displayed_directory) => displayed_directory,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetResolution {
     Permitted,
