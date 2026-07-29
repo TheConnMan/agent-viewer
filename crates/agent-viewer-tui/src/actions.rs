@@ -287,6 +287,7 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
 ) -> io::Result<bool> {
     let AttachPlan { session, command } = plan;
     let key: Key = (session.backend, session.id.clone());
+    let capture_on_attach = matches!(session.backend, BackendKind::Codex | BackendKind::Claude);
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -326,8 +327,9 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     ui.focused = Some(key);
     ui.focused_session = Some(session);
     ui.mode = Mode::Attached;
-    // Selection comes first after attach, so the terminal can copy transcript text directly.
-    set_mouse_capture(ui, false);
+    // Codex and Claude scroll immediately. External opencode keeps host text selection until
+    // Ctrl+T opts into native wheel forwarding.
+    set_mouse_capture(ui, capture_on_attach);
     Ok(true)
 }
 

@@ -184,10 +184,12 @@ its SQLite title still shows the prompt.
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `Ctrl+T` — toggle mouse reporting. The list starts with capture on for left click activation,
-  hover row selection, and wheel scrolling. A successful attach starts with capture off, so the
-  transcript is immediately selectable in the host terminal. While attached, press `Ctrl+T` to
-  enable capture for Codex retained transcript scrolling or Claude and external opencode wheel
-  forwarding. Detaching restores list mouse controls. A footer notice names the mode.
+  hover row selection, and wheel scrolling. Every successful Codex or Claude attach or reattach
+  starts with capture on, so scrolling works immediately. While attached, press `Ctrl+T` to
+  switch capture off for host terminal text selection, then press it again to restore scrolling.
+  External opencode attaches with capture off for selection; press `Ctrl+T` to opt into its native
+  wheel forwarding. Detaching restores list mouse controls. A footer notice names the mode and
+  the way back.
 - `?` — key help.
 - `Ctrl+C` — quit.
 
@@ -211,10 +213,9 @@ explicit indexed and RGB child colors are preserved. The built in terminal match
 uses the captured host foreground and background. Because attached PTYs are reused, changing
 the theme then reentering a retained session refreshes its default foreground and background
 without restarting the child.
-Codex, Claude, and external opencode attached transcripts are immediately selectable in the host
-terminal. While attached, press `Ctrl+T` to enable capture for session scrolling. Codex scrolls
-the viewer's retained transcript, while Claude and external opencode sessions receive the wheel
-in their attached terminal. Detaching restores the list mouse controls.
+Codex and Claude attached transcripts scroll immediately: Codex scrolls the viewer's retained
+transcript, while Claude receives the wheel in its attached terminal. Their capture behavior and
+external opencode selection behavior follow the `Ctrl+T` controls above.
 
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new

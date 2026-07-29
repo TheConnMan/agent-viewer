@@ -316,10 +316,13 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     ui.mouse_capture = on;
     ui.mouse_press = None;
     ui.set_notice(
-        if on {
-            "mouse on - click/hover selects, wheel scrolls (ctrl+t to select text)"
-        } else {
-            "mouse off - drag to select and copy (ctrl+t to restore mouse)"
+        match (&ui.mode, on) {
+            (Mode::Attached, true) => "mouse on: wheel scrolls (ctrl+t to select text)",
+            (Mode::Attached, false) => {
+                "mouse off: drag to select and copy (ctrl+t to restore scrolling)"
+            }
+            (_, true) => "mouse on: click/hover selects, wheel scrolls (ctrl+t to select text)",
+            (_, false) => "mouse off: drag to select and copy (ctrl+t to restore list mouse)",
         }
         .to_string(),
     );
@@ -1105,6 +1108,7 @@ pub(crate) mod tests {
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
         handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
         handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette,
+        set_mouse_capture,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
@@ -1565,7 +1569,29 @@ pub(crate) mod tests {
             _session: &Session,
         ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
             let mut command = std::process::Command::new("sh");
-            command.args(["-c", "sleep 30"]);
+            let script = match self.0 {
+                BackendKind::Codex => concat!(
+                    "index=0; ",
+                    "while [ \"$index\" -lt 40 ]; do ",
+                    "printf 'codex-history-%02d\\r\\n' \"$index\"; ",
+                    "index=$((index + 1)); ",
+                    "done; ",
+                    "printf 'READY'; ",
+                    "sleep 30"
+                ),
+                BackendKind::Claude | BackendKind::Opencode => concat!(
+                    "stty raw -echo; ",
+                    "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
+                    "index=1; ",
+                    "while [ \"$index\" -le 2 ]; do ",
+                    "bytes=$(dd bs=1 count=10 2>/dev/null | od -An -tx1); ",
+                    "printf 'WHEEL-%s:%s\\r\\n' \"$index\" \"$bytes\"; ",
+                    "index=$((index + 1)); ",
+                    "done; ",
+                    "sleep 30"
+                ),
+            };
+            command.args(["-c", script]);
             Ok(command)
         }
     }
@@ -2308,7 +2334,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn set_mouse_capture_flips_state_and_names_the_way_back() {
+    fn set_mouse_capture_names_controls_for_the_active_surface() {
         use super::apply_mouse_capture_state as set_capture;
         let mut ui = test_ui_with(Vec::new());
         assert!(ui.mouse_capture, "capture starts on");
@@ -2333,10 +2359,29 @@ pub(crate) mod tests {
             on.contains("ctrl+t"),
             "notice must name the way back: {on:?}"
         );
+
+        ui.mode = Mode::Attached;
+        set_capture(&mut ui, true);
+        let attached_on = ui.notice.text().to_string();
+        assert!(
+            attached_on.contains("wheel scrolls"),
+            "notice was {attached_on:?}"
+        );
+        assert!(
+            !attached_on.contains("click/hover"),
+            "attached notice must not promise list selection: {attached_on:?}"
+        );
+
+        set_capture(&mut ui, false);
+        let attached_off = ui.notice.text().to_string();
+        assert!(
+            attached_off.contains("restore scrolling"),
+            "notice was {attached_off:?}"
+        );
     }
 
     #[test]
-    fn every_attachable_backend_releases_mouse_capture_after_attach() {
+    fn attach_capture_defaults_are_backend_specific() {
         let mut capture_states = Vec::new();
         for backend in [
             BackendKind::Codex,
@@ -2349,6 +2394,7 @@ pub(crate) mod tests {
             // attach success transition after its command is accepted.
             session.short_id = Some("short".to_string());
             let mut ui = test_ui_with(vec![session]);
+            ui.mouse_capture = backend == BackendKind::Opencode;
             select_session_row(&mut ui, "shared-attach");
             ui.attach_executor = std::sync::Arc::new(move |request| {
                 let mut authority = AnyAttachingBackend(backend);
@@ -2382,11 +2428,11 @@ pub(crate) mod tests {
         assert_eq!(
             capture_states,
             vec![
-                (BackendKind::Codex, false),
-                (BackendKind::Claude, false),
+                (BackendKind::Codex, true),
+                (BackendKind::Claude, true),
                 (BackendKind::Opencode, false),
             ],
-            "attaching must hand mouse input back to the terminal for transcript selection"
+            "attach capture defaults must match each backend"
         );
     }
 
@@ -3373,7 +3419,163 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn external_opencode_wheel_reaches_the_child_after_ctrl_t_opt_in() {
+    fn codex_and_claude_scroll_immediately_after_attach_without_ctrl_t() {
+        for backend in [BackendKind::Codex, BackendKind::Claude] {
+            let id = "shared-attach";
+            let mut session = sess(id, "/tmp/agentviewer-immediate-scroll", 100);
+            session.backend = backend;
+            session.short_id = Some("short".to_string());
+            let key = (backend, id.to_string());
+            let mut ui = test_ui_with(vec![session]);
+            ui.mouse_capture = false;
+            select_session_row(&mut ui, id);
+            ui.attach_executor = std::sync::Arc::new(move |request| {
+                let mut authority = AnyAttachingBackend(backend);
+                crate::ops::resolve_attach_with_backend(&mut authority, request)
+            });
+            let mut terminal = test_terminal();
+
+            assert!(crate::actions::attach_selected(&mut ui));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let plan = loop {
+                if let Some(result) = ui.attaches.poll() {
+                    break result.expect("resolve selected session");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "selected attach did not resolve"
+                );
+                std::thread::yield_now();
+            };
+            assert!(
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                    .expect("install selected session")
+            );
+            assert!(matches!(ui.mode, Mode::Attached));
+            assert!(
+                ui.mouse_capture,
+                "{backend:?} attach must restore capture from selection mode"
+            );
+            let child_pid = ui
+                .attached
+                .get(&key)
+                .expect("attached child")
+                .pid()
+                .expect("attached child pid");
+
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+            match backend {
+                BackendKind::Codex => {
+                    wait_for_pty_screen(&ui, &key, "READY");
+                    let live_frame = render_attached_frame(&ui, &key, &mut terminal);
+
+                    handle_mouse_event(
+                        mouse(MouseEventKind::ScrollUp, 5, 5),
+                        &backends,
+                        &mut ui,
+                        &mut terminal,
+                    )
+                    .expect("scroll Codex immediately after attach");
+
+                    let offset = ui
+                        .attached
+                        .get(&key)
+                        .expect("Codex child")
+                        .with_screen(|screen| screen.scrollback());
+                    let historical_frame = render_attached_frame(&ui, &key, &mut terminal);
+                    assert_eq!(offset, ATTACHED_CODEX_WHEEL_ROWS);
+                    assert_ne!(
+                        historical_frame, live_frame,
+                        "Codex wheel input must render historical output immediately after attach"
+                    );
+                    ui.attached
+                        .get_mut(&key)
+                        .expect("Codex child")
+                        .scroll_viewport_down(usize::MAX);
+                }
+                BackendKind::Claude => {
+                    wait_for_pty_screen(&ui, &key, "READY");
+
+                    handle_mouse_event(
+                        mouse(MouseEventKind::ScrollUp, 5, 5),
+                        &backends,
+                        &mut ui,
+                        &mut terminal,
+                    )
+                    .expect("forward Claude wheel immediately after attach");
+
+                    wait_for_pty_screen(&ui, &key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
+                }
+                BackendKind::Opencode => unreachable!("only attached scroll backends"),
+            }
+
+            set_mouse_capture(&mut ui, false);
+            assert!(!ui.mouse_capture, "selection mode must release capture");
+            assert!(crate::actions::attach_selected(&mut ui));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let plan = loop {
+                if let Some(result) = ui.attaches.poll() {
+                    break result.expect("resolve retained session");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "retained attach did not resolve"
+                );
+                std::thread::yield_now();
+            };
+            assert!(
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                    .expect("install retained session")
+            );
+            assert!(
+                ui.mouse_capture,
+                "{backend:?} reattach must restore capture from selection mode"
+            );
+            assert_eq!(
+                ui.attached.get(&key).expect("retained child").pid(),
+                Some(child_pid),
+                "reattach must retain the existing PTY child"
+            );
+
+            match backend {
+                BackendKind::Codex => {
+                    let live_frame = render_attached_frame(&ui, &key, &mut terminal);
+                    handle_mouse_event(
+                        mouse(MouseEventKind::ScrollUp, 5, 5),
+                        &backends,
+                        &mut ui,
+                        &mut terminal,
+                    )
+                    .expect("scroll retained Codex session");
+                    let offset = ui
+                        .attached
+                        .get(&key)
+                        .expect("retained Codex child")
+                        .with_screen(|screen| screen.scrollback());
+                    let historical_frame = render_attached_frame(&ui, &key, &mut terminal);
+                    assert_eq!(offset, ATTACHED_CODEX_WHEEL_ROWS);
+                    assert_ne!(
+                        historical_frame, live_frame,
+                        "retained Codex wheel input must render historical output"
+                    );
+                }
+                BackendKind::Claude => {
+                    handle_mouse_event(
+                        mouse(MouseEventKind::ScrollUp, 5, 5),
+                        &backends,
+                        &mut ui,
+                        &mut terminal,
+                    )
+                    .expect("forward retained Claude wheel");
+                    wait_for_pty_screen(&ui, &key, "WHEEL-2: 1b 5b 3c 36 34 3b 36 3b 35 4d");
+                }
+                BackendKind::Opencode => unreachable!("only attached scroll backends"),
+            }
+        }
+    }
+
+    #[test]
+    fn external_opencode_ctrl_t_opts_into_wheel_forwarding() {
         let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
         session.backend = BackendKind::Opencode;
         let session_key = (BackendKind::Opencode, session.id.clone());
@@ -3406,7 +3608,7 @@ pub(crate) mod tests {
         assert!(matches!(ui.mode, Mode::Attached));
         assert!(
             !ui.mouse_capture,
-            "attached transcripts must release capture for native terminal selection"
+            "external opencode must keep host text selection after attach"
         );
 
         let (_snapshot_tx, snapshots) = std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
@@ -3425,13 +3627,9 @@ pub(crate) mod tests {
         );
         assert!(
             ui.mouse_capture,
-            "Ctrl+T must opt into mouse capture before forwarding attached wheel input"
+            "Ctrl+T must opt into external opencode wheel forwarding"
         );
 
-        // Replace the inert fake attach command with a raw child that advertises SGR mouse
-        // tracking and prints the exact bytes it receives.
-        ui.attached
-            .insert(session_key.clone(), mouse_scroll_forwarding_pty());
         wait_for_pty_screen(&ui, &session_key, "READY");
 
         handle_mouse_event(
@@ -3443,7 +3641,7 @@ pub(crate) mod tests {
         .expect("forward attached wheel event");
 
         // The child must receive SGR wheel-up (button 64), not ESC [ A prompt-history input.
-        wait_for_pty_screen(&ui, &session_key, "1b 5b 3c 36 34 3b 36 3b 35 4d");
+        wait_for_pty_screen(&ui, &session_key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
         assert!(matches!(ui.mode, Mode::Attached));
     }
 
