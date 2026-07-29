@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use agent_viewer_core::{
     AttachRefusal, Backend, BackendKind, Capabilities, Error, ListingCacheScope, Session,
-    SessionOrigin, SpawnResult, Status, ViewerDb,
+    SessionOrigin, SpawnResult, Status, ViewerDb, spawn::now_ms, state::LISTING_CACHE_FRESHNESS_MS,
 };
 use agent_viewer_tui::shared_listing::{
     RefreshCursor, RefreshOutcome, TargetRequest, TargetResolution, authoritative_target,
@@ -20,6 +20,7 @@ struct CountedBackend {
     scope: ListingCacheScope,
     listing: Listing,
     calls: usize,
+    delay: std::time::Duration,
 }
 
 impl CountedBackend {
@@ -29,6 +30,7 @@ impl CountedBackend {
             scope: scope.clone(),
             listing: Listing::Sessions(sessions),
             calls: 0,
+            delay: std::time::Duration::ZERO,
         }
     }
 
@@ -38,6 +40,7 @@ impl CountedBackend {
             scope: scope.clone(),
             listing: Listing::Error(message.to_string()),
             calls: 0,
+            delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -57,6 +60,7 @@ impl Backend for CountedBackend {
 
     fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
         self.calls += 1;
+        std::thread::sleep(self.delay);
         match &self.listing {
             Listing::Sessions(sessions) => Ok(sessions.clone()),
             Listing::Error(message) => Err(Error::Command(message.clone())),
@@ -225,6 +229,42 @@ fn expired_snapshot_lists_once_then_the_other_viewer_uses_the_publication() {
     );
     assert_eq!(first_backend.calls, 1);
     assert_eq!(second_backend.calls, 1);
+}
+
+#[test]
+fn source_completion_time_keeps_a_delayed_publication_fresh_for_another_viewer() {
+    let (_directory, first, second) = open_viewers();
+    let scope = scope(BackendKind::Codex);
+    let expected = session(BackendKind::Codex, "thread_123", Some(101), false);
+    let mut publisher =
+        CountedBackend::sessions(BackendKind::Codex, &scope, vec![expected.clone()]);
+    publisher.delay = std::time::Duration::from_millis(LISTING_CACHE_FRESHNESS_MS as u64);
+    let mut follower = CountedBackend::sessions(BackendKind::Codex, &scope, Vec::new());
+    let mut publisher_cursor = RefreshCursor::default();
+    let mut follower_cursor = RefreshCursor::default();
+    let refresh_started_at = now_ms();
+
+    let published = refresh_backend(
+        Some(&first),
+        &mut publisher,
+        &[],
+        &mut publisher_cursor,
+        refresh_started_at,
+    );
+    let shared = refresh_backend(
+        Some(&second),
+        &mut follower,
+        &[],
+        &mut follower_cursor,
+        now_ms(),
+    );
+
+    assert!(
+        matches!(published, RefreshOutcome::Authoritative { sessions } if sessions == vec![expected.clone()])
+    );
+    assert_eq!(publisher.calls, 1);
+    assert_eq!(follower.calls, 0);
+    assert!(matches!(shared, RefreshOutcome::Shared { sessions } if sessions == vec![expected]));
 }
 
 #[test]

@@ -129,18 +129,25 @@ where
                     );
                 }
             };
-            let outcome = match source() {
+            let source_started = std::time::Instant::now();
+            let source_result = source();
+            let source_completed_at_ms = now_ms.saturating_add(
+                i64::try_from(source_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            );
+            let outcome = match source_result {
                 Ok(sessions) => {
                     match ListingCacheSnapshot::from_sessions(sessions.clone()) {
-                        Ok(snapshot) => match db.publish_listing(&lease, snapshot, now_ms) {
-                            Ok(agent_viewer_core::ListingCacheWrite::Published) => {
-                                cursor.published_generation =
-                                    Some(lease.next_published_generation());
+                        Ok(snapshot) => {
+                            match db.publish_listing(&lease, snapshot, source_completed_at_ms) {
+                                Ok(agent_viewer_core::ListingCacheWrite::Published) => {
+                                    cursor.published_generation =
+                                        Some(lease.next_published_generation());
+                                }
+                                Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
+                                    cursor.published_generation = None;
+                                }
                             }
-                            Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
-                                cursor.published_generation = None;
-                            }
-                        },
+                        }
                         Err(_) => {
                             cursor.published_generation = None;
                             let _ = db.fail_listing_refresh(&lease);

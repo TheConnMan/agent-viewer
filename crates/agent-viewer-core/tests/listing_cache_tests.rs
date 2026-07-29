@@ -8,6 +8,8 @@ use agent_viewer_core::{
 };
 use rusqlite::{Connection, params};
 #[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
 use std::{net::SocketAddr, sync::Arc};
 use std::{
     path::{Path, PathBuf},
@@ -109,7 +111,11 @@ fn stored_lease(path: &Path, scope: &ListingCacheScope) -> (i64, Option<String>,
 }
 
 #[cfg(target_os = "linux")]
-fn secure_runtime(root: &Path, candidates: [SocketAddr; 2], password: &str) -> OpencodeRuntime {
+fn secure_runtime(
+    root: &Path,
+    candidates: [SocketAddr; 2],
+    password_override: Option<&str>,
+) -> OpencodeRuntime {
     OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
         candidates,
         startup_timeout: Duration::from_millis(20),
@@ -117,9 +123,23 @@ fn secure_runtime(root: &Path, candidates: [SocketAddr; 2], password: &str) -> O
         launcher: Arc::new(|_| Ok(42_424)),
         viewer_db_path: root.join("viewer.sqlite"),
         proc_root: root.join("proc"),
-        password_override: Some(password.to_string()),
+        password_override: password_override.map(str::to_string),
         before_authorized_write: None,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn credential_fingerprint(username: &str, password: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [username.as_bytes(), password.as_bytes()] {
+        hasher.update(
+            u64::try_from(value.len())
+                .expect("credential length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(value);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(target_os = "linux")]
@@ -195,67 +215,51 @@ fn backend_advertised_scopes_change_with_compatibility_namespace_fields() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn secure_opencode_scope_uses_credential_identity_and_source_namespace() {
+fn default_secure_opencode_scope_is_stable_and_excludes_credential_material() {
     let root = tempfile::tempdir().expect("OpenCode runtime directory");
-    let db_a = root.path().join("opencode a.sqlite");
-    let db_b = root.path().join("opencode b.sqlite");
-    let ordered = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
-    let reversed = [ordered[1], ordered[0]];
+    let db = root.path().join("opencode.sqlite");
+    let viewer_db = root.path().join("viewer.sqlite");
+    let candidates = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
     let first = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), ordered, "first private credential"),
+        db.clone(),
+        secure_runtime(root.path(), candidates, None),
     );
     let same = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), ordered, "first private credential"),
+        db.clone(),
+        secure_runtime(root.path(), candidates, None),
     );
-    let different_credential = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), ordered, "second private credential"),
-    );
-    let different_order = OpencodeBackend::with_db_and_runtime(
-        db_a.clone(),
-        secure_runtime(root.path(), reversed, "first private credential"),
-    );
-    let different_db = OpencodeBackend::with_db_and_runtime(
-        db_b,
-        secure_runtime(root.path(), ordered, "first private credential"),
-    );
+    let first_scope = advertised_scope(&first);
+    let managed_password = ViewerDb::open(&viewer_db)
+        .expect("viewer database")
+        .opencode_server_secret()
+        .expect("managed server credential");
 
-    assert_eq!(advertised_scope(&first), advertised_scope(&same));
-    assert_ne!(
-        advertised_scope(&first),
-        advertised_scope(&different_credential)
+    assert_eq!(first_scope, advertised_scope(&same));
+    assert!(!first_scope.as_str().contains(&managed_password));
+    assert!(
+        !first_scope
+            .as_str()
+            .contains(&credential_fingerprint("agent-viewer", &managed_password))
     );
-    assert_ne!(advertised_scope(&first), advertised_scope(&different_order));
-    assert_ne!(advertised_scope(&first), advertised_scope(&different_db));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn secure_opencode_scope_hides_credentials_and_differs_from_compatibility() {
+fn configured_opencode_password_bypasses_shared_listing_cache() {
     let root = tempfile::tempdir().expect("OpenCode runtime directory");
     let db = root.path().join("opencode.sqlite");
     let candidates = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
-    let first_credential = "first private credential";
-    let second_credential = "second private credential";
-    let secure = OpencodeBackend::with_db_and_runtime(
+    let first = OpencodeBackend::with_db_and_runtime(
         db.clone(),
-        secure_runtime(root.path(), candidates, first_credential),
+        secure_runtime(root.path(), candidates, Some("first private credential")),
     );
-    let other = OpencodeBackend::with_db_and_runtime(
-        db.clone(),
-        secure_runtime(root.path(), candidates, second_credential),
+    let second = OpencodeBackend::with_db_and_runtime(
+        db,
+        secure_runtime(root.path(), candidates, Some("second private credential")),
     );
-    let compatibility = OpencodeBackend::with_db(db);
-    let secure_scope = advertised_scope(&secure);
-    let other_scope = advertised_scope(&other);
 
-    for scope in [&secure_scope, &other_scope] {
-        assert!(!scope.as_str().contains(first_credential));
-        assert!(!scope.as_str().contains(second_credential));
-    }
-    assert_ne!(secure_scope, advertised_scope(&compatibility));
+    assert!(first.listing_scope().is_none());
+    assert!(second.listing_scope().is_none());
 }
 
 #[test]

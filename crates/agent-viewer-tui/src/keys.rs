@@ -48,7 +48,7 @@ pub(crate) struct MousePress {
 /// Returns `true` when the app should quit.
 pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     key: KeyEvent,
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
     terminal: &mut ratatui::Terminal<B>,
@@ -204,7 +204,7 @@ fn mouse_target(ui: &Ui, index: usize) -> Option<MouseTarget> {
 
 pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
     me: MouseEvent,
-    _backends: &mut [Box<dyn Backend>],
+    _backends: &[Box<dyn Backend>],
     ui: &mut Ui,
     _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
@@ -352,7 +352,7 @@ fn is_quit_chord(key: KeyEvent, ctrl: bool, mode: &Mode) -> bool {
 fn handle_normal_key<B: ratatui::backend::Backend>(
     key: KeyEvent,
     ctrl: bool,
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
     _terminal: &mut ratatui::Terminal<B>,
@@ -782,7 +782,7 @@ fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn B
 
 fn handle_palette_key<B: ratatui::backend::Backend>(
     key: KeyEvent,
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     ui: &mut Ui,
     terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
@@ -874,7 +874,7 @@ fn execute_cached_palette_action(
 }
 
 fn execute_palette_selection<B: ratatui::backend::Backend>(
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     ui: &mut Ui,
     _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
@@ -1124,7 +1124,7 @@ pub(crate) mod tests {
 
     fn press_normal_key(
         ui: &mut Ui,
-        backends: &mut [Box<dyn agent_viewer_core::Backend>],
+        backends: &[Box<dyn agent_viewer_core::Backend>],
         c: char,
         modifiers: KeyModifiers,
     ) -> bool {
@@ -1133,7 +1133,7 @@ pub(crate) mod tests {
 
     fn press_normal_code(
         ui: &mut Ui,
-        backends: &mut [Box<dyn agent_viewer_core::Backend>],
+        backends: &[Box<dyn agent_viewer_core::Backend>],
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> bool {
@@ -2104,17 +2104,12 @@ pub(crate) mod tests {
         ui.composer.push_str("draft stays");
         let selected = ui.app.selected_index();
 
-        assert!(!press_normal_key(
-            &mut ui,
-            &mut [],
-            'k',
-            KeyModifiers::CONTROL
-        ));
+        assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
         assert!(matches!(ui.mode, Mode::Palette(_)));
         let mut terminal = test_terminal();
         handle_palette_key(
             key(KeyCode::Esc, KeyModifiers::NONE),
-            &mut [],
+            &[],
             &mut ui,
             &mut terminal,
         )
@@ -2133,17 +2128,12 @@ pub(crate) mod tests {
             100,
         )]);
         select_session_row(&mut ui, "external");
-        assert!(!press_normal_key(
-            &mut ui,
-            &mut [],
-            'k',
-            KeyModifiers::CONTROL
-        ));
+        assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
         let mut terminal = test_terminal();
         for character in "arch".chars() {
             handle_palette_key(
                 key(KeyCode::Char(character), KeyModifiers::NONE),
-                &mut [],
+                &[],
                 &mut ui,
                 &mut terminal,
             )
@@ -2151,7 +2141,7 @@ pub(crate) mod tests {
         }
         handle_palette_key(
             key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut [],
+            &[],
             &mut ui,
             &mut terminal,
         )
@@ -2179,7 +2169,7 @@ pub(crate) mod tests {
         for character in "opus".chars() {
             handle_palette_key(
                 key(KeyCode::Char(character), KeyModifiers::NONE),
-                &mut [],
+                &[],
                 &mut ui,
                 &mut terminal,
             )
@@ -2187,7 +2177,7 @@ pub(crate) mod tests {
         }
         handle_palette_key(
             key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut [],
+            &[],
             &mut ui,
             &mut terminal,
         )
@@ -2209,7 +2199,7 @@ pub(crate) mod tests {
         for character in "turbine".chars() {
             handle_palette_key(
                 key(KeyCode::Char(character), KeyModifiers::NONE),
-                &mut [],
+                &[],
                 &mut ui,
                 &mut terminal,
             )
@@ -2217,7 +2207,7 @@ pub(crate) mod tests {
         }
         handle_palette_key(
             key(KeyCode::Enter, KeyModifiers::NONE),
-            &mut [],
+            &[],
             &mut ui,
             &mut terminal,
         )
@@ -2234,10 +2224,10 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(Vec::new());
         let start = ui.sprite;
 
-        press_normal_key(&mut ui, &mut [], 'g', KeyModifiers::CONTROL);
+        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
         assert_eq!(ui.sprite, start.next());
 
-        press_normal_key(&mut ui, &mut [], 'g', KeyModifiers::CONTROL);
+        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
         assert_eq!(ui.sprite, start.next().next());
         assert_ne!(ui.sprite, start);
         assert!(ui.notice.text().contains(ui.sprite.name()));
@@ -2445,8 +2435,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
         // The wheel walks the selection and needs no drawn geometry, unlike a click.
         let wheel = MouseEvent {
@@ -2459,7 +2448,7 @@ pub(crate) mod tests {
         // Capture on: the wheel walks the selection down one row.
         let start = ui.app.selected_index();
         ui.mouse_capture = true;
-        handle_mouse_event(wheel, &mut backends, &mut ui, &mut terminal).expect("wheel event");
+        handle_mouse_event(wheel, &backends, &mut ui, &mut terminal).expect("wheel event");
         let moved = ui.app.selected_index();
         assert_ne!(
             moved, start,
@@ -2472,7 +2461,7 @@ pub(crate) mod tests {
         // terminal owns the mouse, a stray report must not steer the selection.
         let before = ui.app.selected_index();
         ui.mouse_capture = false;
-        handle_mouse_event(wheel, &mut backends, &mut ui, &mut terminal).expect("wheel event");
+        handle_mouse_event(wheel, &backends, &mut ui, &mut terminal).expect("wheel event");
         assert_eq!(
             ui.app.selected_index(),
             before,
@@ -2493,7 +2482,7 @@ pub(crate) mod tests {
             100,
         )]);
         ui.db = Some(ViewerDb::open(&temp.path().join("viewer.db")).expect("viewer db"));
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
 
         let (header_idx, group_key) = ui
@@ -2510,7 +2499,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2530,7 +2519,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2556,7 +2545,7 @@ pub(crate) mod tests {
         let (x, y) = point_for_visible_row(&ui, &mut terminal, header_idx);
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2575,7 +2564,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2606,7 +2595,7 @@ pub(crate) mod tests {
         ui.app.toggle_group_mode();
         assert_eq!(ui.app.group_mode(), GroupMode::ByState);
         ui.db = Some(ViewerDb::open(&temp.path().join("viewer.db")).expect("viewer db"));
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
         let group_key = GroupKey::State(Section::Done);
         let header_idx = ui
@@ -2627,7 +2616,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2647,7 +2636,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2675,8 +2664,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         ui.attach_executor = std::sync::Arc::new(|request| {
             let mut authority = AttachingBackend;
             crate::ops::resolve_attach_with_backend(&mut authority, request)
@@ -2687,7 +2675,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2707,7 +2695,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2757,8 +2745,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         ui.attach_executor = std::sync::Arc::new(|request| {
             let mut authority = AttachingBackend;
             crate::ops::resolve_attach_with_backend(&mut authority, request)
@@ -2768,7 +2755,7 @@ pub(crate) mod tests {
         let (x, y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2816,7 +2803,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2869,14 +2856,13 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
         let pressed_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2907,7 +2893,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2931,8 +2917,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
         let target_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
@@ -2940,7 +2925,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2965,8 +2950,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
         let pressed_idx = visible_session_index(&ui, "b");
         let released_idx = visible_session_index(&ui, "a");
@@ -2975,7 +2959,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), down_x, down_y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -2987,7 +2971,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), up_x, up_y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3012,8 +2996,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let mut terminal = test_terminal();
         let target_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
@@ -3021,14 +3004,14 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), u16::MAX, u16::MAX),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
         .expect("off list button down");
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3050,8 +3033,7 @@ pub(crate) mod tests {
             session.backend = BackendKind::Opencode;
         }
         let mut ui = test_ui_with(sessions);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         ui.attach_executor = std::sync::Arc::new(|request| {
             let mut authority = AttachingBackend;
             crate::ops::resolve_attach_with_backend(&mut authority, request)
@@ -3062,7 +3044,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3075,7 +3057,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3150,8 +3132,7 @@ pub(crate) mod tests {
 
     #[test]
     fn right_and_middle_clicks_do_not_activate() {
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
 
         for button in [MouseButton::Right, MouseButton::Middle] {
             let mut session = sess("a", "/tmp/agentviewer-mouse-other-button", 100);
@@ -3163,14 +3144,14 @@ pub(crate) mod tests {
 
             handle_mouse_event(
                 mouse(MouseEventKind::Down(button), x, y),
-                &mut backends,
+                &backends,
                 &mut ui,
                 &mut terminal,
             )
             .expect("nonleft click");
             handle_mouse_event(
                 mouse(MouseEventKind::Up(button), x, y),
-                &mut backends,
+                &backends,
                 &mut ui,
                 &mut terminal,
             )
@@ -3186,8 +3167,7 @@ pub(crate) mod tests {
     fn mouse_click_is_inert_in_every_modal_mode() {
         use agent_viewer_tui::ui::{RenameModal, ReplyModal};
 
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AttachingBackend)];
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
         let modes = [
             Mode::Filter,
             Mode::Help,
@@ -3218,7 +3198,7 @@ pub(crate) mod tests {
 
             handle_mouse_event(
                 mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-                &mut backends,
+                &backends,
                 &mut ui,
                 &mut terminal,
             )
@@ -3230,7 +3210,7 @@ pub(crate) mod tests {
             ui.mode = mode;
             handle_mouse_event(
                 mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-                &mut backends,
+                &backends,
                 &mut ui,
                 &mut terminal,
             )
@@ -3241,7 +3221,7 @@ pub(crate) mod tests {
             );
             handle_mouse_event(
                 mouse(MouseEventKind::Up(MouseButton::Left), x, y),
-                &mut backends,
+                &backends,
                 &mut ui,
                 &mut terminal,
             )
@@ -3266,12 +3246,12 @@ pub(crate) mod tests {
         ui.focused = Some(key.clone());
         ui.mode = Mode::Attached;
         wait_for_pty_screen(&ui, &key, "READY");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3294,12 +3274,12 @@ pub(crate) mod tests {
             .get(&key)
             .expect("codex child")
             .with_screen(|screen| screen.contents());
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
 
         handle_mouse_event(
             mouse(MouseEventKind::ScrollUp, 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3318,7 +3298,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3344,7 +3324,7 @@ pub(crate) mod tests {
         ui.focused_session = Some(focused_session);
         ui.mode = Mode::Attached;
         wait_for_pty_screen(&ui, &key, "READY");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
 
         let live_frame = render_attached_frame(&ui, &key, &mut terminal);
@@ -3355,7 +3335,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::ScrollUp, 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3377,12 +3357,12 @@ pub(crate) mod tests {
         ui.focused = Some(key.clone());
         ui.mode = Mode::Attached;
         wait_for_pty_screen(&ui, &key, "READY");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         let mut terminal = test_terminal();
 
         handle_mouse_event(
             mouse(MouseEventKind::ScrollUp, 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3399,7 +3379,7 @@ pub(crate) mod tests {
         let session_key = (BackendKind::Opencode, session.id.clone());
         let mut ui = test_ui_with(vec![session]);
         select_session_row(&mut ui, "a");
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
             vec![Box::new(AnyAttachingBackend(BackendKind::Opencode))];
         ui.attach_executor = std::sync::Arc::new(|request| {
             let mut authority = AnyAttachingBackend(BackendKind::Opencode);
@@ -3435,7 +3415,7 @@ pub(crate) mod tests {
         assert!(
             !super::handle_key(
                 key(KeyCode::Char('t'), KeyModifiers::CONTROL),
-                &mut backends,
+                &backends,
                 &refresher,
                 &mut ui,
                 &mut terminal,
@@ -3456,7 +3436,7 @@ pub(crate) mod tests {
 
         handle_mouse_event(
             mouse(MouseEventKind::ScrollUp, 5, 5),
-            &mut backends,
+            &backends,
             &mut ui,
             &mut terminal,
         )
@@ -3563,7 +3543,7 @@ pub(crate) mod tests {
             select_session_row(&mut ui, "s1");
 
             assert!(
-                !press_normal_key(&mut ui, &mut [], c, KeyModifiers::NONE),
+                !press_normal_key(&mut ui, &[], c, KeyModifiers::NONE),
                 "{c:?} must not quit"
             );
             assert_eq!(ui.composer.text(), c.to_string(), "{c:?} must compose");
@@ -3586,7 +3566,7 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-help", 100)]);
         select_session_row(&mut ui, "s1");
 
-        assert!(!press_normal_key(&mut ui, &mut [], '?', KeyModifiers::NONE));
+        assert!(!press_normal_key(&mut ui, &[], '?', KeyModifiers::NONE));
         assert!(matches!(ui.mode, Mode::Help));
         assert!(ui.composer.is_empty(), "help must not become composer text");
     }
@@ -3598,7 +3578,7 @@ pub(crate) mod tests {
         let selected = ui.app.selected_index();
         let visible_rows = ui.app.visible().len();
 
-        assert!(!press_normal_key(&mut ui, &mut [], ' ', KeyModifiers::NONE));
+        assert!(!press_normal_key(&mut ui, &[], ' ', KeyModifiers::NONE));
         assert!(
             ui.composer.is_empty(),
             "space must not become composer text"
@@ -3618,7 +3598,7 @@ pub(crate) mod tests {
             .expect("project header present");
         assert!(ui.app.select_visible_index(header));
 
-        assert!(!press_normal_key(&mut ui, &mut [], ' ', KeyModifiers::NONE));
+        assert!(!press_normal_key(&mut ui, &[], ' ', KeyModifiers::NONE));
         assert!(matches!(
             ui.app.visible().get(ui.app.selected_index()),
             Some(agent_viewer_tui::app::Row::ProjectHeader {
@@ -3637,7 +3617,7 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-slash", 100)]);
         select_session_row(&mut ui, "s1");
 
-        assert!(!press_normal_key(&mut ui, &mut [], '/', KeyModifiers::NONE));
+        assert!(!press_normal_key(&mut ui, &[], '/', KeyModifiers::NONE));
         assert_eq!(ui.composer.text(), "/");
         assert!(matches!(ui.mode, Mode::Normal));
     }
@@ -3647,12 +3627,7 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(Vec::new());
 
         assert!(!ui.app.show_all());
-        assert!(!press_normal_key(
-            &mut ui,
-            &mut [],
-            'a',
-            KeyModifiers::CONTROL
-        ));
+        assert!(!press_normal_key(&mut ui, &[], 'a', KeyModifiers::CONTROL));
         assert!(ui.app.show_all());
         assert!(ui.composer.is_empty());
     }
@@ -3662,12 +3637,12 @@ pub(crate) mod tests {
         for (c, operation) in [('d', "hide"), ('u', "unhide")] {
             let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-archive", 100)]);
             select_session_row(&mut ui, "s1");
-            let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
                 vec![Box::new(ArchivingBackend)];
 
             assert!(!press_normal_key(
                 &mut ui,
-                &mut backends,
+                &backends,
                 c,
                 KeyModifiers::CONTROL
             ));
@@ -3736,14 +3711,14 @@ pub(crate) mod tests {
     #[test]
     fn tab_accepts_theme_suggestion_and_opens_picker() {
         let mut ui = test_ui_with(Vec::new());
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
 
         for character in "/th".chars() {
-            press_normal_key(&mut ui, &mut backends, character, KeyModifiers::NONE);
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
         }
         assert!(ui.composer.suggestions().contains(&"theme"));
 
-        press_normal_code(&mut ui, &mut backends, KeyCode::Tab, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Tab, KeyModifiers::NONE);
 
         assert!(ui.composer.is_theme_command());
         assert!(ui.themes.picker_open());
@@ -3759,15 +3734,15 @@ pub(crate) mod tests {
         persist_theme(&db, "amber").expect("seed theme");
         let mut ui = test_ui_with(Vec::new());
         ui.db = Some(db);
-        let mut backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
 
         for character in "/theme".chars() {
-            press_normal_key(&mut ui, &mut backends, character, KeyModifiers::NONE);
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
         }
         assert!(ui.themes.picker_open());
-        press_normal_code(&mut ui, &mut backends, KeyCode::Down, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(ui.themes.active().id, "terminal");
-        press_normal_code(&mut ui, &mut backends, KeyCode::Esc, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(ui.themes.active().id, "amber");
         assert_eq!(
             persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
@@ -3775,10 +3750,10 @@ pub(crate) mod tests {
         );
 
         for character in "/theme".chars() {
-            press_normal_key(&mut ui, &mut backends, character, KeyModifiers::NONE);
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
         }
-        press_normal_code(&mut ui, &mut backends, KeyCode::Down, KeyModifiers::NONE);
-        press_normal_code(&mut ui, &mut backends, KeyCode::Enter, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &backends, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(ui.themes.active().id, "terminal");
         assert_eq!(
             persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),

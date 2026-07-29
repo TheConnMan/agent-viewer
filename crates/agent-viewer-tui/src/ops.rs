@@ -8,7 +8,7 @@ use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
-use agent_viewer_core::{Session, SpawnResult, ViewerDb, default_codex_home};
+use agent_viewer_core::{Session, SpawnResult, Status, ViewerDb, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
 use agent_viewer_tui::shared_listing::{
@@ -23,7 +23,10 @@ pub(crate) struct AttachPlan {
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
 pub(crate) enum Mutation {
     Stop(TargetRequest),
-    Remove(TargetRequest),
+    Remove {
+        request: TargetRequest,
+        require_finished: bool,
+    },
     Rename(TargetRequest, String),
     Hide(TargetRequest),
     Unhide(TargetRequest),
@@ -167,11 +170,19 @@ fn run_remove(
     backend: &mut dyn Backend,
     db: Option<&ViewerDb>,
     request: &TargetRequest,
+    require_finished: bool,
 ) -> Result<MutationOutcome, String> {
     run_targeted(backend, db, request, |backend, session| {
         if !backend.capabilities_for(session).delete {
             return Err(format!(
                 "{} does not support remove",
+                session.backend.name()
+            ));
+        }
+        let freshly_active = matches!(session.status, Status::Working | Status::NeedsInput { .. });
+        if freshly_active || require_finished && !session.status.is_finished() {
+            return Err(format!(
+                "remove refused: {} session became active",
                 session.backend.name()
             ));
         }
@@ -279,10 +290,13 @@ pub(crate) fn run_mutation_with_opencode(
                     .map_err(|error| format!("stop failed: {error}"))
             })
         }
-        Mutation::Remove(request) => {
+        Mutation::Remove {
+            request,
+            require_finished,
+        } => {
             let mut backend = fresh_backend(request.backend(), &opencode_runtime);
             let db = ViewerDb::open_default().ok();
-            run_remove(backend.as_mut(), db.as_ref(), &request)
+            run_remove(backend.as_mut(), db.as_ref(), &request, require_finished)
         }
         Mutation::Rename(request, name) => {
             run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
@@ -706,6 +720,82 @@ mod tests {
         }
     }
 
+    struct RecordingRemoveBackend {
+        session: Session,
+        removed_ids: RefCell<Vec<String>>,
+    }
+
+    impl Backend for RecordingRemoveBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                delete: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.session.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by remove")
+        }
+
+        fn remove(&self, session: &Session) -> agent_viewer_core::Result<()> {
+            self.removed_ids.borrow_mut().push(session.id.clone());
+            Ok(())
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by remove")
+        }
+    }
+
+    #[test]
+    fn remove_refuses_a_session_that_became_active_after_a_removable_row_was_cached() {
+        for (cached_status, fresh_status, require_finished) in [
+            (Status::Done, Status::Working, true),
+            (Status::Done, Status::needs_input(), true),
+            (Status::Idle, Status::Working, false),
+            (Status::Idle, Status::needs_input(), false),
+            (Status::Unknown, Status::Working, false),
+            (Status::Unknown, Status::needs_input(), false),
+        ] {
+            let mut cached = session(BackendKind::Claude, "stale-status", false);
+            cached.status = cached_status;
+            let request = TargetRequest::from(&cached);
+            let mut fresh = cached;
+            fresh.status = fresh_status;
+            let mut backend = RecordingRemoveBackend {
+                session: fresh,
+                removed_ids: RefCell::new(Vec::new()),
+            };
+
+            let result = run_remove(&mut backend, None, &request, require_finished);
+
+            assert!(
+                result.is_err(),
+                "a fresh active session must refuse a remove requested from a stale removable row"
+            );
+            assert!(
+                backend.removed_ids.borrow().is_empty(),
+                "remove must not reach the backend for a freshly active session"
+            );
+        }
+    }
+
     // The defect: `remove` is advertised backend-wide for claude but gated per row on the
     // short id, so an interactive row passed the capability gate, got its process group
     // SIGTERMed, and only then was declined. The session died and stayed in the list.
@@ -716,7 +806,7 @@ mod tests {
         let request = TargetRequest::from(&session);
         let mut backend = RefusingRemoveBackend { session };
 
-        let result = run_remove(&mut backend, None, &request);
+        let result = run_remove(&mut backend, None, &request, false);
 
         // Give a stray SIGTERM time to land before asserting the process survived.
         std::thread::sleep(Duration::from_millis(250));
