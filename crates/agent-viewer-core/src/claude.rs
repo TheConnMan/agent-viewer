@@ -162,6 +162,14 @@ impl Backend for ClaudeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Claude
     }
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let key = crate::backend::listing_scope_key(&[
+            crate::backend::listing_scope_path(&self.jobs_root),
+            crate::backend::listing_scope_path(&self.sessions_root),
+            crate::backend::listing_scope_executable(&self.binary),
+        ]);
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
+    }
     fn capabilities(&self) -> Capabilities {
         // DELIBERATE DIVERGENCE from the capability table in
         // specs/001-fleet-view-unification/data-model.md, which marks claude `archive` and
