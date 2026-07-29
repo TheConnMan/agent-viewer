@@ -177,8 +177,8 @@ impl<W: io::Write> Drop for BracketedPasteGuard<W> {
     }
 }
 
-/// Apply a changed mouse-capture request once. Input handlers only update `Ui`, so unit tests
-/// never emit terminal control bytes; the live run loop calls this directly after each event.
+/// Apply a changed mouse capture request once. UI state changes never write terminal control
+/// bytes themselves, so the live loop calls this after events and completed attach plans.
 fn sync_mouse_capture<W: io::Write>(
     writer: &mut W,
     applied: &mut bool,
@@ -189,6 +189,19 @@ fn sync_mouse_capture<W: io::Write>(
         *applied = requested;
     }
     Ok(())
+}
+
+/// Install a completed attach plan and immediately apply its mouse capture request.
+fn install_completed_attach_plan<B: ratatui::backend::Backend, W: io::Write>(
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    plan: ops::AttachPlan,
+    writer: &mut W,
+    applied_mouse_capture: &mut bool,
+) -> io::Result<bool> {
+    let installed = actions::install_attach_plan(ui, terminal, plan)?;
+    sync_mouse_capture(writer, applied_mouse_capture, ui.mouse_capture)?;
+    Ok(installed)
 }
 
 /// Route one terminal event, then synchronize mouse reporting with the input handler's
@@ -625,9 +638,9 @@ fn main() -> io::Result<()> {
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
-    // Mouse capture powers click/hover row selection on the list. Attached transcripts turn it
-    // off so ordinary terminal drag-selection works, and every return to the list restores it.
-    // Ctrl+T remains the manual override. Starts on to match `ui.mouse_capture`.
+    // Mouse capture powers list selection and attached transcript scrolling for Codex and
+    // Claude. OpenCode attach turns it off for host terminal selection. Ctrl+T remains the
+    // manual override. Starts on to match `ui.mouse_capture`.
     let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let mut applied_mouse_capture = true;
     let result = {
@@ -693,7 +706,13 @@ fn run(
         while let Some(result) = ui.attaches.poll() {
             match result {
                 Ok(plan) => {
-                    actions::install_attach_plan(ui, terminal, plan)?;
+                    install_completed_attach_plan(
+                        ui,
+                        terminal,
+                        plan,
+                        &mut io::stdout(),
+                        applied_mouse_capture,
+                    )?;
                 }
                 Err(notice) => ui.set_notice(notice),
             }
@@ -1313,20 +1332,15 @@ mod tests {
 
     #[test]
     fn event_bridge_writes_mouse_sequences_for_attach_then_detach() {
-        let mut ui = test_ui(vec![session(
-            BackendKind::Opencode,
-            "attached",
-            1_000,
-            false,
-        )]);
+        let mut ui = test_ui(vec![session(BackendKind::Claude, "attached", 1_000, false)]);
         assert!(
             ui.app
-                .select_by_key(&(BackendKind::Opencode, "attached".to_string()))
+                .select_by_key(&(BackendKind::Claude, "attached".to_string()))
         );
         let current_model = ui.composer.model().to_string();
         ui.models
             .seed(BackendKind::Claude, vec![current_model], true);
-        let authority_session = session(BackendKind::Opencode, "attached", 1_000, false);
+        let authority_session = session(BackendKind::Claude, "attached", 1_000, false);
         ui.attach_executor = Arc::new(move |request| {
             let mut authority = AttachingBackend {
                 session: authority_session.clone(),
@@ -1334,7 +1348,7 @@ mod tests {
             ops::resolve_attach_with_backend(&mut authority, request)
         });
         let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
-            session: session(BackendKind::Opencode, "attached", 1_000, false),
+            session: session(BackendKind::Claude, "attached", 1_000, false),
         })];
         let (_snapshots_tx, snapshots) = channel();
         let (wake, _wake_rx) = channel();
@@ -1342,7 +1356,8 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
             .expect("test terminal");
         let mut output = Vec::new();
-        let mut applied = true;
+        let mut applied = false;
+        ui.mouse_capture = false;
 
         assert!(
             !process_event(
@@ -1372,18 +1387,17 @@ mod tests {
             thread::yield_now();
         };
         assert!(
-            actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            install_completed_attach_plan(&mut ui, &mut terminal, plan, &mut output, &mut applied,)
                 .expect("install event bridge attach")
         );
-        sync_mouse_capture(&mut output, &mut applied, ui.mouse_capture)
-            .expect("apply attach mouse capture");
         assert!(matches!(ui.mode, Mode::Attached));
-        assert!(!ui.mouse_capture);
-        assert!(!applied);
+        assert!(ui.mouse_capture);
+        assert!(applied);
         assert_eq!(
-            output, b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-            "successful attach must disable terminal mouse capture for native selection"
+            output, b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h",
+            "completed attach must immediately enable terminal mouse capture"
         );
+        let attached_output_len = output.len();
 
         assert!(
             !process_event(
@@ -1405,10 +1419,9 @@ mod tests {
         assert!(ui.mouse_capture);
         assert!(applied);
         assert_eq!(
-            output,
-            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
-              \x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h",
-            "detach must append the exact terminal mouse capture enable sequence"
+            output.len(),
+            attached_output_len,
+            "detach must keep terminal mouse capture enabled without another sequence"
         );
     }
 
@@ -1418,7 +1431,7 @@ mod tests {
 
     impl Backend for AttachingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Opencode
+            BackendKind::Claude
         }
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
