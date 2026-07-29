@@ -196,7 +196,7 @@ fn sync_mouse_capture<W: io::Write>(
 /// writing control sequences to the invoking terminal.
 fn process_event<B: ratatui::backend::Backend, W: io::Write>(
     event: Event,
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
     terminal: &mut ratatui::Terminal<B>,
@@ -621,7 +621,7 @@ fn main() -> io::Result<()> {
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
     let refresher = spawn_refresh_worker(list_backends, last, cursors);
-    let mut action_backends = all_backends_with_opencode(opencode_runtime);
+    let action_backends = all_backends_with_opencode(opencode_runtime);
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
@@ -634,7 +634,7 @@ fn main() -> io::Result<()> {
         let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
         run(
             &mut terminal,
-            &mut action_backends,
+            &action_backends,
             &refresher,
             &activity,
             &mut ui,
@@ -648,7 +648,7 @@ fn main() -> io::Result<()> {
 
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    backends: &mut [Box<dyn Backend>],
+    backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     activity: &ActivityWorker,
     ui: &mut Ui,
@@ -1333,7 +1333,7 @@ mod tests {
             };
             ops::resolve_attach_with_backend(&mut authority, request)
         });
-        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
             session: session(BackendKind::Opencode, "attached", 1_000, false),
         })];
         let (_snapshots_tx, snapshots) = channel();
@@ -1350,7 +1350,7 @@ mod tests {
                     crossterm::event::KeyCode::Right,
                     crossterm::event::KeyModifiers::NONE,
                 )),
-                &mut backends,
+                &backends,
                 &refresher,
                 &mut ui,
                 &mut terminal,
@@ -1391,7 +1391,7 @@ mod tests {
                     crossterm::event::KeyCode::Char(']'),
                     crossterm::event::KeyModifiers::CONTROL,
                 )),
-                &mut backends,
+                &backends,
                 &refresher,
                 &mut ui,
                 &mut terminal,

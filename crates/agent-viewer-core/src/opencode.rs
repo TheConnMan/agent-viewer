@@ -3,7 +3,6 @@ use crate::error::{AttachRefusal, Error, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -53,7 +52,6 @@ struct RuntimeInner {
     durable_cwd: PathBuf,
     launcher: Arc<Launcher>,
     secure: Option<SecureRuntimeConfig>,
-    credential_scope_fingerprint: OnceLock<Option<String>>,
     state: Mutex<RuntimeState>,
 }
 
@@ -236,7 +234,6 @@ impl OpencodeRuntime {
                 durable_cwd,
                 launcher,
                 secure,
-                credential_scope_fingerprint: OnceLock::new(),
                 state: Mutex::new(RuntimeState::default()),
             }),
         }
@@ -519,17 +516,6 @@ impl OpencodeRuntime {
             password,
             authorization: format!("Basic {encoded}"),
         })
-    }
-
-    fn credential_scope_fingerprint(&self) -> Option<&str> {
-        self.inner
-            .credential_scope_fingerprint
-            .get_or_init(|| {
-                self.credentials()
-                    .ok()
-                    .map(|credentials| credential_fingerprint(&credentials))
-            })
-            .as_deref()
     }
 
     fn probe_secure(&self) -> std::result::Result<SecureProbe, String> {
@@ -1167,29 +1153,6 @@ impl Credentials {
             .replace(&self.password, "[redacted]")
             .replace(&self.authorization, "[redacted]")
     }
-}
-
-fn credential_fingerprint(credentials: &Credentials) -> String {
-    let mut hasher = Sha256::new();
-    for value in [
-        credentials.username.as_bytes(),
-        credentials.password.as_bytes(),
-    ] {
-        hasher.update(
-            u64::try_from(value.len())
-                .expect("credential length fits u64")
-                .to_be_bytes(),
-        );
-        hasher.update(value);
-    }
-    let digest = hasher.finalize();
-    let mut fingerprint = String::with_capacity(digest.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in digest {
-        fingerprint.push(char::from(HEX[usize::from(byte >> 4)]));
-        fingerprint.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    fingerprint
 }
 
 impl Drop for AdvisoryLockGuard {
@@ -2336,14 +2299,21 @@ impl Backend for OpencodeBackend {
 
     fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
         let key = if let Some(secure) = &self.runtime.inner.secure {
-            let fingerprint = self.runtime.credential_scope_fingerprint()?;
+            if secure
+                .password_override
+                .as_deref()
+                .is_some_and(|password| !password.trim().is_empty())
+                || std::env::var_os("OPENCODE_SERVER_PASSWORD")
+                    .is_some_and(|password| !password.is_empty())
+            {
+                return None;
+            }
             crate::backend::listing_scope_key(&[
                 crate::backend::listing_scope_path(&self.db_path),
                 crate::backend::listing_scope_path(&secure.viewer_db_path),
                 self.runtime.inner.candidates[0].to_string(),
                 self.runtime.inner.candidates[1].to_string(),
                 "secure".to_string(),
-                fingerprint.to_string(),
             ])
         } else {
             crate::backend::listing_scope_key(&[

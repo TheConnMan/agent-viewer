@@ -54,6 +54,17 @@ only. For each id, the latest valid entry with a nonempty name wins. Use the SQL
 the index is missing, unreadable, malformed, invalid, or has no matching entry. The index never
 supplies rows, status, or any field other than the name.
 
+## Shared listing cache
+
+The viewer owns SQLite snapshots keyed by each backend advertised listing scope. A snapshot is
+fresh for two seconds. A renewable five second lease coordinates refreshes, and a generation
+check is the fast path for readers. Successful empty listings are snapshots too. Cold followers
+wait for the lease holder and then read its snapshot rather than independently listing.
+
+This cache is display only. Attach, mutations, and session derived spawn directories always
+relist their authoritative source. Default viewer managed OpenCode credentials use one shared
+noncredential scope. Explicit configured or environment OpenCode passwords bypass sharing.
+
 ## Enumeration and runtime: opencode
 
 The primary OpenCode authority is a secured loopback server. The viewer probes fixed candidates

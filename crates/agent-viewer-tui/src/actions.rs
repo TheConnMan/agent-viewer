@@ -190,7 +190,21 @@ pub(crate) fn kill_request(ui: &mut Ui, request: TargetRequest, title: String, s
             submit_mutation(ui, request, &title, "stop", "stopping", Mutation::Stop);
         }
         KillStage::Remove => {
-            submit_mutation(ui, request, &title, "remove", "removing", Mutation::Remove);
+            let key = (request.backend(), request.id().to_string());
+            let Some(require_finished) = ui
+                .app
+                .session_for(&key)
+                .map(|session| session.status.is_finished())
+            else {
+                ui.set_notice("session is no longer available".to_string());
+                return;
+            };
+            submit_mutation(ui, request, &title, "remove", "removing", move |request| {
+                Mutation::Remove {
+                    request,
+                    require_finished,
+                }
+            });
         }
         KillStage::Noop => {}
     }
@@ -227,7 +241,7 @@ fn submit_mutation(
     title: &str,
     op: &str,
     verb: &str,
-    mutation: fn(TargetRequest) -> Mutation,
+    mutation: impl FnOnce(TargetRequest) -> Mutation,
 ) {
     let key = format!("{}:{}:{}", request.backend().name(), request.id(), op);
     let mutation = mutation(request);
