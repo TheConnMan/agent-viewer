@@ -358,10 +358,6 @@ impl ViewerDb {
         ViewerDb::open(&crate::home_dir().join(".local/state/agent-viewer/viewer.db"))
     }
 
-    pub fn open_at(path: &std::path::Path) -> Result<ViewerDb> {
-        ViewerDb::open(path)
-    }
-
     /// tests: temp path.
     pub fn open(path: &std::path::Path) -> Result<ViewerDb> {
         if let Some(parent) = path
@@ -617,32 +613,6 @@ impl ViewerDb {
             rusqlite::params![scope.backend().name(), scope.as_str()],
         )?;
         Ok(changed == 1)
-    }
-
-    #[doc(hidden)]
-    pub fn overwrite_listing_snapshot_json(
-        &self,
-        scope: &ListingCacheScope,
-        snapshot_json: &str,
-        published_at_ms: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO backend_listing_cache \
-             (backend, scope, snapshot_json, refreshed_at_ms, generation, lease_owner, lease_until_ms) \
-             VALUES (?1, ?2, ?3, ?4, 1, NULL, 0) \
-             ON CONFLICT(backend, scope) DO UPDATE SET \
-                 snapshot_json = excluded.snapshot_json, \
-                 refreshed_at_ms = excluded.refreshed_at_ms, \
-                 generation = backend_listing_cache.generation + 1, \
-                 lease_owner = NULL, lease_until_ms = 0",
-            rusqlite::params![
-                scope.backend().name(),
-                scope.as_str(),
-                snapshot_json,
-                published_at_ms
-            ],
-        )?;
-        Ok(())
     }
 
     /// Prune resolved spawn rows older than 7 days whose (backend, session_id) is NOT in

@@ -23,12 +23,7 @@ pub use backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session, SessionOrigin,
     SpawnResult, Status, StatusEvent, StatusSink, Subscription,
 };
-pub use claude::ClaudeBackend;
-pub use codex::CodexBackend;
 pub use error::{AttachRefusal, Error, Result};
-#[cfg(target_os = "linux")]
-pub use opencode::OpencodeRuntimeTestConfig;
-pub use opencode::{OpencodeBackend, OpencodeRuntime};
 pub use pr_status::PrBadgeColor;
 pub use state::{
     ListingCacheClaim, ListingCacheLease, ListingCacheRead, ListingCacheSnapshot,

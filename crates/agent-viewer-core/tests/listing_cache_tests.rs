@@ -1,13 +1,16 @@
+use agent_viewer_core::claude::ClaudeBackend;
+use agent_viewer_core::codex::CodexBackend;
+#[cfg(target_os = "linux")]
+use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime, OpencodeRuntimeTestConfig};
 use agent_viewer_core::{
-    Backend, BackendKind, ClaudeBackend, CodexBackend, ListingCacheClaim, ListingCacheRead,
-    ListingCacheScope, ListingCacheSnapshot, ListingCacheWrite, OpencodeBackend, OpencodeRuntime,
-    OpencodeRuntimeTestConfig, PrRef, Session, SessionOrigin, Status, ViewerDb,
+    Backend, BackendKind, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
+    ListingCacheSnapshot, ListingCacheWrite, PrRef, Session, SessionOrigin, Status, ViewerDb,
 };
 use rusqlite::{Connection, params};
+#[cfg(target_os = "linux")]
+use std::{net::SocketAddr, sync::Arc};
 use std::{
-    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -19,8 +22,8 @@ const RENEWABLE_LEASE_MS: i64 = 600;
 fn open_viewers() -> (TempDir, PathBuf, ViewerDb, ViewerDb) {
     let directory = tempfile::tempdir().expect("temporary viewer database directory");
     let path = directory.path().join("viewer.sqlite");
-    let first = ViewerDb::open_at(&path).expect("first viewer database");
-    let second = ViewerDb::open_at(&path).expect("second viewer database");
+    let first = ViewerDb::open(&path).expect("first viewer database");
+    let second = ViewerDb::open(&path).expect("second viewer database");
     (directory, path, first, second)
 }
 
@@ -105,6 +108,7 @@ fn stored_lease(path: &Path, scope: &ListingCacheScope) -> (i64, Option<String>,
         .expect("stored listing lease")
 }
 
+#[cfg(target_os = "linux")]
 fn secure_runtime(root: &Path, candidates: [SocketAddr; 2], password: &str) -> OpencodeRuntime {
     OpencodeRuntime::for_test_secure(OpencodeRuntimeTestConfig {
         candidates,
@@ -118,6 +122,7 @@ fn secure_runtime(root: &Path, candidates: [SocketAddr; 2], password: &str) -> O
     })
 }
 
+#[cfg(target_os = "linux")]
 fn socket(address: &str) -> SocketAddr {
     address.parse().expect("loopback test socket")
 }
@@ -175,14 +180,17 @@ fn backend_advertised_scopes_change_with_compatibility_namespace_fields() {
         advertised_scope(&changed_sessions)
     );
 
-    let db_a = root.path().join("opencode-a.sqlite");
-    let db_b = root.path().join("opencode-b.sqlite");
-    let compatibility_a = OpencodeBackend::with_db(db_a);
-    let compatibility_b = OpencodeBackend::with_db(db_b);
-    assert_ne!(
-        advertised_scope(&compatibility_a),
-        advertised_scope(&compatibility_b)
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let db_a = root.path().join("opencode-a.sqlite");
+        let db_b = root.path().join("opencode-b.sqlite");
+        let compatibility_a = OpencodeBackend::with_db(db_a);
+        let compatibility_b = OpencodeBackend::with_db(db_b);
+        assert_ne!(
+            advertised_scope(&compatibility_a),
+            advertised_scope(&compatibility_b)
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
