@@ -12,7 +12,7 @@ use std::{
 };
 use tempfile::TempDir;
 
-const FRESHNESS_MS: i64 = 1_000;
+const FRESHNESS_MS: i64 = agent_viewer_core::state::LISTING_CACHE_FRESHNESS_MS;
 const LEASE_MS: i64 = 2_000;
 const RENEWABLE_LEASE_MS: i64 = 600;
 
