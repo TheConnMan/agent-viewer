@@ -4,26 +4,38 @@
 use std::collections::HashSet;
 
 use agent_viewer_core::backend::{Backend, BackendKind};
-use agent_viewer_core::claude::ClaudeBackend;
+use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::group::project_root;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
-use agent_viewer_core::{Session, SpawnResult, default_codex_home};
+use agent_viewer_core::{Session, SpawnResult, Status, ViewerDb, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
+use agent_viewer_tui::shared_listing::{
+    SpawnDirectoryMode, SpawnTarget, TargetRequest, authoritative_target, invalidate_backend_scope,
+};
+
+pub(crate) struct AttachPlan {
+    pub(crate) session: Session,
+    pub(crate) command: std::process::Command,
+}
 
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
 pub(crate) enum Mutation {
-    Stop(Session),
-    Remove(Session),
-    Rename(Session, String),
-    Hide(Session),
-    Unhide(Session),
+    Stop(TargetRequest),
+    Remove {
+        request: TargetRequest,
+        require_finished: bool,
+    },
+    Rename(TargetRequest, String),
+    Hide(TargetRequest),
+    Unhide(TargetRequest),
     /// Spawn a new session. On the runner, not the key path: a codex spawn now talks to the
     /// app-server daemon and may start one, so it is a multi-second blocking call on a bad day
     /// and would freeze the composer if it ran inline like it used to.
     Spawn {
         backend: BackendKind,
-        dir: std::path::PathBuf,
+        target: SpawnTarget,
         task: String,
         model: Option<String>,
         spawned_at_ms: i64,
@@ -36,7 +48,7 @@ impl Mutation {
     pub(crate) fn spawn(
         app: &App,
         backend: BackendKind,
-        dir: std::path::PathBuf,
+        target: SpawnTarget,
         task: String,
         model: Option<String>,
         spawned_at_ms: i64,
@@ -44,7 +56,7 @@ impl Mutation {
     ) -> Self {
         Self::Spawn {
             backend,
-            dir,
+            target,
             task,
             model,
             spawned_at_ms,
@@ -60,7 +72,7 @@ fn spawn_selection_from_mutation(
 ) -> Option<SpawnSelection> {
     let Mutation::Spawn {
         backend,
-        dir,
+        target,
         spawned_at_ms,
         preexisting_ids,
         ..
@@ -71,21 +83,183 @@ fn spawn_selection_from_mutation(
     Some(SpawnSelection {
         backend: *backend,
         session_id: spawned.session_id.clone(),
-        cwd: dir.clone(),
+        cwd: target.displayed_directory().to_path_buf(),
         spawned_at_ms: *spawned_at_ms,
         preexisting_ids: preexisting_ids.clone(),
     })
 }
 
-/// A fresh backend instance for a worker thread. The mutating methods (stop/remove/
-/// rename/hide) depend only on the passed id/session, never on cached list state, so a
-/// fresh instance behaves identically to the one in the main `backends` slice.
+/// A fresh backend instance for a worker thread.
 fn fresh_backend(kind: BackendKind, opencode_runtime: &OpencodeRuntime) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
         BackendKind::Opencode => Box::new(OpencodeBackend::with_runtime(opencode_runtime.clone())),
     }
+}
+
+fn target_failure(resolution: agent_viewer_tui::shared_listing::TargetResolution) -> String {
+    resolution
+        .notice()
+        .unwrap_or("target resolution failed")
+        .to_string()
+}
+
+pub(crate) fn resolve_attach_with_backend(
+    backend: &mut dyn Backend,
+    request: TargetRequest,
+) -> Result<AttachPlan, String> {
+    let session = authoritative_target(backend, &request).map_err(target_failure)?;
+    if !backend.capabilities_for(&session).attach {
+        return Err(format!(
+            "{} does not support attach",
+            session.backend.name()
+        ));
+    }
+    let claude_fallback = session.backend == BackendKind::Claude
+        && session.short_id.as_deref().unwrap_or_default().is_empty();
+    if claude_fallback {
+        let config = agent_viewer_core::home_dir().join(".claude.json");
+        let _ = ensure_trusted(&config, &session.cwd);
+    }
+    let command = backend
+        .attach_command(&session)
+        .map_err(|refusal| refusal.reason)?;
+    Ok(AttachPlan { session, command })
+}
+
+pub(crate) fn resolve_attach_with_opencode(
+    request: TargetRequest,
+    opencode_runtime: OpencodeRuntime,
+) -> Result<AttachPlan, String> {
+    let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+    resolve_attach_with_backend(backend.as_mut(), request)
+}
+
+fn run_targeted<F>(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    request: &TargetRequest,
+    action: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+{
+    let result = match authoritative_target(backend, request) {
+        Ok(session) => action(backend, &session),
+        Err(resolution) => Err(target_failure(resolution)),
+    };
+    invalidate_backend_scope(db, backend);
+    result
+}
+
+fn run_with_fresh_backend<F>(
+    request: TargetRequest,
+    opencode_runtime: &OpencodeRuntime,
+    action: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+{
+    let mut backend = fresh_backend(request.backend(), opencode_runtime);
+    let db = ViewerDb::open_default().ok();
+    run_targeted(backend.as_mut(), db.as_ref(), &request, action)
+}
+
+fn run_remove(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    request: &TargetRequest,
+    require_finished: bool,
+) -> Result<MutationOutcome, String> {
+    run_targeted(backend, db, request, |backend, session| {
+        if !backend.capabilities_for(session).delete {
+            return Err(format!(
+                "{} does not support remove",
+                session.backend.name()
+            ));
+        }
+        let freshly_active = matches!(session.status, Status::Working | Status::NeedsInput { .. });
+        if freshly_active || require_finished && !session.status.is_finished() {
+            return Err(format!(
+                "remove refused: {} session became active",
+                session.backend.name()
+            ));
+        }
+        if let Some(pid) = session.pid.filter(|_| !session.daemon_hosted) {
+            let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
+        }
+        match backend.remove(session) {
+            Ok(()) => Ok(MutationOutcome {
+                notice: format!("removed: {}", session.title),
+                spawned: None,
+            }),
+            Err(agent_viewer_core::error::Error::Unsupported(name)) => {
+                Err(format!("{name} does not support remove"))
+            }
+            Err(error) => Err(format!("remove failed: {error}")),
+        }
+    })
+}
+
+fn run_spawn_at_directory(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+    directory: std::path::PathBuf,
+) -> Result<MutationOutcome, String> {
+    let Mutation::Spawn {
+        backend: backend_kind,
+        task,
+        model,
+        spawned_at_ms,
+        notice,
+        ..
+    } = mutation
+    else {
+        unreachable!();
+    };
+    let result = match backend.spawn(&directory, task, model.as_deref()) {
+        Ok(spawned) => {
+            if let Some(pid) = spawned.pid
+                && let Some(db) = db
+            {
+                let _ = db.record_spawn(*backend_kind, &directory, pid, *spawned_at_ms);
+            }
+            let mut selection = spawn_selection_from_mutation(mutation, &spawned);
+            if let Some(selection) = &mut selection {
+                selection.cwd = directory;
+            }
+            Ok(MutationOutcome {
+                notice: notice.clone(),
+                spawned: selection,
+            })
+        }
+        Err(error) => Err(format!("spawn failed: {error}")),
+    };
+    invalidate_backend_scope(db, backend);
+    result
+}
+
+fn run_spawn_with_backend(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+) -> Result<MutationOutcome, String> {
+    let Mutation::Spawn { target, .. } = mutation else {
+        unreachable!();
+    };
+    let directory = match target {
+        SpawnTarget::Session { request, mode, .. } => {
+            let session = authoritative_target(backend, request).map_err(target_failure)?;
+            match mode {
+                SpawnDirectoryMode::WorkingDirectory => session.cwd,
+                SpawnDirectoryMode::ProjectRoot => project_root(&session.cwd),
+            }
+        }
+        SpawnTarget::ExplicitDirectory(directory) => directory.clone(),
+    };
+    run_spawn_at_directory(backend, db, mutation, directory)
 }
 
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
@@ -102,113 +276,113 @@ pub(crate) fn run_mutation_with_opencode(
     opencode_runtime: OpencodeRuntime,
 ) -> Result<MutationOutcome, String> {
     match m {
-        Mutation::Stop(s) => match fresh_backend(s.backend, &opencode_runtime).stop(&s) {
-            Ok(()) => Ok(MutationOutcome {
-                notice: format!("stopped: {}", s.title),
-                spawned: None,
-            }),
-            Err(e) => Err(format!("stop failed: {e}")),
-        },
-        Mutation::Remove(s) => {
-            let backend = fresh_backend(s.backend, &opencode_runtime);
-            // Refuse BEFORE the terminate below. `remove` is advertised per backend but gated
-            // per row (claude needs a short id), so an idless row used to be SIGTERMed and
-            // only then declined, killing a live session that stayed in the list.
-            if !backend.capabilities_for(&s).delete {
-                return Err(format!("{} does not support remove", s.backend.name()));
-            }
-            // Terminate the live process FIRST, inside this same thread, before archiving or
-            // deleting. Two-stage Ctrl+X submits `stop` then `remove` on different dedup keys,
-            // so the two race; killing here guarantees ordering within the remove op and makes
-            // a concurrent `stop` harmless. Terminate is idempotent (ESRCH/gone -> Ok) and
-            // pid guarded by comm prefix, so it never signals a recycled pid.
-            //
-            // NEVER for a shared runtime row. Any pid would belong to the host process and
-            // every session inside it. `stop` handles these through the backend runtime, and
-            // `remove` performs only the backend mutation.
-            if let Some(pid) = s.pid.filter(|_| !s.daemon_hosted) {
-                let _ = agent_viewer_core::spawn::terminate(pid, s.backend.name());
-            }
-            match backend.remove(&s) {
-                Ok(()) => Ok(MutationOutcome {
-                    notice: format!("removed: {}", s.title),
-                    spawned: None,
-                }),
-                // A row with no bg job to remove (idless) is a capability miss, not a
-                // failure: surface it as the invariant's benign "not supported" notice, the
-                // same shape as the stop/rename unsupported messaging. Genuine CLI failures
-                // (Error::Command) stay a "remove failed" error.
-                Err(agent_viewer_core::error::Error::Unsupported(name)) => {
-                    Err(format!("{name} does not support remove"))
+        Mutation::Stop(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).stop {
+                    return Err(format!("{} does not support stop", session.backend.name()));
                 }
-                Err(e) => Err(format!("remove failed: {e}")),
-            }
-        }
-        Mutation::Rename(s, name) => {
-            match fresh_backend(s.backend, &opencode_runtime).rename(&s, &name) {
-                Ok(()) => Ok(MutationOutcome {
-                    notice: format!("renamed {}", s.backend.name()),
-                    spawned: None,
-                }),
-                Err(e) => Err(format!("rename failed: {e}")),
-            }
-        }
-        Mutation::Hide(s) => fresh_backend(s.backend, &opencode_runtime)
-            .hide(&s.id)
-            .map(|()| MutationOutcome {
-                notice: format!("archived: {}", s.title),
-                spawned: None,
+                backend
+                    .stop(session)
+                    .map(|()| MutationOutcome {
+                        notice: format!("stopped: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("stop failed: {error}"))
             })
-            .map_err(|e| format!("{}: {e}", s.backend.name())),
+        }
+        Mutation::Remove {
+            request,
+            require_finished,
+        } => {
+            let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+            let db = ViewerDb::open_default().ok();
+            run_remove(backend.as_mut(), db.as_ref(), &request, require_finished)
+        }
+        Mutation::Rename(request, name) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).rename {
+                    return Err(format!(
+                        "{} does not support rename",
+                        session.backend.name()
+                    ));
+                }
+                backend
+                    .rename(session, &name)
+                    .map(|()| MutationOutcome {
+                        notice: format!("renamed {}", session.backend.name()),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("rename failed: {error}"))
+            })
+        }
+        Mutation::Hide(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).archive {
+                    return Err(format!("{} does not support hide", session.backend.name()));
+                }
+                backend
+                    .hide(&session.id)
+                    .map(|()| MutationOutcome {
+                        notice: format!("archived: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("{}: {error}", session.backend.name()))
+            })
+        }
+        Mutation::Unhide(request) => {
+            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
+                if !backend.capabilities_for(session).archive {
+                    return Err(format!(
+                        "{} does not support unhide",
+                        session.backend.name()
+                    ));
+                }
+                backend
+                    .unhide(&session.id)
+                    .map(|()| MutationOutcome {
+                        notice: format!("unarchived: {}", session.title),
+                        spawned: None,
+                    })
+                    .map_err(|error| format!("{}: {error}", session.backend.name()))
+            })
+        }
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
-                backend,
-                dir,
-                task,
-                model,
-                spawned_at_ms,
-                notice,
-                ..
+                backend, target, ..
             } = &mutation
             else {
                 unreachable!();
             };
-            match fresh_backend(*backend, &opencode_runtime).spawn(dir, task, model.as_deref()) {
-                // A pid means the viewer forked the worker itself, so record the spawn for the
-                // pin/stop overlay against a fresh connection, like every other viewer-DB
-                // follow-up here. Every successful spawn also carries enough metadata for the
-                // UI to select its row when it first appears.
-                Ok(spawned) => {
-                    if let Some(pid) = spawned.pid
-                        && let Ok(db) = agent_viewer_core::state::ViewerDb::open_default()
-                    {
-                        let _ = db.record_spawn(*backend, dir, pid, *spawned_at_ms);
-                    }
-                    Ok(MutationOutcome {
-                        notice: notice.clone(),
-                        spawned: spawn_selection_from_mutation(&mutation, &spawned),
-                    })
-                }
-                Err(e) => Err(format!("spawn failed: {e}")),
+            let mut action_backend = fresh_backend(*backend, &opencode_runtime);
+            let db = ViewerDb::open_default().ok();
+            if let SpawnTarget::Session { request, mode, .. } = target
+                && request.backend() != *backend
+            {
+                let mut authority_backend = fresh_backend(request.backend(), &opencode_runtime);
+                let directory = match authoritative_target(authority_backend.as_mut(), request) {
+                    Ok(session) => match mode {
+                        SpawnDirectoryMode::WorkingDirectory => session.cwd,
+                        SpawnDirectoryMode::ProjectRoot => project_root(&session.cwd),
+                    },
+                    Err(resolution) => return Err(target_failure(resolution)),
+                };
+                run_spawn_at_directory(action_backend.as_mut(), db.as_ref(), &mutation, directory)
+            } else {
+                run_spawn_with_backend(action_backend.as_mut(), db.as_ref(), &mutation)
             }
         }
-        Mutation::Unhide(s) => fresh_backend(s.backend, &opencode_runtime)
-            .unhide(&s.id)
-            .map(|()| MutationOutcome {
-                notice: format!("unarchived: {}", s.title),
-                spawned: None,
-            })
-            .map_err(|e| format!("{}: {e}", s.backend.name())),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mutation, run_mutation, spawn_selection_from_mutation};
-    use agent_viewer_core::backend::{BackendKind, Status};
+    use super::{Mutation, run_remove, run_spawn_with_backend, spawn_selection_from_mutation};
+    use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::{Session, SpawnResult};
     use agent_viewer_tui::app::{App, Row};
-    use std::path::PathBuf;
+    use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     fn session(backend: BackendKind, id: &str, hidden: bool) -> Session {
@@ -248,7 +422,7 @@ mod tests {
         Mutation::spawn(
             &app,
             BackendKind::Codex,
-            PathBuf::from("/tmp/spawn_selection"),
+            SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/spawn_selection")),
             "new task".to_string(),
             None,
             42,
@@ -298,6 +472,172 @@ mod tests {
         );
     }
 
+    struct RecordingSpawnBackend {
+        sessions: Vec<Session>,
+        list_calls: usize,
+        spawn_directories: RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingSpawnBackend {
+        fn with_sessions(sessions: Vec<Session>) -> Self {
+            Self {
+                sessions,
+                list_calls: 0,
+                spawn_directories: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for RecordingSpawnBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Codex
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                spawn: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.list_calls += 1;
+            Ok(self.sessions.clone())
+        }
+
+        fn spawn(
+            &self,
+            dir: &Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            self.spawn_directories.borrow_mut().push(dir.to_path_buf());
+            Ok(SpawnResult {
+                pid: None,
+                session_id: Some("spawned_session".to_string()),
+            })
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by spawn")
+        }
+    }
+
+    fn session_at(id: &str, cwd: impl Into<PathBuf>) -> Session {
+        let mut session = session(BackendKind::Codex, id, false);
+        session.cwd = cwd.into();
+        session
+    }
+
+    fn spawn_mutation(target: SpawnTarget) -> Mutation {
+        Mutation::Spawn {
+            backend: BackendKind::Codex,
+            target,
+            task: "new task".to_string(),
+            model: None,
+            spawned_at_ms: 42,
+            preexisting_ids: ["displayed_other_session".to_string()]
+                .into_iter()
+                .collect(),
+            notice: "spawned on codex".to_string(),
+        }
+    }
+
+    #[test]
+    fn session_working_directory_spawn_uses_fresh_authoritative_cwd() {
+        let displayed = session_at("target", "/displayed/stale");
+        let fresh = session_at("target", "/authority/fresh");
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(vec![fresh]);
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![PathBuf::from("/authority/fresh")]
+        );
+        assert_eq!(
+            outcome.spawned.expect("spawn selection").cwd,
+            PathBuf::from("/authority/fresh")
+        );
+    }
+
+    #[test]
+    fn session_project_spawn_recomputes_project_root_from_fresh_cwd() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repository = directory.path().join("fresh_repository");
+        std::fs::create_dir_all(repository.join(".git")).expect("git marker");
+        let fresh_cwd = repository.join("new").join("nested");
+        std::fs::create_dir_all(&fresh_cwd).expect("fresh working directory");
+        let displayed = session_at("target", "/displayed/old_repository");
+        let fresh = session_at("target", fresh_cwd);
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::ProjectRoot,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(vec![fresh]);
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![repository.clone()]
+        );
+        assert_eq!(outcome.spawned.expect("spawn selection").cwd, repository);
+    }
+
+    #[test]
+    fn missing_session_identity_refuses_spawn() {
+        let displayed = session_at("missing", "/displayed/stale");
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = spawn_mutation(target);
+        let mut backend = RecordingSpawnBackend::with_sessions(Vec::new());
+
+        let result = run_spawn_with_backend(&mut backend, None, &mutation);
+
+        assert_eq!(
+            result,
+            Err("codex session is no longer available".to_string())
+        );
+        assert_eq!(backend.list_calls, 1);
+        assert!(backend.spawn_directories.into_inner().is_empty());
+    }
+
+    #[test]
+    fn explicit_directory_spawn_does_not_list_authority() {
+        let directory = PathBuf::from("/explicit/project/header");
+        let mutation = spawn_mutation(SpawnTarget::ExplicitDirectory(directory.clone()));
+        let mut backend = RecordingSpawnBackend::with_sessions(Vec::new());
+
+        let outcome =
+            run_spawn_with_backend(&mut backend, None, &mutation).expect("spawn succeeds");
+
+        assert_eq!(backend.list_calls, 0);
+        assert_eq!(
+            backend.spawn_directories.into_inner(),
+            vec![directory.clone()]
+        );
+        assert_eq!(outcome.spawned.expect("spawn selection").cwd, directory);
+    }
+
     /// A live process whose `/proc/<pid>/comm` starts with "claude", which is the only shape
     /// `spawn::terminate`'s pid-reuse guard will actually signal. Built by copying a sleeper
     /// under a claude-prefixed name; a plain `sleep` would be spared by the guard and so
@@ -336,6 +676,126 @@ mod tests {
         }
     }
 
+    struct RefusingRemoveBackend {
+        session: Session,
+    }
+
+    impl Backend for RefusingRemoveBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                delete: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn capabilities_for(&self, session: &Session) -> Capabilities {
+            Capabilities {
+                delete: session.short_id.is_some(),
+                ..self.capabilities()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.session.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by remove")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by remove")
+        }
+    }
+
+    struct RecordingRemoveBackend {
+        session: Session,
+        removed_ids: RefCell<Vec<String>>,
+    }
+
+    impl Backend for RecordingRemoveBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                delete: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.session.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by remove")
+        }
+
+        fn remove(&self, session: &Session) -> agent_viewer_core::Result<()> {
+            self.removed_ids.borrow_mut().push(session.id.clone());
+            Ok(())
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by remove")
+        }
+    }
+
+    #[test]
+    fn remove_refuses_a_session_that_became_active_after_a_removable_row_was_cached() {
+        for (cached_status, fresh_status, require_finished) in [
+            (Status::Done, Status::Working, true),
+            (Status::Done, Status::needs_input(), true),
+            (Status::Idle, Status::Working, false),
+            (Status::Idle, Status::needs_input(), false),
+            (Status::Unknown, Status::Working, false),
+            (Status::Unknown, Status::needs_input(), false),
+        ] {
+            let mut cached = session(BackendKind::Claude, "stale-status", false);
+            cached.status = cached_status;
+            let request = TargetRequest::from(&cached);
+            let mut fresh = cached;
+            fresh.status = fresh_status;
+            let mut backend = RecordingRemoveBackend {
+                session: fresh,
+                removed_ids: RefCell::new(Vec::new()),
+            };
+
+            let result = run_remove(&mut backend, None, &request, require_finished);
+
+            assert!(
+                result.is_err(),
+                "a fresh active session must refuse a remove requested from a stale removable row"
+            );
+            assert!(
+                backend.removed_ids.borrow().is_empty(),
+                "remove must not reach the backend for a freshly active session"
+            );
+        }
+    }
+
     // The defect: `remove` is advertised backend-wide for claude but gated per row on the
     // short id, so an interactive row passed the capability gate, got its process group
     // SIGTERMed, and only then was declined. The session died and stayed in the list.
@@ -343,8 +803,10 @@ mod tests {
     fn unsupported_remove_never_terminates_the_live_process() {
         let (dir, mut victim) = claude_named_victim("unsupported");
         let session = claude_session(None, victim.id());
+        let request = TargetRequest::from(&session);
+        let mut backend = RefusingRemoveBackend { session };
 
-        let result = run_mutation(Mutation::Remove(session));
+        let result = run_remove(&mut backend, None, &request, false);
 
         // Give a stray SIGTERM time to land before asserting the process survived.
         std::thread::sleep(Duration::from_millis(250));
@@ -363,5 +825,139 @@ mod tests {
             alive,
             "unsupported remove killed the live process before declining"
         );
+    }
+}
+
+#[cfg(test)]
+mod attach_resolution_tests {
+    use super::resolve_attach_with_backend;
+    use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
+    use agent_viewer_core::{AttachRefusal, Session, SpawnResult};
+    use agent_viewer_tui::shared_listing::TargetRequest;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    fn session(id: &str, title: &str) -> Session {
+        Session {
+            backend: BackendKind::Claude,
+            id: id.to_string(),
+            short_id: Some(id.to_string()),
+            origin: agent_viewer_core::SessionOrigin::Background,
+            title: title.to_string(),
+            cwd: PathBuf::from(format!("/tmp/{title}")),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    struct RecordingAttachBackend {
+        sessions: Vec<Session>,
+        attach_allowed: bool,
+        list_calls: usize,
+        command_sessions: RefCell<Vec<Session>>,
+    }
+
+    impl RecordingAttachBackend {
+        fn new(sessions: Vec<Session>, attach_allowed: bool) -> Self {
+            Self {
+                sessions,
+                attach_allowed,
+                list_calls: 0,
+                command_sessions: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for RecordingAttachBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                attach: self.attach_allowed,
+                ..Capabilities::none()
+            }
+        }
+
+        fn capabilities_for(&self, _session: &Session) -> Capabilities {
+            self.capabilities()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            self.list_calls += 1;
+            Ok(self.sessions.clone())
+        }
+
+        fn spawn(
+            &self,
+            _dir: &Path,
+            _task: &str,
+            _model: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("spawn is not exercised by attach resolution")
+        }
+
+        fn attach_command(
+            &self,
+            session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            self.command_sessions.borrow_mut().push(session.clone());
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]);
+            Ok(command)
+        }
+    }
+
+    #[test]
+    fn attach_resolution_builds_the_plan_from_the_fresh_authoritative_session() {
+        let displayed = session("target", "displayed_stale");
+        let fresh = session("target", "authority_fresh");
+        let request = TargetRequest::from(&displayed);
+        let mut backend = RecordingAttachBackend::new(vec![fresh.clone()], true);
+
+        let plan =
+            resolve_attach_with_backend(&mut backend, request).expect("attach plan resolves");
+
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(*backend.command_sessions.borrow(), vec![fresh.clone()]);
+        assert_eq!(plan.session, fresh);
+    }
+
+    #[test]
+    fn missing_or_freshly_refused_attach_never_builds_a_command() {
+        let displayed = session("target", "displayed");
+        let request = TargetRequest::from(&displayed);
+        let mut missing = RecordingAttachBackend::new(Vec::new(), true);
+
+        let missing_result = resolve_attach_with_backend(&mut missing, request.clone());
+
+        assert_eq!(
+            missing_result.err().as_deref(),
+            Some("claude session is no longer available")
+        );
+        assert_eq!(missing.list_calls, 1);
+        assert!(missing.command_sessions.borrow().is_empty());
+
+        let fresh = session("target", "authority_refused");
+        let mut refused = RecordingAttachBackend::new(vec![fresh], false);
+
+        let refused_result = resolve_attach_with_backend(&mut refused, request);
+
+        assert_eq!(
+            refused_result.err().as_deref(),
+            Some("claude does not support attach")
+        );
+        assert_eq!(refused.list_calls, 1);
+        assert!(refused.command_sessions.borrow().is_empty());
     }
 }

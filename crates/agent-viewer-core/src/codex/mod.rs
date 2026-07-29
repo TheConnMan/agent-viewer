@@ -291,6 +291,19 @@ impl Backend for CodexBackend {
         BackendKind::Codex
     }
 
+    fn listing_scope(&self) -> Option<crate::backend::ListingCacheScope> {
+        let platform = match crate::platform::current_platform() {
+            Platform::Linux => "linux",
+            Platform::Macos => "macos",
+            Platform::Windows => "windows",
+        };
+        let key = crate::backend::listing_scope_key(&[
+            crate::backend::listing_scope_path(&self.codex_home),
+            platform.to_string(),
+        ]);
+        crate::backend::ListingCacheScope::new(self.kind(), key).ok()
+    }
+
     fn capabilities(&self) -> Capabilities {
         capabilities_for_platform(crate::platform::current_platform())
     }

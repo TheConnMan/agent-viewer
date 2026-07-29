@@ -4,6 +4,7 @@ use agent_viewer_tui::app::{
     row_layout,
 };
 use agent_viewer_tui::pr_cache::PrStatusCache;
+use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, ThemeState, draw, theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1365,13 +1366,31 @@ fn spawn_target_by_project_is_group_root_by_state_is_cwd() {
     // Default ByProject: a session row's spawn target is its project group root (the repo).
     assert_eq!(app.group_mode(), GroupMode::ByProject);
     select(&mut app, "s");
-    assert_eq!(app.spawn_target(), Some(repo.clone()));
+    let project_target = app.spawn_target().expect("selected session has a target");
+    assert_eq!(project_target.displayed_directory(), repo.as_path());
+    assert_eq!(
+        project_target,
+        SpawnTarget::Session {
+            request: TargetRequest::new(BackendKind::Codex, "s"),
+            mode: SpawnDirectoryMode::ProjectRoot,
+            displayed_directory: repo.clone(),
+        }
+    );
 
     // ByState: the spawn target is the selected session's own cwd (the subdir).
     app.toggle_group_mode();
     assert_eq!(app.group_mode(), GroupMode::ByState);
     select(&mut app, "s");
-    assert_eq!(app.spawn_target(), Some(cwd.clone()));
+    let state_target = app.spawn_target().expect("selected session has a target");
+    assert_eq!(state_target.displayed_directory(), cwd.as_path());
+    assert_eq!(
+        state_target,
+        SpawnTarget::Session {
+            request: TargetRequest::new(BackendKind::Codex, "s"),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: cwd.clone(),
+        }
+    );
 }
 
 #[test]
@@ -2180,7 +2199,14 @@ fn spawn_target_falls_back_to_project_header_root() {
 
     // ByProject: a selected ProjectHeader spawns into its own root.
     select_project_header(&mut app, &root_a);
-    assert_eq!(app.spawn_target(), Some(root_a.clone()));
+    let header_target = app
+        .spawn_target()
+        .expect("selected project header has a target");
+    assert_eq!(header_target.displayed_directory(), root_a.as_path());
+    assert_eq!(
+        header_target,
+        SpawnTarget::ExplicitDirectory(root_a.clone())
+    );
 
     // ByState: a selected SectionHeader has no spawn dir.
     app.toggle_group_mode();

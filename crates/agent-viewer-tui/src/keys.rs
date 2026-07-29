@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
 use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
+use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
 };
@@ -16,8 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
-    hide_selected, kill_selected, open_filter, open_rename, open_reply, send_reply,
-    spawn_from_composer, toggle_group_if_header,
+    hide_request, hide_selected, kill_request, kill_selected, open_filter, open_rename,
+    open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
+    toggle_group_if_header,
 };
 use crate::{Refresher, Ui};
 
@@ -202,13 +204,16 @@ fn mouse_target(ui: &Ui, index: usize) -> Option<MouseTarget> {
 
 pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
     me: MouseEvent,
-    backends: &[Box<dyn Backend>],
+    _backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
+    _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     match handle_mouse(me, ui) {
         MouseAction::None => Ok(()),
-        MouseAction::ActivateSelected => activate_selected(backends, ui, terminal),
+        MouseAction::ActivateSelected => {
+            activate_selected(ui);
+            Ok(())
+        }
     }
 }
 
@@ -350,7 +355,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
+    _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<bool> {
     // Refresh the slash-command list up front (keyed on backend+target, so a no-op unless
     // they changed) BEFORE anything reads `suggestions_active` — otherwise a Ctrl+S regroup
@@ -394,7 +399,9 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
         // Arrows navigate or act at all times.
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
-        KeyCode::Right => attach_selected(backends, ui, terminal)?,
+        KeyCode::Right => {
+            attach_selected(ui);
+        }
         // Tab accepts the highlighted suggestion/model while a popup is open, else cycles the
         // target backend; Shift+Tab cycles that backend's model.
         KeyCode::Tab if suggesting => {
@@ -433,7 +440,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             } else if ui.composer.is_empty() {
                 // On a group header, Enter collapses/expands the group (and persists) instead
                 // of attaching; on a session it attaches as before.
-                activate_selected(backends, ui, terminal)?;
+                activate_selected(ui);
             } else {
                 spawn_from_composer(backends, refresher, ui);
             }
@@ -565,21 +572,27 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
         }));
     }
 
+    let spawn_target = ui.app.spawn_target();
     items.extend(
-        palette_commands(ui.composer.backend(), ui.app.spawn_target().as_deref())
-            .into_iter()
-            .map(|command| {
-                PaletteItem::new(
-                    PaletteGroup::Commands,
-                    "/",
-                    format!("/{command}"),
-                    format!("{} slash command", ui.composer.backend().name()),
-                    None,
-                    true,
-                    None,
-                    PaletteTarget::Command(command),
-                )
-            }),
+        palette_commands(
+            ui.composer.backend(),
+            spawn_target
+                .as_ref()
+                .map(|target| target.displayed_directory()),
+        )
+        .into_iter()
+        .map(|command| {
+            PaletteItem::new(
+                PaletteGroup::Commands,
+                "/",
+                format!("/{command}"),
+                format!("{} slash command", ui.composer.backend().name()),
+                None,
+                true,
+                None,
+                PaletteTarget::Command(command),
+            )
+        }),
     );
     items
 }
@@ -800,10 +813,70 @@ fn handle_palette_key<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+fn cached_palette_target(
+    ui: &Ui,
+    target: &PaletteTarget,
+) -> Option<(TargetRequest, String, PaletteAction)> {
+    match target {
+        PaletteTarget::Action(action) => {
+            let session = ui.app.selected()?;
+            let action = match action {
+                PaletteAction::Attach
+                | PaletteAction::Archive
+                | PaletteAction::Unarchive
+                | PaletteAction::Rename
+                | PaletteAction::StopOrRemove => *action,
+                _ => return None,
+            };
+            Some((TargetRequest::from(session), session.title.clone(), action))
+        }
+        PaletteTarget::Session { backend, id } => {
+            let title = ui
+                .app
+                .session_for(&(*backend, id.clone()))
+                .map(|session| session.title.clone())
+                .unwrap_or_else(|| id.clone());
+            Some((
+                TargetRequest::new(*backend, id.clone()),
+                title,
+                PaletteAction::Attach,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn execute_cached_palette_action(
+    ui: &mut Ui,
+    request: TargetRequest,
+    title: String,
+    action: PaletteAction,
+) {
+    match action {
+        PaletteAction::Attach => {
+            submit_attach(ui, request);
+        }
+        PaletteAction::Archive => {
+            hide_request(ui, request, title, true);
+        }
+        PaletteAction::Unarchive => {
+            hide_request(ui, request, title, false);
+        }
+        PaletteAction::Rename => {
+            open_rename_request(ui, request);
+        }
+        PaletteAction::StopOrRemove => {
+            let stage = ui.app.kill_stage(agent_viewer_core::spawn::now_ms());
+            kill_request(ui, request, title, stage);
+        }
+        _ => {}
+    }
+}
+
 fn execute_palette_selection<B: ratatui::backend::Backend>(
     backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
+    _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
     let Some(item) = (match &ui.mode {
         Mode::Palette(palette) => palette.highlighted().cloned(),
@@ -811,6 +884,14 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
     }) else {
         return Ok(());
     };
+    if let Some((request, title, action)) = cached_palette_target(ui, &item.target) {
+        if let PaletteTarget::Session { backend, id } = &item.target {
+            let _ = ui.app.select_by_key(&(*backend, id.clone()));
+        }
+        ui.mode = Mode::Normal;
+        execute_cached_palette_action(ui, request, title, action);
+        return Ok(());
+    }
     if !item.enabled {
         if let Some(reason) = item.disabled_reason {
             ui.set_notice(reason);
@@ -821,7 +902,9 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
     ui.mode = Mode::Normal;
     match item.target {
         PaletteTarget::Action(action) => match action {
-            PaletteAction::Attach => attach_selected(backends, ui, terminal)?,
+            PaletteAction::Attach => {
+                attach_selected(ui);
+            }
             PaletteAction::Archive => hide_selected(backends, ui, true),
             PaletteAction::Unarchive => hide_selected(backends, ui, false),
             PaletteAction::Rename => open_rename(backends, ui),
@@ -833,7 +916,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
-                attach_selected(backends, ui, terminal)?;
+                attach_selected(ui);
             } else {
                 ui.set_notice("session is no longer visible".to_string());
             }
@@ -1027,7 +1110,7 @@ pub(crate) mod tests {
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
-    use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
+    use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
     use agent_viewer_tui::ui::{AttachView, Draw, Mode, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1099,6 +1182,10 @@ pub(crate) mod tests {
                     notice: String::new(),
                     spawned: None,
                 })
+            }),
+            attaches: AttachRunner::new(),
+            attach_executor: std::sync::Arc::new(|_| {
+                Err("attach is not configured in this test".to_string())
             }),
             models: agent_viewer_tui::model_cache::ModelCache::new(),
             pulses: Pulses::new(),
@@ -1409,7 +1496,14 @@ pub(crate) mod tests {
         }
 
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("list is not exercised by mouse activation")
+            Ok(["a", "b", "c", "attached"]
+                .into_iter()
+                .map(|id| {
+                    let mut session = sess(id, "/tmp/agentviewer-attach", 100);
+                    session.backend = BackendKind::Opencode;
+                    session
+                })
+                .collect())
         }
 
         fn spawn(
@@ -1446,7 +1540,15 @@ pub(crate) mod tests {
         }
 
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("list is not exercised by attach selection")
+            Ok(["shared-attach", "a"]
+                .into_iter()
+                .map(|id| {
+                    let mut session = sess(id, "/tmp/agentviewer-attach", 100);
+                    session.backend = self.0;
+                    session.short_id = Some("short".to_string());
+                    session
+                })
+                .collect())
         }
 
         fn spawn(
@@ -2019,7 +2121,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn enter_on_a_disabled_palette_action_has_no_mutation() {
+    fn cached_palette_action_dispatches_before_fresh_authorization() {
         let mut ui = test_ui_with(vec![sess(
             "external",
             "/tmp/agentviewer-palette-disabled",
@@ -2045,9 +2147,8 @@ pub(crate) mod tests {
         )
         .expect("accept disabled action");
 
-        assert!(matches!(ui.mode, Mode::Palette(_)));
-        assert!(!ui.mutations.in_flight("claude:external:hide"));
-        assert!(ui.notice.text().contains("does not support archive"));
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.mutations.in_flight("claude:external:hide"));
     }
 
     #[test]
@@ -2153,18 +2254,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_r_is_gated_per_row_not_per_backend() {
-        // The claude backend advertises rename but only bg rows have the job dir it writes,
-        // so the gate must ask the ROW. A capability advertised and then failing at press
-        // time is worse than one advertised unsupported up front.
+    fn ctrl_r_defers_row_authorization_to_the_fresh_runner() {
         let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-rename", 100)]);
         select_session_row(&mut ui, "s1"); // sess() builds rows with no short id
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(RenamingBackend)];
 
         crate::actions::open_rename(&backends, &mut ui);
 
-        assert!(matches!(ui.mode, Mode::Normal), "must not open the editor");
-        assert_eq!(ui.notice.text, "claude does not support rename");
+        assert!(matches!(ui.mode, Mode::Rename(_)));
     }
 
     #[test]
@@ -2253,12 +2350,28 @@ pub(crate) mod tests {
             session.short_id = Some("short".to_string());
             let mut ui = test_ui_with(vec![session]);
             select_session_row(&mut ui, "shared-attach");
-            let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-                vec![Box::new(AnyAttachingBackend(backend))];
+            ui.attach_executor = std::sync::Arc::new(move |request| {
+                let mut authority = AnyAttachingBackend(backend);
+                crate::ops::resolve_attach_with_backend(&mut authority, request)
+            });
             let mut terminal = test_terminal();
 
-            crate::actions::attach_selected(&backends, &mut ui, &mut terminal)
-                .expect("attach selected session");
+            assert!(crate::actions::attach_selected(&mut ui));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let plan = loop {
+                if let Some(result) = ui.attaches.poll() {
+                    break result.expect("resolve selected session");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "selected attach did not resolve"
+                );
+                std::thread::yield_now();
+            };
+            assert!(
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                    .expect("install selected session")
+            );
 
             assert!(matches!(ui.mode, Mode::Attached), "{backend:?} must attach");
             capture_states.push((backend, ui.mouse_capture));
@@ -2552,6 +2665,10 @@ pub(crate) mod tests {
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        ui.attach_executor = std::sync::Arc::new(|request| {
+            let mut authority = AttachingBackend;
+            crate::ops::resolve_attach_with_backend(&mut authority, request)
+        });
         let mut terminal = test_terminal();
         let target_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
@@ -2584,6 +2701,21 @@ pub(crate) mod tests {
         )
         .expect("session button up");
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve clicked session");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clicked session attach did not resolve"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install clicked session")
+        );
         assert!(matches!(ui.mode, Mode::Attached));
         assert_eq!(
             ui.focused_session
@@ -2614,6 +2746,10 @@ pub(crate) mod tests {
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        ui.attach_executor = std::sync::Arc::new(|request| {
+            let mut authority = AttachingBackend;
+            crate::ops::resolve_attach_with_backend(&mut authority, request)
+        });
         let mut terminal = test_terminal();
         let pressed_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, pressed_idx);
@@ -2673,6 +2809,21 @@ pub(crate) mod tests {
         )
         .expect("session button up");
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve pressed session after reflow");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reflowed session attach did not resolve"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install pressed session after reflow")
+        );
         assert!(matches!(ui.mode, Mode::Attached));
         assert_eq!(
             ui.focused_session
@@ -2883,6 +3034,10 @@ pub(crate) mod tests {
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
+        ui.attach_executor = std::sync::Arc::new(|request| {
+            let mut authority = AttachingBackend;
+            crate::ops::resolve_attach_with_backend(&mut authority, request)
+        });
         let mut terminal = test_terminal();
         let target_idx = visible_session_index(&ui, "b");
         let (x, y) = point_for_visible_row(&ui, &mut terminal, target_idx);
@@ -2908,6 +3063,21 @@ pub(crate) mod tests {
         )
         .expect("session button up");
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve reused session");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reused session attach did not resolve"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install reused session")
+        );
         assert!(matches!(ui.mode, Mode::Attached));
         wait_for_pty_screen(&ui, &key, "CLEAN");
     }
@@ -3211,18 +3381,35 @@ pub(crate) mod tests {
         select_session_row(&mut ui, "a");
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
             vec![Box::new(AnyAttachingBackend(BackendKind::Opencode))];
+        ui.attach_executor = std::sync::Arc::new(|request| {
+            let mut authority = AnyAttachingBackend(BackendKind::Opencode);
+            crate::ops::resolve_attach_with_backend(&mut authority, request)
+        });
         let mut terminal = test_terminal();
 
-        crate::actions::attach_selected(&backends, &mut ui, &mut terminal)
-            .expect("attach external opencode session");
+        assert!(crate::actions::attach_selected(&mut ui));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve external opencode session");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "external opencode attach did not resolve"
+            );
+            std::thread::yield_now();
+        };
+        assert!(
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install external opencode session")
+        );
         assert!(matches!(ui.mode, Mode::Attached));
         assert!(
             !ui.mouse_capture,
             "attached transcripts must release capture for native terminal selection"
         );
 
-        let (_snapshot_tx, snapshots) =
-            std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
+        let (_snapshot_tx, snapshots) = std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
         let (wake, _wake_rx) = std::sync::mpsc::channel();
         let refresher = crate::Refresher { snapshots, wake };
         assert!(
@@ -3468,7 +3655,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn archive_action_refuses_external_row_and_submits_managed_row() {
+    fn archive_action_dispatches_both_rows_for_fresh_resolution() {
         let mut external = sess("external", "/tmp/external", 200);
         external.backend = BackendKind::Opencode;
         let mut managed = sess("managed", "/tmp/managed", 100);
@@ -3480,8 +3667,7 @@ pub(crate) mod tests {
 
         select_session_row(&mut ui, "external");
         crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(!ui.mutations.in_flight("opencode:external:hide"));
-        assert_eq!(ui.notice.text(), "opencode does not support hide");
+        assert!(ui.mutations.in_flight("opencode:external:hide"));
 
         select_session_row(&mut ui, "managed");
         crate::actions::hide_selected(&backends, &mut ui, true);
