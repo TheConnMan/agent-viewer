@@ -1,7 +1,6 @@
-//! MutationRunner — runs backend mutations (remove/stop/rename/hide) on a worker thread
-//! so the render loop never blocks. Each op is a self-contained closure returning a
-//! structured outcome; results are drained non-blocking via `poll()`. In-flight keys
-//! are deduped so a repeated keypress while an op is pending is a no-op.
+//! Background runners for backend work that must not block the render loop. Each operation is
+//! a self contained closure returning a structured outcome; results are drained without blocking
+//! through `poll()`. In flight keys deduplicate repeated submissions while work is pending.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -25,22 +24,25 @@ pub struct MutationOutcome {
     pub spawned: Option<SpawnSelection>,
 }
 
-pub struct MutationRunner {
-    tx: Sender<(String, Result<MutationOutcome, String>)>,
-    rx: Receiver<(String, Result<MutationOutcome, String>)>,
+pub struct BackgroundRunner<T> {
+    tx: Sender<(String, Result<T, String>)>,
+    rx: Receiver<(String, Result<T, String>)>,
     in_flight: HashSet<String>,
 }
 
-impl Default for MutationRunner {
+pub type MutationRunner = BackgroundRunner<MutationOutcome>;
+pub type AttachRunner<T> = BackgroundRunner<T>;
+
+impl<T: Send + 'static> Default for BackgroundRunner<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MutationRunner {
-    pub fn new() -> MutationRunner {
+impl<T: Send + 'static> BackgroundRunner<T> {
+    pub fn new() -> BackgroundRunner<T> {
         let (tx, rx) = channel();
-        MutationRunner {
+        BackgroundRunner {
             tx,
             rx,
             in_flight: HashSet::new(),
@@ -51,7 +53,7 @@ impl MutationRunner {
     /// already in flight.
     pub fn submit<F>(&mut self, key: String, op: F) -> bool
     where
-        F: FnOnce() -> Result<MutationOutcome, String> + Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
     {
         if self.in_flight.contains(&key) {
             return false;
@@ -67,7 +69,7 @@ impl MutationRunner {
     }
 
     /// Drain one completed result if ready (non-blocking), clearing its in-flight key.
-    pub fn poll(&mut self) -> Option<Result<MutationOutcome, String>> {
+    pub fn poll(&mut self) -> Option<Result<T, String>> {
         match self.rx.try_recv() {
             Ok((key, result)) => {
                 self.in_flight.remove(&key);

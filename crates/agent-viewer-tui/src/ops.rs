@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use agent_viewer_core::backend::{Backend, BackendKind};
-use agent_viewer_core::claude::ClaudeBackend;
+use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
@@ -14,6 +14,11 @@ use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
 use agent_viewer_tui::shared_listing::{
     SpawnDirectoryMode, SpawnTarget, TargetRequest, authoritative_target, invalidate_backend_scope,
 };
+
+pub(crate) struct AttachPlan {
+    pub(crate) session: Session,
+    pub(crate) command: std::process::Command,
+}
 
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
 pub(crate) enum Mutation {
@@ -95,6 +100,37 @@ fn target_failure(resolution: agent_viewer_tui::shared_listing::TargetResolution
         .notice()
         .unwrap_or("target resolution failed")
         .to_string()
+}
+
+pub(crate) fn resolve_attach_with_backend(
+    backend: &mut dyn Backend,
+    request: TargetRequest,
+) -> Result<AttachPlan, String> {
+    let session = authoritative_target(backend, &request).map_err(target_failure)?;
+    if !backend.capabilities_for(&session).attach {
+        return Err(format!(
+            "{} does not support attach",
+            session.backend.name()
+        ));
+    }
+    let claude_fallback = session.backend == BackendKind::Claude
+        && session.short_id.as_deref().unwrap_or_default().is_empty();
+    if claude_fallback {
+        let config = agent_viewer_core::home_dir().join(".claude.json");
+        let _ = ensure_trusted(&config, &session.cwd);
+    }
+    let command = backend
+        .attach_command(&session)
+        .map_err(|refusal| refusal.reason)?;
+    Ok(AttachPlan { session, command })
+}
+
+pub(crate) fn resolve_attach_with_opencode(
+    request: TargetRequest,
+    opencode_runtime: OpencodeRuntime,
+) -> Result<AttachPlan, String> {
+    let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+    resolve_attach_with_backend(backend.as_mut(), request)
 }
 
 fn run_targeted<F>(

@@ -15,9 +15,11 @@ use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
-use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner, SpawnSelection};
+use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner, SpawnSelection};
 use agent_viewer_tui::pr_cache::PrStatusCache;
-use agent_viewer_tui::shared_listing::{RefreshCursor, RefreshOutcome, refresh_backend};
+use agent_viewer_tui::shared_listing::{
+    RefreshCursor, RefreshOutcome, TargetRequest, refresh_backend,
+};
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 use agent_viewer_tui::{StartupAction, startup_action};
@@ -340,6 +342,10 @@ struct Ui {
     mutations: MutationRunner,
     /// Backend mutation boundary used by every submission on the runner thread.
     mutation_executor: Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>,
+    /// Authoritative attach resolution runs off the render thread.
+    attaches: AttachRunner<ops::AttachPlan>,
+    /// Fresh backend attach boundary used by every attach worker.
+    attach_executor: Arc<dyn Fn(TargetRequest) -> Result<ops::AttachPlan, String> + Send + Sync>,
     /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
     models: ModelCache,
     /// Live one-shot spawn blooms, keyed by session -> start now_ms.
@@ -573,6 +579,7 @@ fn main() -> io::Result<()> {
     }
 
     let mutation_runtime = opencode_runtime.clone();
+    let attach_runtime = opencode_runtime.clone();
     let mut ui = Ui {
         app,
         workspace,
@@ -586,6 +593,10 @@ fn main() -> io::Result<()> {
         mutations: MutationRunner::new(),
         mutation_executor: Arc::new(move |mutation| {
             ops::run_mutation_with_opencode(mutation, mutation_runtime.clone())
+        }),
+        attaches: AttachRunner::new(),
+        attach_executor: Arc::new(move |request| {
+            ops::resolve_attach_with_opencode(request, attach_runtime.clone())
         }),
         models,
         pulses: Pulses::new(),
@@ -604,12 +615,9 @@ fn main() -> io::Result<()> {
         sprite: startup_sprite,
     };
 
-    // Hand the listing backends to the refresh worker; the UI keeps a separate set for the
-    // non-list calls: attach_command and capabilities. Only the worker set ever calls the slow
-    // list(). These are no longer all cheap stateless builders: `attach_command` shells out to
-    // `codex app-server daemon version` for a daemon-hosted row (about 34ms, and only for
-    // those rows). Spawn used to be here too and is now a `Mutation::Spawn` on the runner,
-    // because a codex spawn dials the daemon and may start one.
+    // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
+    // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
+    // a mutation because either operation can dial the backend runtime.
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
     let refresher = spawn_refresh_worker(list_backends, last, cursors);
@@ -680,6 +688,15 @@ fn run(
         }
         if mutation_completed {
             refresher.force();
+        }
+
+        while let Some(result) = ui.attaches.poll() {
+            match result {
+                Ok(plan) => {
+                    actions::install_attach_plan(ui, terminal, plan)?;
+                }
+                Err(notice) => ui.set_notice(notice),
+            }
         }
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
@@ -1249,6 +1266,8 @@ mod tests {
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
             mutation_executor: Arc::new(ops::run_mutation),
+            attaches: AttachRunner::new(),
+            attach_executor: Arc::new(|_| Err("attach is not configured in this test".to_string())),
             models: ModelCache::new(),
             pulses: Pulses::new(),
             pr_status: PrStatusCache::new(),
@@ -1307,6 +1326,13 @@ mod tests {
         let current_model = ui.composer.model().to_string();
         ui.models
             .seed(BackendKind::Claude, vec![current_model], true);
+        let authority_session = session(BackendKind::Opencode, "attached", 1_000, false);
+        ui.attach_executor = Arc::new(move |request| {
+            let mut authority = AttachingBackend {
+                session: authority_session.clone(),
+            };
+            ops::resolve_attach_with_backend(&mut authority, request)
+        });
         let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(AttachingBackend {
             session: session(BackendKind::Opencode, "attached", 1_000, false),
         })];
@@ -1334,6 +1360,23 @@ mod tests {
             .expect("attach event"),
             "attach must not quit the viewer"
         );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let plan = loop {
+            if let Some(result) = ui.attaches.poll() {
+                break result.expect("resolve event bridge attach");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "event bridge attach did not resolve"
+            );
+            thread::yield_now();
+        };
+        assert!(
+            actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                .expect("install event bridge attach")
+        );
+        sync_mouse_capture(&mut output, &mut applied, ui.mouse_capture)
+            .expect("apply attach mouse capture");
         assert!(matches!(ui.mode, Mode::Attached));
         assert!(!ui.mouse_capture);
         assert!(!applied);
