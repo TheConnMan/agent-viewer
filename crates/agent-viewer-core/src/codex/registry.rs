@@ -58,16 +58,15 @@ impl Registry {
         })
     }
 
-    /// All rows including archived, updated_at_ms ascending. COALESCE bridges the nullable *_ms
-    /// columns (backfilled by triggers in the live schema) to the *_at * 1000 fallback.
+    /// All rows including archived, ordered by effective updated_at_ms ascending and id
+    /// descending. COALESCE bridges the nullable *_ms columns to the *_at * 1000 fallback.
     pub fn threads(&self) -> Result<Vec<Thread>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rollout_path, \
                     COALESCE(created_at_ms, created_at * 1000), \
                     COALESCE(updated_at_ms, updated_at * 1000), \
                     source, cwd, git_branch, title, archived, preview \
-             FROM threads \
-             ORDER BY COALESCE(updated_at_ms, updated_at * 1000) ASC, id DESC",
+             FROM threads",
         )?;
         let mut threads = stmt
             .query_map([], |row| {
@@ -87,6 +86,11 @@ impl Registry {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        threads.sort_by(|a, b| {
+            a.updated_at_ms
+                .cmp(&b.updated_at_ms)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         let names = read_thread_names(&self.session_index_path);
         for thread in &mut threads {
             if let Some(name) = names.get(&thread.id) {
