@@ -83,7 +83,7 @@ const VIEWER_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListingCacheSnapshot {
     sessions: Vec<Session>,
-    snapshot_json: String,
+    snapshot_json: Option<String>,
     published_at_ms: i64,
     published_generation: i64,
 }
@@ -93,7 +93,7 @@ impl ListingCacheSnapshot {
         let snapshot_json = serde_json::to_string(&sessions)?;
         Ok(ListingCacheSnapshot {
             sessions,
-            snapshot_json,
+            snapshot_json: Some(snapshot_json),
             published_at_ms: 0,
             published_generation: 0,
         })
@@ -130,7 +130,7 @@ impl ListingCacheSnapshot {
         }
         Some(ListingCacheSnapshot {
             sessions,
-            snapshot_json: String::new(),
+            snapshot_json: None,
             published_at_ms,
             published_generation,
         })
@@ -562,13 +562,18 @@ impl ViewerDb {
         snapshot: ListingCacheSnapshot,
         now_ms: i64,
     ) -> Result<ListingCacheWrite> {
+        let Some(snapshot_json) = snapshot.snapshot_json else {
+            return Err(crate::error::Error::Command(
+                "decoded listing snapshot cannot be published".to_string(),
+            ));
+        };
         let changed = self.conn.execute(
             "UPDATE backend_listing_cache \
              SET snapshot_json = ?1, refreshed_at_ms = ?2, generation = ?3, \
                  lease_owner = NULL, lease_until_ms = 0 \
              WHERE backend = ?4 AND scope = ?5 AND generation = ?6 AND lease_owner = ?7",
             rusqlite::params![
-                snapshot.snapshot_json,
+                snapshot_json,
                 now_ms,
                 lease.next_published_generation(),
                 lease.scope.backend().name(),
