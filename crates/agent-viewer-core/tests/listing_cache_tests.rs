@@ -195,24 +195,67 @@ fn backend_advertised_scopes_change_with_compatibility_namespace_fields() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn secure_opencode_bypasses_shared_listing_cache() {
+fn secure_opencode_scope_uses_credential_identity_and_source_namespace() {
+    let root = tempfile::tempdir().expect("OpenCode runtime directory");
+    let db_a = root.path().join("opencode a.sqlite");
+    let db_b = root.path().join("opencode b.sqlite");
+    let ordered = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
+    let reversed = [ordered[1], ordered[0]];
+    let first = OpencodeBackend::with_db_and_runtime(
+        db_a.clone(),
+        secure_runtime(root.path(), ordered, "first private credential"),
+    );
+    let same = OpencodeBackend::with_db_and_runtime(
+        db_a.clone(),
+        secure_runtime(root.path(), ordered, "first private credential"),
+    );
+    let different_credential = OpencodeBackend::with_db_and_runtime(
+        db_a.clone(),
+        secure_runtime(root.path(), ordered, "second private credential"),
+    );
+    let different_order = OpencodeBackend::with_db_and_runtime(
+        db_a.clone(),
+        secure_runtime(root.path(), reversed, "first private credential"),
+    );
+    let different_db = OpencodeBackend::with_db_and_runtime(
+        db_b,
+        secure_runtime(root.path(), ordered, "first private credential"),
+    );
+
+    assert_eq!(advertised_scope(&first), advertised_scope(&same));
+    assert_ne!(
+        advertised_scope(&first),
+        advertised_scope(&different_credential)
+    );
+    assert_ne!(advertised_scope(&first), advertised_scope(&different_order));
+    assert_ne!(advertised_scope(&first), advertised_scope(&different_db));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn secure_opencode_scope_hides_credentials_and_differs_from_compatibility() {
     let root = tempfile::tempdir().expect("OpenCode runtime directory");
     let db = root.path().join("opencode.sqlite");
     let candidates = [socket("127.0.0.1:41001"), socket("127.0.0.1:41002")];
+    let first_credential = "first private credential";
+    let second_credential = "second private credential";
     let secure = OpencodeBackend::with_db_and_runtime(
         db.clone(),
-        secure_runtime(root.path(), candidates, "private test credential"),
+        secure_runtime(root.path(), candidates, first_credential),
+    );
+    let other = OpencodeBackend::with_db_and_runtime(
+        db.clone(),
+        secure_runtime(root.path(), candidates, second_credential),
     );
     let compatibility = OpencodeBackend::with_db(db);
+    let secure_scope = advertised_scope(&secure);
+    let other_scope = advertised_scope(&other);
 
-    assert!(
-        secure.listing_scope().is_none(),
-        "secure server listings must never enter the shared cache"
-    );
-    assert!(
-        compatibility.listing_scope().is_some(),
-        "compatibility SQLite listings remain safe to share"
-    );
+    for scope in [&secure_scope, &other_scope] {
+        assert!(!scope.as_str().contains(first_credential));
+        assert!(!scope.as_str().contains(second_credential));
+    }
+    assert_ne!(secure_scope, advertised_scope(&compatibility));
 }
 
 #[test]
