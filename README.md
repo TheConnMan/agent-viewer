@@ -79,8 +79,8 @@ The default list groups alphabetic project directories and orders each project's
 The list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
-Working rows shimmer their glyph, needs-input rows breathe between muted and bright, and a
-session you just spawned blooms once when its row first appears.
+Working rows shimmer their glyph, NeedsInput rows stay static with a warning-colored `◐`, and
+a session you just spawned blooms once when its row first appears.
 
 ## Companion filtering
 
