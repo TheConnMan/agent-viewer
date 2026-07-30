@@ -452,6 +452,70 @@ mod tests {
         buffer
     }
 
+    fn sailboat(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        Sailboat::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn airplane(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        Airplane::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn hot_air_balloon(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        HotAirBalloon::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn pixel_color(buffer: &Buffer, x: u16, y: u16) -> Color {
+        let cell = &buffer[(x, y / 2)];
+        if y % 2 == 0 { cell.fg } else { cell.bg }
+    }
+
+    fn foreground_points(buffer: &Buffer, theme: &Theme) -> Vec<(i32, i32)> {
+        (0..ROWS as u16)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let color = pixel_color(buffer, *x, *y);
+                color != theme.bg && color != theme.faint
+            })
+            .map(|(x, y)| (i32::from(x), i32::from(y)))
+            .collect()
+    }
+
+    fn bounds(points: &[(i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+        Some((
+            points.iter().map(|(x, _)| *x).min()?,
+            points.iter().map(|(x, _)| *x).max()?,
+            points.iter().map(|(_, y)| *y).min()?,
+            points.iter().map(|(_, y)| *y).max()?,
+        ))
+    }
+
+    fn horizontal_changes(frames: &[Buffer], theme: &Theme) -> usize {
+        let positions: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                bounds(&foreground_points(frame, theme)).map(|(left, right, _, _)| left + right)
+            })
+            .collect();
+        positions
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count()
+    }
+
+    fn block_count(buffer: &Buffer) -> usize {
+        buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "▀")
+            .count()
+    }
+
     /// Star slot `index` as (column, terminal row, is_upper_half), read off the bitmap so a
     /// layout tweak cannot silently point the assertions at empty sky.
     fn star_cell(index: usize) -> (u16, u16, bool) {
@@ -636,6 +700,175 @@ mod tests {
         assert_eq!(turbine(&theme, 4, 0), turbine(&theme, 4, 400));
     }
 
+    #[test]
+    fn sailboat_hull_bobs_while_wave_crests_advance() {
+        let theme = theme::amber(false);
+        let frames: Vec<_> = (0..=120).map(|step| sailboat(&theme, step * 100)).collect();
+        let top_edges: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                foreground_points(frame, &theme)
+                    .iter()
+                    .map(|(_, y)| *y)
+                    .min()
+                    .unwrap()
+            })
+            .collect();
+        let hull_edges: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                foreground_points(frame, &theme)
+                    .iter()
+                    .filter(|(_, y)| *y < ROWS as i32 - 2)
+                    .map(|(_, y)| *y)
+                    .max()
+                    .unwrap()
+            })
+            .collect();
+        let wave_rows: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                (ROWS as u16 - 2..ROWS as u16)
+                    .flat_map(|y| (0..WIDTH).map(move |x| pixel_color(frame, x, y)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            top_edges.iter().max().unwrap() - top_edges.iter().min().unwrap(),
+            1
+        );
+        assert_eq!(
+            hull_edges.iter().max().unwrap() - hull_edges.iter().min().unwrap(),
+            1
+        );
+        assert!(wave_rows.iter().skip(1).any(|phase| phase != &wave_rows[0]));
+    }
+
+    #[test]
+    fn sailboat_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(sailboat(&theme, 0), sailboat(&theme, 12_000));
+    }
+
+    #[test]
+    fn airplane_crosses_clouds_and_wraps_through_clipped_edges() {
+        let theme = theme::amber(false);
+        let frames: Vec<_> = (0..=200).map(|step| airplane(&theme, step * 100)).collect();
+        let planes: Vec<_> = frames
+            .iter()
+            .map(|frame| foreground_points(frame, &theme))
+            .collect();
+        let visible: Vec<_> = planes.iter().filter(|plane| !plane.is_empty()).collect();
+        let counts: Vec<_> = visible.iter().map(|plane| plane.len()).collect();
+        let cloud_cells: Vec<_> = frames
+            .iter()
+            .flat_map(|frame| {
+                (0..ROWS as u16).flat_map(move |y| {
+                    (0..WIDTH)
+                        .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
+                        .map(move |x| (i32::from(x), i32::from(y)))
+                })
+            })
+            .collect();
+
+        assert!(
+            visible
+                .iter()
+                .filter_map(|plane| bounds(plane))
+                .any(|(left, _, _, _)| left == 0)
+        );
+        assert!(
+            visible
+                .iter()
+                .filter_map(|plane| bounds(plane))
+                .any(|(_, right, _, _)| right == i32::from(WIDTH - 1))
+        );
+        assert!(counts.iter().min().unwrap() < counts.iter().max().unwrap());
+        assert!(
+            visible
+                .iter()
+                .any(|plane| plane.iter().any(|point| cloud_cells.contains(point)))
+        );
+    }
+
+    #[test]
+    fn airplane_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(airplane(&theme, 0), airplane(&theme, 12_000));
+    }
+
+    #[test]
+    fn hot_air_balloon_drifts_more_slowly_with_one_pixel_vertical_change() {
+        let theme = theme::amber(false);
+        let times: Vec<_> = (0..=200).map(|step| step * 100).collect();
+        let airplane_frames: Vec<_> = times
+            .iter()
+            .map(|now_ms| airplane(&theme, *now_ms))
+            .collect();
+        let balloon_frames: Vec<_> = times
+            .iter()
+            .map(|now_ms| hot_air_balloon(&theme, *now_ms))
+            .collect();
+        let visible_bounds: Vec<_> = balloon_frames
+            .iter()
+            .filter_map(|frame| bounds(&foreground_points(frame, &theme)))
+            .filter(|(left, right, _, _)| *left > 0 && *right < i32::from(WIDTH - 1))
+            .collect();
+        let top_edges: Vec<_> = visible_bounds.iter().map(|(_, _, top, _)| *top).collect();
+        let bottom_edges: Vec<_> = visible_bounds
+            .iter()
+            .map(|(_, _, _, bottom)| *bottom)
+            .collect();
+        let horizontal_positions: Vec<_> = visible_bounds
+            .iter()
+            .map(|(left, right, _, _)| left + right)
+            .collect();
+
+        assert!(
+            horizontal_positions
+                .iter()
+                .any(|position| *position != horizontal_positions[0])
+        );
+        assert_eq!(
+            top_edges.iter().max().unwrap() - top_edges.iter().min().unwrap(),
+            1
+        );
+        assert_eq!(
+            bottom_edges.iter().max().unwrap() - bottom_edges.iter().min().unwrap(),
+            1
+        );
+        assert!(
+            horizontal_changes(&airplane_frames, &theme)
+                > horizontal_changes(&balloon_frames, &theme)
+        );
+    }
+
+    #[test]
+    fn hot_air_balloon_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(hot_air_balloon(&theme, 0), hot_air_balloon(&theme, 12_000));
+    }
+
+    #[test]
+    fn negative_timestamps_keep_new_scenes_inside_the_slot() {
+        let theme = theme::amber(false);
+
+        for buffer in [
+            sailboat(&theme, -12_345),
+            airplane(&theme, -12_345),
+            hot_air_balloon(&theme, -12_345),
+        ] {
+            assert_eq!(block_count(&buffer), 66);
+        }
+    }
+
     /// The parked pose is one blade up and two down at 120 degrees, so its three tips are fixed
     /// points: a rotation-math regression moves them.
     #[test]
@@ -675,4 +908,3 @@ mod tests {
         }
     }
 }
-
