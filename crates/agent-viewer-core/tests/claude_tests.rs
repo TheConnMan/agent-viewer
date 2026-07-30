@@ -831,7 +831,7 @@ fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
 }
 
 #[test]
-fn claude_stop_invokes_the_native_cli_with_the_short_id() {
+fn claude_stop_invokes_the_native_cli_for_an_idle_row() {
     let directory = tempfile::TempDir::new().expect("create fake cli directory");
     let binary = directory.path().join("claude");
     let args_path = directory.path().join("claude.args");
@@ -845,7 +845,8 @@ fn claude_stop_invokes_the_native_cli_with_the_short_id() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
         .expect("make fake claude cli executable");
 
-    let session = session_with_short_id(Some("stop01"));
+    let mut session = session_with_short_id(Some("stop01"));
+    session.status = Status::Idle;
     let backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
 
     Backend::stop(&backend, &session).expect("stop Claude session through its cli");
@@ -856,7 +857,7 @@ fn claude_stop_invokes_the_native_cli_with_the_short_id() {
 }
 
 #[test]
-fn claude_stop_capability_depends_only_on_active_status_and_short_id() {
+fn claude_stop_capability_requires_nonterminal_status_and_short_id() {
     use agent_viewer_core::claude::capabilities_for_session_on_platform;
     use agent_viewer_core::platform::Platform;
 
@@ -895,12 +896,21 @@ fn claude_stop_capability_depends_only_on_active_status_and_short_id() {
             );
         }
 
-        for status in [Status::Idle, Status::Done, Status::Error, Status::Unknown] {
-            let mut inactive = session_with_short_id(Some("stop01"));
-            inactive.status = status.clone();
+        for status in [Status::Idle, Status::Unknown] {
+            let mut active = session_with_short_id(Some("stop01"));
+            active.status = status.clone();
             assert!(
-                !capabilities_for_session_on_platform(platform, &inactive).stop,
-                "{platform:?} must not stop a {status:?} row"
+                capabilities_for_session_on_platform(platform, &active).stop,
+                "{platform:?} must allow Claude Agents to stop a nonterminal {status:?} row"
+            );
+        }
+
+        for status in [Status::Done, Status::Error] {
+            let mut finished = session_with_short_id(Some("stop01"));
+            finished.status = status.clone();
+            assert!(
+                !capabilities_for_session_on_platform(platform, &finished).stop,
+                "{platform:?} must not stop a finished {status:?} row"
             );
         }
     }

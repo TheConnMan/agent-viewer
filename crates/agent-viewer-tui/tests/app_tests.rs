@@ -1151,6 +1151,8 @@ fn kill_stage_two_stage() {
     let sessions = vec![
         sess(BackendKind::Codex, "work", "/p", 300, Status::Working),
         sess(BackendKind::Codex, "other", "/p", 200, Status::Working),
+        sess(BackendKind::Claude, "idle", "/p", 150, Status::Idle),
+        sess(BackendKind::Claude, "unknown", "/p", 125, Status::Unknown),
         sess(BackendKind::Codex, "done", "/p", 100, Status::Done),
     ];
     let mut app = App::new(sessions);
@@ -1161,6 +1163,12 @@ fn kill_stage_two_stage() {
     assert_eq!(app.kill_stage(2_999), KillStage::Remove); // 1999ms later, in window
     // Third press later re-arms (window elapsed / cleared by the remove) -> Stop.
     assert_eq!(app.kill_stage(5_000), KillStage::Stop);
+
+    // Idle and unknown rows are nonterminal. The backend decides whether the stop succeeds.
+    select(&mut app, "idle");
+    assert_eq!(app.kill_stage(6_000), KillStage::Stop);
+    select(&mut app, "unknown");
+    assert_eq!(app.kill_stage(7_000), KillStage::Stop);
 
     // Done session: first press is a silent Noop (not stoppable), second -> Remove.
     select(&mut app, "done");
