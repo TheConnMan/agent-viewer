@@ -265,6 +265,7 @@ fn codex_spawned_session_can_write_git_metadata() {
             "Run exactly this one shell command and then stop: \
              git checkout -b sandbox-probe. Do not do anything else.",
             None,
+            None,
         )
         .expect("spawn codex exec");
 
@@ -311,7 +312,7 @@ fn codex_spawn_running_then_done() {
     // 2. Spawn a trivial background codex exec.
     let spawn_at = Instant::now();
     backend
-        .spawn(&repo, "Reply with exactly the word DONE.", None)
+        .spawn(&repo, "Reply with exactly the word DONE.", None, None)
         .expect("spawn codex exec");
 
     // 3. Session appears in the list (spec ~1s, done-when ~2s; assert within 15s).
@@ -381,7 +382,7 @@ fn embedded_attach_live() {
 
     let mut backend = CodexBackend::new(default_codex_home());
     backend
-        .spawn(&repo, "Reply with exactly the word DONE.", None)
+        .spawn(&repo, "Reply with exactly the word DONE.", None, None)
         .expect("spawn codex exec");
 
     let canon = std::fs::canonicalize(&repo).unwrap_or(repo.clone());
@@ -465,7 +466,7 @@ fn opencode_live_short_lived_child() {
     let cwd = PathBuf::from(cwd);
     let backend = OpencodeBackend::with_runtime(OpencodeRuntime::new());
     let spawned = backend
-        .spawn(&cwd, &prompt, None)
+        .spawn(&cwd, &prompt, None, None)
         .expect("helper creates one server session");
     let session_id = spawned
         .session_id
@@ -489,7 +490,7 @@ fn opencode_live_cross_process_child() {
     wait_for_paths(&[start_path], Duration::from_secs(10));
 
     let spawned = OpencodeBackend::with_runtime(OpencodeRuntime::new())
-        .spawn(Path::new(&cwd), &prompt, None)
+        .spawn(Path::new(&cwd), &prompt, None, None)
         .expect("helper creates one server session");
     let session_id = spawned
         .session_id
@@ -1032,6 +1033,7 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
         &repo,
         "Count from 1 to 40, printing one number per line, and nothing else.",
         None,
+        None,
     )
     .expect("spawn a thread through the daemon");
     println!("[daemon] thread {thread_id}");
@@ -1148,6 +1150,7 @@ fn codex_spawn_identity_and_immediate_rename_persists() {
             &repo,
             "Run exactly this one shell command and then stop: sleep 12. \
              Do not do anything else.",
+            None,
             None,
         )
         .expect("spawn through the shared daemon");

@@ -174,7 +174,7 @@ fn thread_start_request_carries_a_model_only_when_one_was_picked() {
 
 #[test]
 fn turn_start_request_wraps_the_task_as_one_text_input() {
-    let request = json(&turn_start_request(6, "thread-abc", "do a thing"));
+    let request = json(&turn_start_request(6, "thread-abc", "do a thing", None));
     assert_envelope(&request, 6, "turn/start");
     assert_eq!(
         request.pointer("/params/threadId").and_then(Value::as_str),
@@ -188,12 +188,40 @@ fn turn_start_request_wraps_the_task_as_one_text_input() {
 }
 
 #[test]
+fn turn_start_request_carries_effort_only_when_requested() {
+    // Some(effort) puts the reasoning effort on the turn params verbatim.
+    let requested = json(&turn_start_request(
+        9,
+        "thread-abc",
+        "do a thing",
+        Some("xhigh"),
+    ));
+    assert_eq!(
+        requested.pointer("/params/effort").and_then(Value::as_str),
+        Some("xhigh")
+    );
+
+    // None means "let codex resolve its own default", so the key must be ABSENT entirely
+    // rather than present as a null, which the daemon would read as an explicit value.
+    let defaulted = json(&turn_start_request(10, "thread-abc", "do a thing", None));
+    assert_eq!(defaulted.pointer("/params/effort"), None);
+    assert!(
+        !defaulted
+            .pointer("/params")
+            .and_then(Value::as_object)
+            .expect("params is an object")
+            .contains_key("effort"),
+        "an absent effort must not serialize the key at all"
+    );
+}
+
+#[test]
 fn turn_start_request_round_trips_quotes_and_newlines() {
     // Proof the builders serialize through serde instead of formatting a string: a task
     // carrying a quote, a newline and a backslash must still parse as JSON at all, and the
     // text must come back out unchanged.
     let task = "say \"hello\"\nthen stop \\ here";
-    let request = json(&turn_start_request(7, "thread-abc", task));
+    let request = json(&turn_start_request(7, "thread-abc", task, None));
     assert_eq!(
         request
             .pointer("/params/input/0/text")

@@ -449,7 +449,13 @@ impl Backend for CodexBackend {
             .clone()
     }
 
-    fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<SpawnResult> {
+    fn spawn(
+        &self,
+        dir: &Path,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<SpawnResult> {
         if crate::platform::current_platform() != Platform::Linux {
             return Err(crate::error::Error::Unsupported(self.kind().name()));
         }
@@ -466,7 +472,7 @@ impl Backend for CodexBackend {
         let daemon = daemon.and_then(std::result::Result::ok);
         match spawn_route(daemon.as_ref(), exec_opt_in) {
             SpawnRoute::Daemon(daemon) => {
-                return match app_server::try_spawn_thread(daemon, dir, task, model) {
+                return match app_server::try_spawn_thread(daemon, dir, task, model, effort) {
                     // The daemon owns the thread, so its pid must never be handed back as a
                     // killable one. The exact thread id is safe to return and lets the TUI
                     // select the new row without guessing from cwd and creation time.

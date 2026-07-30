@@ -72,6 +72,7 @@ impl Backend for CountedBackend {
         _dir: &std::path::Path,
         _task: &str,
         _model: Option<&str>,
+        _effort: Option<&str>,
     ) -> agent_viewer_core::Result<SpawnResult> {
         unreachable!("spawn is not exercised by listing tests")
     }

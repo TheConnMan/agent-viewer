@@ -1157,6 +1157,7 @@ mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawning is not exercised by listing refresh tests")
         }
@@ -1450,6 +1451,7 @@ mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawning is not exercised by the event bridge")
         }
@@ -1502,6 +1504,7 @@ mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawning is not exercised by the activity cache")
         }
