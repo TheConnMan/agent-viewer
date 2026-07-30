@@ -15,6 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LINES: u16 = 10;
 const MARK_FIELD: usize = 4;
+/// The Auto entry's mark. Auto is not a backend, so it has no brand glyph and no logo image:
+/// it borrows the textual tag shape so the metadata row keeps its width in every mark mode.
+const AUTO_TAG: &str = "[au]";
 const INPUT_GUTTER: usize = MARK_FIELD + 1;
 pub(super) const COMPOSER_HINT: &str = "⇥ agent · ⇧⇥ model · ⏎ spawn";
 
@@ -271,7 +274,18 @@ pub(super) fn draw(
     show_cursor: bool,
 ) {
     let backend = composer.backend();
-    let mark = backend_mark(backend, theme);
+    let auto = composer.is_auto();
+    let provider = composer.provider_name();
+    let mark = if auto {
+        AUTO_TAG
+    } else {
+        backend_mark(backend, theme)
+    };
+    let mark_color = if auto {
+        theme.text
+    } else {
+        backend_mark_color(backend, theme)
+    };
     let directory = app
         .spawn_target()
         .map(|target| abbreviate_dir(target.displayed_directory()))
@@ -285,20 +299,11 @@ pub(super) fn draw(
         return;
     }
 
-    let layout = metadata_layout(
-        mark,
-        backend.name(),
-        model,
-        &directory,
-        inner.width as usize,
-    );
+    let layout = metadata_layout(mark, provider, model, &directory, inner.width as usize);
     let mut metadata = vec![
-        Span::styled(
-            field(mark, MARK_FIELD),
-            fg(backend_mark_color(backend, theme)),
-        ),
+        Span::styled(field(mark, MARK_FIELD), fg(mark_color)),
         Span::raw(" "),
-        Span::styled(backend.name().to_string(), fg(theme.text)),
+        Span::styled(provider.to_string(), fg(theme.text)),
         Span::styled(" · ", fg(theme.faint)),
         Span::styled(model.to_string(), fg(theme.muted)),
         Span::styled(" · ", fg(theme.faint)),
@@ -306,7 +311,7 @@ pub(super) fn draw(
     ];
     if let Some(hint) = layout.hint {
         let used = INPUT_GUTTER
-            + display_width(backend.name())
+            + display_width(provider)
             + display_width(" · ")
             + display_width(model)
             + display_width(" · ")
@@ -384,6 +389,7 @@ pub(super) fn draw(
 
     if let Some(logos) = logos
         && logo_marks()
+        && !auto
         && inner.width >= 3
     {
         let image = logos.composer_image(backend);

@@ -1,0 +1,49 @@
+{
+  "classification": {
+    "classifier_failed": false,
+    "claude_signals": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "codex_ready": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "confidence": "high",
+    "missing_connector": false,
+    "rationale": "Task is explicit (add unit test for truncated_title, run cargo test), verification is mechanical (test passes or fails), requires only shell and file tools already available, and can complete without strategic discoveries or mid-run judgment.",
+    "verdict": "codex"
+  },
+  "dispatch": null,
+  "dry_run": true,
+  "effort": "xhigh",
+  "gates": [],
+  "log_error": null,
+  "log_id": 25,
+  "model": null,
+  "provider": "codex",
+  "rationale": "codex: Task is explicit (add unit test for truncated_title, run cargo test), verification is mechanical (test passes or fails), requires only shell and file tools already available, and can complete without strategic discoveries or mid-run judgment. (codex_ready 6/6, claude_signals 0/6, High confidence; codex weekly 87%, claude weekly 52%)",
+  "usage": {
+    "claude": {
+      "five_hour_pct": 6.0,
+      "five_hour_reset_epoch": 1785393600,
+      "weekly_pct": 52.0,
+      "weekly_reset_epoch": 1785589200
+    },
+    "codex": {
+      "five_hour_pct": 0.0,
+      "five_hour_reset_epoch": 0,
+      "weekly_pct": 87.0,
+      "weekly_reset_epoch": 1785908348
+    }
+  },
+  "watch": "agent-viewer"
+}
