@@ -577,11 +577,7 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
     });
     items.extend(sessions.into_iter().map(|(_, item)| item));
 
-    for backend in [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Opencode,
-    ] {
+    for backend in ui.composer.available_backends().iter().copied() {
         let mut models = ui
             .models
             .models(backend)
@@ -1149,7 +1145,7 @@ pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
         handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
-        handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette,
+        handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette, palette_items,
         set_mouse_capture,
     };
     use crate::{NoticeState, Ui};
@@ -1161,7 +1157,7 @@ pub(crate) mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -2232,6 +2228,27 @@ pub(crate) mod tests {
             item.name == "Show all sessions"
                 && matches!(&item.target, PaletteTarget::Action(PaletteAction::ShowAll))
         }));
+    }
+
+    #[test]
+    fn palette_models_only_include_available_backends() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer
+            .set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+
+        let items = palette_items(&[], &ui);
+        let model_backends = items
+            .iter()
+            .filter_map(|item| match item.target {
+                PaletteTarget::Model { backend, .. } => Some(backend),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            model_backends,
+            HashSet::from([BackendKind::Codex, BackendKind::Opencode])
+        );
     }
 
     #[test]

@@ -7,11 +7,12 @@ use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
 
 /// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
-/// the task text plus the target backend, which Tab cycles Claude -> Codex -> Opencode.
+/// the task text plus the installed target backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composer {
     text: String,
     backend: BackendKind,
+    available_backends: Vec<BackendKind>,
     /// Whether the selector sits on the Auto entry, where `agent-router` picks the provider.
     /// Auto is not a `BackendKind` (it lists nothing and owns no sessions), so it rides
     /// alongside the concrete selection rather than replacing it.
@@ -75,12 +76,17 @@ impl Default for Composer {
 }
 
 impl Composer {
-    /// Fresh composer: empty text, Claude backend, its default model. `models_key` is None so
-    /// the first `ensure_models` call installs the real discovered Claude list.
+    /// Fresh composer with all backends available for isolated tests. Startup replaces this
+    /// list with host discovery before the first render.
     pub fn new() -> Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
+            available_backends: vec![
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Opencode,
+            ],
             auto: false,
             auto_available: false,
             model: BackendKind::Claude.default_model().to_string(),
@@ -99,6 +105,23 @@ impl Composer {
 
     pub fn backend(&self) -> BackendKind {
         self.backend
+    }
+
+    pub fn available_backends(&self) -> &[BackendKind] {
+        &self.available_backends
+    }
+
+    pub fn set_available_backends(&mut self, backends: Vec<BackendKind>) {
+        self.available_backends = backends;
+        if let Some(first) = self.available_backends.first().copied()
+            && !self.available_backends.contains(&self.backend)
+        {
+            self.backend = first;
+            self.model = first.default_model().to_string();
+            self.models = vec![first.default_model().to_string()];
+            self.models_key = None;
+            self.commands_key = None;
+        }
     }
 
     /// Whether the selector is on Auto, where the spawn goes through `agent-router` instead of
@@ -194,21 +217,28 @@ impl Composer {
         self.suggest_dismissed = false;
     }
 
-    /// Tab: Claude -> Codex -> Opencode -> Auto -> Claude, with Auto skipped entirely unless
-    /// `set_auto_available(true)` found the router. The model list is left stale for this one
-    /// step — `ensure_models` reinstalls (and resets to the default) at the end of the key
-    /// handler before any render, so nothing observes the stale list.
+    /// Tab advances through the available concrete backends, then Auto when offered.
     pub fn cycle_backend(&mut self) {
         if self.auto {
-            self.auto = false;
-            self.backend = BackendKind::Claude;
+            if let Some(first) = self.available_backends.first().copied() {
+                self.auto = false;
+                self.backend = first;
+            }
             return;
         }
-        match self.backend {
-            BackendKind::Claude => self.backend = BackendKind::Codex,
-            BackendKind::Codex => self.backend = BackendKind::Opencode,
-            BackendKind::Opencode if self.auto_available => self.auto = true,
-            BackendKind::Opencode => self.backend = BackendKind::Claude,
+        let Some(index) = self
+            .available_backends
+            .iter()
+            .position(|backend| *backend == self.backend)
+        else {
+            return;
+        };
+        if let Some(next) = self.available_backends.get(index + 1).copied() {
+            self.backend = next;
+        } else if self.auto_available {
+            self.auto = true;
+        } else if let Some(first) = self.available_backends.first().copied() {
+            self.backend = first;
         }
     }
 
@@ -516,6 +546,30 @@ mod tests {
 
         assert!(!composer.is_auto());
         assert_eq!(composer.provider_name(), "claude");
+    }
+
+    #[test]
+    fn provider_cycle_only_includes_backends_available_on_the_host() {
+        let mut composer = Composer::new();
+        composer.set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+
+        assert_eq!(composer.provider_name(), "codex");
+        composer.cycle_backend();
+        assert_eq!(composer.provider_name(), "opencode");
+        composer.cycle_backend();
+        assert_eq!(composer.provider_name(), "codex");
+    }
+
+    #[test]
+    fn auto_returns_to_the_first_available_backend() {
+        let mut composer = Composer::new();
+        composer.set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+        composer.set_auto_available(true);
+        composer.default_to_auto();
+
+        assert_eq!(composer.provider_name(), "auto");
+        composer.cycle_backend();
+        assert_eq!(composer.provider_name(), "codex");
     }
 
     /// Losing the router while Auto is selected must fall back to a real backend rather than
