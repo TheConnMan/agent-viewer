@@ -8,8 +8,12 @@
 mod common;
 
 use agent_viewer_core::BackendKind;
-use agent_viewer_core::router::{ROUTER_BIN, RouterOutcome, find_on_path, parse_outcome};
+use agent_viewer_core::platform::Platform;
+use agent_viewer_core::router::{
+    ROUTER_BIN, RouterOutcome, find_on_path, parse_outcome, route_command,
+};
 use common::read_fixture;
+use std::ffi::OsStr;
 
 /// The dispatched shape: the same live output with the `dispatch` object the router writes
 /// once it has actually started the job (`{job_id, job_name}`).
@@ -118,22 +122,22 @@ fn an_unreadable_decision_is_an_error_not_a_panic_and_not_a_fallback() {
 fn the_auto_gate_is_off_when_the_router_binary_is_not_on_the_path() {
     let empty = tempfile::tempdir().expect("temp dir");
     let installed = tempfile::tempdir().expect("temp dir");
-    write_router(installed.path(), true);
+    write_router(installed.path(), ROUTER_BIN, true);
 
     assert_eq!(
-        find_on_path(ROUTER_BIN, Some(empty.path().as_os_str())),
+        find_on_path(Platform::Linux, ROUTER_BIN, Some(empty.path().as_os_str())),
         None,
         "a PATH without the router must not offer Auto"
     );
     assert_eq!(
-        find_on_path(ROUTER_BIN, None),
+        find_on_path(Platform::Linux, ROUTER_BIN, None),
         None,
         "no PATH at all must not offer Auto"
     );
 
     let path = std::env::join_paths([empty.path(), installed.path()]).expect("join paths");
     assert_eq!(
-        find_on_path(ROUTER_BIN, Some(path.as_os_str())),
+        find_on_path(Platform::Linux, ROUTER_BIN, Some(path.as_os_str())),
         Some(installed.path().join(ROUTER_BIN)),
         "the router must be found in the second PATH entry"
     );
@@ -145,19 +149,97 @@ fn the_auto_gate_is_off_when_the_router_binary_is_not_on_the_path() {
 #[cfg(unix)]
 fn the_auto_gate_is_off_for_a_non_executable_file_named_like_the_router() {
     let unexecutable = tempfile::tempdir().expect("temp dir");
-    write_router(unexecutable.path(), false);
+    write_router(unexecutable.path(), ROUTER_BIN, false);
 
     assert_eq!(
-        find_on_path(ROUTER_BIN, Some(unexecutable.path().as_os_str())),
+        find_on_path(
+            Platform::Linux,
+            ROUTER_BIN,
+            Some(unexecutable.path().as_os_str())
+        ),
         None,
         "a non-executable agent-router must not offer Auto"
     );
 }
 
-/// Write a fake router into `dir`, with or without the executable bit (a no-op off unix, where
-/// there is no bit to set).
-fn write_router(dir: &std::path::Path, executable: bool) {
-    let path = dir.join(ROUTER_BIN);
+/// The windows release installs `agent-router.exe`, so a gate that only ever probes the bare name
+/// leaves Auto permanently missing on a supported platform. The platform is a parameter (as in
+/// `platform_tests.rs`), so the windows branch is exercised on this host too.
+#[test]
+fn the_windows_router_is_found_by_its_exe_suffix() {
+    let installed = tempfile::tempdir().expect("temp dir");
+    write_router(installed.path(), "agent-router.exe", true);
+
+    assert_eq!(
+        find_on_path(
+            Platform::Windows,
+            ROUTER_BIN,
+            Some(installed.path().as_os_str())
+        ),
+        Some(installed.path().join("agent-router.exe")),
+        "a windows install must satisfy the Auto gate"
+    );
+    assert_eq!(
+        find_on_path(
+            Platform::Linux,
+            ROUTER_BIN,
+            Some(installed.path().as_os_str())
+        ),
+        None,
+        "a unix router is the bare name; an .exe must not satisfy the gate off windows"
+    );
+}
+
+/// The task is user text and can begin with a hyphen (`--help ...`, `-v ...`). Passed as a bare
+/// positional it is parsed by the router's own clap as an option, so the run fails instead of
+/// routing. A literal `--` ends option parsing and keeps the task a positional whatever it says.
+#[test]
+fn the_task_is_passed_after_a_double_dash_so_a_hyphen_task_stays_the_task() {
+    let command = route_command(
+        std::path::Path::new("/tmp/routed proj"),
+        "--help me refactor",
+    );
+
+    assert_eq!(command.get_program(), OsStr::new(ROUTER_BIN));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            OsStr::new("run"),
+            OsStr::new("--json"),
+            OsStr::new("--dir"),
+            OsStr::new("/tmp/routed proj"),
+            OsStr::new("--"),
+            OsStr::new("--help me refactor"),
+        ]
+    );
+}
+
+/// The router's job name falls back to a prefix of the task when the backend reported no id, and a
+/// task is multi-line often enough. A newline in the footer notice splits or clips the one line the
+/// user reads, so the name is collapsed to single spaces before it lands there.
+#[test]
+fn a_multiline_job_name_still_yields_a_one_line_notice() {
+    let multiline = read_fixture("router_run_dry_run.json").replace(
+        "\"dispatch\": null",
+        "\"dispatch\": {\n    \"job_id\": null,\n    \"job_name\": \"Fix the parser\\n\\nthen add a test\"\n  }",
+    );
+    let outcome = parse_outcome(&multiline).expect("parsed decision");
+
+    let notice = outcome.notice();
+    assert_eq!(
+        notice,
+        "auto: codex effort xhigh job Fix the parser then add a test (codex weekly 87%, claude 52%)"
+    );
+    assert!(
+        !notice.contains('\n') && !notice.contains('\r'),
+        "the footer is one line: {notice:?}"
+    );
+}
+
+/// Write a fake router named `name` into `dir`, with or without the executable bit (a no-op off
+/// unix, where there is no bit to set).
+fn write_router(dir: &std::path::Path, name: &str, executable: bool) {
+    let path = dir.join(name);
     std::fs::write(&path, b"#!/bin/sh\n").expect("write router");
     #[cfg(unix)]
     {

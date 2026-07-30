@@ -3,7 +3,7 @@
 use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::state::{
     DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
-    apply_viewer_state, match_spawn,
+    apply_viewer_state, match_spawn, match_spawn_between,
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
@@ -752,6 +752,72 @@ fn match_spawn_window_and_nearest() {
         ),
     ];
     assert_eq!(match_spawn(&record, &miss), None);
+}
+
+/// A routed spawn is matched over the INTERVAL the session could have been created in (the router
+/// invocation through its return), not one instant. The router keeps polling for the winning
+/// backend's job id for seconds after the job already exists, so the row it must select predates
+/// the return stamp by far more than the 2s of backward slack a single stamp reaches. The interval
+/// keeps that same slack on each side, so nothing created outside the router call gets in.
+#[test]
+fn match_spawn_between_spans_the_whole_routing_interval() {
+    let cwd = PathBuf::from("/home/user/routed-proj");
+    let invoked_at = 1_000_000;
+    let returned_at = 1_010_000;
+
+    let created_while_routing = vec![sess(
+        BackendKind::Codex,
+        "routed",
+        "/home/user/routed-proj",
+        // 5s before the router returned: outside a single stamp's window, inside the interval.
+        1_005_000,
+        Status::Working,
+    )];
+    assert_eq!(
+        match_spawn_between(
+            BackendKind::Codex,
+            &cwd,
+            invoked_at,
+            returned_at,
+            &created_while_routing
+        ),
+        Some("routed".to_string())
+    );
+
+    let outside = vec![
+        sess(
+            BackendKind::Codex,
+            "before-the-router-ran",
+            "/home/user/routed-proj",
+            invoked_at - 2_001,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "long-after-it-returned",
+            "/home/user/routed-proj",
+            returned_at + 30_001,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "wrong-cwd",
+            "/home/user/other",
+            1_005_000,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Opencode,
+            "wrong-backend",
+            "/home/user/routed-proj",
+            1_005_000,
+            Status::Working,
+        ),
+    ];
+    assert_eq!(
+        match_spawn_between(BackendKind::Codex, &cwd, invoked_at, returned_at, &outside),
+        None
+    );
 }
 
 #[test]

@@ -14,6 +14,12 @@ pub struct SpawnSelection {
     pub backend: BackendKind,
     pub session_id: Option<String>,
     pub cwd: PathBuf,
+    /// The earliest instant the new session could have been created: the spawn call itself for a
+    /// direct spawn, the router INVOCATION for a routed one. Together with `spawned_at_ms` it
+    /// brackets the interval the cwd + creation-time fallback searches, because a routed job is
+    /// created while the router runs, not when its decision lands.
+    pub submitted_at_ms: i64,
+    /// The latest instant it could have been created: the spawn call, or the router's return.
     pub spawned_at_ms: i64,
     pub preexisting_ids: HashSet<String>,
 }

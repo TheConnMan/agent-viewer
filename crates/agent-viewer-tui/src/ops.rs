@@ -49,8 +49,8 @@ pub(crate) enum Mutation {
     /// it returns. Auto is not a `Backend` (it lists nothing), which is why this variant does
     /// not go through the trait at all.
     ///
-    /// Deliberately carries NO submission timestamp: the instant a routed row is matched against
-    /// is stamped when the router returns (see `run_spawn_auto`).
+    /// Deliberately carries NO timestamps: the interval a routed row is matched against is
+    /// stamped on the worker, around the router call itself (see `run_spawn_auto`).
     SpawnAuto {
         target: SpawnTarget,
         task: String,
@@ -115,6 +115,8 @@ fn spawn_selection_from_mutation(
         backend: *backend,
         session_id: spawned.session_id.clone(),
         cwd: target.displayed_directory().to_path_buf(),
+        // A direct spawn is one instant: submission and completion are the same stamp.
+        submitted_at_ms: *spawned_at_ms,
         spawned_at_ms: *spawned_at_ms,
         preexisting_ids: preexisting_ids.clone(),
     })
@@ -327,11 +329,14 @@ fn run_spawn_auto(
     route: impl FnOnce(&std::path::Path, &str) -> Result<RouterOutcome, String>,
 ) -> Result<MutationOutcome, String> {
     let directory = spawn_directory(target, opencode_runtime)?;
+    // BOTH stamps are kept, because the routed job is created somewhere between them and the
+    // fallback has to bracket that whole interval. The classifier call plus the winning backend's
+    // own spawn can burn most of the router's 180s deadline, and the router then polls seconds
+    // longer for a job id it may never resolve. Matched against the return stamp alone the row is
+    // already too old (that window reaches only 2s back); matched against the invocation alone the
+    // window can expire before the row appears.
+    let submitted_at_ms = now_ms();
     let outcome = route(&directory, task)?;
-    // Stamped HERE, not when Enter was pressed: the classifier call plus the winning backend's
-    // own spawn can burn most of the router's 180s deadline, while `match_spawn` only accepts a
-    // row created within 30s of the stamp. A submission stamp therefore expired before the row
-    // it was meant to select ever appeared.
     let spawned_at_ms = now_ms();
     Ok(MutationOutcome {
         notice: outcome.notice(),
@@ -339,6 +344,7 @@ fn run_spawn_auto(
             backend: outcome.provider,
             session_id: outcome.job_id,
             cwd: directory,
+            submitted_at_ms,
             spawned_at_ms,
             preexisting_ids: preexisting_ids
                 .get(&outcome.provider)
@@ -529,6 +535,54 @@ mod tests {
         );
     }
 
+    /// The routed job is created somewhere INSIDE the router call, not at its return: the router
+    /// polls for the winning backend's job id for up to ~10s after it dispatched, and reports no
+    /// id when that resolution misses. The row must then be selected by cwd + creation time, and
+    /// against a single return stamp its creation is already outside the 2s that window reaches
+    /// backwards. So the selection window opens at the instant the router was invoked.
+    #[test]
+    fn a_routed_selection_window_opens_when_the_router_was_invoked() {
+        let before_call = now_ms();
+        let routing_ms = 60;
+
+        let outcome = run_spawn_auto(
+            &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_window")),
+            "a routed task",
+            &HashMap::new(),
+            &OpencodeRuntime::new(),
+            |_directory, _task| {
+                std::thread::sleep(Duration::from_millis(routing_ms));
+                Ok(RouterOutcome {
+                    provider: BackendKind::Claude,
+                    model: None,
+                    effort: None,
+                    // The short-id resolution missed, so the row is matched by cwd + time.
+                    job_id: None,
+                    job_name: Some("a routed task".to_string()),
+                    gates: Vec::new(),
+                    rationale: String::new(),
+                    claude_weekly_pct: 0.0,
+                    codex_weekly_pct: 0.0,
+                })
+            },
+        )
+        .expect("a routed decision is a successful mutation");
+
+        let selection = outcome.spawned.expect("a routed spawn selects its row");
+        assert!(
+            selection.submitted_at_ms >= before_call,
+            "the window must open no earlier than the submission: {} is before {}",
+            selection.submitted_at_ms,
+            before_call
+        );
+        assert!(
+            selection.spawned_at_ms - selection.submitted_at_ms >= routing_ms as i64,
+            "the window must span the whole router call: {} to {} is shorter than {routing_ms}ms",
+            selection.submitted_at_ms,
+            selection.spawned_at_ms
+        );
+    }
+
     fn session(backend: BackendKind, id: &str, hidden: bool) -> Session {
         Session {
             backend,
@@ -608,6 +662,8 @@ mod tests {
         assert_eq!(selection.session_id.as_deref(), Some("new_session"));
         assert_eq!(selection.cwd, PathBuf::from("/tmp/spawn_selection"));
         assert_eq!(selection.spawned_at_ms, 42);
+        // A direct spawn knows exactly when it happened, so its window is that one instant.
+        assert_eq!(selection.submitted_at_ms, 42);
         assert_eq!(
             selection.preexisting_ids,
             ["visible".to_string(), "archived".to_string()]
