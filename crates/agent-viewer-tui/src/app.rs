@@ -405,16 +405,13 @@ impl App {
 
     /// Two-stage Ctrl+X (list page only). Selected session S, injected now_ms:
     ///  - armed for (S.backend,S.id) and now-armed <= 2_000 -> clear, Remove
-    ///  - else arm (S, now): S.status in {Working, NeedsInput} -> Stop,
+    ///  - else arm (S, now): nonterminal S -> Stop,
     ///    else Noop (armed silently; footer shows the countdown hint)
     pub fn kill_stage(&mut self, now_ms: i64) -> KillStage {
-        let Some((backend, id, should_stop)) = self.selected().map(|s| {
-            (
-                s.backend,
-                s.id.clone(),
-                matches!(s.status, Status::Working | Status::NeedsInput { .. }),
-            )
-        }) else {
+        let Some((backend, id, should_stop)) = self
+            .selected()
+            .map(|s| (s.backend, s.id.clone(), !s.status.is_finished()))
+        else {
             return KillStage::Noop;
         };
 
