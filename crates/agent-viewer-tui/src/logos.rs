@@ -15,6 +15,8 @@ use ratatui_image::protocol::Protocol;
 const CLAUDE_SVG: &str = include_str!("../assets/logos/claude.svg");
 const CODEX_SVG: &str = include_str!("../assets/logos/codex.svg");
 const OPENCODE_SVG: &str = include_str!("../assets/logos/opencode.svg");
+/// The Auto spawn entry is not a backend, so it carries a neutral robot mark instead of a brand.
+const AUTO_SVG: &str = include_str!("../assets/logos/auto.svg");
 
 /// Pixel size the SVGs are rasterized to before `new_protocol` downsizes them into the
 /// two cell slot; oversampling keeps the half blocks fallback from looking chunky.
@@ -27,9 +29,11 @@ pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
     opencode: Protocol,
+    auto: Protocol,
     composer_claude: Option<Protocol>,
     composer_codex: Option<Protocol>,
     composer_opencode: Option<Protocol>,
+    composer_auto: Option<Protocol>,
 }
 
 impl LogoMarks {
@@ -52,13 +56,16 @@ impl LogoMarks {
         let (claude, composer_claude) = build_protocols(picker, CLAUDE_SVG)?;
         let (codex, composer_codex) = build_protocols(picker, CODEX_SVG)?;
         let (opencode, composer_opencode) = build_protocols(picker, OPENCODE_SVG)?;
+        let (auto, composer_auto) = build_protocols(picker, AUTO_SVG)?;
         Ok(LogoMarks {
             claude,
             codex,
             opencode,
+            auto,
             composer_claude,
             composer_codex,
             composer_opencode,
+            composer_auto,
         })
     }
 
@@ -79,6 +86,12 @@ impl LogoMarks {
             BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
             BackendKind::Opencode => self.composer_opencode.as_ref().unwrap_or(&self.opencode),
         }
+    }
+
+    /// The composer protocol for the Auto entry's robot mark, on the same three cell canvas
+    /// as the backend composer marks and with the same halfblocks fallback.
+    pub fn composer_auto_image(&self) -> &Protocol {
+        self.composer_auto.as_ref().unwrap_or(&self.auto)
     }
 }
 
@@ -175,6 +188,8 @@ mod tests {
             logos.composer_image(BackendKind::Codex).size(),
             Size::new(3, 1)
         );
+        assert_eq!(logos.auto.size(), Size::new(2, 1));
+        assert_eq!(logos.composer_auto_image().size(), Size::new(3, 1));
     }
 
     #[test]
