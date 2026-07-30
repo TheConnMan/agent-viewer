@@ -292,6 +292,272 @@ fn set_sessions_sanitizes_session_titles_before_storing_and_rendering() {
     assert_title_is_safe_in_storage_and_rendering(&mut app, "refreshed-title", expected);
 }
 
+#[test]
+fn project_rows_hide_ascii_case_insensitive_exact_hold_titles_and_count_visible_members() {
+    let root = PathBuf::from("/synthetic/mixed_hold");
+    let mut sanitized_hold = sess(
+        BackendKind::Codex,
+        "sanitized_hold",
+        "/synthetic/mixed_hold",
+        100,
+        Status::Working,
+    );
+    sanitized_hold.title = "ho\u{200B}ld".to_string();
+    let mut title_case = sess(
+        BackendKind::Codex,
+        "title_case",
+        "/synthetic/mixed_hold",
+        200,
+        Status::Working,
+    );
+    title_case.title = "Hold".to_string();
+    let mut uppercase = sess(
+        BackendKind::Codex,
+        "uppercase",
+        "/synthetic/mixed_hold",
+        300,
+        Status::Working,
+    );
+    uppercase.title = "HOLD".to_string();
+    let mut trailing_space = sess(
+        BackendKind::Codex,
+        "trailing_space",
+        "/synthetic/mixed_hold",
+        400,
+        Status::Done,
+    );
+    trailing_space.title = "hold ".to_string();
+    let mut substring = sess(
+        BackendKind::Codex,
+        "substring",
+        "/synthetic/mixed_hold",
+        500,
+        Status::Done,
+    );
+    substring.title = "my hold".to_string();
+
+    let mut app = App::new(vec![
+        sanitized_hold,
+        title_case,
+        uppercase,
+        trailing_space,
+        substring,
+    ]);
+
+    assert!(app.visible().iter().any(|row| matches!(
+        row,
+        Row::ProjectHeader {
+            root: row_root,
+            count: 2,
+            ..
+        } if row_root == &root
+    )));
+    let project_titles = session_rows(app.visible())
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session { title, .. } => Some(title.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(project_titles, vec!["hold ", "my hold"]);
+    assert!(!has_session(&app, "sanitized_hold"));
+    assert!(!has_session(&app, "title_case"));
+    assert!(!has_session(&app, "uppercase"));
+
+    app.toggle_group_mode();
+
+    assert_eq!(section_headers(app.visible()), vec![Section::Done]);
+    assert!(app.visible().iter().any(|row| matches!(
+        row,
+        Row::SectionHeader {
+            section: Section::Done,
+            count: 2,
+            ..
+        }
+    )));
+    assert!(!app.visible().iter().any(|row| matches!(
+        row,
+        Row::SectionHeader {
+            section: Section::Working,
+            ..
+        }
+    )));
+    assert!(!has_session(&app, "sanitized_hold"));
+    assert!(!has_session(&app, "title_case"));
+    assert!(!has_session(&app, "uppercase"));
+}
+
+#[test]
+fn project_header_remains_when_all_members_match_hold_sentinel() {
+    let root = PathBuf::from("/synthetic/hold_only");
+    let mut lowercase = sess(
+        BackendKind::Codex,
+        "lowercase",
+        "/synthetic/hold_only",
+        100,
+        Status::Idle,
+    );
+    lowercase.title = "hold".to_string();
+    let mut title_case = sess(
+        BackendKind::Codex,
+        "title_case",
+        "/synthetic/hold_only",
+        200,
+        Status::Done,
+    );
+    title_case.title = "Hold".to_string();
+    let mut uppercase = sess(
+        BackendKind::Codex,
+        "uppercase",
+        "/synthetic/hold_only",
+        300,
+        Status::Working,
+    );
+    uppercase.title = "HOLD".to_string();
+
+    let app = App::new(vec![lowercase, title_case, uppercase]);
+
+    assert_eq!(project_headers(app.visible()).len(), 1);
+    assert!(app.visible().iter().any(|row| matches!(
+        row,
+        Row::ProjectHeader {
+            root: row_root,
+            count: 0,
+            ..
+        } if row_root == &root
+    )));
+    assert!(session_rows(app.visible()).is_empty());
+}
+
+#[test]
+fn hold_rows_cannot_be_revealed_and_do_not_change_hidden_count() {
+    let mut title_convention = sess(
+        BackendKind::Codex,
+        "title_convention",
+        "/synthetic/visibility",
+        100,
+        Status::Idle,
+    );
+    title_convention.title = "Hold".to_string();
+    let visible = sess(
+        BackendKind::Codex,
+        "visible",
+        "/synthetic/visibility",
+        200,
+        Status::Idle,
+    );
+    let mut archived = sess(
+        BackendKind::Codex,
+        "archived",
+        "/synthetic/visibility",
+        300,
+        Status::Done,
+    );
+    archived.hidden = true;
+    let mut companion = sess(
+        BackendKind::Codex,
+        "companion",
+        "/synthetic/visibility",
+        400,
+        Status::Working,
+    );
+    companion.companion = true;
+    let mut app = App::new(vec![title_convention, visible, archived, companion]);
+
+    assert_eq!(app.hidden_count(), 2);
+    assert!(!has_session(&app, "title_convention"));
+    assert!(has_session(&app, "visible"));
+
+    app.set_filter("hold".to_string());
+
+    assert_eq!(app.hidden_count(), 0);
+    assert!(session_rows(app.visible()).is_empty());
+    assert!(!has_session(&app, "title_convention"));
+
+    app.set_filter(String::new());
+    assert_eq!(app.hidden_count(), 2);
+    app.toggle_show_all();
+
+    assert_eq!(app.hidden_count(), 0);
+    assert!(!has_session(&app, "title_convention"));
+    assert!(has_session(&app, "visible"));
+    assert!(has_session(&app, "archived"));
+    assert!(has_session(&app, "companion"));
+}
+
+#[test]
+fn refresh_of_selected_session_to_hold_falls_back_safely() {
+    let mut selected = sess(
+        BackendKind::Codex,
+        "selected",
+        "/synthetic/refresh_with_sibling",
+        100,
+        Status::Idle,
+    );
+    selected.title = "active".to_string();
+    let sibling = sess(
+        BackendKind::Codex,
+        "sibling",
+        "/synthetic/refresh_with_sibling",
+        200,
+        Status::Idle,
+    );
+    let mut app = App::new(vec![selected, sibling.clone()]);
+    select(&mut app, "selected");
+
+    let mut renamed = sess(
+        BackendKind::Codex,
+        "selected",
+        "/synthetic/refresh_with_sibling",
+        100,
+        Status::Idle,
+    );
+    renamed.title = "Hold".to_string();
+    app.set_sessions(vec![renamed, sibling]);
+
+    assert_eq!(
+        app.selected().map(|session| session.id.as_str()),
+        Some("sibling")
+    );
+    assert!(!has_session(&app, "selected"));
+
+    let root = PathBuf::from("/synthetic/refresh_without_sibling");
+    let only = sess(
+        BackendKind::Codex,
+        "only",
+        "/synthetic/refresh_without_sibling",
+        100,
+        Status::Idle,
+    );
+    let mut only_app = App::new(vec![only]);
+    select(&mut only_app, "only");
+    let mut renamed_only = sess(
+        BackendKind::Codex,
+        "only",
+        "/synthetic/refresh_without_sibling",
+        100,
+        Status::Idle,
+    );
+    renamed_only.title = "Hold".to_string();
+
+    only_app.set_sessions(vec![renamed_only]);
+
+    assert!(only_app.visible().iter().any(|row| matches!(
+        row,
+        Row::ProjectHeader {
+            root: row_root,
+            count: 0,
+            ..
+        } if row_root == &root
+    )));
+    assert!(session_rows(only_app.visible()).is_empty());
+    assert!(only_app.selected().is_none());
+    assert_eq!(
+        only_app.toggle_selected_group(),
+        Some((GroupKey::Project(root), true))
+    );
+}
+
 // --- v2 list model (tests 31-37) ---
 
 #[test]

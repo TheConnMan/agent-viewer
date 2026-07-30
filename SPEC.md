@@ -616,6 +616,14 @@ remain safe cross platform smoke paths.
   opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
   Project groups remain alphabetic and their members order by `created_at_ms` ascending.
   State sections remain fixed and their members order by `updated_at_ms` ascending.
+  After sanitization, the exact whole title `hold` is matched without regard to ASCII letter
+  case and omitted only when the TUI emits a session row. Thus `hold`, `Hold`, and `HOLD` are
+  omitted, while whitespace and substring variants remain visible. Project headers count
+  rendered non hold sessions, so a project containing only matching sessions remains as a header
+  with count zero. State section counts include only rendered rows, so a section containing
+  only matching sessions is absent. `Ctrl+K` quickswitcher session entries use the same visible
+  row model, so matching sessions are omitted while ordinary sessions and independent
+  quickswitcher actions remain. Enumeration, backend data, and mutation behavior do not change.
 - Keys: `Enter` attach/resume when the composer is empty, or spawn a composed task; bare letters
   and numbers type into the composer, including when empty, and `/` composes; `Ctrl+D` hide
   (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` toggles a selected group
