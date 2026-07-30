@@ -9,11 +9,11 @@ mod palette;
 mod sprite;
 pub mod theme;
 
-pub use attach::ATTACHED_CHROME_ROWS;
 use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
+pub use attach::ATTACHED_CHROME_ROWS;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;

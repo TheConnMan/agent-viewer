@@ -937,10 +937,7 @@ mod tests {
             .with_screen(|screen| screen.size());
         assert_eq!(
             screen_size,
-            (
-                terminal_height - ATTACHED_CHROME_ROWS,
-                terminal_width
-            )
+            (terminal_height - ATTACHED_CHROME_ROWS, terminal_width)
         );
 
         ui.attached
@@ -968,16 +965,13 @@ mod tests {
         );
 
         let key = (BackendKind::Claude, session.id.clone());
-        let initial_pid = ui
-            .attached
-            .get(&key)
-            .expect("initial attached pty")
-            .pid();
+        let initial_pid = ui.attached.get(&key).expect("initial attached pty").pid();
         let terminal_width = 149;
         let terminal_height = 43;
-        let mut retained_terminal = ratatui::Terminal::new(
-            ratatui::backend::TestBackend::new(terminal_width, terminal_height),
-        )
+        let mut retained_terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            terminal_width,
+            terminal_height,
+        ))
         .expect("retained test terminal");
         let mut retained_command = std::process::Command::new("sh");
         retained_command.args(["-c", "exit 99"]);
@@ -995,10 +989,7 @@ mod tests {
         assert_eq!(retained_pty.pid(), initial_pid);
         assert_eq!(
             retained_pty.with_screen(|screen| screen.size()),
-            (
-                terminal_height - ATTACHED_CHROME_ROWS,
-                terminal_width
-            )
+            (terminal_height - ATTACHED_CHROME_ROWS, terminal_width)
         );
 
         ui.attached
