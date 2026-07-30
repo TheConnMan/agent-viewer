@@ -9,7 +9,7 @@ use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_com
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
-use agent_viewer_tui::ui::{Mode, RenameModal};
+use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal};
 
 use crate::keys::set_mouse_capture;
 use crate::ops::{AttachPlan, Mutation};
@@ -322,7 +322,7 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let rows = size.height.saturating_sub(1).max(1);
+    let rows = size.height.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
     let cols = size.width.max(1);
     let palette = ui
         .themes
@@ -457,7 +457,7 @@ mod tests {
     use agent_viewer_tui::app::KillStage;
     use agent_viewer_tui::mutations::MutationOutcome;
     use agent_viewer_tui::shared_listing::TargetRequest;
-    use agent_viewer_tui::ui::Mode;
+    use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode};
     use std::sync::{
         Arc, Mutex,
         mpsc::{TryRecvError, channel},
@@ -907,6 +907,104 @@ mod tests {
             *routed.lock().unwrap(),
             vec!["route this somewhere".to_string()]
         );
+    }
+
+    #[test]
+    fn initial_attach_sizes_the_real_pty_to_the_terminal_content_area() {
+        let session = sess("sized_attach", "/tmp/agentviewer_sized_attach", 100);
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let terminal_width = 137;
+        let terminal_height = 29;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            terminal_width,
+            terminal_height,
+        ))
+        .expect("test terminal");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let plan = crate::ops::AttachPlan {
+            session: session.clone(),
+            command,
+        };
+
+        assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
+
+        let key = (BackendKind::Claude, session.id);
+        let screen_size = ui
+            .attached
+            .get(&key)
+            .expect("fresh attached pty")
+            .with_screen(|screen| screen.size());
+        assert_eq!(
+            screen_size,
+            (
+                terminal_height - ATTACHED_CHROME_ROWS,
+                terminal_width
+            )
+        );
+
+        ui.attached
+            .get_mut(&key)
+            .expect("fresh attached pty")
+            .kill();
+    }
+
+    #[test]
+    fn retained_reattach_resizes_the_real_pty_to_the_terminal_content_area() {
+        let session = sess("sized_reattach", "/tmp/agentviewer_sized_reattach", 100);
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let mut initial_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(91, 17))
+                .expect("initial test terminal");
+        let mut initial_command = std::process::Command::new("sh");
+        initial_command.args(["-c", "sleep 30"]);
+        let initial_plan = crate::ops::AttachPlan {
+            session: session.clone(),
+            command: initial_command,
+        };
+        assert!(
+            install_attach_plan(&mut ui, &mut initial_terminal, initial_plan)
+                .expect("install initial attach plan")
+        );
+
+        let key = (BackendKind::Claude, session.id.clone());
+        let initial_pid = ui
+            .attached
+            .get(&key)
+            .expect("initial attached pty")
+            .pid();
+        let terminal_width = 149;
+        let terminal_height = 43;
+        let mut retained_terminal = ratatui::Terminal::new(
+            ratatui::backend::TestBackend::new(terminal_width, terminal_height),
+        )
+        .expect("retained test terminal");
+        let mut retained_command = std::process::Command::new("sh");
+        retained_command.args(["-c", "exit 99"]);
+        let retained_plan = crate::ops::AttachPlan {
+            session,
+            command: retained_command,
+        };
+
+        assert!(
+            install_attach_plan(&mut ui, &mut retained_terminal, retained_plan)
+                .expect("install retained attach plan")
+        );
+
+        let retained_pty = ui.attached.get(&key).expect("retained attached pty");
+        assert_eq!(retained_pty.pid(), initial_pid);
+        assert_eq!(
+            retained_pty.with_screen(|screen| screen.size()),
+            (
+                terminal_height - ATTACHED_CHROME_ROWS,
+                terminal_width
+            )
+        );
+
+        ui.attached
+            .get_mut(&key)
+            .expect("retained attached pty")
+            .kill();
     }
 
     #[test]
