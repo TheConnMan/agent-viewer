@@ -326,6 +326,7 @@ fn run_spawn_auto(
     task: &str,
     preexisting_ids: &HashMap<BackendKind, HashSet<String>>,
     opencode_runtime: &OpencodeRuntime,
+    db: Option<&ViewerDb>,
     route: impl FnOnce(&std::path::Path, &str) -> Result<RouterOutcome, String>,
 ) -> Result<MutationOutcome, String> {
     let directory = spawn_directory(target, opencode_runtime)?;
@@ -338,6 +339,10 @@ fn run_spawn_auto(
     let submitted_at_ms = now_ms();
     let outcome = route(&directory, task)?;
     let spawned_at_ms = now_ms();
+    // The winning provider's cached listing predates the job it now owns: fence it, same as a
+    // direct spawn does, so the next tick refetches instead of waiting out the freshness window.
+    let winner = fresh_backend(outcome.provider, opencode_runtime);
+    invalidate_backend_scope(db, winner.as_ref());
     Ok(MutationOutcome {
         notice: outcome.notice(),
         spawned: Some(SpawnSelection {
@@ -442,13 +447,17 @@ pub(crate) fn run_mutation_with_opencode(
             target,
             task,
             preexisting_ids,
-        } => run_spawn_auto(
-            &target,
-            &task,
-            &preexisting_ids,
-            &opencode_runtime,
-            agent_viewer_core::router::route,
-        ),
+        } => {
+            let db = ViewerDb::open_default().ok();
+            run_spawn_auto(
+                &target,
+                &task,
+                &preexisting_ids,
+                &opencode_runtime,
+                db.as_ref(),
+                agent_viewer_core::router::route,
+            )
+        }
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
                 backend, target, ..
@@ -484,9 +493,10 @@ mod tests {
         spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
+    use agent_viewer_core::claude::ClaudeBackend;
     use agent_viewer_core::opencode::OpencodeRuntime;
     use agent_viewer_core::spawn::now_ms;
-    use agent_viewer_core::{Session, SpawnResult};
+    use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
     use std::cell::RefCell;
@@ -508,6 +518,7 @@ mod tests {
             "a routed task",
             &HashMap::new(),
             &OpencodeRuntime::new(),
+            None,
             |_directory, _task| {
                 std::thread::sleep(Duration::from_millis(routing_ms));
                 Ok(RouterOutcome {
@@ -535,6 +546,65 @@ mod tests {
         );
     }
 
+    /// A direct spawn invalidates its backend's shared listing cache so the new row appears on
+    /// the next tick instead of waiting out the freshness window; a routed spawn owes the
+    /// winning provider the same. The scope is seeded exactly as production resolves it
+    /// (`fresh_backend`), because invalidation is keyed by the backend's own scope string.
+    #[test]
+    fn a_successful_routed_spawn_invalidates_the_winning_provider_listing() {
+        let directory = tempfile::tempdir().expect("temporary viewer state directory");
+        let db = ViewerDb::open(&directory.path().join("viewer.sqlite"))
+            .expect("temporary viewer database");
+        let scope = ClaudeBackend::new()
+            .listing_scope()
+            .expect("claude advertises a listing scope");
+
+        // A listing worker holds a live lease; without invalidation a re-claim only observes it.
+        let claim = db
+            .claim_listing_refresh(Some(&scope), None, 1_000, 60_000, 60_000)
+            .expect("claiming an empty scope");
+        let ListingCacheClaim::Claimed(lease) = claim else {
+            panic!("the first claim must win the lease, got {claim:?}");
+        };
+
+        run_spawn_auto(
+            &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_invalidate")),
+            "a routed task",
+            &HashMap::new(),
+            &OpencodeRuntime::new(),
+            Some(&db),
+            |_directory, _task| {
+                Ok(RouterOutcome {
+                    provider: BackendKind::Claude,
+                    model: None,
+                    effort: None,
+                    job_id: Some("routed-short-id".to_string()),
+                    job_name: None,
+                    gates: Vec::new(),
+                    rationale: String::new(),
+                    claude_weekly_pct: 0.0,
+                    codex_weekly_pct: 0.0,
+                })
+            },
+        )
+        .expect("a routed decision is a successful mutation");
+
+        let reclaim = db
+            .claim_listing_refresh(Some(&scope), None, 2_000, 60_000, 60_000)
+            .expect("re-claiming after the routed spawn");
+        match reclaim {
+            ListingCacheClaim::Claimed(next) => assert!(
+                next.next_published_generation() > lease.next_published_generation(),
+                "the routed spawn must bump the generation: {} is not past {}",
+                next.next_published_generation(),
+                lease.next_published_generation()
+            ),
+            other => panic!(
+                "the routed spawn must clear the lease so the next tick refetches, got {other:?}"
+            ),
+        }
+    }
+
     /// The routed job is created somewhere INSIDE the router call, not at its return: the router
     /// polls for the winning backend's job id for up to ~10s after it dispatched, and reports no
     /// id when that resolution misses. The row must then be selected by cwd + creation time, and
@@ -550,6 +620,7 @@ mod tests {
             "a routed task",
             &HashMap::new(),
             &OpencodeRuntime::new(),
+            None,
             |_directory, _task| {
                 std::thread::sleep(Duration::from_millis(routing_ms));
                 Ok(RouterOutcome {
