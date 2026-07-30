@@ -161,8 +161,7 @@ pub fn capabilities_for_session_on_platform(
     capabilities.delete = has_short_id
         && (platform == crate::platform::Platform::Linux
             || (session.pid.is_none() && session.status.is_finished()));
-    capabilities.stop =
-        has_short_id && matches!(&session.status, Status::Working | Status::NeedsInput { .. });
+    capabilities.stop = has_short_id && !session.status.is_finished();
     capabilities
 }
 
