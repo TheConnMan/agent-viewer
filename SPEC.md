@@ -596,6 +596,9 @@ The composer's fourth selector entry, `auto`, delegates the provider choice to t
 `agent-router` CLI: `agent-router run --json --dir <target> --provider auto -- "<task>"`, parsed into a
 `RouterOutcome` by `core/router.rs`.
 
+Concrete composer providers are discovered once from `PATH` at startup. The Tab cycle, model
+palette, model cache seed, and model probes include only providers with an installed executable.
+
 - **Auto is deliberately NOT a `Backend`.** It enumerates nothing, owns no sessions, advertises
   no capabilities, and never appears in `all_backends()`. It exists only in the spawn flow, so
   the routed job shows up through the winning backend's normal listing path and is selected by
@@ -608,7 +611,7 @@ The composer's fourth selector entry, `auto`, delegates the provider choice to t
 - **When the router is present, Auto is the composer's STARTING selection**
   (`Composer::default_to_auto`, called once at startup after the availability probe): routed
   spawns are the default posture, and one `Tab` reaches the concrete backends. Without the
-  router the composer starts on Claude exactly as before Auto existed.
+  router the composer starts on the first installed concrete backend.
 - **No model is passed.** The router owns model and reasoning-effort selection, so the picker
   offers a single `auto` entry and the CLI is invoked without `--model`.
 - **Every router failure is a footer error with nothing spawned** — missing binary, non-zero

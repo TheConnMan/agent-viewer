@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencode};
 use agent_viewer_core::opencode::OpencodeRuntime;
+use agent_viewer_core::platform::{Platform, current_platform};
 use agent_viewer_core::pty::{PtySession, TerminalPalette};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn, match_spawn_between};
@@ -56,6 +58,19 @@ const PALETTE_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
 const ACTIVITY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const ACTIVITY_REFRESH_MS: i64 = 30_000;
 const ACTIVITY_LOOKAHEAD: usize = 8;
+
+fn available_spawn_backends(platform: Platform, path: Option<&OsStr>) -> Vec<BackendKind> {
+    [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Opencode,
+    ]
+    .into_iter()
+    .filter(|backend| {
+        agent_viewer_core::router::find_on_path(platform, backend.name(), path).is_some()
+    })
+    .collect()
+}
 
 type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
@@ -554,6 +569,8 @@ fn main() -> io::Result<()> {
 
     let workspace = std::env::current_dir().unwrap_or_default();
     let terminal_palette = capture_terminal_palette();
+    let available_backends =
+        available_spawn_backends(current_platform(), std::env::var_os("PATH").as_deref());
 
     // Inline brand-logo images are always attempted. The probe queries the terminal (stdin
     // raw-mode toggle) so it runs BEFORE ratatui::init() takes the alt screen; on a non-tty or
@@ -619,11 +636,7 @@ fn main() -> io::Result<()> {
     let mut models = ModelCache::new();
     if let Some(db) = &db {
         let now = now_ms();
-        for backend in [
-            BackendKind::Codex,
-            BackendKind::Claude,
-            BackendKind::Opencode,
-        ] {
+        for backend in available_backends.iter().copied() {
             if let Ok(Some(cached)) = db.cached_models(backend) {
                 models.seed(backend, cached.models, !is_stale(cached.fetched_at_ms, now));
             }
@@ -633,23 +646,21 @@ fn main() -> io::Result<()> {
     // discovering in the background while the user reads the list rather than starting a
     // multi-second probe the moment they tab the composer onto that backend. A backend with
     // a fresh seed is already marked attempted, so the steady state spawns nothing.
-    for backend in [
-        BackendKind::Codex,
-        BackendKind::Claude,
-        BackendKind::Opencode,
-    ] {
+    for backend in available_backends.iter().copied() {
         models.request(backend);
     }
 
     let mutation_runtime = opencode_runtime.clone();
     let attach_runtime = opencode_runtime.clone();
+    let mut composer = Composer::new();
+    composer.set_available_backends(available_backends);
     let mut ui = Ui {
         app,
         workspace,
         mode: Mode::Normal,
         notice: startup_notice,
         db,
-        composer: Composer::new(),
+        composer,
         themes,
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
@@ -1203,6 +1214,30 @@ mod tests {
     };
 
     const CWD: &str = "/tmp";
+
+    #[test]
+    fn spawn_backend_discovery_only_returns_installed_clis() {
+        let directory = tempfile::tempdir().expect("temporary executable directory");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        for name in ["codex", "opencode"] {
+            let path = directory.path().join(format!("{name}{suffix}"));
+            std::fs::write(&path, "").expect("write executable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path)
+                    .expect("executable metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(path, permissions).expect("make executable");
+            }
+        }
+
+        assert_eq!(
+            available_spawn_backends(current_platform(), Some(directory.path().as_os_str())),
+            vec![BackendKind::Codex, BackendKind::Opencode]
+        );
+    }
 
     fn session(backend: BackendKind, id: &str, created_at_ms: i64, hidden: bool) -> Session {
         Session {
