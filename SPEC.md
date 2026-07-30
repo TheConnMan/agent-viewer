@@ -673,11 +673,10 @@ requires `Ctrl+T` to opt into native wheel forwarding. Detaching requests captur
 list mouse controls. External opencode behavior is described as its supported attach path, not as
 a live verification claim.
 
-The cost is that **capture swallows the terminal's own drag-select**, so text cannot be copied
-out of the viewer. This spec previously waved that away with "the terminal's native text
-selection still works with Shift held in most terminals" — "most" is the bug. That override is
-a per-terminal convention, not a protocol guarantee, and where it is absent the content on
-screen is simply uncopyable.
+The cost is that **capture swallows the terminal's own drag-select**. This spec previously
+waved that away with "the terminal's native text selection still works with Shift held in most
+terminals". That override is a per-terminal convention, not a protocol guarantee. `Ctrl+T`
+therefore remains the universal fallback for host terminal selection.
 
 `Ctrl+T` toggles mouse reporting at runtime, sending the real
 `DisableMouseCapture`/`EnableMouseCapture` sequences and flipping `Ui::mouse_capture`. Rules:
@@ -692,6 +691,51 @@ screen is simply uncopyable.
   capture **on**. External opencode attach requests capture **off** until `Ctrl+T` opts into
   scrolling. Attached `Ctrl+T` toggles between selection and scrolling. Every detach requests
   capture **on**.
+
+If a mouse mode transition write fails, the viewer writes the complete prior mouse mode as a
+rollback. A successful rollback restores `Ui::mouse_capture` to the prior applied value and
+reports that it was restored. If rollback also fails, the UI retains its last known value but
+reports that the terminal mouse state is unknown. Both paths clear stale mouse press state.
+Guidance mentions `Ctrl+Y` only while attached; list and modal guidance mention `Ctrl+T`.
+
+### Remote attached viewport copy (`Ctrl+Y`)
+
+The confirmed deployment boundary is a Linux `agent-viewer` process displayed through Windows
+Terminal over SSH. A process local clipboard API writes on the Linux host, which is the wrong
+machine. Such APIs are prohibited for this deployment. While attached, `Ctrl+Y` instead writes
+one Microsoft compatible OSC 52 request to the outer terminal:
+
+```text
+ESC ] 52 ; ; BASE64(UTF8(screen.contents())) BEL
+```
+
+The empty selector addresses the default clipboard, standard base64 encodes the exact UTF8
+bytes, and BEL terminates the frame. The request uses `screen.contents()` without trimming,
+truncation, or an arbitrary payload cap. It therefore represents exactly the current visible
+vt100 viewport. If the user has scrolled, it represents the visible historical viewport, not
+the live bottom or content outside the viewport.
+
+Attached PTY sizing reserves exactly two chrome rows. On initial attach, retained reattach, and
+resize, the PTY width matches the terminal width and its height is the terminal height minus
+two, with a minimum of one row. An exited retained PTY keeps its final screen, and `Ctrl+Y`
+remains available for that visible content.
+
+`Ctrl+Y` is claimed only in attached mode before ordinary child forwarding. It never reaches
+the child, changes mouse capture, changes scrolling, or alters `Ctrl+C` child interrupt
+delivery. Mouse wheel behavior and the `Ctrl+T` host selection fallback remain unchanged.
+
+OSC 52 has no acknowledgement. A complete frame write and flush reports only
+`copy request sent to terminal`; it never claims that the clipboard changed. On any write or
+flush failure, the viewer makes a best effort to write `ESC \` to terminate a possibly partial
+OSC sequence and reports that the terminal clipboard state is unknown. A partial frame may
+already have reached the client, so failure never reports copied or sent.
+
+Windows Terminal supports this remote clipboard path, but terminal policy or implementation
+limits may reject the request or limit its payload. The viewer cannot detect that rejection.
+Only clipboard readback on the client proves mutation.
+
+OSC 52 clipboard reads, terminal multiplexer passthrough wrapping, forwarding OSC 52 emitted by
+the child, and copying content beyond the visible viewport are out of scope.
 
 ## Testing
 

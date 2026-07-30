@@ -9,6 +9,7 @@ mod palette;
 mod sprite;
 pub mod theme;
 
+pub use attach::ATTACHED_CHROME_ROWS;
 use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
 use agent_viewer_core::pty::PtySession;
@@ -302,7 +303,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     );
 
     if let Some(av) = d.attach {
-        attach::draw(frame, av, d.now_ms, theme);
+        attach::draw(frame, av, d.notice, d.now_ms, theme);
         return;
     }
 

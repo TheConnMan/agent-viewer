@@ -24,6 +24,7 @@ use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
 use agent_viewer_tui::{StartupAction, startup_action};
 
+use base64::Engine as _;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyEventKind,
@@ -192,6 +193,50 @@ fn sync_mouse_capture<W: io::Write>(
     Ok(())
 }
 
+fn reconcile_mouse_capture<W: io::Write>(ui: &mut Ui, writer: &mut W, applied: &mut bool) {
+    if let Err(error) = sync_mouse_capture(writer, applied, ui.mouse_capture) {
+        let prior_mode = *applied;
+        let rollback = keys::write_mouse_capture(writer, prior_mode);
+        ui.mouse_capture = prior_mode;
+        ui.mouse_press = None;
+        let prior_name = if prior_mode { "on" } else { "off" };
+        let guidance = if matches!(ui.mode, Mode::Attached) {
+            "press ctrl+t to retry or ctrl+y to copy"
+        } else {
+            "press ctrl+t to retry"
+        };
+        match rollback {
+            Ok(()) => ui.set_notice(format!(
+                "mouse change failed and prior mode was restored to {prior_name}: {error}; {guidance}"
+            )),
+            Err(rollback_error) => ui.set_notice(format!(
+                "terminal mouse state unknown after change failed: {error}; rollback failed: {rollback_error}; {guidance}"
+            )),
+        }
+    }
+}
+
+fn drain_pending_copy<W: io::Write>(ui: &mut Ui, writer: &mut W) {
+    let Some(contents) = ui.pending_copy.take() else {
+        return;
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(contents.as_bytes());
+    let mut frame = Vec::with_capacity(7 + encoded.len());
+    frame.extend_from_slice(b"\x1b]52;;");
+    frame.extend_from_slice(encoded.as_bytes());
+    frame.push(b'\x07');
+
+    match writer.write_all(&frame).and_then(|()| writer.flush()) {
+        Ok(()) => ui.set_notice("copy request sent to terminal".to_string()),
+        Err(error) => {
+            let _ = writer.write_all(b"\x1b\\");
+            ui.set_notice(format!(
+                "terminal clipboard state unknown after request output failed: {error}; use ctrl+t to select text"
+            ));
+        }
+    }
+}
+
 /// Install a completed attach plan and immediately apply its mouse capture request.
 fn install_completed_attach_plan<B: ratatui::backend::Backend, W: io::Write>(
     ui: &mut Ui,
@@ -201,7 +246,7 @@ fn install_completed_attach_plan<B: ratatui::backend::Backend, W: io::Write>(
     applied_mouse_capture: &mut bool,
 ) -> io::Result<bool> {
     let installed = actions::install_attach_plan(ui, terminal, plan)?;
-    sync_mouse_capture(writer, applied_mouse_capture, ui.mouse_capture)?;
+    reconcile_mouse_capture(ui, writer, applied_mouse_capture);
     Ok(installed)
 }
 
@@ -228,7 +273,8 @@ fn process_event<B: ratatui::backend::Backend, W: io::Write>(
                 let size = terminal
                     .size()
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                let _ = pty.resize(size.height.saturating_sub(1).max(1), size.width.max(1));
+                let rows = size.height.saturating_sub(ui::ATTACHED_CHROME_ROWS).max(1);
+                let _ = pty.resize(rows, size.width.max(1));
             }
             false
         }
@@ -245,7 +291,8 @@ fn process_event<B: ratatui::backend::Backend, W: io::Write>(
     if quit {
         return Ok(true);
     }
-    let _ = sync_mouse_capture(writer, applied_mouse_capture, ui.mouse_capture);
+    reconcile_mouse_capture(ui, writer, applied_mouse_capture);
+    drain_pending_copy(ui, writer);
     Ok(false)
 }
 
@@ -372,6 +419,8 @@ struct Ui {
     /// focused PTY and writes the reply payload once it is safe (in the run, settled).
     /// Cleared on write, timeout, user takeover, or PTY prune.
     pending_reply: Option<PendingReply>,
+    /// The exact attached viewport armed by Ctrl+Y and drained once by the outer terminal writer.
+    pending_copy: Option<String>,
     /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
     /// on quit — conversation state persists in each backend's own store.
     attached: HashMap<Key, PtySession>,
@@ -617,6 +666,7 @@ fn main() -> io::Result<()> {
         pr_status: PrStatusCache::new(),
         pending_spawn: None,
         pending_reply: None,
+        pending_copy: None,
         attached: HashMap::new(),
         terminal_palette,
         focused: None,
@@ -733,7 +783,7 @@ fn run(
         apply_snapshot(refresher, ui);
         // Age-based notice expiry: a notice lives NOTICE_MS from when it was set, so it
         // always renders at least once regardless of where the loop is when it lands.
-        if matches!(ui.mode, Mode::Normal) && ui.notice.expired(now) {
+        if matches!(ui.mode, Mode::Normal | Mode::Attached) && ui.notice.expired(now) {
             ui.notice.clear();
         }
 
@@ -1142,6 +1192,7 @@ mod tests {
     };
     use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
     use std::{
+        collections::VecDeque,
         io as test_io,
         panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
@@ -1393,6 +1444,7 @@ mod tests {
             pr_status: PrStatusCache::new(),
             pending_spawn: None,
             pending_reply: None,
+            pending_copy: None,
             attached: HashMap::new(),
             focused: None,
             focused_session: None,
@@ -1404,6 +1456,620 @@ mod tests {
             terminal_palette: None,
             sprite: ui::SpriteKind::default(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteAction {
+        Accept(usize),
+        Fail,
+        Zero,
+    }
+
+    #[derive(Default)]
+    struct RecordingTerminalWriter {
+        output: Vec<u8>,
+        attempts: Vec<Vec<u8>>,
+        actions: VecDeque<WriteAction>,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    impl RecordingTerminalWriter {
+        fn with_actions(actions: impl IntoIterator<Item = WriteAction>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl test_io::Write for RecordingTerminalWriter {
+        fn write(&mut self, buffer: &[u8]) -> test_io::Result<usize> {
+            self.attempts.push(buffer.to_vec());
+            match self.actions.pop_front() {
+                Some(WriteAction::Accept(limit)) => {
+                    let accepted = limit.min(buffer.len());
+                    self.output.extend_from_slice(&buffer[..accepted]);
+                    Ok(accepted)
+                }
+                Some(WriteAction::Fail) => Err(test_io::Error::new(
+                    test_io::ErrorKind::PermissionDenied,
+                    "terminal write rejected",
+                )),
+                Some(WriteAction::Zero) => Ok(0),
+                None => {
+                    self.output.extend_from_slice(buffer);
+                    Ok(buffer.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> test_io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(test_io::Error::new(
+                    test_io::ErrorKind::BrokenPipe,
+                    "terminal flush rejected",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn osc52_frame(contents: &str) -> Vec<u8> {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(contents.as_bytes());
+        let mut frame = b"\x1b]52;;".to_vec();
+        frame.extend_from_slice(encoded.as_bytes());
+        frame.push(b'\x07');
+        frame
+    }
+
+    fn control_key(character: char) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(character),
+            crossterm::event::KeyModifiers::CONTROL,
+        ))
+    }
+
+    fn process_test_event<W: test_io::Write>(
+        event: Event,
+        ui: &mut Ui,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        writer: &mut W,
+        applied_mouse_capture: &mut bool,
+    ) -> test_io::Result<bool> {
+        let refresher = test_refresher();
+        process_event(
+            event,
+            &[],
+            &refresher,
+            ui,
+            terminal,
+            writer,
+            applied_mouse_capture,
+        )
+    }
+
+    fn test_refresher() -> Refresher {
+        let (_snapshots_tx, snapshots) = channel();
+        let (wake, _wake_rx) = channel();
+        Refresher { snapshots, wake }
+    }
+
+    fn wait_for_screen(pty: &PtySession, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pty.with_screen(|screen| screen.contents().contains(needle)) {
+            assert!(
+                Instant::now() < deadline,
+                "attached child screen did not contain {needle:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn attached_ui(attached_session: Session, pty: PtySession) -> (Ui, Key) {
+        let key = (attached_session.backend, attached_session.id.clone());
+        let mut ui = test_ui(vec![attached_session.clone()]);
+        ui.mode = Mode::Attached;
+        ui.focused = Some(key.clone());
+        ui.focused_session = Some(attached_session);
+        ui.detach_trackers.insert(key.clone(), DetachTracker::new());
+        ui.attached.insert(key.clone(), pty);
+        (ui, key)
+    }
+
+    #[test]
+    fn attached_ctrl_y_emits_exact_unicode_frame_once_and_retains_child_interrupt() {
+        let attached_session = session(BackendKind::Codex, "copy", 1_000, false);
+        let pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "printf 'visible λ🦀\\r\\nsecond café\\r\\nCOPYREADY'; ",
+                    "captured=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); ",
+                    "printf '\\r\\nFIRST:%s\\r\\n' \"$captured\"; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("spawn attached copy child");
+        wait_for_screen(&pty, "COPYREADY");
+
+        let expected = pty.with_screen(|screen| screen.contents());
+        assert!(expected.contains("visible λ🦀"));
+        assert!(expected.contains("second café"));
+
+        let (mut ui, key) = attached_ui(attached_session, pty);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut writer = RecordingTerminalWriter::default();
+        let mut applied_mouse_capture = true;
+
+        let copied = process_test_event(
+            control_key('y'),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied_mouse_capture,
+        );
+
+        assert!(!copied.expect("copy event must keep the viewer running"));
+        assert_eq!(writer.output, osc52_frame(&expected));
+        assert_eq!(writer.flushes, 1, "the complete request must be flushed");
+        assert!(ui.pending_copy.is_none(), "the request must drain once");
+        assert!(ui.mouse_capture);
+        assert!(applied_mouse_capture);
+        assert_eq!(
+            ui.notice.text().to_lowercase(),
+            "copy request sent to terminal"
+        );
+        assert!(!ui.notice.text().to_lowercase().contains("copied"));
+
+        let interrupted = process_test_event(
+            control_key('c'),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied_mouse_capture,
+        );
+        assert!(!interrupted.expect("interrupt event must keep the viewer running"));
+        wait_for_screen(ui.attached.get(&key).unwrap(), "FIRST:03");
+
+        let output_after_copy = writer.output.clone();
+        process_test_event(
+            Event::FocusGained,
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied_mouse_capture,
+        )
+        .expect("followup event");
+        assert_eq!(writer.output, output_after_copy, "copy must be one shot");
+        ui.attached.get_mut(&key).unwrap().kill();
+    }
+
+    #[test]
+    fn attached_ctrl_y_emits_the_real_scrolled_historical_viewport() {
+        let attached_session = session(BackendKind::Codex, "history", 1_000, false);
+        let mut pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                concat!(
+                    "stty raw -echo; ",
+                    "index=0; ",
+                    "while [ \"$index\" -lt 12 ]; do ",
+                    "printf 'history-%02d\\r\\n' \"$index\"; ",
+                    "index=$((index + 1)); ",
+                    "done; ",
+                    "printf 'LIVE-END'; ",
+                    "sleep 30"
+                )
+                .to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 4,
+            cols: 40,
+            palette: None,
+            scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("spawn historical viewport child");
+        wait_for_screen(&pty, "LIVE-END");
+        assert!(pty.scroll_viewport_up(usize::MAX) > 0);
+        let historical = pty.with_screen(|screen| screen.contents());
+        assert!(historical.contains("history-00"), "{historical:?}");
+        assert!(!historical.contains("LIVE-END"), "{historical:?}");
+
+        let (mut ui, key) = attached_ui(attached_session, pty);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut writer = RecordingTerminalWriter::default();
+        let mut applied_mouse_capture = true;
+
+        process_test_event(
+            control_key('y'),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied_mouse_capture,
+        )
+        .expect("historical copy request");
+
+        assert_eq!(writer.output, osc52_frame(&historical));
+        ui.attached.get_mut(&key).unwrap().kill();
+    }
+
+    #[test]
+    fn missing_and_whitespace_transcripts_emit_no_request_and_recommend_selection() {
+        let mut missing = test_ui(Vec::new());
+        missing.mode = Mode::Attached;
+        missing.focused = Some((BackendKind::Codex, "missing".to_string()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut writer = RecordingTerminalWriter::default();
+        let mut applied = true;
+
+        process_test_event(
+            control_key('y'),
+            &mut missing,
+            &mut terminal,
+            &mut writer,
+            &mut applied,
+        )
+        .expect("missing transcript request");
+        assert!(writer.output.is_empty());
+        assert_eq!(writer.flushes, 0);
+        assert!(missing.pending_copy.is_none());
+        let missing_notice = missing.notice.text().to_lowercase();
+        assert!(missing_notice.contains("ctrl+t"), "{missing_notice:?}");
+        assert!(!missing_notice.contains("sent"), "{missing_notice:?}");
+        assert!(!missing_notice.contains("copied"), "{missing_notice:?}");
+
+        let attached_session = session(BackendKind::Codex, "blank", 1_000, false);
+        let pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "printf '   '; sleep 30".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 4,
+            cols: 20,
+            palette: None,
+            scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("spawn whitespace transcript child");
+        wait_for_screen(&pty, "   ");
+        let (mut blank, key) = attached_ui(attached_session, pty);
+        let mut blank_writer = RecordingTerminalWriter::default();
+
+        process_test_event(
+            control_key('y'),
+            &mut blank,
+            &mut terminal,
+            &mut blank_writer,
+            &mut applied,
+        )
+        .expect("whitespace transcript request");
+        assert!(blank_writer.output.is_empty());
+        assert_eq!(blank_writer.flushes, 0);
+        assert!(blank.pending_copy.is_none());
+        let blank_notice = blank.notice.text().to_lowercase();
+        assert!(blank_notice.contains("ctrl+t"), "{blank_notice:?}");
+        assert!(!blank_notice.contains("sent"), "{blank_notice:?}");
+        assert!(!blank_notice.contains("copied"), "{blank_notice:?}");
+        blank.attached.get_mut(&key).unwrap().kill();
+    }
+
+    #[test]
+    fn exited_retained_pty_emits_its_final_visible_screen() {
+        let attached_session = session(BackendKind::Codex, "exited", 1_000, false);
+        let mut pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "printf 'retained final λ'".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 4,
+            cols: 24,
+            palette: None,
+            scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("spawn retained transcript child");
+        wait_for_screen(&pty, "retained final λ");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pty.is_exited() {
+            assert!(Instant::now() < deadline, "attached child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let expected = pty.with_screen(|screen| screen.contents());
+        let (mut ui, _) = attached_ui(attached_session, pty);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut writer = RecordingTerminalWriter::default();
+        let mut applied = true;
+
+        process_test_event(
+            control_key('y'),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied,
+        )
+        .expect("retained transcript request");
+
+        assert_eq!(writer.output, osc52_frame(&expected));
+        assert_eq!(ui.notice.text(), "copy request sent to terminal");
+    }
+
+    #[test]
+    fn resize_updates_the_real_viewport_before_the_next_copy_request() {
+        let attached_session = session(BackendKind::Codex, "resize", 1_000, false);
+        let pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'resize marker one\\r\\nresize marker two'; sleep 30".to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 4,
+            cols: 20,
+            palette: None,
+            scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+        })
+        .expect("spawn resize transcript child");
+        wait_for_screen(&pty, "resize marker");
+        let (mut ui, key) = attached_ui(attached_session, pty);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6)).unwrap();
+        terminal.backend_mut().resize(18, 9);
+        let mut writer = RecordingTerminalWriter::default();
+        let mut applied = true;
+
+        process_test_event(
+            Event::Resize(18, 9),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied,
+        )
+        .expect("resize event");
+        assert_eq!(
+            ui.attached
+                .get(&key)
+                .unwrap()
+                .with_screen(|screen| screen.size()),
+            (7, 18)
+        );
+        assert!(writer.output.is_empty());
+        let resized = ui
+            .attached
+            .get(&key)
+            .unwrap()
+            .with_screen(|screen| screen.contents());
+
+        process_test_event(
+            control_key('y'),
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied,
+        )
+        .expect("copy after resize");
+        assert_eq!(writer.output, osc52_frame(&resized));
+        ui.attached.get_mut(&key).unwrap().kill();
+    }
+
+    fn assert_failed_copy_is_drained(writer: &mut RecordingTerminalWriter) {
+        let mut ui = test_ui(Vec::new());
+        ui.mode = Mode::Attached;
+        ui.pending_copy = Some("failure λ".to_string());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut applied = true;
+
+        let result = process_test_event(
+            Event::FocusGained,
+            &mut ui,
+            &mut terminal,
+            writer,
+            &mut applied,
+        );
+
+        assert!(!result.expect("copy failure must keep the viewer running"));
+        assert!(ui.pending_copy.is_none(), "failed requests must drain");
+        let notice = ui.notice.text().to_lowercase();
+        assert!(notice.contains("clipboard"), "{notice:?}");
+        assert!(notice.contains("unknown"), "{notice:?}");
+        assert!(notice.contains("ctrl+t"), "{notice:?}");
+        assert!(!notice.contains("sent"), "{notice:?}");
+        assert!(!notice.contains("copied"), "{notice:?}");
+        let attempts = writer.attempts.len();
+        let output = writer.output.clone();
+        let flushes = writer.flushes;
+
+        process_test_event(
+            Event::FocusGained,
+            &mut ui,
+            &mut terminal,
+            writer,
+            &mut applied,
+        )
+        .expect("event after failed copy");
+        assert_eq!(writer.attempts.len(), attempts, "failure must not retry");
+        assert_eq!(writer.output, output, "failure must not emit again");
+        assert_eq!(writer.flushes, flushes, "failure must not flush again");
+    }
+
+    #[test]
+    fn write_failure_before_frame_output_attempts_recovery_without_false_success() {
+        let frame = osc52_frame("failure λ");
+        let mut writer =
+            RecordingTerminalWriter::with_actions([WriteAction::Fail]);
+
+        assert_failed_copy_is_drained(&mut writer);
+
+        assert_eq!(writer.attempts[0], frame);
+        assert_eq!(
+            writer.attempts.last().map(Vec::as_slice),
+            Some(&b"\x1b\\"[..])
+        );
+        assert_eq!(writer.output, b"\x1b\\");
+    }
+
+    #[test]
+    fn prefix_then_write_failure_attempts_recovery_and_reports_unknown_state() {
+        let frame = osc52_frame("failure λ");
+        let prefix = 5;
+        let mut writer = RecordingTerminalWriter::with_actions([
+            WriteAction::Accept(prefix),
+            WriteAction::Fail,
+        ]);
+
+        assert_failed_copy_is_drained(&mut writer);
+
+        let mut expected = frame[..prefix].to_vec();
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(writer.output, expected);
+        assert_eq!(
+            writer.attempts.last().map(Vec::as_slice),
+            Some(&b"\x1b\\"[..])
+        );
+    }
+
+    #[test]
+    fn zero_write_attempts_recovery_and_drains_the_request() {
+        let frame = osc52_frame("failure λ");
+        let mut writer =
+            RecordingTerminalWriter::with_actions([WriteAction::Zero]);
+
+        assert_failed_copy_is_drained(&mut writer);
+
+        assert_eq!(writer.attempts[0], frame);
+        assert_eq!(
+            writer.attempts.last().map(Vec::as_slice),
+            Some(&b"\x1b\\"[..])
+        );
+        assert_eq!(writer.output, b"\x1b\\");
+    }
+
+    #[test]
+    fn flush_failure_attempts_recovery_and_never_claims_the_request_was_sent() {
+        let frame = osc52_frame("failure λ");
+        let mut writer = RecordingTerminalWriter {
+            fail_flush: true,
+            ..RecordingTerminalWriter::default()
+        };
+
+        assert_failed_copy_is_drained(&mut writer);
+
+        let mut expected = frame;
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(writer.output, expected);
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(
+            writer.attempts.last().map(Vec::as_slice),
+            Some(&b"\x1b\\"[..])
+        );
+    }
+
+    const MOUSE_ENABLE: &[u8] =
+        b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+    const MOUSE_DISABLE: &[u8] =
+        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+    #[test]
+    fn partial_mouse_failure_restores_the_prior_mode_with_surface_guidance() {
+        for (mode, attached) in [
+            (Mode::Normal, false),
+            (Mode::Help, false),
+            (Mode::Attached, true),
+        ] {
+            let mut ui = test_ui(Vec::new());
+            ui.mode = mode;
+            ui.mouse_capture = false;
+            keys::tests::seed_mouse_press_for_reconciliation(&mut ui);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let prefix = 5;
+            let mut writer = RecordingTerminalWriter::with_actions([
+                WriteAction::Accept(prefix),
+                WriteAction::Fail,
+            ]);
+            let mut applied = true;
+
+            process_test_event(
+                Event::FocusGained,
+                &mut ui,
+                &mut terminal,
+                &mut writer,
+                &mut applied,
+            )
+            .expect("mouse rollback");
+
+            let mut expected = MOUSE_DISABLE[..prefix].to_vec();
+            expected.extend_from_slice(MOUSE_ENABLE);
+            assert_eq!(writer.output, expected);
+            assert_eq!(writer.attempts[0], MOUSE_DISABLE);
+            assert_eq!(writer.attempts[1], MOUSE_DISABLE[prefix..]);
+            assert_eq!(writer.attempts[2], MOUSE_ENABLE);
+            assert!(applied);
+            assert!(ui.mouse_capture);
+            assert!(ui.mouse_press.is_none());
+            let notice = ui.notice.text().to_lowercase();
+            assert!(notice.contains("restored"), "{notice:?}");
+            assert!(!notice.contains("unknown"), "{notice:?}");
+            assert!(notice.contains("ctrl+t"), "{notice:?}");
+            assert_eq!(notice.contains("ctrl+y"), attached, "{notice:?}");
+        }
+    }
+
+    #[test]
+    fn failed_mouse_rollback_reports_unknown_and_keeps_the_last_known_mode() {
+        let mut ui = test_ui(Vec::new());
+        ui.mode = Mode::Attached;
+        ui.mouse_capture = false;
+        keys::tests::seed_mouse_press_for_reconciliation(&mut ui);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let prefix = 5;
+        let mut writer = RecordingTerminalWriter::with_actions([
+            WriteAction::Accept(prefix),
+            WriteAction::Fail,
+            WriteAction::Fail,
+        ]);
+        let mut applied = true;
+
+        process_test_event(
+            Event::FocusGained,
+            &mut ui,
+            &mut terminal,
+            &mut writer,
+            &mut applied,
+        )
+        .expect("failed mouse rollback");
+
+        assert_eq!(writer.output, MOUSE_DISABLE[..prefix]);
+        assert_eq!(writer.attempts[2], MOUSE_ENABLE);
+        assert!(applied);
+        assert!(ui.mouse_capture);
+        assert!(ui.mouse_press.is_none());
+        let notice = ui.notice.text().to_lowercase();
+        assert!(notice.contains("mouse"), "{notice:?}");
+        assert!(notice.contains("unknown"), "{notice:?}");
+        assert!(notice.contains("ctrl+t"), "{notice:?}");
+        assert!(notice.contains("ctrl+y"), "{notice:?}");
+        assert!(!notice.contains("restored"), "{notice:?}");
     }
 
     #[test]

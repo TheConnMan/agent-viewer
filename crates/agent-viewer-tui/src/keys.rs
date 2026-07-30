@@ -69,6 +69,10 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         set_mouse_capture(ui, !ui.mouse_capture);
         return Ok(false);
     }
+    if matches!(ui.mode, Mode::Attached) && is_copy_chord(key, ctrl) {
+        copy_attached_transcript(ui);
+        return Ok(false);
+    }
     match &mut ui.mode {
         Mode::Attached => handle_attached_key(key, ui),
         Mode::Normal => return handle_normal_key(key, ctrl, backends, refresher, ui, terminal),
@@ -287,6 +291,35 @@ fn single_line_paste(text: &str) -> String {
 /// without a live terminal; a bare `t` must stay composer text.
 fn is_mouse_toggle_chord(key: KeyEvent, ctrl: bool) -> bool {
     ctrl && matches!(key.code, KeyCode::Char('t'))
+}
+
+fn is_copy_chord(key: KeyEvent, ctrl: bool) -> bool {
+    ctrl && matches!(key.code, KeyCode::Char('y'))
+}
+
+fn copy_attached_transcript(ui: &mut Ui) {
+    ui.pending_copy = None;
+    let contents = ui
+        .focused
+        .as_ref()
+        .and_then(|key| ui.attached.get(key))
+        .map(|pty| pty.with_screen(|screen| screen.contents()));
+
+    let Some(contents) = contents else {
+        ui.set_notice(
+            "copy failed: no attached transcript is available; use ctrl+t to select text"
+                .to_string(),
+        );
+        return;
+    };
+    if contents.trim().is_empty() {
+        ui.set_notice(
+            "copy failed: the visible transcript is empty; use ctrl+t to select text".to_string(),
+        );
+        return;
+    }
+
+    ui.pending_copy = Some(contents);
 }
 
 /// Record the requested mouse reporting state and tell the user which mode they are in. The
@@ -1205,6 +1238,7 @@ pub(crate) mod tests {
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
             pending_spawn: None,
             pending_reply: None,
+            pending_copy: None,
             attached: HashMap::new(),
             terminal_palette: None,
             focused: None,
@@ -1216,6 +1250,14 @@ pub(crate) mod tests {
             mouse_press: None,
             sprite: Default::default(),
         }
+    }
+
+    pub(crate) fn seed_mouse_press_for_reconciliation(ui: &mut Ui) {
+        ui.mouse_press = Some(super::MousePress {
+            target: MouseTarget::StateHeader(Section::Done),
+            column: 1,
+            row: 1,
+        });
     }
 
     type TestTerminal = ratatui::Terminal<ratatui::backend::TestBackend>;

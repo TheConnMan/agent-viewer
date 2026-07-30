@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "agent-viewer-core",
  "anyhow",
+ "base64",
  "crossterm",
  "image",
  "ratatui",

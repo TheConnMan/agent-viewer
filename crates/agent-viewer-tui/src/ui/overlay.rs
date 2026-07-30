@@ -214,7 +214,8 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Ctrl+D / Ctrl+U", "archive / unarchive"),
         ("Ctrl+F", "filter (searches hidden too)"),
         ("Ctrl+G", "cycle the header sprite"),
-        ("Ctrl+T", "mouse off/on (off = drag to select + copy)"),
+        ("Ctrl+Y", "send visible copy request to terminal"),
+        ("Ctrl+T", "optional terminal selection mode"),
         ("?", "this help"),
         ("Ctrl+C", "quit"),
     ];
