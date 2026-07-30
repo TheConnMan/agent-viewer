@@ -1,8 +1,8 @@
 use super::{
     fg,
     sprite::{
-        Constellation, Fleet, HEIGHT as SPRITE_HEIGHT, Lighthouse, SpriteKind, Turbine,
-        WIDTH as SPRITE_WIDTH,
+        Airplane, Constellation, Fleet, HEIGHT as SPRITE_HEIGHT, HotAirBalloon, Lighthouse,
+        Sailboat, SpriteKind, Turbine, WIDTH as SPRITE_WIDTH,
     },
     theme::Theme,
 };
@@ -80,6 +80,15 @@ pub(super) fn draw(
                 Turbine::new(theme, lamp, app.running_count(), now_ms),
                 slot,
             ),
+            SpriteKind::Sailboat => {
+                frame.render_widget(Sailboat::new(theme, now_ms), slot)
+            }
+            SpriteKind::Airplane => {
+                frame.render_widget(Airplane::new(theme, now_ms), slot)
+            }
+            SpriteKind::HotAirBalloon => {
+                frame.render_widget(HotAirBalloon::new(theme, now_ms), slot)
+            }
         }
     }
 
