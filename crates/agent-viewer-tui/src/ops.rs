@@ -2,6 +2,7 @@
 //! `MutationRunner` worker thread with all data owned (Send).
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
@@ -200,40 +201,64 @@ where
     run_targeted(backend.as_mut(), db.as_ref(), &request, action)
 }
 
+/// A session we just stopped can briefly still resolve as `Working`/`NeedsInput`: `claude stop`
+/// (and the codex/opencode equivalents) reports success once the interrupt is accepted, but the
+/// session's own status source (Claude's `claude agents --json`, a rollout file, etc.) settles a
+/// beat later. Poll `authoritative_target` again within this bounded window before concluding
+/// the session is genuinely active again, rather than refusing on the very next stale read.
+const REMOVE_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
+const REMOVE_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(60);
+
 fn run_remove(
     backend: &mut dyn Backend,
     db: Option<&ViewerDb>,
     request: &TargetRequest,
     require_finished: bool,
 ) -> Result<MutationOutcome, String> {
-    run_targeted(backend, db, request, |backend, session| {
-        if !backend.capabilities_for(session).delete {
-            return Err(format!(
-                "{} does not support remove",
-                session.backend.name()
-            ));
+    let result = remove_settled_target(backend, request, require_finished);
+    invalidate_backend_scope(db, backend);
+    result
+}
+
+fn remove_settled_target(
+    backend: &mut dyn Backend,
+    request: &TargetRequest,
+    require_finished: bool,
+) -> Result<MutationOutcome, String> {
+    let deadline = Instant::now() + REMOVE_SETTLE_TIMEOUT;
+    let mut session = authoritative_target(backend, request).map_err(target_failure)?;
+    while matches!(session.status, Status::Working | Status::NeedsInput { .. })
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(REMOVE_SETTLE_POLL_INTERVAL);
+        session = authoritative_target(backend, request).map_err(target_failure)?;
+    }
+    if !backend.capabilities_for(&session).delete {
+        return Err(format!(
+            "{} does not support remove",
+            session.backend.name()
+        ));
+    }
+    let freshly_active = matches!(session.status, Status::Working | Status::NeedsInput { .. });
+    if freshly_active || require_finished && !session.status.is_finished() {
+        return Err(format!(
+            "remove refused: {} session became active",
+            session.backend.name()
+        ));
+    }
+    if let Some(pid) = session.pid.filter(|_| !session.daemon_hosted) {
+        let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
+    }
+    match backend.remove(&session) {
+        Ok(()) => Ok(MutationOutcome {
+            notice: format!("removed: {}", session.title),
+            spawned: None,
+        }),
+        Err(agent_viewer_core::error::Error::Unsupported(name)) => {
+            Err(format!("{name} does not support remove"))
         }
-        let freshly_active = matches!(session.status, Status::Working | Status::NeedsInput { .. });
-        if freshly_active || require_finished && !session.status.is_finished() {
-            return Err(format!(
-                "remove refused: {} session became active",
-                session.backend.name()
-            ));
-        }
-        if let Some(pid) = session.pid.filter(|_| !session.daemon_hosted) {
-            let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
-        }
-        match backend.remove(session) {
-            Ok(()) => Ok(MutationOutcome {
-                notice: format!("removed: {}", session.title),
-                spawned: None,
-            }),
-            Err(agent_viewer_core::error::Error::Unsupported(name)) => {
-                Err(format!("{name} does not support remove"))
-            }
-            Err(error) => Err(format!("remove failed: {error}")),
-        }
-    })
+        Err(error) => Err(format!("remove failed: {error}")),
+    }
 }
 
 fn run_spawn_at_directory(
