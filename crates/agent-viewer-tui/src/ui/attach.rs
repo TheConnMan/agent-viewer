@@ -14,13 +14,7 @@ use tui_term::{
 
 pub const ATTACHED_CHROME_ROWS: u16 = 2;
 
-pub(super) fn draw(
-    frame: &mut Frame,
-    av: AttachView,
-    notice: &str,
-    now_ms: i64,
-    theme: &Theme,
-) {
+pub(super) fn draw(frame: &mut Frame, av: AttachView, notice: &str, now_ms: i64, theme: &Theme) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -42,10 +36,7 @@ pub(super) fn draw(
         );
     });
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            notice.to_string(),
-            fg(theme.warn),
-        ))),
+        Paragraph::new(Line::from(Span::styled(notice.to_string(), fg(theme.warn)))),
         chunks[2],
     );
 }

@@ -459,11 +459,7 @@ fn sailboat_grid(bob: usize, wave_phase: usize) -> Grid {
         }
     }
     for (crest, row) in grid[ROWS - 2..].iter_mut().enumerate() {
-        for pixel in row
-            .iter_mut()
-            .skip((crest + wave_phase) % 2)
-            .step_by(2)
-        {
+        for pixel in row.iter_mut().skip((crest + wave_phase) % 2).step_by(2) {
             *pixel = b'W';
         }
     }
@@ -479,8 +475,7 @@ const AIRPLANE_PIXELS: [&[u8]; 5] = [
 ];
 const AIRPLANE_WIDTH: i32 = 9;
 const AIRPLANE_STEP_MS: i64 = 250;
-const AIRPLANE_PERIOD_MS: i64 =
-    (COLS as i64 + AIRPLANE_WIDTH as i64) * AIRPLANE_STEP_MS;
+const AIRPLANE_PERIOD_MS: i64 = (COLS as i64 + AIRPLANE_WIDTH as i64) * AIRPLANE_STEP_MS;
 
 pub(super) struct Airplane<'a> {
     theme: &'a Theme,
@@ -496,8 +491,7 @@ impl<'a> Airplane<'a> {
         if !self.theme.animation {
             return 2;
         }
-        (self.now_ms.rem_euclid(AIRPLANE_PERIOD_MS) / AIRPLANE_STEP_MS) as i32
-            - AIRPLANE_WIDTH
+        (self.now_ms.rem_euclid(AIRPLANE_PERIOD_MS) / AIRPLANE_STEP_MS) as i32 - AIRPLANE_WIDTH
     }
 
     fn pixel_color(&self, pixel: u8) -> Color {
@@ -535,18 +529,10 @@ fn airplane_grid(x: i32) -> Grid {
     grid
 }
 
-const BALLOON_PIXELS: [&[u8]; 6] = [
-    b".BBB.",
-    b"BBBBB",
-    b"BBBBB",
-    b".BBB.",
-    b"..R..",
-    b"..K..",
-];
+const BALLOON_PIXELS: [&[u8]; 6] = [b".BBB.", b"BBBBB", b"BBBBB", b".BBB.", b"..R..", b"..K.."];
 const BALLOON_WIDTH: i32 = 5;
 const BALLOON_STEP_MS: i64 = 700;
-const BALLOON_PERIOD_MS: i64 =
-    (COLS as i64 + BALLOON_WIDTH as i64) * BALLOON_STEP_MS;
+const BALLOON_PERIOD_MS: i64 = (COLS as i64 + BALLOON_WIDTH as i64) * BALLOON_STEP_MS;
 const BALLOON_DRIFT_PERIOD_MS: i64 = 4_000;
 
 pub(super) struct HotAirBalloon<'a> {
@@ -564,13 +550,10 @@ impl<'a> HotAirBalloon<'a> {
             return (3, 2);
         }
         let x =
-            (self.now_ms.rem_euclid(BALLOON_PERIOD_MS) / BALLOON_STEP_MS) as i32
-                - BALLOON_WIDTH;
-        let y = 2
-            + usize::from(
-                self.now_ms.rem_euclid(BALLOON_DRIFT_PERIOD_MS)
-                    >= BALLOON_DRIFT_PERIOD_MS / 2,
-            );
+            (self.now_ms.rem_euclid(BALLOON_PERIOD_MS) / BALLOON_STEP_MS) as i32 - BALLOON_WIDTH;
+        let y = 2 + usize::from(
+            self.now_ms.rem_euclid(BALLOON_DRIFT_PERIOD_MS) >= BALLOON_DRIFT_PERIOD_MS / 2,
+        );
         (x, y)
     }
 
@@ -710,7 +693,11 @@ mod tests {
 
     fn pixel_color(buffer: &Buffer, x: u16, y: u16) -> Color {
         let cell = &buffer[(x, y / 2)];
-        if y % 2 == 0 { cell.fg } else { cell.bg }
+        if y.is_multiple_of(2) {
+            cell.fg
+        } else {
+            cell.bg
+        }
     }
 
     fn foreground_points(buffer: &Buffer, theme: &Theme) -> Vec<(i32, i32)> {
@@ -995,12 +982,13 @@ mod tests {
         let visible: Vec<_> = planes.iter().filter(|plane| !plane.is_empty()).collect();
         let counts: Vec<_> = visible.iter().map(|plane| plane.len()).collect();
         let cloud_cells = |frame: &Buffer| {
-            (0..ROWS as u16).flat_map(|y| {
-                (0..WIDTH)
-                    .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
-                    .map(move |x| (i32::from(x), i32::from(y)))
-            })
-            .collect::<std::collections::BTreeSet<_>>()
+            (0..ROWS as u16)
+                .flat_map(|y| {
+                    (0..WIDTH)
+                        .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
+                        .map(move |x| (i32::from(x), i32::from(y)))
+                })
+                .collect::<std::collections::BTreeSet<_>>()
         };
         let clouds_at_start = cloud_cells(&airplane(&theme, 0));
 
