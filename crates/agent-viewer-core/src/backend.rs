@@ -373,11 +373,14 @@ pub trait Backend: Send {
     /// identity when the spawn protocol provides one.
     /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
     /// None uses the backend's own default.
+    /// `effort` is the optional per-spawn reasoning effort; it is advisory and is ignored by
+    /// backends without the concept.
     fn spawn(
         &self,
         dir: &std::path::Path,
         task: &str,
         model: Option<&str>,
+        effort: Option<&str>,
     ) -> crate::error::Result<SpawnResult>;
     /// Candidate models for the composer's model picker, DEFAULT-FIRST and deduped.
     /// Discovery is best-effort and cached; a failing probe degrades to just the default.
@@ -506,6 +509,7 @@ mod tests {
                 _dir: &std::path::Path,
                 _task: &str,
                 _model: Option<&str>,
+                _effort: Option<&str>,
             ) -> crate::error::Result<SpawnResult> {
                 Ok(SpawnResult::default())
             }
