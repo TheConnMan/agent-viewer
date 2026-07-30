@@ -1,9 +1,24 @@
 # AGENTS.md - agent-viewer
 
-Project-specific guidance for this repo. The global `~/.claude/AGENTS.md` rules still
-apply (no AI mentions in commits, no emojis/em-dashes, test-first, branch-before-editing,
-delegate edits to sub-agents). This file adds what is true only of `agent-viewer` and must
-not be re-derived every session.
+Project-specific guidance for this repo. The global `~/.claude/AGENTS.md` rules apply except
+for the local small change override below. This file adds what is true only of `agent-viewer`
+and must not be re-derived every session.
+
+## Small change process
+
+Direct editing is allowed for clear, low risk changes affecting one or two files. This path
+needs no implementation plan or subagent. Delegate distinct work streams, substantial
+exploration, architectural or security risk, or independent review that materially improves
+confidence.
+
+Test first development is required for new behavior and reproducible bug fixes when a
+behavioral regression test provides protection. It is not required for documentation, copy,
+formatting, straightforward configuration, mechanical refactors covered by existing tests, or
+visual tuning better verified interactively. Verification remains proportional: run relevant
+tests and clippy where applicable, and never weaken or remove tests to make a change pass.
+
+Any project invariant or specialized live verification rule in this file overrides this small
+change path.
 
 `README.md` is the user-facing behavior contract. `SPEC.md` is the architecture contract and
 the evidence behind every design decision. Read `SPEC.md` before changing enumeration, status
