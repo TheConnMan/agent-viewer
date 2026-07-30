@@ -950,10 +950,8 @@ mod tests {
             foreground: [0xab, 0xcd, 0xef],
             background: [0x10, 0x20, 0x30],
         };
-        let mut pty = attached_pty_with_palette(
-            "printf 'P\\033[?25l'; sleep 30",
-            Some(host_palette),
-        );
+        let mut pty =
+            attached_pty_with_palette("printf 'P\\033[?25l'; sleep 30", Some(host_palette));
         wait_for_attached_screen(&pty, "P");
         let mut themes = ThemeState::default();
         themes.move_preview(1);
