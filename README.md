@@ -204,6 +204,12 @@ its SQLite title still shows the prompt.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
+- `Ctrl+Y` — while attached, send the exact visible PTY viewport to the client terminal as an
+  OSC 52 clipboard request. This includes a visible scrolled historical viewport. It does not
+  change mouse capture or reach the child. A completed write reports only
+  `copy request sent to terminal`; an output failure reports that the terminal clipboard state
+  is unknown. This requires Windows Terminal or another terminal that supports OSC 52. Use
+  `Ctrl+T` and host terminal selection as the fallback.
 - `Ctrl+T` — toggle mouse reporting. The list starts with capture on for left click activation,
   hover row selection, and wheel scrolling. Every successful Codex or Claude attach or reattach
   starts with capture on, so scrolling works immediately. While attached, press `Ctrl+T` to
@@ -238,6 +244,15 @@ Codex and Claude attached transcripts scroll immediately: Codex scrolls the view
 transcript, while Claude receives the wheel in its attached terminal. Their capture behavior and
 external opencode selection behavior follow the `Ctrl+T` controls above.
 
+When a Linux viewer is displayed remotely through Windows Terminal or another terminal with
+OSC 52 support, `Ctrl+Y` sends the exact visible PTY viewport to that client terminal. The
+request includes only `screen.contents()`, so scrolling first sends the visible historical
+viewport rather than text outside it. The chord leaves mouse capture unchanged and is not
+forwarded to the child. A complete output write means only `copy request sent to terminal`,
+because OSC 52 has no acknowledgement; an output failure means the terminal clipboard state is
+unknown. Terminal policy may still reject the request. Use `Ctrl+T` to disable capture and select
+text in the host terminal when OSC 52 is unavailable.
+
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
 `codex resume` process replays the transcript, finds it ends mid-turn, and writes a synthesized
@@ -258,8 +273,9 @@ for an oversight; see the constitution's Additional Constraints.
 
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
-If a child exits while you are attached, its final screen stays visible and any key
-except `Ctrl+T` returns you to the list; `Ctrl+T` toggles the mouse instead.
+If a child exits while you are attached, its final screen stays visible. `Ctrl+Y` remains
+available to send that retained visible screen, and `Ctrl+T` remains available for host
+selection. Any other key returns you to the list.
 
 Viewer-local presentation state is kept in a SQLite database at
 `~/.local/state/agent-viewer/viewer.db`, separate from every backend's own store. OpenCode's own
