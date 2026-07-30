@@ -615,7 +615,7 @@ remain safe cross platform smoke paths.
 - Single list: sessions grouped by project or state, with status glyphs based on
   opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
   Project groups remain alphabetic and their members order by `created_at_ms` ascending.
-  State sections remain fixed and their members order by `updated_at_ms` ascending.
+  State sections remain fixed and their members order by `created_at_ms` ascending.
   After sanitization, the exact whole title `hold` is matched without regard to ASCII letter
   case and omitted only when the TUI emits a session row. Thus `hold`, `Hold`, and `HOLD` are
   omitted, while whitespace and substring variants remain visible. Project headers count

@@ -619,28 +619,58 @@ fn state_sections_order_and_fold() {
 }
 
 #[test]
-fn state_sections_keep_fixed_order_and_sort_members_by_oldest_update() {
+fn state_sections_keep_fixed_order_and_sort_members_by_oldest_creation() {
     let sessions = vec![
         sess_with_times(
             BackendKind::Codex,
-            "idle_tie_first",
+            "working_old",
             "/p",
-            300,
-            200,
-            Status::Idle,
+            100,
+            400,
+            Status::Working,
         ),
-        sess_with_times(BackendKind::Codex, "idle_new", "/p", 100, 300, Status::Idle),
-        sess_with_times(BackendKind::Codex, "idle_old", "/p", 400, 100, Status::Idle),
         sess_with_times(
             BackendKind::Codex,
-            "idle_tie_second",
+            "working_tie_alpha",
+            "/p",
+            200,
+            300,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_tie_beta",
             "/p",
             200,
             200,
-            Status::Idle,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_backend_tie",
+            "/p",
+            250,
+            150,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Claude,
+            "working_backend_tie",
+            "/p",
+            250,
+            100,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_young",
+            "/p",
+            300,
+            50,
+            Status::Working,
         ),
         sess(BackendKind::Codex, "done", "/p", 400, Status::Done),
-        sess(BackendKind::Codex, "working", "/p", 500, Status::Working),
+        sess(BackendKind::Codex, "idle", "/p", 500, Status::Idle),
         sess(
             BackendKind::Codex,
             "needs",
@@ -661,21 +691,96 @@ fn state_sections_keep_fixed_order_and_sort_members_by_oldest_update() {
             Section::Done
         ]
     );
-    let idle_ids = app
-        .visible()
-        .iter()
-        .filter_map(|row| match row {
-            Row::Session {
-                id,
-                status: Status::Idle,
-                ..
-            } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let working_ids = |app: &App| {
+        app.visible()
+            .iter()
+            .filter_map(|row| match row {
+                Row::Session {
+                    backend,
+                    id,
+                    status: Status::Working,
+                    ..
+                } => Some((*backend, id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        (BackendKind::Codex, "working_old".to_string()),
+        (BackendKind::Codex, "working_tie_alpha".to_string()),
+        (BackendKind::Codex, "working_tie_beta".to_string()),
+        (BackendKind::Codex, "working_backend_tie".to_string()),
+        (BackendKind::Claude, "working_backend_tie".to_string()),
+        (BackendKind::Codex, "working_young".to_string()),
+    ];
+    let before_refresh = working_ids(&app);
+    assert_eq!(before_refresh, expected);
+
+    app.set_sessions(vec![
+        sess_with_times(
+            BackendKind::Codex,
+            "working_old",
+            "/p",
+            100,
+            100,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_tie_alpha",
+            "/p",
+            200,
+            200,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_tie_beta",
+            "/p",
+            200,
+            300,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_backend_tie",
+            "/p",
+            250,
+            400,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Claude,
+            "working_backend_tie",
+            "/p",
+            250,
+            500,
+            Status::Working,
+        ),
+        sess_with_times(
+            BackendKind::Codex,
+            "working_young",
+            "/p",
+            300,
+            600,
+            Status::Working,
+        ),
+        sess(BackendKind::Codex, "done", "/p", 400, Status::Done),
+        sess(BackendKind::Codex, "idle", "/p", 500, Status::Idle),
+        sess(
+            BackendKind::Codex,
+            "needs",
+            "/p",
+            600,
+            Status::needs_input(),
+        ),
+    ]);
+    let after_refresh = working_ids(&app);
+
+    assert_eq!(after_refresh, expected);
     assert_eq!(
-        idle_ids,
-        vec!["idle_old", "idle_tie_first", "idle_tie_second", "idle_new"]
+        after_refresh, before_refresh,
+        "changing only update timestamps must not reorder Working rows"
     );
 }
 
