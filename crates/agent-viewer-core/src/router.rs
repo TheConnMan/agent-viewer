@@ -10,6 +10,7 @@
 //! the `codex` and `claude` CLIs: no cargo dependency in either direction.
 
 use crate::BackendKind;
+use crate::platform::{Platform, current_platform};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,18 +28,35 @@ pub const ROUTER_TIMEOUT: Duration = Duration::from_secs(180);
 pub const AUTO_MODEL: &str = "auto";
 
 /// PURE: the first executable `binary` found in a PATH-style variable value. An absolute or
-/// multi-component name is taken as-is. Kept pure (the PATH value is an argument, not a read)
-/// so the Auto gate is testable without mutating the process environment.
-pub fn find_on_path(binary: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
+/// multi-component name is taken as-is. Kept pure (the PATH value and the platform are
+/// arguments, not reads) so the Auto gate is testable without mutating the process environment,
+/// and on a host that is not the platform under test.
+pub fn find_on_path(platform: Platform, binary: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
     let path = Path::new(binary);
     if path.is_absolute() || path.components().count() > 1 {
-        return is_executable_file(path).then(|| path.to_path_buf());
+        return executable_candidate(platform, path.to_path_buf());
     }
     path_var
         .into_iter()
         .flat_map(std::env::split_paths)
-        .map(|directory| directory.join(path))
-        .find(|candidate| is_executable_file(candidate))
+        .find_map(|directory| executable_candidate(platform, directory.join(path)))
+}
+
+/// PURE: `candidate` when it is executable, else its windows `.exe` sibling. The windows release
+/// installs `agent-router.exe`, so a gate that only ever probed the bare name would leave Auto
+/// permanently missing on a supported platform. Only `.exe` is probed: full PATHEXT generality
+/// buys nothing for one known binary name.
+fn executable_candidate(platform: Platform, candidate: PathBuf) -> Option<PathBuf> {
+    if is_executable_file(&candidate) {
+        return Some(candidate);
+    }
+    if platform != Platform::Windows {
+        return None;
+    }
+    let mut suffixed = candidate.into_os_string();
+    suffixed.push(".exe");
+    let suffixed = PathBuf::from(suffixed);
+    is_executable_file(&suffixed).then_some(suffixed)
 }
 
 /// PURE: whether `path` is a regular file this process could actually exec. A file merely NAMED
@@ -63,7 +81,12 @@ fn is_executable_file(path: &Path) -> bool {
 /// never appears, matching the backends-appear-when-present posture: there is no error state
 /// for a router that is simply not installed.
 pub fn available() -> bool {
-    find_on_path(ROUTER_BIN, std::env::var_os("PATH").as_deref()).is_some()
+    find_on_path(
+        current_platform(),
+        ROUTER_BIN,
+        std::env::var_os("PATH").as_deref(),
+    )
+    .is_some()
 }
 
 /// One routing decision as the CLI reports it. Only the fields the viewer shows or acts on
@@ -99,7 +122,7 @@ impl RouterOutcome {
             line.push_str(&format!(" effort {effort}"));
         }
         if let Some(job) = self.job_id.as_deref().or(self.job_name.as_deref()) {
-            line.push_str(&format!(" job {job}"));
+            line.push_str(&format!(" job {}", one_line(job)));
         }
         if !self.gates.is_empty() {
             line.push_str(&format!(" gates[{}]", self.gates.join(",")));
@@ -146,13 +169,34 @@ pub fn parse_outcome(stdout: &str) -> std::result::Result<RouterOutcome, String>
     })
 }
 
-/// IMPURE: route one task and let the router dispatch it. `--json` only; no `--model`, since
-/// the router owns model and effort selection.
-pub fn route(dir: &Path, task: &str) -> std::result::Result<RouterOutcome, String> {
+/// PURE: the argv for one routing run. `--json` only; no `--model`, since the router owns model
+/// and effort selection.
+///
+/// The task is separated from the options by a literal `--`: it is user text and can begin with a
+/// hyphen (`--help ...`, `-v ...`), which the router's own clap would otherwise parse as an option
+/// and fail on instead of routing.
+pub fn route_command(dir: &Path, task: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(ROUTER_BIN);
-    cmd.arg("run").arg("--json").arg("--dir").arg(dir).arg(task);
-    let stdout = crate::spawn::run_reporting_failure(cmd, ROUTER_TIMEOUT)?;
+    cmd.arg("run")
+        .arg("--json")
+        .arg("--dir")
+        .arg(dir)
+        .arg("--")
+        .arg(task);
+    cmd
+}
+
+/// IMPURE: route one task and let the router dispatch it.
+pub fn route(dir: &Path, task: &str) -> std::result::Result<RouterOutcome, String> {
+    let stdout = crate::spawn::run_reporting_failure(route_command(dir, task), ROUTER_TIMEOUT)?;
     parse_outcome(&stdout)
+}
+
+/// PURE: whitespace runs (newlines included) collapsed to single spaces. The router's job name
+/// falls back to a prefix of the task, and a multi-line task would otherwise split or clip the
+/// one line the footer notice gets.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// PURE: the backend a router provider name denotes. An unknown name is an error, not a
