@@ -783,7 +783,7 @@ fn opencode_spawn_readiness_deadline_is_one_bounded_budget() {
 
     let start = Instant::now();
     let error = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "hello", None)
+        .spawn(PathBuf::from("/tmp").as_path(), "hello", None, None)
         .expect_err("a launcher that never becomes healthy must fail");
     let elapsed = start.elapsed();
     assert!(
@@ -1804,7 +1804,7 @@ fn opencode_spawn_create_then_prompt_returns_exact_id_and_model_shapes() {
     let task = "A title with Unicode 雪 and enough text to exceed the forty character title limit";
 
     let spawned = backend
-        .spawn(&cwd, task, Some("openai/gpt-5.6-sol"))
+        .spawn(&cwd, task, Some("openai/gpt-5.6-sol"), None)
         .expect("server spawn");
     assert_eq!(spawned.pid, None);
     assert_eq!(spawned.session_id.as_deref(), Some("ses_exact_identity"));
@@ -1873,7 +1873,12 @@ fn opencode_spawn_omits_default_model_and_rejects_malformed_model_before_mutatio
     let backend = backend_with_runtime(runtime);
 
     backend
-        .spawn(PathBuf::from("/tmp").as_path(), "default prompt", None)
+        .spawn(
+            PathBuf::from("/tmp").as_path(),
+            "default prompt",
+            None,
+            None,
+        )
         .expect("default spawn");
     let all_requests = server.wait_for_requests(6);
     assert_test_secret_pairs(&all_requests);
@@ -1886,6 +1891,7 @@ fn opencode_spawn_omits_default_model_and_rejects_malformed_model_before_mutatio
             PathBuf::from("/tmp").as_path(),
             "must not submit",
             Some("missing-provider-separator"),
+            None,
         )
         .expect_err("malformed model must fail");
     assert!(error.to_string().contains("provider"), "{error}");
@@ -1923,7 +1929,12 @@ fn opencode_prompt_failure_reports_created_id_and_never_submits_twice() {
     let backend = backend_with_runtime(runtime);
 
     let error = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "one submission", None)
+        .spawn(
+            PathBuf::from("/tmp").as_path(),
+            "one submission",
+            None,
+            None,
+        )
         .expect_err("prompt failure must be visible");
     let message = error.to_string();
     assert!(message.contains("ses_orphan_visible"), "{message}");
@@ -2241,7 +2252,7 @@ fn secure_transport_verifies_before_auth_and_accepts_bodyless_204() {
     let backend = backend_with_runtime(runtime);
 
     let spawned = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "secure prompt", None)
+        .spawn(PathBuf::from("/tmp").as_path(), "secure prompt", None, None)
         .expect("secure spawn");
     assert_eq!(spawned.session_id.as_deref(), Some("ses_secure"));
 
@@ -2281,6 +2292,7 @@ fn secure_health_uses_startup_budget_for_delayed_authenticated_response() {
             PathBuf::from("/tmp/slow_health").as_path(),
             "slow health",
             None,
+            None,
         )
         .expect("300 ms authenticated health fits one second startup budget");
     assert_eq!(spawned.session_id.as_deref(), Some("ses_slow_health"));
@@ -2312,6 +2324,7 @@ fn deferred_accept_preflights_then_authenticates_on_the_same_connection() {
         .spawn(
             PathBuf::from("/tmp/deferred").as_path(),
             "deferred body",
+            None,
             None,
         )
         .expect("deferred accept spawn");
@@ -2503,7 +2516,7 @@ fn startup_credentials_are_env_only_and_errors_are_sanitized() {
     let backend = backend_with_runtime(runtime);
 
     let error = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "must not leak", None)
+        .spawn(PathBuf::from("/tmp").as_path(), "must not leak", None, None)
         .expect_err("launcher failure");
     let message = error.to_string();
     assert!(!message.contains("test-secret"), "{message}");
@@ -2583,6 +2596,7 @@ fn viewer_server_launch_marks_its_process_and_installs_a_shell_credential_scrubb
     let _ = backend_with_runtime(runtime).spawn(
         PathBuf::from("/tmp").as_path(),
         "must not reach a server",
+        None,
         None,
     );
 
@@ -3186,12 +3200,14 @@ fn independently_created_runtimes_converge_on_one_secure_server_and_secret() {
             PathBuf::from("/race_one").as_path(),
             "run sleep 20",
             None,
+            None,
         )
     });
     let second_worker = std::thread::spawn(move || {
         backend_with_runtime(second).spawn(
             PathBuf::from("/race_two").as_path(),
             "run sleep 20",
+            None,
             None,
         )
     });
@@ -3359,12 +3375,14 @@ fn detached_launch_loser_adopts_the_exact_verified_server_that_won_the_bind() {
             PathBuf::from("/detached_one").as_path(),
             "run sleep 20",
             None,
+            None,
         )
     });
     let second_worker = std::thread::spawn(move || {
         backend_with_runtime(second).spawn(
             PathBuf::from("/detached_two").as_path(),
             "run sleep 20",
+            None,
             None,
         )
     });
@@ -3474,6 +3492,7 @@ fn cloned_runtime_concurrent_discovery_publishes_one_identical_pin() {
             PathBuf::from("/shared_pin").as_path(),
             "shared pin",
             None,
+            None,
         )
     });
 
@@ -3554,6 +3573,7 @@ fn readiness_rejects_a_server_not_owned_by_the_exact_launched_pid() {
             PathBuf::from("/wrong_pid").as_path(),
             "must not submit",
             None,
+            None,
         )
         .expect_err("readiness rejects the wrong launched pid");
 
@@ -3621,7 +3641,12 @@ fn secret_storage_failure_refuses_startup_before_launcher() {
     let backend = backend_with_runtime(runtime);
 
     let error = backend
-        .spawn(PathBuf::from("/tmp").as_path(), "must not launch", None)
+        .spawn(
+            PathBuf::from("/tmp").as_path(),
+            "must not launch",
+            None,
+            None,
+        )
         .expect_err("secret storage failure");
 
     assert_eq!(launches.load(Ordering::SeqCst), 0);

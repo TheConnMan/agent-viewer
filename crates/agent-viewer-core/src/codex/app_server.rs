@@ -134,15 +134,18 @@ pub fn thread_start_request(id: i64, cwd: &Path, model: Option<&str>) -> String 
 }
 
 /// PURE builder: `turn/start` carrying the task as one text UserInput.
-pub fn turn_start_request(id: i64, thread_id: &str, task: &str) -> String {
-    request(
-        id,
-        "turn/start",
-        serde_json::json!({
-            "threadId": thread_id,
-            "input": [{ "type": "text", "text": task }],
-        }),
-    )
+///
+/// `effort` None omits the key entirely so codex resolves its own reasoning effort; a null
+/// would be an explicit value rather than a default.
+pub fn turn_start_request(id: i64, thread_id: &str, task: &str, effort: Option<&str>) -> String {
+    let mut params = serde_json::json!({
+        "threadId": thread_id,
+        "input": [{ "type": "text", "text": task }],
+    });
+    if let (Some(effort), Some(params)) = (effort, params.as_object_mut()) {
+        params.insert("effort".to_string(), serde_json::json!(effort));
+    }
+    request(id, "turn/start", params)
 }
 
 /// PURE builder: `turn/interrupt`, which needs BOTH the thread and the turn to interrupt.
@@ -326,6 +329,7 @@ pub fn try_spawn_thread(
     cwd: &Path,
     task: &str,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> SpawnAttempt {
     let deadline = Instant::now() + RPC_TIMEOUT;
     let mut client = match Client::connect(daemon, deadline) {
@@ -346,7 +350,11 @@ pub fn try_spawn_thread(
     };
     // `turn/start` answers immediately with the new turn (`status: inProgress`), so waiting
     // for the response confirms the turn was accepted without waiting for it to finish.
-    match client.request(3, &turn_start_request(3, &thread_id, task), deadline) {
+    match client.request(
+        3,
+        &turn_start_request(3, &thread_id, task, effort),
+        deadline,
+    ) {
         Ok(_) => SpawnAttempt::Started(thread_id),
         Err(error) => SpawnAttempt::TurnFailed { thread_id, error },
     }
@@ -359,6 +367,7 @@ pub fn try_spawn_thread(
     _cwd: &Path,
     _task: &str,
     _model: Option<&str>,
+    _effort: Option<&str>,
 ) -> SpawnAttempt {
     SpawnAttempt::NotCreated(Error::Unsupported("codex"))
 }
@@ -369,8 +378,9 @@ pub fn spawn_thread(
     cwd: &Path,
     task: &str,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<String> {
-    match try_spawn_thread(daemon, cwd, task, model) {
+    match try_spawn_thread(daemon, cwd, task, model, effort) {
         SpawnAttempt::Started(thread_id) => Ok(thread_id),
         SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
             "app-server started thread {thread_id} but its first turn failed: {error}"
@@ -527,7 +537,7 @@ mod tests {
             socket_path: PathBuf::from("/nonexistent/agent-viewer/app-server.sock"),
         };
         let started = std::time::Instant::now();
-        assert!(spawn_thread(&daemon, Path::new("/tmp"), "t", None).is_err());
+        assert!(spawn_thread(&daemon, Path::new("/tmp"), "t", None, None).is_err());
         assert!(interrupt_thread(&daemon, "thread-abc").is_err());
         // Both must fail on connect, not ride out the 10s RPC deadline.
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
