@@ -554,7 +554,10 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
             .models(backend)
             .map(<[String]>::to_vec)
             .unwrap_or_else(|| vec![backend.default_model().to_string()]);
-        if backend == ui.composer.backend()
+        // Under Auto the composer's model is the "auto" placeholder, which is not a model any
+        // backend accepts, so it must not be offered as one of this backend's picks.
+        if !ui.composer.is_auto()
+            && backend == ui.composer.backend()
             && !models.iter().any(|model| model == ui.composer.model())
         {
             models.push(ui.composer.model().to_string());
@@ -576,9 +579,10 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
     }
 
     let spawn_target = ui.app.spawn_target();
+    let command_backend = (!ui.composer.is_auto()).then(|| ui.composer.backend());
     items.extend(
         palette_commands(
-            ui.composer.backend(),
+            command_backend,
             spawn_target
                 .as_ref()
                 .map(|target| target.displayed_directory()),
@@ -589,7 +593,7 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
                 PaletteGroup::Commands,
                 "/",
                 format!("/{command}"),
-                format!("{} slash command", ui.composer.backend().name()),
+                format!("{} slash command", ui.composer.provider_name()),
                 None,
                 true,
                 None,
@@ -756,18 +760,22 @@ fn status_word(status: &Status) -> &'static str {
     }
 }
 
-fn palette_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<String> {
+/// The palette's slash commands: the viewer's own `/model` and `/theme` always, plus the
+/// backend's scanned commands. `backend` is None under Auto, where the provider is unknown until
+/// the router answers, so no backend-specific command is offered (matching the typed `/` popup).
+fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Path>) -> Vec<String> {
     let home = agent_viewer_core::home_dir();
     let mut commands = match backend {
-        BackendKind::Claude => {
+        Some(BackendKind::Claude) => {
             let mut commands = subdir_names(&home.join(".claude/skills"));
             if let Some(target) = target {
                 commands.extend(subdir_names(&target.join(".claude/skills")));
             }
             commands
         }
-        BackendKind::Opencode => file_stems(&home.join(".config/opencode/command")),
-        BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
+        Some(BackendKind::Opencode) => file_stems(&home.join(".config/opencode/command")),
+        Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
+        None => Vec::new(),
     };
     commands.extend(["model".to_string(), "theme".to_string()]);
     commands.retain(|command| !matches!(command.as_str(), "wall" | "tail"));
@@ -941,9 +949,10 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
 }
 
 fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
-    while ui.composer.backend() != backend {
-        ui.composer.cycle_backend();
-    }
+    // Selects outright rather than Tab-cycling to it: cycling stops as soon as the backend
+    // matches, which under Auto is true on entry (Auto rides on top of opencode), so Auto would
+    // survive the pick and `ensure_models` would put the "auto" entry back.
+    ui.composer.select_backend(backend);
     let mut models = ui
         .models
         .models(backend)
@@ -2212,6 +2221,32 @@ pub(crate) mod tests {
 
         assert!(matches!(ui.mode, Mode::Normal));
         assert!(ui.mutations.in_flight("claude:external:hide"));
+    }
+
+    /// Picking a model explicitly is a decision to use that provider, so it must leave Auto even
+    /// when the model belongs to the backend already sitting underneath Auto. Otherwise
+    /// `ensure_models` restores the single "auto" entry and Enter routes instead of spawning the
+    /// model the user just chose.
+    #[test]
+    fn palette_model_pick_on_the_backend_under_auto_leaves_auto() {
+        use super::{ensure_models, select_palette_model};
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_auto_available(true);
+        while !ui.composer.is_auto() {
+            ui.composer.cycle_backend();
+        }
+        ensure_models(&mut ui);
+        assert_eq!(ui.composer.backend(), BackendKind::Opencode);
+        assert_eq!(ui.composer.model(), "auto");
+
+        select_palette_model(&mut ui, BackendKind::Opencode, "grok-4".to_string());
+        ensure_models(&mut ui);
+
+        assert!(
+            !ui.composer.is_auto(),
+            "an explicit model pick must leave Auto"
+        );
+        assert_eq!(ui.composer.model(), "grok-4");
     }
 
     #[test]

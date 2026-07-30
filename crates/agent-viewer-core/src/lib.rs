@@ -16,6 +16,7 @@ pub mod opencode {
 pub mod platform;
 pub mod pr_status;
 pub mod pty;
+pub mod router;
 pub mod spawn;
 pub mod state;
 

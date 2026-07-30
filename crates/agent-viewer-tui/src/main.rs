@@ -10,7 +10,7 @@ use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencod
 use agent_viewer_core::opencode::OpencodeRuntime;
 use agent_viewer_core::pty::{PtySession, TerminalPalette};
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_core::state::{SpawnRecord, ViewerDb, apply_viewer_state, match_spawn};
+use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn, match_spawn_between};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
@@ -628,6 +628,11 @@ fn main() -> io::Result<()> {
         sprite: startup_sprite,
     };
 
+    // The composer's Auto entry is capability-gated on the router binary, resolved once here:
+    // without `agent-router` on PATH the entry never appears in the Tab cycle.
+    ui.composer
+        .set_auto_available(agent_viewer_core::router::available());
+
     // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
     // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
     // a mutation because either operation can dial the backend runtime.
@@ -934,22 +939,24 @@ fn apply_mutation_result(ui: &mut Ui, result: Result<MutationOutcome, String>) {
 
 /// Resolve a successful spawn against a fresh backend listing. An exact backend identity
 /// always wins. Backends without one reuse the viewer database's cwd and creation time rule.
+///
+/// The identity is matched against the row's short id as well as its id, because a routed claude
+/// job is only ever reported by its SHORT id (the `~/.claude/jobs` key `claude agents` publishes
+/// as `id`), never the full `sessionId` a claude row is keyed by. Comparing both here is smaller
+/// and safer than translating the short id on the mutation worker, which would need a second
+/// `claude agents --json` call with its own race against the job appearing; short ids are unique
+/// job keys, so the extra comparison cannot mis-select.
 fn match_pending_spawn(spawn: &SpawnSelection, sessions: &[Session]) -> Option<Key> {
     if let Some(session_id) = &spawn.session_id {
         return sessions
             .iter()
             .find(|session| {
-                session.backend == spawn.backend && session.id.as_str() == session_id.as_str()
+                session.backend == spawn.backend
+                    && (session.id.as_str() == session_id.as_str()
+                        || session.short_id.as_deref() == Some(session_id.as_str()))
             })
             .map(|session| (session.backend, session.id.clone()));
     }
-    let record = SpawnRecord {
-        rowid: 0,
-        backend: spawn.backend,
-        cwd: spawn.cwd.clone(),
-        pid: 0,
-        spawned_at_ms: spawn.spawned_at_ms,
-    };
     let candidates = sessions
         .iter()
         .filter(|session| {
@@ -957,7 +964,32 @@ fn match_pending_spawn(spawn: &SpawnSelection, sessions: &[Session]) -> Option<K
         })
         .cloned()
         .collect::<Vec<_>>();
-    match_spawn(&record, &candidates).map(|id| (spawn.backend, id))
+    if let Some(job_name) = &spawn.job_name {
+        let exact_title = candidates
+            .iter()
+            .filter(|session| session.title == *job_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(id) = match_spawn_between(
+            spawn.backend,
+            &spawn.cwd,
+            spawn.submitted_at_ms,
+            spawn.spawned_at_ms,
+            &exact_title,
+        ) {
+            return Some((spawn.backend, id));
+        }
+    }
+    // The interval, not one stamp: a routed job is created while the router runs, so its row can
+    // be seconds older than the decision that selects it.
+    match_spawn_between(
+        spawn.backend,
+        &spawn.cwd,
+        spawn.submitted_at_ms,
+        spawn.spawned_at_ms,
+        &candidates,
+    )
+    .map(|id| (spawn.backend, id))
 }
 
 /// Whether a snapshot's backend-error `err` should replace the current footer notice, given
@@ -1107,7 +1139,29 @@ mod tests {
         SpawnSelection {
             backend,
             session_id: session_id.map(str::to_string),
+            job_name: None,
             cwd: PathBuf::from(CWD),
+            submitted_at_ms: spawned_at_ms,
+            spawned_at_ms,
+            preexisting_ids: HashSet::new(),
+        }
+    }
+
+    /// A routed pending spawn: the window opens when the router was invoked and closes when it
+    /// returned, because the job was created somewhere in between.
+    fn routed_pending(
+        backend: BackendKind,
+        session_id: Option<&str>,
+        job_name: Option<&str>,
+        submitted_at_ms: i64,
+        spawned_at_ms: i64,
+    ) -> SpawnSelection {
+        SpawnSelection {
+            backend,
+            session_id: session_id.map(str::to_string),
+            job_name: job_name.map(str::to_string),
+            cwd: PathBuf::from(CWD),
+            submitted_at_ms,
             spawned_at_ms,
             preexisting_ids: HashSet::new(),
         }
@@ -1122,7 +1176,9 @@ mod tests {
         SpawnSelection {
             backend,
             session_id: session_id.map(str::to_string),
+            job_name: None,
             cwd: PathBuf::from(CWD),
+            submitted_at_ms: spawned_at_ms,
             spawned_at_ms,
             preexisting_ids: preexisting_ids.iter().map(|id| (*id).to_string()).collect(),
         }
@@ -1633,6 +1689,25 @@ mod tests {
         );
     }
 
+    /// A routed claude job is reported by the router as its SHORT id (the `~/.claude/jobs` key),
+    /// which is never the full sessionId a claude row is keyed by. Matching the identity against
+    /// `Session.id` alone left every routed claude spawn unselected AND disabled the cwd+time
+    /// fallback, since a present identity takes that branch.
+    #[test]
+    fn routed_claude_short_id_selects_the_row_whose_full_session_id_differs() {
+        let old = session(BackendKind::Claude, "old-session-uuid", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Claude, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Claude, Some("abc12345"), 10_000));
+
+        let mut routed = session(BackendKind::Claude, "routed-session-uuid", 10_100, false);
+        routed.short_id = Some("abc12345".to_string());
+        apply_listing(&mut ui, vec![old, routed]);
+
+        assert_eq!(selected_id(&ui), Some("routed-session-uuid"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
     #[test]
     fn successful_spawn_outcome_drives_selection_through_the_main_loop_bridge() {
         let old = session(BackendKind::Codex, "old", 1_000, false);
@@ -1652,6 +1727,74 @@ mod tests {
         assert_eq!(selected_id(&ui), Some("new"));
         assert!(ui.pending_spawn.is_none());
         assert_eq!(ui.notice.text(), "spawned on codex");
+    }
+
+    /// A routed spawn whose job id never resolved (the router's short-id poll can miss after the
+    /// job is already created) is selected by cwd + creation time. The job was created WHILE the
+    /// router ran, so its row can be many seconds older than the instant the decision landed;
+    /// matched against that instant alone, with 2s of backward slack, it was never selected.
+    #[test]
+    fn routed_spawn_selects_a_row_created_while_the_router_was_still_running() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(routed_pending(
+            BackendKind::Codex,
+            None,
+            None,
+            30_000,
+            60_000,
+        ));
+
+        // Created 5s before the decision landed, 25s after the router was invoked.
+        let routed = session(BackendKind::Codex, "routed", 55_000, false);
+        apply_listing(&mut ui, vec![old, routed]);
+
+        assert_eq!(selected_id(&ui), Some("routed"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
+    /// When the router cannot resolve a job id, its returned job name still identifies the row.
+    /// Two concurrent jobs can share a backend and cwd, so exact title must beat time proximity.
+    #[test]
+    fn routed_spawn_without_an_id_prefers_the_exact_job_name_over_time_proximity() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(routed_pending(
+            BackendKind::Codex,
+            None,
+            Some("Add the requested viewer regression tests"),
+            30_000,
+            60_000,
+        ));
+
+        let mut nearer = session(BackendKind::Codex, "nearer", 59_999, false);
+        nearer.title = "Another concurrent task".to_string();
+        let mut exact_title = session(BackendKind::Codex, "exact-title", 45_000, false);
+        exact_title.title = "Add the requested viewer regression tests".to_string();
+
+        apply_listing(&mut ui, vec![old, nearer, exact_title]);
+
+        assert_eq!(selected_id(&ui), Some("exact-title"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
+    /// The widened routed window must not become an open door: a row created before the router was
+    /// ever invoked is some other session, and the routed spawn stays pending.
+    #[test]
+    fn routed_spawn_ignores_a_row_created_before_the_router_was_invoked() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        let pending = routed_pending(BackendKind::Codex, None, None, 30_000, 60_000);
+        ui.pending_spawn = Some(pending.clone());
+
+        let earlier = session(BackendKind::Codex, "earlier", 27_999, false);
+        apply_listing(&mut ui, vec![old, earlier]);
+
+        assert_eq!(selected_id(&ui), Some("old"));
+        assert_eq!(ui.pending_spawn, Some(pending));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
-use agent_viewer_tui::shared_listing::TargetRequest;
+use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{Mode, RenameModal};
 
 use crate::keys::set_mouse_capture;
@@ -85,6 +85,12 @@ pub(crate) fn ensure_completions(ui: &mut Ui) {
 /// takes seconds and this runs on the key path. Until a list exists the picker holds just the
 /// backend's default; `install_models` swaps the real one in when the probe lands.
 pub(crate) fn ensure_models(ui: &mut Ui) {
+    // Auto has no catalog to discover: the router picks model and effort, so the picker holds
+    // one "auto" entry and no probe runs.
+    if ui.composer.is_auto() {
+        ui.composer.set_auto_model();
+        return;
+    }
     let backend = ui.composer.backend();
     ui.models.request(backend);
     if ui.composer.models_key() != Some(backend) {
@@ -104,7 +110,9 @@ pub(crate) fn install_models(ui: &mut Ui) {
         if let Some(db) = &ui.db {
             let _ = db.set_cached_models(backend, &models, now_ms());
         }
-        if ui.composer.backend() == backend {
+        // A catalog landing while Auto is selected must not overwrite its single entry: the
+        // composer's `backend` still holds the concrete selection underneath Auto.
+        if !ui.composer.is_auto() && ui.composer.backend() == backend {
             ui.composer.set_models(models, backend);
         }
     }
@@ -349,6 +357,10 @@ pub(crate) fn spawn_from_composer(
         ui.set_notice("no target directory".to_string());
         return;
     };
+    if ui.composer.is_auto() {
+        spawn_through_router(refresher, ui, target);
+        return;
+    }
     let backend_kind = ui.composer.backend();
     let Some(backend) = backend_of(backends, backend_kind) else {
         return;
@@ -387,6 +399,26 @@ pub(crate) fn spawn_from_composer(
     ui.composer.clear();
     // Hasten the next listing so the spawned row (and its bloom) appears promptly; the
     // notice survives until the 1s clear cadence since apply_snapshot preserves it.
+    refresher.force();
+}
+
+/// The Auto path: hand the task to `agent-router`, which classifies it, weighs weekly usage
+/// headroom, and dispatches to whichever backend won. No backend is consulted here — Auto is
+/// not one — and no model is passed, because the router owns model and effort selection.
+fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget) {
+    let task = ui.composer.text().to_string();
+    // Same dedup shape as a backend spawn, so a double Enter cannot route the same task twice
+    // while the first classifier call is still out.
+    let key = format!("auto:{task}:spawn");
+    // No submission timestamp: the router's own return is what stamps the routed spawn, since
+    // classification plus dispatch can outlive the 30s row-matching window from here.
+    let mutation = Mutation::spawn_auto(&ui.app, target, task);
+    let executor = ui.mutation_executor.clone();
+    if !ui.mutations.submit(key, move || executor(mutation)) {
+        return;
+    }
+    ui.set_notice("routing… via agent-router".to_string());
+    ui.composer.clear();
     refresher.force();
 }
 
@@ -607,6 +639,55 @@ mod tests {
         }
         assert_eq!(*calls.lock().unwrap(), vec![payload.to_string()]);
         assert!(ui.mutations.poll().is_none());
+    }
+
+    /// With Auto selected the spawn must leave the Backend trait entirely: no backend is
+    /// consulted, no model is chosen, and the winning provider comes back from the router.
+    #[test]
+    fn an_auto_submission_routes_through_agent_router_instead_of_a_backend() {
+        let routed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&routed);
+        let mut ui = test_ui_with(vec![sess("router_target", "/tmp/agentviewer_auto", 100)]);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            let Mutation::SpawnAuto {
+                task,
+                preexisting_ids,
+                ..
+            } = mutation
+            else {
+                panic!("an auto submission must never reach a backend spawn");
+            };
+            // The row selection needs the winning provider's preexisting ids, and which
+            // provider wins is unknown until the router answers, so all three are captured.
+            assert!(preexisting_ids.contains_key(&BackendKind::Claude));
+            assert!(preexisting_ids.contains_key(&BackendKind::Codex));
+            assert!(preexisting_ids.contains_key(&BackendKind::Opencode));
+            recorded.lock().unwrap().push(task);
+            Ok(MutationOutcome {
+                notice: "auto: codex effort xhigh (codex weekly 87%, claude 52%)".to_string(),
+                spawned: None,
+            })
+        });
+        ui.composer.set_auto_available(true);
+        while !ui.composer.is_auto() {
+            ui.composer.cycle_backend();
+        }
+        ui.composer.push_str("route this somewhere");
+
+        // No backends at all: the auto path must not need one.
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        spawn_from_composer(&backends, &inert_refresher(), &mut ui);
+
+        assert_eq!(ui.composer.text(), "");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(Instant::now() < deadline, "auto mutation did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *routed.lock().unwrap(),
+            vec!["route this somewhere".to_string()]
+        );
     }
 
     #[test]
