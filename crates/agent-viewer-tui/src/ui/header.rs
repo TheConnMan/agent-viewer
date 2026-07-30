@@ -1,8 +1,8 @@
 use super::{
     fg,
     sprite::{
-        Constellation, Fleet, HEIGHT as SPRITE_HEIGHT, Lighthouse, SpriteKind, Turbine,
-        WIDTH as SPRITE_WIDTH,
+        Airplane, Constellation, Fleet, HEIGHT as SPRITE_HEIGHT, HotAirBalloon, Lighthouse,
+        Sailboat, SpriteKind, Turbine, WIDTH as SPRITE_WIDTH,
     },
     theme::Theme,
 };
@@ -78,6 +78,15 @@ pub(super) fn draw(
             }
             SpriteKind::Turbine => {
                 frame.render_widget(Turbine::new(theme, lamp, app.running_count(), now_ms), slot)
+            }
+            SpriteKind::Sailboat => {
+                frame.render_widget(Sailboat::new(theme, now_ms), slot)
+            }
+            SpriteKind::Airplane => {
+                frame.render_widget(Airplane::new(theme, now_ms), slot)
+            }
+            SpriteKind::HotAirBalloon => {
+                frame.render_widget(HotAirBalloon::new(theme, now_ms), slot)
             }
         }
     }
@@ -248,16 +257,34 @@ mod tests {
         let app = App::new(vec![session(Status::Working)]);
         let viewport = Rect::new(0, 0, COMFORTABLE_WIDTH, 40);
         let render = |sprite| render_sprite_header(&app, &theme, viewport, 3, 0, sprite);
-        let lighthouse = render(SpriteKind::Lighthouse);
-        let constellation = render(SpriteKind::Constellation);
-        let turbine = render(SpriteKind::Turbine);
+        let buffers = SpriteKind::ALL.map(render);
 
-        for buffer in [&lighthouse, &constellation, &turbine] {
+        for buffer in &buffers {
             assert_eq!(block_count(buffer), 66);
         }
-        assert_ne!(lighthouse, constellation);
-        assert_ne!(lighthouse, turbine);
-        assert_ne!(constellation, turbine);
+        for left in 0..buffers.len() {
+            for right in left + 1..buffers.len() {
+                assert_ne!(buffers[left], buffers[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn sprite_choices_follow_the_exact_six_scene_order() {
+        let expected = [
+            SpriteKind::Lighthouse,
+            SpriteKind::Constellation,
+            SpriteKind::Turbine,
+            SpriteKind::Sailboat,
+            SpriteKind::Airplane,
+            SpriteKind::HotAirBalloon,
+        ];
+
+        assert_eq!(SpriteKind::ALL, expected);
+        for pair in expected.windows(2) {
+            assert_eq!(pair[0].next(), pair[1]);
+        }
+        assert_eq!(expected.last().unwrap().next(), expected[0]);
     }
 
     /// Names round-trip through storage: a saved sprite must come back as the same sprite, and

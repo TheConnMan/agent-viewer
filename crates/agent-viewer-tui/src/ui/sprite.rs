@@ -22,6 +22,9 @@ pub enum SpriteKind {
     Lighthouse,
     Constellation,
     Turbine,
+    Sailboat,
+    Airplane,
+    HotAirBalloon,
 }
 
 impl SpriteKind {
@@ -29,16 +32,22 @@ impl SpriteKind {
         match self {
             SpriteKind::Lighthouse => SpriteKind::Constellation,
             SpriteKind::Constellation => SpriteKind::Turbine,
-            SpriteKind::Turbine => SpriteKind::Lighthouse,
+            SpriteKind::Turbine => SpriteKind::Sailboat,
+            SpriteKind::Sailboat => SpriteKind::Airplane,
+            SpriteKind::Airplane => SpriteKind::HotAirBalloon,
+            SpriteKind::HotAirBalloon => SpriteKind::Lighthouse,
         }
     }
 
     /// Every sprite, in cycle order. Drives the palette listing so a new sprite shows up there
     /// by adding one variant.
-    pub const ALL: [SpriteKind; 3] = [
+    pub const ALL: [SpriteKind; 6] = [
         SpriteKind::Lighthouse,
         SpriteKind::Constellation,
         SpriteKind::Turbine,
+        SpriteKind::Sailboat,
+        SpriteKind::Airplane,
+        SpriteKind::HotAirBalloon,
     ];
 
     /// Resolve a stored or env-supplied name. `None` for anything unknown, so a stale setting
@@ -57,6 +66,9 @@ impl SpriteKind {
             SpriteKind::Lighthouse => "lighthouse",
             SpriteKind::Constellation => "constellation",
             SpriteKind::Turbine => "turbine",
+            SpriteKind::Sailboat => "sailboat",
+            SpriteKind::Airplane => "airplane",
+            SpriteKind::HotAirBalloon => "hot air balloon",
         }
     }
 
@@ -70,6 +82,9 @@ impl SpriteKind {
                 "header sprite · one star per session, brightest need input"
             }
             SpriteKind::Turbine => "header sprite · spins with the working count, parks when idle",
+            SpriteKind::Sailboat => "header sprite · bobs as the waves advance",
+            SpriteKind::Airplane => "header sprite · crosses a field of clouds",
+            SpriteKind::HotAirBalloon => "header sprite · drifts gently past clouds",
         }
     }
 }
@@ -379,6 +394,223 @@ fn draw_line(grid: &mut Grid, from_x: i32, from_y: i32, to_x: i32, to_y: i32) {
     }
 }
 
+const SAILBOAT_PIXELS: [&[u8]; 7] = [
+    b".....T.....",
+    b"....ST.....",
+    b"...SST.....",
+    b"..SSST.....",
+    b".....T.....",
+    b"..HHHHHH...",
+    b"...HHHH....",
+];
+const SAILBOAT_BOB_PERIOD_MS: i64 = 2_400;
+const WAVE_PERIOD_MS: i64 = 600;
+const SAILBOAT_Y: usize = 3;
+
+pub(super) struct Sailboat<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> Sailboat<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn bob(&self) -> usize {
+        if !self.theme.animation {
+            return 0;
+        }
+        usize::from(self.now_ms.rem_euclid(SAILBOAT_BOB_PERIOD_MS) >= 1_200)
+    }
+
+    fn wave_phase(&self) -> usize {
+        if !self.theme.animation {
+            return 0;
+        }
+        (self.now_ms.rem_euclid(WAVE_PERIOD_MS) / 300) as usize
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'S' => self.theme.warn,
+            b'T' => self.theme.text,
+            b'H' => self.theme.accent,
+            b'W' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for Sailboat<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let grid = sailboat_grid(self.bob(), self.wave_phase());
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn sailboat_grid(bob: usize, wave_phase: usize) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    for (source_y, row) in SAILBOAT_PIXELS.iter().enumerate() {
+        for (x, pixel) in row.iter().enumerate() {
+            if *pixel != b'.' {
+                grid[SAILBOAT_Y + source_y + bob][x] = *pixel;
+            }
+        }
+    }
+    for (crest, row) in grid[ROWS - 2..].iter_mut().enumerate() {
+        for pixel in row
+            .iter_mut()
+            .skip((crest + wave_phase) % 2)
+            .step_by(2)
+        {
+            *pixel = b'W';
+        }
+    }
+    grid
+}
+
+const AIRPLANE_PIXELS: [&[u8]; 5] = [
+    b"......P..",
+    b"P....PPP.",
+    b"PPPPPPPPN",
+    b"..PPPP...",
+    b"...PP....",
+];
+const AIRPLANE_WIDTH: i32 = 9;
+const AIRPLANE_STEP_MS: i64 = 250;
+const AIRPLANE_PERIOD_MS: i64 =
+    (COLS as i64 + AIRPLANE_WIDTH as i64) * AIRPLANE_STEP_MS;
+
+pub(super) struct Airplane<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> Airplane<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn x(&self) -> i32 {
+        if !self.theme.animation {
+            return 2;
+        }
+        (self.now_ms.rem_euclid(AIRPLANE_PERIOD_MS) / AIRPLANE_STEP_MS) as i32
+            - AIRPLANE_WIDTH
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'N' => self.theme.text,
+            b'P' => self.theme.accent,
+            b'C' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for Airplane<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let grid = airplane_grid(self.x());
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn airplane_grid(x: i32) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    grid[4][1] = b'C';
+    grid[5][0..=2].fill(b'C');
+    grid[8][8..=10].fill(b'C');
+    grid[9][9] = b'C';
+
+    for (source_y, row) in AIRPLANE_PIXELS.iter().enumerate() {
+        for (source_x, pixel) in row.iter().enumerate() {
+            let target_x = x + source_x as i32;
+            if *pixel != b'.' && (0..COLS as i32).contains(&target_x) {
+                grid[source_y + 3][target_x as usize] = *pixel;
+            }
+        }
+    }
+    grid
+}
+
+const BALLOON_PIXELS: [&[u8]; 6] = [
+    b".BBB.",
+    b"BBBBB",
+    b"BBBBB",
+    b".BBB.",
+    b"..R..",
+    b"..K..",
+];
+const BALLOON_WIDTH: i32 = 5;
+const BALLOON_STEP_MS: i64 = 700;
+const BALLOON_PERIOD_MS: i64 =
+    (COLS as i64 + BALLOON_WIDTH as i64) * BALLOON_STEP_MS;
+const BALLOON_DRIFT_PERIOD_MS: i64 = 4_000;
+
+pub(super) struct HotAirBalloon<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> HotAirBalloon<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn position(&self) -> (i32, usize) {
+        if !self.theme.animation {
+            return (3, 2);
+        }
+        let x =
+            (self.now_ms.rem_euclid(BALLOON_PERIOD_MS) / BALLOON_STEP_MS) as i32
+                - BALLOON_WIDTH;
+        let y = 2
+            + usize::from(
+                self.now_ms.rem_euclid(BALLOON_DRIFT_PERIOD_MS)
+                    >= BALLOON_DRIFT_PERIOD_MS / 2,
+            );
+        (x, y)
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'B' => self.theme.warn,
+            b'R' => self.theme.muted,
+            b'K' => self.theme.text,
+            b'C' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for HotAirBalloon<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let (x, y) = self.position();
+        let grid = hot_air_balloon_grid(x, y);
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn hot_air_balloon_grid(x: i32, y: usize) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    grid[1][0..=2].fill(b'C');
+    grid[2][1] = b'C';
+    grid[9][8..=10].fill(b'C');
+    grid[10][9] = b'C';
+
+    for (source_y, row) in BALLOON_PIXELS.iter().enumerate() {
+        for (source_x, pixel) in row.iter().enumerate() {
+            let target_x = x + source_x as i32;
+            if *pixel != b'.' && (0..COLS as i32).contains(&target_x) {
+                grid[y + source_y][target_x as usize] = *pixel;
+            }
+        }
+    }
+    grid
+}
+
 // --- Shared rendering -----------------------------------------------------------
 
 /// Two pixel rows per terminal row: the upper half block's foreground is the top pixel and its
@@ -456,6 +688,62 @@ mod tests {
         Turbine::new(theme, theme.accent, working, now_ms)
             .render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
         buffer
+    }
+
+    fn sailboat(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        Sailboat::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn airplane(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        Airplane::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn hot_air_balloon(theme: &Theme, now_ms: i64) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
+        HotAirBalloon::new(theme, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        buffer
+    }
+
+    fn pixel_color(buffer: &Buffer, x: u16, y: u16) -> Color {
+        let cell = &buffer[(x, y / 2)];
+        if y % 2 == 0 { cell.fg } else { cell.bg }
+    }
+
+    fn foreground_points(buffer: &Buffer, theme: &Theme) -> Vec<(i32, i32)> {
+        (0..ROWS as u16)
+            .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let color = pixel_color(buffer, *x, *y);
+                color != theme.bg && color != theme.faint
+            })
+            .map(|(x, y)| (i32::from(x), i32::from(y)))
+            .collect()
+    }
+
+    fn bounds(points: &[(i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+        Some((
+            points.iter().map(|(x, _)| *x).min()?,
+            points.iter().map(|(x, _)| *x).max()?,
+            points.iter().map(|(_, y)| *y).min()?,
+            points.iter().map(|(_, y)| *y).max()?,
+        ))
+    }
+
+    fn horizontal_changes(frames: &[Buffer], theme: &Theme) -> usize {
+        let positions: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                bounds(&foreground_points(frame, theme)).map(|(left, right, _, _)| left + right)
+            })
+            .collect();
+        positions
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count()
     }
 
     /// Star slot `index` as (column, terminal row, is_upper_half), read off the bitmap so a
@@ -640,6 +928,164 @@ mod tests {
         theme.animation = false;
 
         assert_eq!(turbine(&theme, 4, 0), turbine(&theme, 4, 400));
+    }
+
+    #[test]
+    fn sailboat_hull_bobs_while_wave_crests_advance() {
+        let theme = theme::amber(false);
+        let frames: Vec<_> = (0..=120).map(|step| sailboat(&theme, step * 100)).collect();
+        let top_edges: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                foreground_points(frame, &theme)
+                    .iter()
+                    .map(|(_, y)| *y)
+                    .min()
+                    .unwrap()
+            })
+            .collect();
+        let hull_edges: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                foreground_points(frame, &theme)
+                    .iter()
+                    .map(|(_, y)| *y)
+                    .max()
+                    .unwrap()
+            })
+            .collect();
+        let wave_rows: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                (ROWS as u16 - 2..ROWS as u16)
+                    .flat_map(|y| (0..WIDTH).map(move |x| pixel_color(frame, x, y)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            top_edges.iter().max().unwrap() - top_edges.iter().min().unwrap(),
+            1
+        );
+        assert_eq!(*top_edges.iter().min().unwrap(), SAILBOAT_Y as i32);
+        assert_eq!(
+            hull_edges.iter().max().unwrap() - hull_edges.iter().min().unwrap(),
+            1
+        );
+        assert_eq!(*hull_edges.iter().max().unwrap(), ROWS as i32 - 2);
+        assert!(wave_rows.iter().skip(1).any(|phase| phase != &wave_rows[0]));
+    }
+
+    #[test]
+    fn sailboat_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(sailboat(&theme, 0), sailboat(&theme, 1_500));
+    }
+
+    #[test]
+    fn airplane_crosses_clouds_and_wraps_through_clipped_edges() {
+        let theme = theme::amber(false);
+        let frames: Vec<_> = (0..=200).map(|step| airplane(&theme, step * 100)).collect();
+        let planes: Vec<_> = frames
+            .iter()
+            .map(|frame| foreground_points(frame, &theme))
+            .collect();
+        let visible: Vec<_> = planes.iter().filter(|plane| !plane.is_empty()).collect();
+        let counts: Vec<_> = visible.iter().map(|plane| plane.len()).collect();
+        let cloud_cells = |frame: &Buffer| {
+            (0..ROWS as u16).flat_map(|y| {
+                (0..WIDTH)
+                    .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
+                    .map(move |x| (i32::from(x), i32::from(y)))
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+        };
+        let clouds_at_start = cloud_cells(&airplane(&theme, 0));
+
+        assert_eq!(clouds_at_start, cloud_cells(&airplane(&theme, 3_000)));
+
+        assert!(
+            visible
+                .iter()
+                .filter_map(|plane| bounds(plane))
+                .any(|(left, _, _, _)| left == 0)
+        );
+        assert!(
+            visible
+                .iter()
+                .filter_map(|plane| bounds(plane))
+                .any(|(_, right, _, _)| right == i32::from(WIDTH - 1))
+        );
+        assert!(counts.iter().min().unwrap() < counts.iter().max().unwrap());
+        assert!(
+            visible
+                .iter()
+                .any(|plane| plane.iter().any(|point| clouds_at_start.contains(point)))
+        );
+    }
+
+    #[test]
+    fn airplane_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(airplane(&theme, 0), airplane(&theme, 12_000));
+    }
+
+    #[test]
+    fn hot_air_balloon_drifts_more_slowly_with_one_pixel_vertical_change() {
+        let theme = theme::amber(false);
+        let times: Vec<_> = (0..=200).map(|step| step * 100).collect();
+        let airplane_frames: Vec<_> = times
+            .iter()
+            .map(|now_ms| airplane(&theme, *now_ms))
+            .collect();
+        let balloon_frames: Vec<_> = times
+            .iter()
+            .map(|now_ms| hot_air_balloon(&theme, *now_ms))
+            .collect();
+        let visible_bounds: Vec<_> = balloon_frames
+            .iter()
+            .filter_map(|frame| bounds(&foreground_points(frame, &theme)))
+            .filter(|(left, right, _, _)| *left > 0 && *right < i32::from(WIDTH - 1))
+            .collect();
+        let top_edges: Vec<_> = visible_bounds.iter().map(|(_, _, top, _)| *top).collect();
+        let bottom_edges: Vec<_> = visible_bounds
+            .iter()
+            .map(|(_, _, _, bottom)| *bottom)
+            .collect();
+        let horizontal_positions: Vec<_> = visible_bounds
+            .iter()
+            .map(|(left, right, _, _)| left + right)
+            .collect();
+
+        assert!(
+            horizontal_positions
+                .iter()
+                .any(|position| *position != horizontal_positions[0])
+        );
+        assert_eq!(
+            top_edges.iter().max().unwrap() - top_edges.iter().min().unwrap(),
+            1
+        );
+        assert_eq!(
+            bottom_edges.iter().max().unwrap() - bottom_edges.iter().min().unwrap(),
+            1
+        );
+        assert!(
+            horizontal_changes(&airplane_frames, &theme)
+                > horizontal_changes(&balloon_frames, &theme)
+        );
+    }
+
+    #[test]
+    fn hot_air_balloon_holds_still_when_animation_is_disabled() {
+        let mut theme = theme::amber(false);
+        theme.animation = false;
+
+        assert_eq!(hot_air_balloon(&theme, 0), hot_air_balloon(&theme, 12_000));
     }
 
     /// The parked pose is one blade up and two down at 120 degrees, so its three tips are fixed
