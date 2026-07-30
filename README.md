@@ -75,7 +75,7 @@ work. A child row shows only its own subtree.
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
 `✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
 
-The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by update time. Every row renders.
+The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by update time. After sanitization, the exact whole title `hold` is matched without regard to ASCII letter case as a TUI presentation convention. Thus `hold`, `Hold`, and `HOLD` session rows are omitted in either grouping, while whitespace and substring variants remain visible. Project headers count rendered non hold sessions, so a project with only matching sessions remains with count zero. State section counts include only rendered rows. `Ctrl+K` quickswitcher session entries use the same visible row model, so matching sessions are omitted while ordinary sessions and independent quickswitcher actions remain. This does not change backend data or mutation behavior.
 The list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
