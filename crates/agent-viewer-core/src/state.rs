@@ -999,9 +999,10 @@ pub fn match_spawn_between(
     latest_ms: i64,
     sessions: &[Session],
 ) -> Option<String> {
-    let lo = earliest_ms - 2_000;
-    let hi = latest_ms + 30_000;
-    let mut best: Option<(&str, i64)> = None;
+    let (earliest_ms, latest_ms) = (earliest_ms.min(latest_ms), earliest_ms.max(latest_ms));
+    let lo = earliest_ms.saturating_sub(2_000);
+    let hi = latest_ms.saturating_add(30_000);
+    let mut best: Option<(&str, u64)> = None;
     for session in sessions {
         if session.backend != backend || session.cwd != cwd {
             continue;
@@ -1013,7 +1014,7 @@ pub fn match_spawn_between(
         // equally plausible, and rows outside rank by how far out they sit. Identical to
         // |created_at - spawned_at| when the interval is a single instant.
         let clamped = session.created_at_ms.clamp(earliest_ms, latest_ms);
-        let distance = (session.created_at_ms - clamped).abs();
+        let distance = session.created_at_ms.abs_diff(clamped);
         if best.is_none_or(|(_, best_distance)| distance < best_distance) {
             best = Some((session.id.as_str(), distance));
         }

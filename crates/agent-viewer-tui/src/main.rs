@@ -964,6 +964,22 @@ fn match_pending_spawn(spawn: &SpawnSelection, sessions: &[Session]) -> Option<K
         })
         .cloned()
         .collect::<Vec<_>>();
+    if let Some(job_name) = &spawn.job_name {
+        let exact_title = candidates
+            .iter()
+            .filter(|session| session.title == *job_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(id) = match_spawn_between(
+            spawn.backend,
+            &spawn.cwd,
+            spawn.submitted_at_ms,
+            spawn.spawned_at_ms,
+            &exact_title,
+        ) {
+            return Some((spawn.backend, id));
+        }
+    }
     // The interval, not one stamp: a routed job is created while the router runs, so its row can
     // be seconds older than the decision that selects it.
     match_spawn_between(
@@ -1123,6 +1139,7 @@ mod tests {
         SpawnSelection {
             backend,
             session_id: session_id.map(str::to_string),
+            job_name: None,
             cwd: PathBuf::from(CWD),
             submitted_at_ms: spawned_at_ms,
             spawned_at_ms,
@@ -1135,12 +1152,14 @@ mod tests {
     fn routed_pending(
         backend: BackendKind,
         session_id: Option<&str>,
+        job_name: Option<&str>,
         submitted_at_ms: i64,
         spawned_at_ms: i64,
     ) -> SpawnSelection {
         SpawnSelection {
             backend,
             session_id: session_id.map(str::to_string),
+            job_name: job_name.map(str::to_string),
             cwd: PathBuf::from(CWD),
             submitted_at_ms,
             spawned_at_ms,
@@ -1157,6 +1176,7 @@ mod tests {
         SpawnSelection {
             backend,
             session_id: session_id.map(str::to_string),
+            job_name: None,
             cwd: PathBuf::from(CWD),
             submitted_at_ms: spawned_at_ms,
             spawned_at_ms,
@@ -1718,13 +1738,45 @@ mod tests {
         let old = session(BackendKind::Codex, "old", 1_000, false);
         let mut ui = test_ui(vec![old.clone()]);
         assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
-        ui.pending_spawn = Some(routed_pending(BackendKind::Codex, None, 30_000, 60_000));
+        ui.pending_spawn = Some(routed_pending(
+            BackendKind::Codex,
+            None,
+            None,
+            30_000,
+            60_000,
+        ));
 
         // Created 5s before the decision landed, 25s after the router was invoked.
         let routed = session(BackendKind::Codex, "routed", 55_000, false);
         apply_listing(&mut ui, vec![old, routed]);
 
         assert_eq!(selected_id(&ui), Some("routed"));
+        assert!(ui.pending_spawn.is_none());
+    }
+
+    /// When the router cannot resolve a job id, its returned job name still identifies the row.
+    /// Two concurrent jobs can share a backend and cwd, so exact title must beat time proximity.
+    #[test]
+    fn routed_spawn_without_an_id_prefers_the_exact_job_name_over_time_proximity() {
+        let old = session(BackendKind::Codex, "old", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(routed_pending(
+            BackendKind::Codex,
+            None,
+            Some("Add the requested viewer regression tests"),
+            30_000,
+            60_000,
+        ));
+
+        let mut nearer = session(BackendKind::Codex, "nearer", 59_999, false);
+        nearer.title = "Another concurrent task".to_string();
+        let mut exact_title = session(BackendKind::Codex, "exact-title", 45_000, false);
+        exact_title.title = "Add the requested viewer regression tests".to_string();
+
+        apply_listing(&mut ui, vec![old, nearer, exact_title]);
+
+        assert_eq!(selected_id(&ui), Some("exact-title"));
         assert!(ui.pending_spawn.is_none());
     }
 
@@ -1735,7 +1787,7 @@ mod tests {
         let old = session(BackendKind::Codex, "old", 1_000, false);
         let mut ui = test_ui(vec![old.clone()]);
         assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
-        let pending = routed_pending(BackendKind::Codex, None, 30_000, 60_000);
+        let pending = routed_pending(BackendKind::Codex, None, None, 30_000, 60_000);
         ui.pending_spawn = Some(pending.clone());
 
         let earlier = session(BackendKind::Codex, "earlier", 27_999, false);
