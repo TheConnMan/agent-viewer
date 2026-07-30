@@ -212,6 +212,17 @@ impl Composer {
         }
     }
 
+    /// Start the selector on Auto when the router is offered: routed spawns are the default
+    /// posture for a fresh composer, and one Tab returns to the concrete backends. Installs
+    /// the single "auto" model entry too, since this runs at startup before any key handler
+    /// reaches `ensure_models`.
+    pub fn default_to_auto(&mut self) {
+        if self.auto_available {
+            self.auto = true;
+            self.set_auto_model();
+        }
+    }
+
     /// Select `backend` outright (the Ctrl+K palette picking a model), which always LEAVES Auto:
     /// naming a model is a decision to use that provider, so Auto must stop routing even when the
     /// chosen backend is the one already sitting underneath Auto (where a Tab-cycle loop would
@@ -477,6 +488,34 @@ mod tests {
         }
         assert_eq!(seen, vec!["claude", "codex", "opencode", "auto"]);
         assert_eq!(composer.provider_name(), "claude", "the cycle must wrap");
+    }
+
+    /// With the router installed the composer opens ON Auto: routed spawns are the default
+    /// posture, and one Tab leads back to the concrete backends.
+    #[test]
+    fn a_fresh_composer_defaults_to_auto_when_the_router_is_offered() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        composer.default_to_auto();
+
+        assert!(composer.is_auto());
+        assert_eq!(composer.provider_name(), "auto");
+        assert_eq!(composer.model(), AUTO_MODEL);
+
+        composer.cycle_backend();
+        assert!(!composer.is_auto());
+        assert_eq!(composer.provider_name(), "claude");
+    }
+
+    /// Without the router the default posture is unchanged: Claude, exactly as before Auto
+    /// existed.
+    #[test]
+    fn defaulting_to_auto_without_the_router_stays_on_claude() {
+        let mut composer = Composer::new();
+        composer.default_to_auto();
+
+        assert!(!composer.is_auto());
+        assert_eq!(composer.provider_name(), "claude");
     }
 
     /// Losing the router while Auto is selected must fall back to a real backend rather than
