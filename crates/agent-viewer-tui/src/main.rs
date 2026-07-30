@@ -628,6 +628,11 @@ fn main() -> io::Result<()> {
         sprite: startup_sprite,
     };
 
+    // The composer's Auto entry is capability-gated on the router binary, resolved once here:
+    // without `agent-router` on PATH the entry never appears in the Tab cycle.
+    ui.composer
+        .set_auto_available(agent_viewer_core::router::available());
+
     // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
     // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
     // a mutation because either operation can dial the backend runtime.

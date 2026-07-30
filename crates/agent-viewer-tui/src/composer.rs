@@ -3,6 +3,7 @@
 //! helpers. Moved verbatim out of `app` to keep that module focused on the list model.
 
 use agent_viewer_core::BackendKind;
+use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
 
 /// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
@@ -11,6 +12,14 @@ use std::path::{Path, PathBuf};
 pub struct Composer {
     text: String,
     backend: BackendKind,
+    /// Whether the selector sits on the Auto entry, where `agent-router` picks the provider.
+    /// Auto is not a `BackendKind` (it lists nothing and owns no sessions), so it rides
+    /// alongside the concrete selection rather than replacing it.
+    auto: bool,
+    /// Whether the Auto entry is offered by the Tab cycle at all: the caller installs this
+    /// once at startup from the `agent-router` PATH lookup. A missing router means the entry
+    /// never appears.
+    auto_available: bool,
     /// The current per-spawn model selection for `self.backend`.
     model: String,
     /// Discovered model list for the current backend (default-first), caller-installed via
@@ -72,6 +81,8 @@ impl Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
+            auto: false,
+            auto_available: false,
             model: BackendKind::Claude.default_model().to_string(),
             models: vec![BackendKind::Claude.default_model().to_string()],
             models_key: None,
@@ -88,6 +99,40 @@ impl Composer {
 
     pub fn backend(&self) -> BackendKind {
         self.backend
+    }
+
+    /// Whether the selector is on Auto, where the spawn goes through `agent-router` instead of
+    /// a backend. Every `backend()` caller that would act on the selection checks this first.
+    pub fn is_auto(&self) -> bool {
+        self.auto
+    }
+
+    /// Offer (or withdraw) the Auto entry. Withdrawing it while it is selected falls back to
+    /// the concrete backend underneath, so the selector can never point at a missing router.
+    pub fn set_auto_available(&mut self, available: bool) {
+        self.auto_available = available;
+        if !available {
+            self.auto = false;
+        }
+    }
+
+    /// The provider label for the metadata row: "auto" or the backend's own name.
+    pub fn provider_name(&self) -> &'static str {
+        if self.auto {
+            AUTO_MODEL
+        } else {
+            self.backend.name()
+        }
+    }
+
+    /// Install the single-entry model list Auto offers. The router owns model and effort
+    /// selection, so there is nothing for the user to pick and nothing to pass it.
+    pub fn set_auto_model(&mut self) {
+        self.model = AUTO_MODEL.to_string();
+        self.models = vec![AUTO_MODEL.to_string()];
+        // Deliberately left as the non-auto key it was: `models_key` tracks which BACKEND's
+        // catalog is installed, so clearing it makes the next concrete selection reinstall.
+        self.models_key = None;
     }
 
     /// The currently-selected model for the composer's backend.
@@ -149,15 +194,22 @@ impl Composer {
         self.suggest_dismissed = false;
     }
 
-    /// Tab: Claude -> Codex -> Opencode -> Claude. The model list is left stale for this one
+    /// Tab: Claude -> Codex -> Opencode -> Auto -> Claude, with Auto skipped entirely unless
+    /// `set_auto_available(true)` found the router. The model list is left stale for this one
     /// step — `ensure_models` reinstalls (and resets to the default) at the end of the key
     /// handler before any render, so nothing observes the stale list.
     pub fn cycle_backend(&mut self) {
-        self.backend = match self.backend {
-            BackendKind::Claude => BackendKind::Codex,
-            BackendKind::Codex => BackendKind::Opencode,
-            BackendKind::Opencode => BackendKind::Claude,
-        };
+        if self.auto {
+            self.auto = false;
+            self.backend = BackendKind::Claude;
+            return;
+        }
+        match self.backend {
+            BackendKind::Claude => self.backend = BackendKind::Codex,
+            BackendKind::Codex => self.backend = BackendKind::Opencode,
+            BackendKind::Opencode if self.auto_available => self.auto = true,
+            BackendKind::Opencode => self.backend = BackendKind::Claude,
+        }
     }
 
     /// Shift+Tab: advance to the next discovered model after the current one, wrapping. A
@@ -390,6 +442,60 @@ mod tests {
                 "/theme missing for {backend:?}"
             );
         }
+    }
+
+    /// The Auto entry is gated: without a discoverable router the Tab cycle is exactly the
+    /// three backends it always was, and no spawn can be aimed at a missing binary.
+    #[test]
+    fn auto_is_absent_from_the_cycle_until_the_router_is_available() {
+        let mut composer = Composer::new();
+        for _ in 0..6 {
+            composer.cycle_backend();
+            assert!(!composer.is_auto(), "Auto must not appear ungated");
+        }
+
+        composer.set_auto_available(true);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(composer.provider_name());
+            composer.cycle_backend();
+        }
+        assert_eq!(seen, vec!["claude", "codex", "opencode", "auto"]);
+        assert_eq!(composer.provider_name(), "claude", "the cycle must wrap");
+    }
+
+    /// Losing the router while Auto is selected must fall back to a real backend rather than
+    /// leaving the selector pointed at something that cannot spawn.
+    #[test]
+    fn withdrawing_the_router_deselects_auto() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        while !composer.is_auto() {
+            composer.cycle_backend();
+        }
+
+        composer.set_auto_available(false);
+
+        assert!(!composer.is_auto());
+        assert_eq!(composer.provider_name(), "opencode");
+    }
+
+    /// Auto offers one model entry and no picker: the router chooses model and effort, so the
+    /// viewer has nothing to pass it.
+    #[test]
+    fn auto_offers_a_single_model_entry_that_shift_tab_cannot_change() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        while !composer.is_auto() {
+            composer.cycle_backend();
+        }
+        composer.set_auto_model();
+
+        assert_eq!(composer.model(), "auto");
+        composer.cycle_model();
+        assert_eq!(composer.model(), "auto");
+        composer.push_str("/model");
+        assert_eq!(composer.model_suggestions(), vec!["auto".to_string()]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Blocking backend mutations (stop/remove/rename/hide), each run to completion on a
 //! `MutationRunner` worker thread with all data owned (Send).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
@@ -42,9 +42,42 @@ pub(crate) enum Mutation {
         preexisting_ids: HashSet<String>,
         notice: String,
     },
+    /// Spawn through `agent-router`: the router classifies the task, weighs weekly usage
+    /// headroom, and dispatches to whichever backend won, so the provider is only known once
+    /// it returns. Auto is not a `Backend` (it lists nothing), which is why this variant does
+    /// not go through the trait at all.
+    SpawnAuto {
+        target: SpawnTarget,
+        task: String,
+        spawned_at_ms: i64,
+        /// Per-backend session ids as of submission: the winning provider's set is the one the
+        /// row selection needs, and which that is cannot be known until the router answers.
+        preexisting_ids: HashMap<BackendKind, HashSet<String>>,
+    },
 }
 
 impl Mutation {
+    pub(crate) fn spawn_auto(
+        app: &App,
+        target: SpawnTarget,
+        task: String,
+        spawned_at_ms: i64,
+    ) -> Self {
+        Self::SpawnAuto {
+            target,
+            task,
+            spawned_at_ms,
+            preexisting_ids: [
+                BackendKind::Codex,
+                BackendKind::Claude,
+                BackendKind::Opencode,
+            ]
+            .into_iter()
+            .map(|backend| (backend, app.session_ids_for_backend(backend)))
+            .collect(),
+        }
+    }
+
     pub(crate) fn spawn(
         app: &App,
         backend: BackendKind,
@@ -262,6 +295,54 @@ fn run_spawn_with_backend(
     run_spawn_at_directory(backend, db, mutation, directory)
 }
 
+/// The directory a spawn target resolves to, for a spawn path with no backend of its own.
+/// A session target is resolved against the backend that OWNS the row, which is the only one
+/// that can answer for it.
+fn spawn_directory(
+    target: &SpawnTarget,
+    opencode_runtime: &OpencodeRuntime,
+) -> Result<std::path::PathBuf, String> {
+    match target {
+        SpawnTarget::ExplicitDirectory(directory) => Ok(directory.clone()),
+        SpawnTarget::Session { request, mode, .. } => {
+            let mut owner = fresh_backend(request.backend(), opencode_runtime);
+            let session = authoritative_target(owner.as_mut(), request).map_err(target_failure)?;
+            Ok(match mode {
+                SpawnDirectoryMode::WorkingDirectory => session.cwd,
+                SpawnDirectoryMode::ProjectRoot => project_root(&session.cwd),
+            })
+        }
+    }
+}
+
+/// Route one task through `agent-router` and turn its decision into the footer notice plus the
+/// row selection for whichever backend won. Every router failure (missing binary, non-zero
+/// exit, timeout, unreadable json) is an Err the user reads: nothing is spawned, and there is
+/// no fallback to a guessed provider.
+fn run_spawn_auto(
+    target: &SpawnTarget,
+    task: &str,
+    spawned_at_ms: i64,
+    preexisting_ids: &HashMap<BackendKind, HashSet<String>>,
+    opencode_runtime: &OpencodeRuntime,
+) -> Result<MutationOutcome, String> {
+    let directory = spawn_directory(target, opencode_runtime)?;
+    let outcome = agent_viewer_core::router::route(&directory, task)?;
+    Ok(MutationOutcome {
+        notice: outcome.notice(),
+        spawned: Some(SpawnSelection {
+            backend: outcome.provider,
+            session_id: outcome.job_id,
+            cwd: directory,
+            spawned_at_ms,
+            preexisting_ids: preexisting_ids
+                .get(&outcome.provider)
+                .cloned()
+                .unwrap_or_default(),
+        }),
+    })
+}
+
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
 /// connection so the render loop never blocks. Returns the user-facing notice and any
 /// successful spawn identity needed by the UI.
@@ -346,6 +427,18 @@ pub(crate) fn run_mutation_with_opencode(
                     .map_err(|error| format!("{}: {error}", session.backend.name()))
             })
         }
+        Mutation::SpawnAuto {
+            target,
+            task,
+            spawned_at_ms,
+            preexisting_ids,
+        } => run_spawn_auto(
+            &target,
+            &task,
+            spawned_at_ms,
+            &preexisting_ids,
+            &opencode_runtime,
+        ),
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
                 backend, target, ..

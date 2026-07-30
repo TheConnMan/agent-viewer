@@ -586,6 +586,29 @@ write is accepted: the worker re-reads the file immediately before each write, s
 new name rather than reverting it, which is the same race Claude's own fleet view runs. No
 viewer-local name override is involved, so the list can never disagree with `claude agents`.
 
+## Auto spawn — `agent-router`, and why it is not a backend
+
+The composer's fourth selector entry, `auto`, delegates the provider choice to the
+`agent-router` CLI: `agent-router run --json --dir <target> "<task>"`, parsed into a
+`RouterOutcome` by `core/router.rs`.
+
+- **Auto is deliberately NOT a `Backend`.** It enumerates nothing, owns no sessions, advertises
+  no capabilities, and never appears in `all_backends()`. It exists only in the spawn flow, so
+  the routed job shows up through the winning backend's normal listing path and is selected by
+  the existing `SpawnSelection` mechanism (the router's resolved job id when it returned one,
+  otherwise the cwd-plus-creation-time rule against that provider's preexisting ids).
+- **The entry is capability-gated on the binary**, resolved once at startup with a PATH lookup
+  (`router::available()`), matching the backends-appear-when-present posture: no router means no
+  entry, which is not an error state.
+- **No model is passed.** The router owns model and reasoning-effort selection, so the picker
+  offers a single `auto` entry and the CLI is invoked without `--model`.
+- **Every router failure is a footer error with nothing spawned** — missing binary, non-zero
+  exit (carrying its stderr), timeout, or unreadable JSON, including a provider name the viewer
+  does not know. There is deliberately no fallback to a hardcoded provider: a decision the
+  viewer cannot read must not become a silent spawn somewhere.
+- It runs on the mutation worker like every other spawn, since a routed dispatch pays for a
+  classifier call plus the winning backend's own spawn.
+
 ## Crate layout
 
 - `agent-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),
