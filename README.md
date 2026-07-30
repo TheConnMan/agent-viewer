@@ -105,7 +105,8 @@ The list view carries a persistent composer in a rounded box between the list an
 footer. Its metadata row shows the backend, the selected model when it is not the default,
 and the target folder. The task input is below it, uses the full width, and wraps as it grows.
 Just start typing to describe a task. A bracketed multiline paste remains one draft with its
-line breaks preserved. `Tab` cycles the target agent among Claude, Codex, and opencode;
+line breaks preserved. `Tab` cycles the target agent among Claude, Codex, and opencode (plus
+`auto` when `agent-router` is installed, below);
 `Shift+Tab` cycles that agent's model; and `Enter` explicitly submits the draft and spawns it
 detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
@@ -120,8 +121,22 @@ target directory is the selected row's project root (by-project view) or its exa
 (by-state view). Bare letters, numbers, and slash always type into the composer, including when
 it is empty; once you have typed anything, every printable key (and space) is task text, and
 `Esc` clears it. After a spawn, the list selects the new row in the first selectable snapshot
-that contains it and keeps that selection. When a backend does not return a new identifier, rows
-that existed before submission are excluded while finding the new one.
+that contains it and keeps that selection. It uses the exact returned identifier first, then the
+exact returned job name, otherwise bounded cwd and invocation-interval matching while excluding
+rows that existed before submission.
+
+### Auto (agent-router)
+
+When the `agent-router` CLI is on your `PATH`, `Tab` offers a fourth entry after opencode:
+`auto`. It has a single `auto` model, because the
+router chooses the provider, model, and reasoning effort itself: on `Enter` the viewer runs
+`agent-router run --json --dir <target> --provider auto -- "<task>"`, and the router classifies the task, weighs
+the weekly usage headroom of each subscription, and dispatches the job. The footer then shows
+the decision (for example `auto: codex effort xhigh job 0199… (codex weekly 87%, claude 52%)`),
+and the new session appears and is selected through the winning agent's normal listing. Without
+the binary installed the entry never appears at all, and a router that fails (missing, non-zero
+exit, timeout, unreadable output) is a footer error with nothing spawned, never a fallback to a
+guessed provider.
 
 An opencode spawn may start a secured loopback server when neither verified candidate is usable.
 It starts from the user home directory and the viewer never stops or restarts it. The viewer uses

@@ -1,0 +1,49 @@
+{
+  "classification": {
+    "classifier_failed": false,
+    "claude_signals": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "codex_ready": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "complexity": "trivial",
+    "confidence": "high",
+    "missing_connector": false,
+    "rationale": "Fix single README typo and verify via test suite; outcome explicit, source of truth in files and commands, verification entirely mechanical.",
+    "verdict": "codex"
+  },
+  "dispatch": null,
+  "dry_run": true,
+  "effort": "low",
+  "gates": [],
+  "log_error": null,
+  "log_id": 40,
+  "model": "gpt-5.6-luna",
+  "provider": "codex",
+  "rationale": "codex: Fix single README typo and verify via test suite; outcome explicit, source of truth in files and commands, verification entirely mechanical. (codex_ready 6/6, claude_signals 0/6, High confidence; codex weekly 3%, claude weekly 47%)",
+  "usage": {
+    "claude": {
+      "five_hour_pct": 16.0,
+      "five_hour_reset_epoch": 1785427200,
+      "weekly_pct": 47.0,
+      "weekly_reset_epoch": 1785621599
+    },
+    "codex": {
+      "five_hour_pct": 0.0,
+      "five_hour_reset_epoch": 0,
+      "weekly_pct": 3.0,
+      "weekly_reset_epoch": 1786013887
+    }
+  }
+}

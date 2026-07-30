@@ -15,6 +15,10 @@ use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LINES: u16 = 10;
 const MARK_FIELD: usize = 4;
+/// The Auto entry's textual fallback mark, used whenever the logo images are unavailable.
+/// Auto is not a backend, so it has no brand glyph: it borrows the textual tag shape so the
+/// metadata row keeps its width in every mark mode.
+const AUTO_TAG: &str = "[au]";
 const INPUT_GUTTER: usize = MARK_FIELD + 1;
 pub(super) const COMPOSER_HINT: &str = "⇥ agent · ⇧⇥ model · ⏎ spawn";
 
@@ -271,7 +275,23 @@ pub(super) fn draw(
     show_cursor: bool,
 ) {
     let backend = composer.backend();
-    let mark = backend_mark(backend, theme);
+    let auto = composer.is_auto();
+    let provider = composer.provider_name();
+    // Logo mode blanks the Auto slot for the image overlay, mirroring `backend_mark`.
+    let mark = if auto {
+        if logos.is_some() && logo_marks() {
+            "    "
+        } else {
+            AUTO_TAG
+        }
+    } else {
+        backend_mark(backend, theme)
+    };
+    let mark_color = if auto {
+        theme.text
+    } else {
+        backend_mark_color(backend, theme)
+    };
     let directory = app
         .spawn_target()
         .map(|target| abbreviate_dir(target.displayed_directory()))
@@ -285,20 +305,11 @@ pub(super) fn draw(
         return;
     }
 
-    let layout = metadata_layout(
-        mark,
-        backend.name(),
-        model,
-        &directory,
-        inner.width as usize,
-    );
+    let layout = metadata_layout(mark, provider, model, &directory, inner.width as usize);
     let mut metadata = vec![
-        Span::styled(
-            field(mark, MARK_FIELD),
-            fg(backend_mark_color(backend, theme)),
-        ),
+        Span::styled(field(mark, MARK_FIELD), fg(mark_color)),
         Span::raw(" "),
-        Span::styled(backend.name().to_string(), fg(theme.text)),
+        Span::styled(provider.to_string(), fg(theme.text)),
         Span::styled(" · ", fg(theme.faint)),
         Span::styled(model.to_string(), fg(theme.muted)),
         Span::styled(" · ", fg(theme.faint)),
@@ -306,7 +317,7 @@ pub(super) fn draw(
     ];
     if let Some(hint) = layout.hint {
         let used = INPUT_GUTTER
-            + display_width(backend.name())
+            + display_width(provider)
             + display_width(" · ")
             + display_width(model)
             + display_width(" · ")
@@ -386,7 +397,11 @@ pub(super) fn draw(
         && logo_marks()
         && inner.width >= 3
     {
-        let image = logos.composer_image(backend);
+        let image = if auto {
+            logos.composer_auto_image()
+        } else {
+            logos.composer_image(backend)
+        };
         let width = image.size().width;
         frame.render_widget(
             Image::new(image),

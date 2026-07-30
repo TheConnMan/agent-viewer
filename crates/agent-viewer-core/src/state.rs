@@ -974,17 +974,47 @@ pub fn apply_viewer_state(sessions: &mut [Session], state: &ViewerState) {
 /// [spawned_at_ms - 2_000, spawned_at_ms + 30_000]; nearest created_at wins on ties.
 /// (cwd + time window only — deliberately no pid correlation.)
 pub fn match_spawn(record: &SpawnRecord, sessions: &[Session]) -> Option<String> {
-    let lo = record.spawned_at_ms - 2_000;
-    let hi = record.spawned_at_ms + 30_000;
-    let mut best: Option<(&str, i64)> = None;
+    match_spawn_between(
+        record.backend,
+        &record.cwd,
+        record.spawned_at_ms,
+        record.spawned_at_ms,
+        sessions,
+    )
+}
+
+/// PURE spawn matching over the INTERVAL the session could have been created in: a session of
+/// `backend` with cwd == `cwd` and created_at_ms within
+/// [earliest_ms - 2_000, latest_ms + 30_000]; the candidate nearest that interval wins.
+///
+/// A direct spawn knows the one instant it happened, so it passes the same value twice and gets
+/// the single-stamp window above. A ROUTED spawn does not: the router classifies, dispatches, and
+/// then polls for the winning backend's job id, so the job is created somewhere between the
+/// invocation (`earliest_ms`) and the return (`latest_ms`) and can be many seconds older than the
+/// decision the viewer stamps. Bracketing the whole call is what keeps that row selectable.
+pub fn match_spawn_between(
+    backend: BackendKind,
+    cwd: &Path,
+    earliest_ms: i64,
+    latest_ms: i64,
+    sessions: &[Session],
+) -> Option<String> {
+    let (earliest_ms, latest_ms) = (earliest_ms.min(latest_ms), earliest_ms.max(latest_ms));
+    let lo = earliest_ms.saturating_sub(2_000);
+    let hi = latest_ms.saturating_add(30_000);
+    let mut best: Option<(&str, u64)> = None;
     for session in sessions {
-        if session.backend != record.backend || session.cwd != record.cwd {
+        if session.backend != backend || session.cwd != cwd {
             continue;
         }
         if session.created_at_ms < lo || session.created_at_ms > hi {
             continue;
         }
-        let distance = (session.created_at_ms - record.spawned_at_ms).abs();
+        // Distance to the interval, not to a point: every row created while the router ran is
+        // equally plausible, and rows outside rank by how far out they sit. Identical to
+        // |created_at - spawned_at| when the interval is a single instant.
+        let clamped = session.created_at_ms.clamp(earliest_ms, latest_ms);
+        let distance = session.created_at_ms.abs_diff(clamped);
         if best.is_none_or(|(_, best_distance)| distance < best_distance) {
             best = Some((session.id.as_str(), distance));
         }
