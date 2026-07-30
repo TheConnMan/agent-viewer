@@ -114,6 +114,7 @@ fn spawn_selection_from_mutation(
     Some(SpawnSelection {
         backend: *backend,
         session_id: spawned.session_id.clone(),
+        job_name: None,
         cwd: target.displayed_directory().to_path_buf(),
         // A direct spawn is one instant: submission and completion are the same stamp.
         submitted_at_ms: *spawned_at_ms,
@@ -348,6 +349,7 @@ fn run_spawn_auto(
         spawned: Some(SpawnSelection {
             backend: outcome.provider,
             session_id: outcome.job_id,
+            job_name: outcome.job_name,
             cwd: directory,
             submitted_at_ms,
             spawned_at_ms,

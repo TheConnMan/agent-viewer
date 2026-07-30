@@ -13,6 +13,7 @@ use agent_viewer_core::BackendKind;
 pub struct SpawnSelection {
     pub backend: BackendKind,
     pub session_id: Option<String>,
+    pub job_name: Option<String>,
     pub cwd: PathBuf,
     /// The earliest instant the new session could have been created: the spawn call itself for a
     /// direct spawn, the router INVOCATION for a routed one. Together with `spawned_at_ms` it

@@ -65,6 +65,10 @@ const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// never shown and only serves to let a chatty descendant grow the buffer unboundedly.
 const STDERR_CAP: usize = 8 * 1024;
 
+/// Ceiling on captured stdout. Model catalogs can exceed the OS pipe buffer, so the reader
+/// continues draining after this limit while retaining at most 384 KiB in memory.
+const STDOUT_CAP: usize = 384 * 1024;
+
 /// `run_with_timeout` for callers that must TELL THE USER why it failed, returning the
 /// failure as a one-line diagnostic naming the command.
 ///
@@ -96,8 +100,20 @@ pub(crate) fn run_reporting_failure(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let read = stdout.read_to_end(&mut buf).is_ok();
-        let _ = tx.send(read.then_some(buf));
+        let mut chunk = [0u8; 8 * 1024];
+        let mut truncated = false;
+        let read = loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(n) => {
+                    let retained = n.min(STDOUT_CAP.saturating_sub(buf.len()));
+                    buf.extend_from_slice(&chunk[..retained]);
+                    truncated |= retained < n;
+                }
+                Err(_) => break false,
+            }
+        };
+        let _ = tx.send(read.then_some((buf, truncated)));
     });
     // stderr gets its OWN reader thread for both of the reasons stdout does: a command that
     // writes more than the pipe buffer (64KB) blocks on write until someone reads, and a
@@ -155,11 +171,16 @@ pub(crate) fn run_reporting_failure(
                 let remaining = deadline
                     .saturating_duration_since(std::time::Instant::now())
                     .max(std::time::Duration::from_secs(1));
-                let buf = rx
+                let (buf, truncated) = rx
                     .recv_timeout(remaining)
                     .ok()
                     .flatten()
                     .ok_or_else(|| format!("`{described}` stdout was unreadable"))?;
+                if truncated {
+                    return Err(format!(
+                        "`{described}` stdout was truncated after {STDOUT_CAP} bytes"
+                    ));
+                }
                 return String::from_utf8(buf)
                     .map_err(|_| format!("`{described}` printed non-utf8 stdout"));
             }

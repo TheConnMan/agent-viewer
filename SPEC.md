@@ -589,14 +589,15 @@ viewer-local name override is involved, so the list can never disagree with `cla
 ## Auto spawn — `agent-router`, and why it is not a backend
 
 The composer's fourth selector entry, `auto`, delegates the provider choice to the
-`agent-router` CLI: `agent-router run --json --dir <target> "<task>"`, parsed into a
+`agent-router` CLI: `agent-router run --json --dir <target> --provider auto -- "<task>"`, parsed into a
 `RouterOutcome` by `core/router.rs`.
 
 - **Auto is deliberately NOT a `Backend`.** It enumerates nothing, owns no sessions, advertises
   no capabilities, and never appears in `all_backends()`. It exists only in the spawn flow, so
   the routed job shows up through the winning backend's normal listing path and is selected by
-  the existing `SpawnSelection` mechanism (the router's resolved job id when it returned one,
-  otherwise the cwd-plus-creation-time rule against that provider's preexisting ids).
+  the existing `SpawnSelection` mechanism (the router's exact returned id when available,
+  otherwise its exact returned job name, then bounded cwd and invocation-interval matching while
+  excluding that provider's preexisting ids).
 - **The entry is capability-gated on the binary**, resolved once at startup with a PATH lookup
   (`router::available()`), matching the backends-appear-when-present posture: no router means no
   entry, which is not an error state.

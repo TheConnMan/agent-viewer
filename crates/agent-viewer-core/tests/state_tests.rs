@@ -821,6 +821,32 @@ fn match_spawn_between_spans_the_whole_routing_interval() {
 }
 
 #[test]
+fn match_spawn_between_normalizes_a_reversed_clock_interval() {
+    let cwd = PathBuf::from("/home/user/routed-proj");
+    let sessions = vec![
+        sess(
+            BackendKind::Codex,
+            "created-before-clock-jump",
+            "/home/user/routed-proj",
+            1_009_000,
+            Status::Working,
+        ),
+        sess(
+            BackendKind::Codex,
+            "outside-the-normalized-window",
+            "/home/user/routed-proj",
+            999_000 - 2_001,
+            Status::Working,
+        ),
+    ];
+
+    assert_eq!(
+        match_spawn_between(BackendKind::Codex, &cwd, 1_010_000, 1_000_000, &sessions),
+        Some("created-before-clock-jump".to_string())
+    );
+}
+
+#[test]
 fn viewer_db_collapsed_groups_roundtrip() {
     let (_dir, path) = temp_db_path();
 

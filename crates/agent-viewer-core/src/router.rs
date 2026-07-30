@@ -141,31 +141,48 @@ impl RouterOutcome {
 pub fn parse_outcome(stdout: &str) -> std::result::Result<RouterOutcome, String> {
     let value: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|e| format!("`{ROUTER_BIN}` printed unreadable json: {e}"))?;
-    let provider = crate::json_str(&value, "provider")
-        .ok_or_else(|| format!("`{ROUTER_BIN}` json has no provider"))?;
+    let provider = required_str(&value, "provider")?;
     let provider = provider_kind(provider)?;
-    let dispatch = value.get("dispatch");
+    let dry_run = required_bool(&value, "dry_run")?;
+    if dry_run {
+        return Err(format!("`{ROUTER_BIN}` json reports dry_run true"));
+    }
+    let dispatch = required_object(&value, "dispatch")?;
+    let gates = required_string_array(&value, "gates")?;
+    let rationale = required_str(&value, "rationale")?.to_string();
+    let usage = required_object(&value, "usage")?;
+    let job_id = nullable_string_from_object(dispatch, "job_id")
+        .map_err(|error| format!("dispatch: {error}"))?;
+    if job_id.as_deref() == Some("") {
+        return Err(format!(
+            "`{ROUTER_BIN}` json field dispatch.job_id is empty"
+        ));
+    }
+    let job_name = nullable_string_from_object(dispatch, "job_name")
+        .map_err(|error| format!("dispatch: {error}"))?;
+    match job_name.as_deref() {
+        None => {
+            return Err(format!(
+                "`{ROUTER_BIN}` json field dispatch.job_name is null"
+            ));
+        }
+        Some("") => {
+            return Err(format!(
+                "`{ROUTER_BIN}` json field dispatch.job_name is empty"
+            ));
+        }
+        Some(_) => {}
+    }
     Ok(RouterOutcome {
         provider,
-        model: owned_str(&value, "model"),
-        effort: owned_str(&value, "effort"),
-        job_id: dispatch.and_then(|d| owned_str(d, "job_id")),
-        job_name: dispatch.and_then(|d| owned_str(d, "job_name")),
-        gates: value
-            .get("gates")
-            .and_then(|gates| gates.as_array())
-            .map(|gates| {
-                gates
-                    .iter()
-                    .filter_map(|gate| gate.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        rationale: crate::json_str(&value, "rationale")
-            .unwrap_or_default()
-            .to_string(),
-        claude_weekly_pct: weekly_pct(&value, "claude"),
-        codex_weekly_pct: weekly_pct(&value, "codex"),
+        model: nullable_string(&value, "model")?,
+        effort: nullable_string(&value, "effort")?,
+        job_id,
+        job_name,
+        gates,
+        rationale,
+        claude_weekly_pct: weekly_pct(usage, "claude")?,
+        codex_weekly_pct: weekly_pct(usage, "codex")?,
     })
 }
 
@@ -181,6 +198,8 @@ pub fn route_command(dir: &Path, task: &str) -> std::process::Command {
         .arg("--json")
         .arg("--dir")
         .arg(dir)
+        .arg("--provider")
+        .arg("auto")
         .arg("--")
         .arg(task);
     cmd
@@ -212,18 +231,96 @@ fn provider_kind(name: &str) -> std::result::Result<BackendKind, String> {
     }
 }
 
-/// PURE: an owned string field, treating JSON null (the router's "not applicable") as absent.
-fn owned_str(value: &serde_json::Value, key: &str) -> Option<String> {
-    crate::json_str(value, key).map(str::to_string)
+fn required_str<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> std::result::Result<&'a str, String> {
+    match value.get(key) {
+        Some(serde_json::Value::String(text)) => Ok(text),
+        Some(_) => Err(format!("`{ROUTER_BIN}` json field {key} is not a string")),
+        None => Err(format!("`{ROUTER_BIN}` json has no {key}")),
+    }
 }
 
-/// PURE: `usage.<provider>.weekly_pct`, 0 when the router could not read it (its usage
-/// readers fail open, so a missing number means "no known consumption", not an error).
-fn weekly_pct(value: &serde_json::Value, provider: &str) -> f64 {
-    value
-        .get("usage")
-        .and_then(|usage| usage.get(provider))
+fn required_bool(value: &serde_json::Value, key: &str) -> std::result::Result<bool, String> {
+    match value.get(key) {
+        Some(serde_json::Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(format!("`{ROUTER_BIN}` json field {key} is not a boolean")),
+        None => Err(format!("`{ROUTER_BIN}` json has no {key}")),
+    }
+}
+
+fn required_object<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> std::result::Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    match value.get(key) {
+        Some(serde_json::Value::Object(object)) => Ok(object),
+        Some(_) => Err(format!("`{ROUTER_BIN}` json field {key} is not an object")),
+        None => Err(format!("`{ROUTER_BIN}` json has no {key}")),
+    }
+}
+
+fn nullable_string(
+    value: &serde_json::Value,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    nullable_string_value(value.get(key), key)
+}
+
+fn nullable_string_from_object(
+    value: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    nullable_string_value(value.get(key), key)
+}
+
+fn nullable_string_value(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    match value {
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Err(format!(
+            "`{ROUTER_BIN}` json field {key} is not a string or null"
+        )),
+        None => Err(format!("`{ROUTER_BIN}` json has no {key}")),
+    }
+}
+
+fn required_string_array(
+    value: &serde_json::Value,
+    key: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let Some(gates) = value.get(key) else {
+        return Err(format!("`{ROUTER_BIN}` json has no {key}"));
+    };
+    let serde_json::Value::Array(gates) = gates else {
+        return Err(format!("`{ROUTER_BIN}` json field {key} is not an array"));
+    };
+    gates
+        .iter()
+        .map(|gate| {
+            gate.as_str().map(str::to_string).ok_or_else(|| {
+                format!("`{ROUTER_BIN}` json field {key} contains a non-string value")
+            })
+        })
+        .collect()
+}
+
+fn weekly_pct(
+    usage: &serde_json::Map<String, serde_json::Value>,
+    provider: &str,
+) -> std::result::Result<f64, String> {
+    usage
+        .get(provider)
+        .and_then(serde_json::Value::as_object)
         .and_then(|headroom| headroom.get("weekly_pct"))
         .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0)
+        .ok_or_else(|| {
+            format!(
+                "`{ROUTER_BIN}` json field usage.{provider}.weekly_pct is missing or not numeric"
+            )
+        })
 }

@@ -23,15 +23,17 @@ fn dispatched_fixture() -> String {
         dry_run.contains("\"dispatch\": null"),
         "the captured dry run must carry a null dispatch"
     );
-    dry_run.replace(
-        "\"dispatch\": null",
-        "\"dispatch\": {\n    \"job_id\": \"0199c0de-thread\",\n    \"job_name\": \"Add a unit test for the trunc\"\n  }",
-    )
+    dry_run
+        .replace("\"dry_run\": true", "\"dry_run\": false")
+        .replace(
+            "\"dispatch\": null",
+            "\"dispatch\": {\n    \"job_id\": \"0199c0de-thread\",\n    \"job_name\": \"Add a unit test for the trunc\"\n  }",
+        )
 }
 
 #[test]
-fn a_dry_run_decision_parses_provider_effort_and_weekly_headroom() {
-    let outcome = parse_outcome(&read_fixture("router_run_dry_run.json")).expect("parsed decision");
+fn a_dispatched_decision_parses_provider_effort_and_weekly_headroom() {
+    let outcome = parse_outcome(&dispatched_fixture()).expect("parsed decision");
 
     assert_eq!(outcome.provider, BackendKind::Codex);
     // Codex leaves the model to codex itself and routes at the highest reasoning effort.
@@ -45,15 +47,6 @@ fn a_dry_run_decision_parses_provider_effort_and_weekly_headroom() {
         "the rationale must survive parsing, got {:?}",
         outcome.rationale
     );
-    // A dry run dispatched nothing, so there is no job to select a row for.
-    assert_eq!(outcome.job_id, None);
-    assert_eq!(outcome.job_name, None);
-}
-
-#[test]
-fn a_dispatched_decision_carries_the_job_identity_the_viewer_selects_by() {
-    let outcome = parse_outcome(&dispatched_fixture()).expect("parsed decision");
-
     assert_eq!(outcome.job_id.as_deref(), Some("0199c0de-thread"));
     assert_eq!(
         outcome.job_name.as_deref(),
@@ -62,16 +55,57 @@ fn a_dispatched_decision_carries_the_job_identity_the_viewer_selects_by() {
 }
 
 #[test]
-fn the_footer_notice_is_one_line_naming_the_provider_and_both_headrooms() {
-    let outcome = parse_outcome(&read_fixture("router_run_dry_run.json")).expect("parsed decision");
+fn a_dispatched_decision_rejects_an_empty_job_id() {
+    let empty_id =
+        dispatched_fixture().replace("\"job_id\": \"0199c0de-thread\"", "\"job_id\": \"\"");
 
-    assert_eq!(
-        outcome.notice(),
-        "auto: codex effort xhigh (codex weekly 87%, claude 52%)"
+    let error = parse_outcome(&empty_id).expect_err("an empty job id is not an identity");
+    assert!(
+        error.contains("job_id") && error.contains("empty"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn a_dispatched_decision_rejects_an_empty_job_name() {
+    let empty_name = dispatched_fixture().replace(
+        "\"job_name\": \"Add a unit test for the trunc\"",
+        "\"job_name\": \"\"",
     );
 
-    let dispatched = parse_outcome(&dispatched_fixture()).expect("parsed decision");
-    let notice = dispatched.notice();
+    let error = parse_outcome(&empty_name).expect_err("an empty job name is not an identity");
+    assert!(
+        error.contains("job_name") && error.contains("empty"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn a_dispatched_decision_requires_a_job_name_but_allows_a_null_job_id() {
+    let null_id =
+        dispatched_fixture().replace("\"job_id\": \"0199c0de-thread\"", "\"job_id\": null");
+    let outcome = parse_outcome(&null_id).expect("a backend may omit its job id");
+    assert_eq!(outcome.job_id, None);
+    assert_eq!(
+        outcome.job_name.as_deref(),
+        Some("Add a unit test for the trunc")
+    );
+
+    let null_name = null_id.replace(
+        "\"job_name\": \"Add a unit test for the trunc\"",
+        "\"job_name\": null",
+    );
+    let error = parse_outcome(&null_name).expect_err("every dispatched job requires a name");
+    assert!(
+        error.contains("job_name") && error.contains("null"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn the_footer_notice_is_one_line_naming_the_provider_and_both_headrooms() {
+    let outcome = parse_outcome(&dispatched_fixture()).expect("parsed decision");
+    let notice = outcome.notice();
     assert_eq!(
         notice,
         "auto: codex effort xhigh job 0199c0de-thread (codex weekly 87%, claude 52%)"
@@ -81,8 +115,8 @@ fn the_footer_notice_is_one_line_naming_the_provider_and_both_headrooms() {
 
 #[test]
 fn gate_tags_reach_the_notice_so_a_flipped_decision_says_why() {
-    let flipped = read_fixture("router_run_dry_run.json")
-        .replace("\"gates\": []", "\"gates\": [\"headroom_tiebreak\"]");
+    let flipped =
+        dispatched_fixture().replace("\"gates\": []", "\"gates\": [\"headroom_tiebreak\"]");
     let outcome = parse_outcome(&flipped).expect("parsed decision");
 
     assert_eq!(outcome.gates, vec!["headroom_tiebreak".to_string()]);
@@ -91,6 +125,87 @@ fn gate_tags_reach_the_notice_so_a_flipped_decision_says_why() {
         "got {:?}",
         outcome.notice()
     );
+}
+
+#[test]
+fn a_real_router_run_rejects_dry_run_or_undispatched_output() {
+    let dry_run = dispatched_fixture().replace("\"dry_run\": false", "\"dry_run\": true");
+    let error = parse_outcome(&dry_run).expect_err("dry run output must not become a viewer spawn");
+    assert!(error.contains("dry_run"), "got {error:?}");
+
+    let undispatched = dispatched_fixture().replace(
+        "\"dispatch\": {\n    \"job_id\": \"0199c0de-thread\",\n    \"job_name\": \"Add a unit test for the trunc\"\n  }",
+        "\"dispatch\": null",
+    );
+    let error = parse_outcome(&undispatched).expect_err("a null dispatch means no job was started");
+    assert!(error.contains("dispatch"), "got {error:?}");
+}
+
+#[test]
+fn a_real_router_run_requires_gates_rationale_and_usage() {
+    for field in ["gates", "rationale", "usage"] {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&dispatched_fixture()).expect("fixture json");
+        value.as_object_mut().expect("fixture object").remove(field);
+
+        let error = parse_outcome(&value.to_string())
+            .expect_err("missing required router fields must reject the decision");
+        assert!(error.contains(field), "{field} error was {error:?}");
+    }
+}
+
+#[test]
+fn malformed_router_field_types_reject_the_decision() {
+    let malformed = [
+        ("provider", serde_json::json!(17)),
+        ("model", serde_json::json!({"unexpected": true})),
+        ("effort", serde_json::json!(false)),
+        ("gates", serde_json::json!("headroom_tiebreak")),
+        ("gates", serde_json::json!(["headroom_tiebreak", 17])),
+        ("rationale", serde_json::json!(["not", "text"])),
+        ("usage", serde_json::json!("unavailable")),
+        ("dry_run", serde_json::json!("false")),
+        ("dispatch", serde_json::json!([])),
+        (
+            "dispatch",
+            serde_json::json!({
+                "job_id": 17,
+                "job_name": "Add a unit test for the trunc"
+            }),
+        ),
+        (
+            "dispatch",
+            serde_json::json!({
+                "job_id": null,
+                "job_name": false
+            }),
+        ),
+    ];
+
+    for (field, replacement) in malformed {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&dispatched_fixture()).expect("fixture json");
+        value
+            .as_object_mut()
+            .expect("fixture object")
+            .insert(field.to_string(), replacement);
+
+        let error = parse_outcome(&value.to_string())
+            .expect_err("malformed router fields must reject the decision");
+        assert!(error.contains(field), "{field} error was {error:?}");
+    }
+
+    for provider in ["claude", "codex"] {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&dispatched_fixture()).expect("fixture json");
+        value["usage"][provider]["weekly_pct"] = serde_json::json!("unknown");
+
+        let error = parse_outcome(&value.to_string()).expect_err("weekly usage must be numeric");
+        assert!(
+            error.contains("usage"),
+            "{provider} usage error was {error:?}"
+        );
+    }
 }
 
 /// Every unreadable decision is an error the user sees, never a default that would spawn on a
@@ -208,6 +323,8 @@ fn the_task_is_passed_after_a_double_dash_so_a_hyphen_task_stays_the_task() {
             OsStr::new("--json"),
             OsStr::new("--dir"),
             OsStr::new("/tmp/routed proj"),
+            OsStr::new("--provider"),
+            OsStr::new("auto"),
             OsStr::new("--"),
             OsStr::new("--help me refactor"),
         ]
@@ -219,9 +336,9 @@ fn the_task_is_passed_after_a_double_dash_so_a_hyphen_task_stays_the_task() {
 /// user reads, so the name is collapsed to single spaces before it lands there.
 #[test]
 fn a_multiline_job_name_still_yields_a_one_line_notice() {
-    let multiline = read_fixture("router_run_dry_run.json").replace(
-        "\"dispatch\": null",
-        "\"dispatch\": {\n    \"job_id\": null,\n    \"job_name\": \"Fix the parser\\n\\nthen add a test\"\n  }",
+    let multiline = dispatched_fixture().replace(
+        "\"job_id\": \"0199c0de-thread\",\n    \"job_name\": \"Add a unit test for the trunc\"",
+        "\"job_id\": null,\n    \"job_name\": \"Fix the parser\\n\\nthen add a test\"",
     );
     let outcome = parse_outcome(&multiline).expect("parsed decision");
 
@@ -255,7 +372,7 @@ fn write_router(dir: &std::path::Path, name: &str, executable: bool) {
 /// model and effort choice, so a routed decision's own model must survive untouched.
 #[test]
 fn the_router_model_is_reported_when_the_router_chose_one() {
-    let claude = read_fixture("router_run_dry_run.json")
+    let claude = dispatched_fixture()
         .replace("\"provider\": \"codex\"", "\"provider\": \"claude\"")
         .replace("\"model\": null", "\"model\": \"opus[1m]\"")
         .replace("\"effort\": \"xhigh\"", "\"effort\": null");
@@ -266,6 +383,51 @@ fn the_router_model_is_reported_when_the_router_chose_one() {
     assert_eq!(outcome.effort, None);
     assert_eq!(
         outcome.notice(),
-        "auto: claude opus[1m] (codex weekly 87%, claude 52%)"
+        "auto: claude opus[1m] job 0199c0de-thread (codex weekly 87%, claude 52%)"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_router_stdout_larger_than_the_json_limit_is_drained_and_rejected() {
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = PATH_LOCK.lock().expect("path lock");
+    let original_path = std::env::var_os("PATH");
+    let router_dir = tempfile::tempdir().expect("router dir");
+    let router_path = router_dir.path().join(ROUTER_BIN);
+    let script = r#"#!/bin/sh
+printf '%s' '{"provider":"codex","model":null,"effort":"xhigh","dry_run":false,"dispatch":{"job_id":"large","job_name":"large"},"gates":[],"rationale":"large","usage":{"claude":{"weekly_pct":52},"codex":{"weekly_pct":87}},"padding":"'
+/usr/bin/head -c 524288 /dev/zero | /usr/bin/tr '\000' x
+printf '%s' '"}'
+"#;
+    std::fs::write(&router_path, script).expect("write router");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&router_path, std::fs::Permissions::from_mode(0o755))
+        .expect("set router mode");
+
+    unsafe {
+        std::env::set_var("PATH", router_dir.path());
+    }
+    let started = std::time::Instant::now();
+    let result = agent_viewer_core::router::route(std::path::Path::new("/tmp"), "task");
+    if let Some(path) = original_path {
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("PATH");
+        }
+    }
+
+    let error = result.expect_err("oversized router json must be rejected");
+    assert!(
+        error.contains(ROUTER_BIN) && error.contains("truncated"),
+        "got {error:?}"
+    );
+    assert!(!error.contains("timed out"), "got {error:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the oversized pipe was not drained promptly"
     );
 }
