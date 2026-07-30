@@ -388,10 +388,58 @@ fn the_router_model_is_reported_when_the_router_chose_one() {
     );
 }
 
+/// Serializes the tests that point PATH at a fake router: two of them racing would restore
+/// each other's temporary PATH mid-run.
+#[cfg(target_os = "linux")]
+static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A router failure lands in the one line footer, and the error carries both the described
+/// argv (which embeds the raw, possibly multi-line task) and the router's stderr. The route
+/// boundary must collapse them.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_failing_router_reports_a_one_line_error() {
+    let _lock = PATH_LOCK.lock().expect("path lock");
+    let original_path = std::env::var_os("PATH");
+    let router_dir = tempfile::tempdir().expect("router dir");
+    let router_path = router_dir.path().join(ROUTER_BIN);
+    let script = "#!/bin/sh\necho 'boom line one' >&2\necho 'boom line two' >&2\nexit 7\n";
+    std::fs::write(&router_path, script).expect("write router");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&router_path, std::fs::Permissions::from_mode(0o755))
+        .expect("set router mode");
+
+    unsafe {
+        std::env::set_var("PATH", router_dir.path());
+    }
+    let result = agent_viewer_core::router::route(
+        std::path::Path::new("/tmp"),
+        "fix the parser\n\nthen add a test",
+    );
+    if let Some(path) = original_path {
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("PATH");
+        }
+    }
+
+    let error = result.expect_err("a non-zero router exit is a failure");
+    assert!(
+        error.contains("boom line one") && error.contains("boom line two"),
+        "the router's stderr must survive into the error, got {error:?}"
+    );
+    assert!(
+        !error.contains('\n') && !error.contains('\r'),
+        "the footer shows one line, got {error:?}"
+    );
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn a_router_stdout_larger_than_the_json_limit_is_drained_and_rejected() {
-    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _lock = PATH_LOCK.lock().expect("path lock");
     let original_path = std::env::var_os("PATH");
     let router_dir = tempfile::tempdir().expect("router dir");
