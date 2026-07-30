@@ -205,10 +205,13 @@ pub fn route_command(dir: &Path, task: &str) -> std::process::Command {
     cmd
 }
 
-/// IMPURE: route one task and let the router dispatch it.
+/// IMPURE: route one task and let the router dispatch it. Every error is collapsed to one
+/// line before it reaches the caller: it lands in the single-line footer, and both the
+/// described argv (which embeds the raw task) and the router's stderr can carry newlines.
 pub fn route(dir: &Path, task: &str) -> std::result::Result<RouterOutcome, String> {
-    let stdout = crate::spawn::run_reporting_failure(route_command(dir, task), ROUTER_TIMEOUT)?;
-    parse_outcome(&stdout)
+    let stdout = crate::spawn::run_reporting_failure(route_command(dir, task), ROUTER_TIMEOUT)
+        .map_err(|error| one_line(&error))?;
+    parse_outcome(&stdout).map_err(|error| one_line(&error))
 }
 
 /// PURE: whitespace runs (newlines included) collapsed to single spaces. The router's job name
