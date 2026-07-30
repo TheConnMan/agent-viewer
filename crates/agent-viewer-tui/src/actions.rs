@@ -195,7 +195,12 @@ pub(crate) fn kill_selected(_backends: &[Box<dyn Backend>], ui: &mut Ui) {
 pub(crate) fn kill_request(ui: &mut Ui, request: TargetRequest, title: String, stage: KillStage) {
     match stage {
         KillStage::Stop => {
-            submit_mutation(ui, request, &title, "stop", "stopping", Mutation::Stop);
+            let key = format!("{}:{}:kill", request.backend().name(), request.id());
+            let mutation = Mutation::Stop(request);
+            let executor = ui.mutation_executor.clone();
+            if ui.mutations.submit(key, move || executor(mutation)) {
+                ui.set_notice(format!("stopping… {title}"));
+            }
         }
         KillStage::Remove => {
             let key = (request.backend(), request.id().to_string());
@@ -207,7 +212,7 @@ pub(crate) fn kill_request(ui: &mut Ui, request: TargetRequest, title: String, s
                 ui.set_notice("session is no longer available".to_string());
                 return;
             };
-            submit_mutation(ui, request, &title, "remove", "removing", move |request| {
+            submit_kill_mutation(ui, request, &title, "removing", move |request| {
                 Mutation::Remove {
                     request,
                     require_finished,
@@ -238,6 +243,24 @@ pub(crate) fn hide_request(ui: &mut Ui, request: TargetRequest, title: String, h
             "unarchiving",
             Mutation::Unhide,
         );
+    }
+}
+
+fn submit_kill_mutation(
+    ui: &mut Ui,
+    request: TargetRequest,
+    title: &str,
+    verb: &str,
+    mutation: impl FnOnce(TargetRequest) -> Mutation,
+) {
+    let key = format!("{}:{}:kill", request.backend().name(), request.id());
+    let mutation = mutation(request);
+    let executor = ui.mutation_executor.clone();
+    if ui
+        .mutations
+        .submit_after_success(key, move || executor(mutation))
+    {
+        ui.set_notice(format!("{verb}… {title}"));
     }
 }
 
@@ -424,17 +447,21 @@ fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget)
 
 #[cfg(test)]
 mod tests {
-    use super::{install_attach_plan, spawn_from_composer};
+    use super::{install_attach_plan, kill_request, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{sess, test_ui_with};
     use crate::ops::{Mutation, resolve_attach_with_backend};
     use agent_viewer_core::pty::TerminalPalette;
-    use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session};
+    use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session, Status};
+    use agent_viewer_tui::app::KillStage;
     use agent_viewer_tui::mutations::MutationOutcome;
     use agent_viewer_tui::shared_listing::TargetRequest;
     use agent_viewer_tui::ui::Mode;
-    use std::sync::{Arc, Mutex, mpsc::channel};
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{TryRecvError, channel},
+    };
     use std::time::{Duration, Instant};
 
     struct SpawnCapableBackend;
@@ -596,6 +623,198 @@ mod tests {
         let (_snapshot_tx, snapshots) = channel();
         let (wake, _wake_rx) = channel();
         Refresher { snapshots, wake }
+    }
+
+    fn poll_mutation(ui: &mut crate::Ui) -> Result<MutationOutcome, String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = ui.mutations.poll() {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background mutation did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn kill_remove_waits_for_stop_success() {
+        let session = sess("kill_success", "/tmp/agentviewer_kill_success", 100);
+        let request = TargetRequest::from(&session);
+        let mut ui = test_ui_with(vec![session]);
+        let (stop_started_tx, stop_started_rx) = channel();
+        let (release_stop_tx, release_stop_rx) = channel();
+        let release_stop_rx = Arc::new(Mutex::new(release_stop_rx));
+        let (remove_started_tx, remove_started_rx) = channel();
+        ui.mutation_executor = Arc::new(move |mutation| match mutation {
+            Mutation::Stop(_) => {
+                stop_started_tx.send(()).expect("report stop start");
+                release_stop_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release stop");
+                Ok(MutationOutcome {
+                    notice: "stopped".to_string(),
+                    spawned: None,
+                })
+            }
+            Mutation::Remove { .. } => {
+                remove_started_tx.send(()).expect("report remove start");
+                Ok(MutationOutcome {
+                    notice: "removed".to_string(),
+                    spawned: None,
+                })
+            }
+            _ => panic!("unexpected mutation"),
+        });
+
+        kill_request(
+            &mut ui,
+            request.clone(),
+            "kill success".to_string(),
+            KillStage::Stop,
+        );
+        stop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop started");
+        kill_request(
+            &mut ui,
+            request,
+            "kill success".to_string(),
+            KillStage::Remove,
+        );
+        assert_eq!(remove_started_rx.try_recv(), Err(TryRecvError::Empty));
+
+        release_stop_tx.send(()).expect("finish stop");
+        assert_eq!(
+            poll_mutation(&mut ui),
+            Ok(MutationOutcome {
+                notice: "stopped".to_string(),
+                spawned: None,
+            })
+        );
+        remove_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remove started after stop");
+        assert_eq!(
+            poll_mutation(&mut ui),
+            Ok(MutationOutcome {
+                notice: "removed".to_string(),
+                spawned: None,
+            })
+        );
+    }
+
+    #[test]
+    fn kill_remove_is_discarded_after_stop_failure() {
+        let session = sess("kill_failure", "/tmp/agentviewer_kill_failure", 100);
+        let request = TargetRequest::from(&session);
+        let mut ui = test_ui_with(vec![session]);
+        let (stop_started_tx, stop_started_rx) = channel();
+        let (release_stop_tx, release_stop_rx) = channel();
+        let release_stop_rx = Arc::new(Mutex::new(release_stop_rx));
+        let (remove_started_tx, remove_started_rx) = channel();
+        ui.mutation_executor = Arc::new(move |mutation| match mutation {
+            Mutation::Stop(_) => {
+                stop_started_tx.send(()).expect("report stop start");
+                release_stop_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release stop");
+                Err("stop failed".to_string())
+            }
+            Mutation::Remove { .. } => {
+                remove_started_tx.send(()).expect("report remove start");
+                Ok(MutationOutcome {
+                    notice: "removed".to_string(),
+                    spawned: None,
+                })
+            }
+            _ => panic!("unexpected mutation"),
+        });
+
+        kill_request(
+            &mut ui,
+            request.clone(),
+            "kill failure".to_string(),
+            KillStage::Stop,
+        );
+        stop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop started");
+        kill_request(
+            &mut ui,
+            request,
+            "kill failure".to_string(),
+            KillStage::Remove,
+        );
+        assert_eq!(remove_started_rx.try_recv(), Err(TryRecvError::Empty));
+
+        release_stop_tx.send(()).expect("finish stop");
+        assert_eq!(poll_mutation(&mut ui), Err("stop failed".to_string()));
+        drop(ui);
+        assert_eq!(
+            remove_started_rx.try_recv(),
+            Err(TryRecvError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn kill_stop_deduplicates_after_the_removal_window_expires() {
+        let mut session = sess("kill_dedup", "/tmp/agentviewer_kill_dedup", 100);
+        session.status = Status::Working;
+        let request = TargetRequest::from(&session);
+        let mut ui = test_ui_with(vec![session]);
+        let (stop_started_tx, stop_started_rx) = channel();
+        let (release_stop_tx, release_stop_rx) = channel();
+        let release_stop_rx = Arc::new(Mutex::new(release_stop_rx));
+        ui.mutation_executor = Arc::new(move |mutation| match mutation {
+            Mutation::Stop(_) => {
+                stop_started_tx.send(()).expect("report stop start");
+                release_stop_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release stop");
+                Ok(MutationOutcome {
+                    notice: "stopped".to_string(),
+                    spawned: None,
+                })
+            }
+            _ => panic!("unexpected mutation"),
+        });
+
+        let first_stage = ui.app.kill_stage(1_000);
+        assert_eq!(first_stage, KillStage::Stop);
+        kill_request(
+            &mut ui,
+            request.clone(),
+            "kill dedup".to_string(),
+            first_stage,
+        );
+        stop_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop started");
+
+        let repeated_stage = ui.app.kill_stage(3_001);
+        assert_eq!(repeated_stage, KillStage::Stop);
+        kill_request(&mut ui, request, "kill dedup".to_string(), repeated_stage);
+        assert_eq!(stop_started_rx.try_recv(), Err(TryRecvError::Empty));
+
+        release_stop_tx.send(()).expect("finish stop");
+        assert_eq!(
+            poll_mutation(&mut ui),
+            Ok(MutationOutcome {
+                notice: "stopped".to_string(),
+                spawned: None,
+            })
+        );
+        drop(ui);
+        assert_eq!(stop_started_rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     #[test]

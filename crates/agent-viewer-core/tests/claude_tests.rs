@@ -830,6 +830,82 @@ fn session_with_short_id(short_id: Option<&str>) -> agent_viewer_core::Session {
     }
 }
 
+#[test]
+fn claude_stop_invokes_the_native_cli_with_the_short_id() {
+    let directory = tempfile::TempDir::new().expect("create fake cli directory");
+    let binary = directory.path().join("claude");
+    let args_path = directory.path().join("claude.args");
+    let mut script =
+        tempfile::NamedTempFile::new_in(directory.path()).expect("create fake claude cli");
+    script
+        .write_all(b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\n")
+        .expect("write fake claude cli");
+    let published = script.persist(&binary).expect("publish fake claude cli");
+    drop(published);
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake claude cli executable");
+
+    let session = session_with_short_id(Some("stop01"));
+    let backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
+
+    Backend::stop(&backend, &session).expect("stop Claude session through its cli");
+    assert_eq!(
+        std::fs::read_to_string(args_path).expect("read recorded cli arguments"),
+        "stop\nstop01\n"
+    );
+}
+
+#[test]
+fn claude_stop_capability_depends_only_on_active_status_and_short_id() {
+    use agent_viewer_core::claude::capabilities_for_session_on_platform;
+    use agent_viewer_core::platform::Platform;
+
+    assert!(
+        ClaudeBackend::new().capabilities().stop,
+        "backend wide stop stays true because the native cli supports it"
+    );
+
+    for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
+        let working = session_with_short_id(Some("stop01"));
+        assert_eq!(working.pid, None);
+        assert!(
+            capabilities_for_session_on_platform(platform, &working).stop,
+            "{platform:?} must allow the native cli to stop a pidless working row"
+        );
+
+        let mut needs_input = session_with_short_id(Some("stop01"));
+        needs_input.status = Status::needs_input();
+        assert!(
+            capabilities_for_session_on_platform(platform, &needs_input).stop,
+            "{platform:?} must allow the native cli to stop a row needing input"
+        );
+
+        let mut daemon_hosted = session_with_short_id(Some("stop01"));
+        daemon_hosted.daemon_hosted = true;
+        assert!(
+            capabilities_for_session_on_platform(platform, &daemon_hosted).stop,
+            "{platform:?} must use the native cli for a daemon hosted row"
+        );
+
+        for short_id in [None, Some("")] {
+            let missing_id = session_with_short_id(short_id);
+            assert!(
+                !capabilities_for_session_on_platform(platform, &missing_id).stop,
+                "{platform:?} must not stop a row without a short id"
+            );
+        }
+
+        for status in [Status::Idle, Status::Done, Status::Error, Status::Unknown] {
+            let mut inactive = session_with_short_id(Some("stop01"));
+            inactive.status = status.clone();
+            assert!(
+                !capabilities_for_session_on_platform(platform, &inactive).stop,
+                "{platform:?} must not stop a {status:?} row"
+            );
+        }
+    }
+}
+
 // `remove` is advertised true for the claude backend as a whole, but `claude rm` needs the
 // short id and a row without one has no bg job to remove. The capability is therefore
 // per-row, and callers must be able to ask BEFORE taking any destructive step.

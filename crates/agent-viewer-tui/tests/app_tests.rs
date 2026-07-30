@@ -1174,6 +1174,32 @@ fn kill_stage_two_stage() {
     assert_eq!(app.kill_stage(20_500), KillStage::Stop);
 }
 
+#[test]
+fn failed_stop_disarms_only_its_removal_confirmation() {
+    let mut app = App::new(vec![sess(
+        BackendKind::Codex,
+        "work",
+        "/p",
+        300,
+        Status::Working,
+    )]);
+
+    select(&mut app, "work");
+    assert_eq!(app.kill_stage(1_000), KillStage::Stop);
+    assert!(app.is_armed(1_500));
+
+    app.disarm_kill_for(BackendKind::Codex, "other");
+    assert!(app.is_armed(1_500));
+
+    app.disarm_kill_for(BackendKind::Claude, "work");
+    assert!(app.is_armed(1_500));
+
+    app.disarm_kill_for(BackendKind::Codex, "work");
+
+    assert!(!app.is_armed(1_500));
+    assert_eq!(app.kill_stage(2_000), KillStage::Stop);
+}
+
 // --- Sticky selection across per-tick reordering (finding 4) ---
 
 #[test]

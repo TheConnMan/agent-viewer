@@ -24,8 +24,9 @@ no data or whose CLI is not installed simply list empty — they never error the
   creating a session nobody could ever join), attaches by joining that daemon
   (`codex resume --remote`), stops a hosted session by interrupting its turn, and
   archives/unarchives.
-- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), remove (`claude rm`),
-  and rename background sessions. Rename writes `name`/`nameSource` into that job's
+- **Claude / Claude Code** — enumerate, spawn, attach (`claude attach`), stop working or
+  needs input background sessions (`claude stop`), remove (`claude rm`), and rename background
+  sessions. Rename writes `name`/`nameSource` into that job's
   `~/.claude/jobs/<short>/state.json`, which is what Claude's own fleet view does and the only
   channel it has (there is no `claude rename` subcommand). It applies to background rows only:
   an interactive row has no job dir, so `Ctrl+R` there is a footer notice. No archive/hide
@@ -192,10 +193,13 @@ its SQLite title still shows the prompt.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
   Claude row, which has no job dir) is a no-op with a footer notice.
-- `Ctrl+X` — stop the selected session; press again within 2s to remove it. A Codex session
-  hosted by the app-server daemon is stopped by interrupting its current turn, never by
-  signalling a process: the daemon runs every session it hosts, so a signal would take all of
-  them down with it.
+- `Ctrl+X` — stop the selected session; press again within 2s to queue its removal after stop
+  succeeds. If stop fails, removal is discarded and confirmation is cleared, so the next press
+  retries stop. Claude stops a working or needs input background session with `claude stop`,
+  retaining it for later attach.
+  A Codex session hosted by the app-server daemon is stopped by interrupting its current turn,
+  never by signalling a process: the daemon runs every session it hosts, so a signal would take
+  all of them down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
