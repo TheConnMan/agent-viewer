@@ -629,9 +629,11 @@ fn main() -> io::Result<()> {
     };
 
     // The composer's Auto entry is capability-gated on the router binary, resolved once here:
-    // without `agent-router` on PATH the entry never appears in the Tab cycle.
+    // without `agent-router` on PATH the entry never appears in the Tab cycle. When the router
+    // is present it is also the STARTING selection: routed spawns are the default posture.
     ui.composer
         .set_auto_available(agent_viewer_core::router::available());
+    ui.composer.default_to_auto();
 
     // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
     // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
