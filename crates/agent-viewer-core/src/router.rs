@@ -26,19 +26,37 @@ pub const ROUTER_TIMEOUT: Duration = Duration::from_secs(180);
 /// effort choice, so the viewer must not send one.
 pub const AUTO_MODEL: &str = "auto";
 
-/// PURE: the first `binary` found as a file in a PATH-style variable value. An absolute or
+/// PURE: the first executable `binary` found in a PATH-style variable value. An absolute or
 /// multi-component name is taken as-is. Kept pure (the PATH value is an argument, not a read)
 /// so the Auto gate is testable without mutating the process environment.
 pub fn find_on_path(binary: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
     let path = Path::new(binary);
     if path.is_absolute() || path.components().count() > 1 {
-        return path.is_file().then(|| path.to_path_buf());
+        return is_executable_file(path).then(|| path.to_path_buf());
     }
     path_var
         .into_iter()
         .flat_map(std::env::split_paths)
         .map(|directory| directory.join(path))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// PURE: whether `path` is a regular file this process could actually exec. A file merely NAMED
+/// `agent-router` (a half-finished download, a stray text file) must not open the Auto entry:
+/// the entry would look installed and every submission would fail on exec instead.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
 }
 
 /// IMPURE: whether the Auto spawn entry is offered at all. A missing binary means the entry

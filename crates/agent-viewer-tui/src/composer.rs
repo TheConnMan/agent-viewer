@@ -212,6 +212,15 @@ impl Composer {
         }
     }
 
+    /// Select `backend` outright (the Ctrl+K palette picking a model), which always LEAVES Auto:
+    /// naming a model is a decision to use that provider, so Auto must stop routing even when the
+    /// chosen backend is the one already sitting underneath Auto (where a Tab-cycle loop would
+    /// exit immediately and leave Auto on, letting `ensure_models` restore the "auto" entry).
+    pub fn select_backend(&mut self, backend: BackendKind) {
+        self.auto = false;
+        self.backend = backend;
+    }
+
     /// Shift+Tab: advance to the next discovered model after the current one, wrapping. A
     /// no-op for opencode (its list is huge — use the `/model` picker) or a <2-entry list.
     pub fn cycle_model(&mut self) {
@@ -268,6 +277,12 @@ impl Composer {
         let mut suggestions = Vec::with_capacity(8);
         if include_theme {
             suggestions.push("theme");
+        }
+        // Under Auto the provider is not known until the router answers, so the backend's own
+        // commands must not be offered: the task may well land on a different provider, where an
+        // opencode-only command means nothing. The viewer's own `/theme` is provider-independent.
+        if self.auto {
+            return suggestions;
         }
         suggestions.extend(
             self.commands
@@ -496,6 +511,33 @@ mod tests {
         assert_eq!(composer.model(), "auto");
         composer.push_str("/model");
         assert_eq!(composer.model_suggestions(), vec!["auto".to_string()]);
+    }
+
+    /// Auto has no provider until the router answers, so the backend's own slash commands must
+    /// not be offered: a task routed to codex has no business carrying an opencode-only command.
+    /// The viewer's own commands are provider-independent and stay.
+    #[test]
+    fn auto_offers_no_backend_slash_commands() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        while !composer.is_auto() {
+            composer.cycle_backend();
+        }
+        composer.set_commands(
+            vec!["opencode-only".to_string()],
+            (BackendKind::Opencode, None),
+        );
+
+        composer.push_str("/open");
+        assert!(
+            composer.suggestions().is_empty(),
+            "Auto must offer no backend commands, got {:?}",
+            composer.suggestions()
+        );
+
+        composer.clear();
+        composer.push_str("/th");
+        assert_eq!(composer.suggestions(), vec!["theme"]);
     }
 
     #[test]

@@ -939,12 +939,21 @@ fn apply_mutation_result(ui: &mut Ui, result: Result<MutationOutcome, String>) {
 
 /// Resolve a successful spawn against a fresh backend listing. An exact backend identity
 /// always wins. Backends without one reuse the viewer database's cwd and creation time rule.
+///
+/// The identity is matched against the row's short id as well as its id, because a routed claude
+/// job is only ever reported by its SHORT id (the `~/.claude/jobs` key `claude agents` publishes
+/// as `id`), never the full `sessionId` a claude row is keyed by. Comparing both here is smaller
+/// and safer than translating the short id on the mutation worker, which would need a second
+/// `claude agents --json` call with its own race against the job appearing; short ids are unique
+/// job keys, so the extra comparison cannot mis-select.
 fn match_pending_spawn(spawn: &SpawnSelection, sessions: &[Session]) -> Option<Key> {
     if let Some(session_id) = &spawn.session_id {
         return sessions
             .iter()
             .find(|session| {
-                session.backend == spawn.backend && session.id.as_str() == session_id.as_str()
+                session.backend == spawn.backend
+                    && (session.id.as_str() == session_id.as_str()
+                        || session.short_id.as_deref() == Some(session_id.as_str()))
             })
             .map(|session| (session.backend, session.id.clone()));
     }
@@ -1636,6 +1645,25 @@ mod tests {
             ui.pulses
                 .contains_key(&(BackendKind::Codex, "exact".to_string()))
         );
+    }
+
+    /// A routed claude job is reported by the router as its SHORT id (the `~/.claude/jobs` key),
+    /// which is never the full sessionId a claude row is keyed by. Matching the identity against
+    /// `Session.id` alone left every routed claude spawn unselected AND disabled the cwd+time
+    /// fallback, since a present identity takes that branch.
+    #[test]
+    fn routed_claude_short_id_selects_the_row_whose_full_session_id_differs() {
+        let old = session(BackendKind::Claude, "old-session-uuid", 1_000, false);
+        let mut ui = test_ui(vec![old.clone()]);
+        assert!(ui.app.select_by_key(&(BackendKind::Claude, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Claude, Some("abc12345"), 10_000));
+
+        let mut routed = session(BackendKind::Claude, "routed-session-uuid", 10_100, false);
+        routed.short_id = Some("abc12345".to_string());
+        apply_listing(&mut ui, vec![old, routed]);
+
+        assert_eq!(selected_id(&ui), Some("routed-session-uuid"));
+        assert!(ui.pending_spawn.is_none());
     }
 
     #[test]

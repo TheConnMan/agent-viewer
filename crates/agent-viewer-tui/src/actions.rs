@@ -410,7 +410,9 @@ fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget)
     // Same dedup shape as a backend spawn, so a double Enter cannot route the same task twice
     // while the first classifier call is still out.
     let key = format!("auto:{task}:spawn");
-    let mutation = Mutation::spawn_auto(&ui.app, target, task, now_ms());
+    // No submission timestamp: the router's own return is what stamps the routed spawn, since
+    // classification plus dispatch can outlive the 30s row-matching window from here.
+    let mutation = Mutation::spawn_auto(&ui.app, target, task);
     let executor = ui.mutation_executor.clone();
     if !ui.mutations.submit(key, move || executor(mutation)) {
         return;
