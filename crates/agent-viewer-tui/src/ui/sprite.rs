@@ -400,6 +400,7 @@ const SAILBOAT_PIXELS: [&[u8]; 7] = [
 ];
 const SAILBOAT_BOB_PERIOD_MS: i64 = 2_400;
 const WAVE_PERIOD_MS: i64 = 600;
+const SAILBOAT_Y: usize = 3;
 
 pub(super) struct Sailboat<'a> {
     theme: &'a Theme,
@@ -448,7 +449,7 @@ fn sailboat_grid(bob: usize, wave_phase: usize) -> Grid {
     for (source_y, row) in SAILBOAT_PIXELS.iter().enumerate() {
         for (x, pixel) in row.iter().enumerate() {
             if *pixel != b'.' {
-                grid[source_y + bob][x] = *pixel;
+                grid[SAILBOAT_Y + source_y + bob][x] = *pixel;
             }
         }
     }
@@ -464,8 +465,14 @@ fn sailboat_grid(bob: usize, wave_phase: usize) -> Grid {
     grid
 }
 
-const AIRPLANE_PIXELS: [&[u8]; 3] = [b"...N...", b"PPPPPPP", b"..PPP.."];
-const AIRPLANE_WIDTH: i32 = 7;
+const AIRPLANE_PIXELS: [&[u8]; 5] = [
+    b"......P..",
+    b"P....PPP.",
+    b"PPPPPPPPN",
+    b"..PPPP...",
+    b"...PP....",
+];
+const AIRPLANE_WIDTH: i32 = 9;
 const AIRPLANE_STEP_MS: i64 = 250;
 const AIRPLANE_PERIOD_MS: i64 =
     (COLS as i64 + AIRPLANE_WIDTH as i64) * AIRPLANE_STEP_MS;
@@ -516,7 +523,7 @@ fn airplane_grid(x: i32) -> Grid {
         for (source_x, pixel) in row.iter().enumerate() {
             let target_x = x + source_x as i32;
             if *pixel != b'.' && (0..COLS as i32).contains(&target_x) {
-                grid[source_y + 4][target_x as usize] = *pixel;
+                grid[source_y + 3][target_x as usize] = *pixel;
             }
         }
     }
@@ -936,7 +943,6 @@ mod tests {
             .map(|frame| {
                 foreground_points(frame, &theme)
                     .iter()
-                    .filter(|(_, y)| *y < ROWS as i32 - 2)
                     .map(|(_, y)| *y)
                     .max()
                     .unwrap()
@@ -955,10 +961,12 @@ mod tests {
             top_edges.iter().max().unwrap() - top_edges.iter().min().unwrap(),
             1
         );
+        assert_eq!(*top_edges.iter().min().unwrap(), SAILBOAT_Y as i32);
         assert_eq!(
             hull_edges.iter().max().unwrap() - hull_edges.iter().min().unwrap(),
             1
         );
+        assert_eq!(*hull_edges.iter().max().unwrap(), ROWS as i32 - 2);
         assert!(wave_rows.iter().skip(1).any(|phase| phase != &wave_rows[0]));
     }
 
@@ -990,7 +998,7 @@ mod tests {
         };
         let clouds_at_start = cloud_cells(&airplane(&theme, 0));
 
-        assert_eq!(clouds_at_start, cloud_cells(&airplane(&theme, 2_500)));
+        assert_eq!(clouds_at_start, cloud_cells(&airplane(&theme, 3_000)));
 
         assert!(
             visible
