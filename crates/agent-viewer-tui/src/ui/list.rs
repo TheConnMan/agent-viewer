@@ -226,7 +226,9 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         Span::raw(" "),
         Span::styled(status, fg(status_color(row.status, theme))),
     ];
-    if let Some(project) = row.project {
+    if row.project_width > 0
+        && let Some(project) = row.project
+    {
         let content_width = row.project_width.saturating_sub(2);
         let mut project = truncate_display_width(project, content_width);
         project
@@ -444,7 +446,7 @@ mod activity_ribbon_tests {
     }
 
     #[test]
-    fn project_column_precedes_activity_ribbon() {
+    fn zero_project_width_omits_project_without_activity_padding() {
         let themes = crate::ui::ThemeState::default();
         let theme = themes.active();
         let line = session_line(
@@ -463,7 +465,7 @@ mod activity_ribbon_tests {
                 elapsed: "3m",
                 elapsed_width: 2,
                 show_activity: true,
-                project_width: 26,
+                project_width: 0,
                 width: 140,
                 title_width: 32,
             },
@@ -471,13 +473,17 @@ mod activity_ribbon_tests {
         );
         let text: String = line
             .spans
-            .into_iter()
-            .map(|span| span.content.into_owned())
+            .iter()
+            .map(|span| span.content.as_ref())
             .collect();
-        let project = text.find("example-user/agent-viewer").unwrap();
-        let ribbon = text.find("█▆▃▂▁▁▁▁").unwrap();
-        let summary = text.find("summary").unwrap();
-        assert!(project < ribbon);
-        assert!(ribbon < summary);
+        assert!(!text.contains("example-user/agent-viewer"));
+        assert!(text.contains("█▆▃▂▁▁▁▁"));
+        assert!(text.contains("summary"));
+        let ribbon = line
+            .spans
+            .iter()
+            .position(|span| span.content == "█▆▃▂▁▁▁▁")
+            .unwrap();
+        assert_eq!(line.spans[ribbon - 2].content, "Working    ");
     }
 }

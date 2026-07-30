@@ -9,7 +9,7 @@ mod palette;
 mod sprite;
 pub mod theme;
 
-use crate::app::{App, Composer, GroupMode, Row};
+use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
@@ -455,11 +455,7 @@ fn draw_list(
 ) -> ListHit {
     let width = area.width as usize;
     let show_activity = width >= 126;
-    let project_width = match app.group_mode() {
-        GroupMode::ByState if width >= 130 => 26,
-        GroupMode::ByState => 20,
-        GroupMode::ByProject => 0,
-    };
+    let project_width = 0;
     let layout_width = width.saturating_sub(project_width + usize::from(show_activity) * 10);
     let rows = app.visible();
     let elapsed_width = rows
@@ -1318,13 +1314,13 @@ mod tests {
     }
 
     #[test]
-    fn state_group_places_project_before_activity_ribbon() {
+    fn state_group_omits_project_while_rendering_activity_ribbon() {
         let terminal = render_activity_row(140, true);
         let buffer = terminal.backend().buffer();
         let text: String = (0..140).map(|x| buffer[(x, 1)].symbol()).collect();
-        let project = text.find("/tmp/agent-viewer").unwrap();
-        let ribbon = text.find("█▆▃▂▁▁▁▁").unwrap();
-        assert!(project < ribbon);
+        assert!(!text.contains("/tmp/agent-viewer"));
+        assert!(text.contains("Activity"));
+        assert!(text.contains("█▆▃▂▁▁▁▁"));
     }
 
     #[test]
@@ -1347,9 +1343,8 @@ mod tests {
                     let row: String = (0..buffer.area.width)
                         .map(|x| buffer[(x, y)].symbol())
                         .collect();
-                    let project = row.find("agent-viewer-status").unwrap();
-                    let ribbon = row.find('█').unwrap();
-                    assert!(project < ribbon);
+                    assert!(!row.contains("agent-viewer"));
+                    assert!(row.contains("row"));
                 }
             }
         }
