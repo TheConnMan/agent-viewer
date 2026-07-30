@@ -435,6 +435,16 @@ impl App {
         }
     }
 
+    pub fn disarm_kill_for(&mut self, backend: BackendKind, id: &str) {
+        if self
+            .armed_kill
+            .as_ref()
+            .is_some_and(|(armed_backend, armed_id, _)| *armed_backend == backend && armed_id == id)
+        {
+            self.armed_kill = None;
+        }
+    }
+
     /// Whether the selected row is currently armed for removal (footer hint).
     pub fn is_armed(&self, now_ms: i64) -> bool {
         let Some(session) = self.selected() else {

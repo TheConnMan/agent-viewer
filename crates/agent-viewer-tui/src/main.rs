@@ -43,6 +43,7 @@ use pending_reply::PendingReply;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 /// How long a footer notice stays up (age-based, independent of loop phase).
 const NOTICE_MS: i64 = 4000;
+const STOP_FAILURE_MARKER: &str = "\0stop failure\0";
 /// Base event-poll cadence; drops to `FAST_POLL` while the list is animating.
 const POLL: Duration = Duration::from_millis(100);
 const FAST_POLL: Duration = Duration::from_millis(120);
@@ -604,7 +605,7 @@ fn main() -> io::Result<()> {
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
-        mutation_executor: Arc::new(move |mutation| {
+        mutation_executor: mutation_executor(move |mutation| {
             ops::run_mutation_with_opencode(mutation, mutation_runtime.clone())
         }),
         attaches: AttachRunner::new(),
@@ -928,8 +929,49 @@ fn apply_mutation_result(ui: &mut Ui, result: Result<MutationOutcome, String>) {
             }
             ui.set_notice(outcome.notice);
         }
-        Err(msg) => ui.set_notice(msg),
+        Err(msg) => {
+            if msg.starts_with(STOP_FAILURE_MARKER) {
+                if let Some((backend, id, notice)) = decode_stop_failure(&msg) {
+                    ui.app.disarm_kill_for(backend, id);
+                    ui.set_notice(notice.to_string());
+                } else {
+                    ui.set_notice("stop failed".to_string());
+                }
+            } else {
+                ui.set_notice(msg);
+            }
+        }
     }
+}
+
+fn mutation_executor<F>(
+    executor: F,
+) -> Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>
+where
+    F: Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync + 'static,
+{
+    Arc::new(move |mutation| {
+        let stop_target = match &mutation {
+            ops::Mutation::Stop(request) => Some((request.backend(), request.id().to_string())),
+            _ => None,
+        };
+        match stop_target {
+            Some((backend, id)) => executor(mutation)
+                .map_err(|msg| format!("{STOP_FAILURE_MARKER}{}\0{id}\0{msg}", backend.name())),
+            None => executor(mutation),
+        }
+    })
+}
+
+fn decode_stop_failure(msg: &str) -> Option<(BackendKind, &str, &str)> {
+    let mut fields = msg.strip_prefix(STOP_FAILURE_MARKER)?.splitn(3, '\0');
+    let backend = match fields.next()? {
+        "codex" => BackendKind::Codex,
+        "claude" => BackendKind::Claude,
+        "opencode" => BackendKind::Opencode,
+        _ => return None,
+    };
+    Some((backend, fields.next()?, fields.next()?))
 }
 
 /// Resolve a successful spawn against a fresh backend listing. An exact backend identity
@@ -1285,7 +1327,7 @@ mod tests {
             detach_trackers: HashMap::new(),
             last_backend_error: String::new(),
             mutations: MutationRunner::new(),
-            mutation_executor: Arc::new(ops::run_mutation),
+            mutation_executor: mutation_executor(ops::run_mutation),
             attaches: AttachRunner::new(),
             attach_executor: Arc::new(|_| Err("attach is not configured in this test".to_string())),
             models: ModelCache::new(),
@@ -1652,6 +1694,111 @@ mod tests {
         assert_eq!(selected_id(&ui), Some("new"));
         assert!(ui.pending_spawn.is_none());
         assert_eq!(ui.notice.text(), "spawned on codex");
+    }
+
+    #[test]
+    fn stop_mutation_failure_disarms_removal_confirmation_through_main_loop_bridge() {
+        let working = session(BackendKind::Codex, "working", 1_000, false);
+        let mut ui = test_ui(vec![working.clone()]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, working.id.clone()))
+        );
+        assert_eq!(
+            ui.app.kill_stage(1_000),
+            agent_viewer_tui::app::KillStage::Stop
+        );
+        assert!(ui.app.is_armed(1_500));
+
+        let executor = mutation_executor(|mutation| match mutation {
+            ops::Mutation::Stop(_) => Err("stop failed".to_string()),
+            _ => panic!("expected stop mutation"),
+        });
+        let result = executor(ops::Mutation::Stop(TargetRequest::new(
+            BackendKind::Codex,
+            working.id.clone(),
+        )));
+        apply_mutation_result(&mut ui, result);
+
+        assert_eq!(ui.notice.text(), "stop failed");
+        assert!(!ui.app.is_armed(1_500));
+        assert_eq!(
+            ui.app.kill_stage(2_000),
+            agent_viewer_tui::app::KillStage::Stop
+        );
+    }
+
+    #[test]
+    fn stop_failure_for_another_session_preserves_removal_confirmation() {
+        let first = session(BackendKind::Codex, "first", 1_000, false);
+        let second = session(BackendKind::Codex, "second", 900, false);
+        let mut ui = test_ui(vec![first.clone(), second.clone()]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, first.id.clone()))
+        );
+        assert_eq!(
+            ui.app.kill_stage(1_000),
+            agent_viewer_tui::app::KillStage::Stop
+        );
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, second.id.clone()))
+        );
+        assert_eq!(
+            ui.app.kill_stage(1_100),
+            agent_viewer_tui::app::KillStage::Stop
+        );
+        assert!(ui.app.is_armed(1_500));
+
+        let executor = mutation_executor(|mutation| match mutation {
+            ops::Mutation::Stop(_) => Err("stop failed".to_string()),
+            _ => panic!("expected stop mutation"),
+        });
+        let result = executor(ops::Mutation::Stop(TargetRequest::new(
+            BackendKind::Codex,
+            first.id,
+        )));
+        apply_mutation_result(&mut ui, result);
+
+        assert_eq!(ui.notice.text(), "stop failed");
+        assert!(ui.app.is_armed(1_500));
+        assert_eq!(
+            ui.app.kill_stage(2_000),
+            agent_viewer_tui::app::KillStage::Remove
+        );
+    }
+
+    #[test]
+    fn unrelated_mutation_failure_preserves_removal_confirmation() {
+        let working = session(BackendKind::Codex, "working", 1_000, false);
+        let mut ui = test_ui(vec![working.clone()]);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, working.id.clone()))
+        );
+        assert_eq!(
+            ui.app.kill_stage(1_000),
+            agent_viewer_tui::app::KillStage::Stop
+        );
+        assert!(ui.app.is_armed(1_500));
+
+        let executor = mutation_executor(|mutation| match mutation {
+            ops::Mutation::Rename(_, _) => Err("rename failed".to_string()),
+            _ => panic!("expected rename mutation"),
+        });
+        let result = executor(ops::Mutation::Rename(
+            TargetRequest::new(BackendKind::Codex, working.id),
+            "new name".to_string(),
+        ));
+        apply_mutation_result(&mut ui, result);
+
+        assert_eq!(ui.notice.text(), "rename failed");
+        assert!(ui.app.is_armed(1_500));
+        assert_eq!(
+            ui.app.kill_stage(2_000),
+            agent_viewer_tui::app::KillStage::Remove
+        );
     }
 
     #[test]

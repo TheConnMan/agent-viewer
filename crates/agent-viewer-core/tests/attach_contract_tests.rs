@@ -103,18 +103,17 @@ fn args_of(cmd: &std::process::Command) -> Vec<&OsStr> {
     cmd.get_args().collect()
 }
 
-// --- Claude capability: native `claude rm` makes the remove action supported ---
+// --- Claude capability: native stop and delete mutations are supported ---
 
 #[test]
-fn claude_capabilities_advertise_native_remove() {
-    // `claude rm <short_id>` deletes a bg session (and its worktree), so remove is now a
-    // real capability. The rest of the claude caps are unchanged by this.
+fn claude_capabilities_advertise_native_mutations() {
+    // Claude provides native stop and delete mutations for supported background sessions.
     let caps = claude_capabilities_for_platform(Platform::Linux);
     assert!(caps.delete, "claude advertises native rm as delete");
     assert!(caps.spawn);
     assert!(caps.attach);
     assert!(!caps.archive);
-    assert!(!caps.stop);
+    assert!(caps.stop);
     assert!(caps.needs_input);
     assert!(caps.pr_refs);
     assert!(caps.live_status);

@@ -128,6 +128,12 @@ fn claude_rm_command(binary: &std::path::Path, short_id: &str) -> std::process::
     cmd
 }
 
+fn claude_stop_command(binary: &std::path::Path, short_id: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("stop").arg(short_id);
+    cmd
+}
+
 pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabilities {
     Capabilities {
         spawn: true,
@@ -135,7 +141,7 @@ pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabil
         rename: platform != crate::platform::Platform::Windows,
         archive: false,
         delete: true,
-        stop: false,
+        stop: true,
         needs_input: true,
         pr_refs: true,
         live_status: true,
@@ -155,6 +161,8 @@ pub fn capabilities_for_session_on_platform(
     capabilities.delete = has_short_id
         && (platform == crate::platform::Platform::Linux
             || (session.pid.is_none() && session.status.is_finished()));
+    capabilities.stop =
+        has_short_id && matches!(&session.status, Status::Working | Status::NeedsInput { .. });
     capabilities
 }
 
@@ -171,21 +179,9 @@ impl Backend for ClaudeBackend {
         crate::backend::ListingCacheScope::new(self.kind(), key).ok()
     }
     fn capabilities(&self) -> Capabilities {
-        // DELIBERATE DIVERGENCE from the capability table in
-        // specs/001-fleet-view-unification/data-model.md, which marks claude `archive` and
-        // `stop` as yes. Reason: `ClaudeBackend` implements neither the `hide` nor the `stop`
-        // trait method below, so the trait defaults return Unsupported for both. Advertising
-        // true here would be a promise this backend cannot keep, and a capability that is
-        // advertised and then fails at press time is worse than one advertised as
-        // unsupported, which is exactly what the footer notice exists to signal. Keep the
-        // gate; the table is the coarser statement.
         capabilities_for_platform(crate::platform::current_platform())
     }
     fn capabilities_for(&self, session: &Session) -> Capabilities {
-        // Per-row, not backend-wide: `claude rm` keys off the short id, so an interactive row
-        // (which carries none) has nothing to remove. Callers check this BEFORE terminating.
-        // Rename rides the same gate for the same reason - the short id names the job dir
-        // whose state.json holds the name, and an interactive row has no job dir at all.
         capabilities_for_session_on_platform(crate::platform::current_platform(), session)
     }
     fn list(&mut self) -> Result<Vec<Session>> {
@@ -314,6 +310,23 @@ impl Backend for ClaudeBackend {
     }
     fn remove(&self, session: &Session) -> Result<()> {
         self.remove_for_platform(crate::platform::current_platform(), session)
+    }
+    fn stop(&self, session: &Session) -> Result<()> {
+        if !capabilities_for_session_on_platform(crate::platform::current_platform(), session).stop
+        {
+            return Err(Error::Unsupported(self.kind().name()));
+        }
+        let Some(short_id) = session
+            .short_id
+            .as_deref()
+            .filter(|short_id| !short_id.is_empty())
+        else {
+            return Err(Error::Unsupported(self.kind().name()));
+        };
+        crate::spawn::run_checked(&mut claude_stop_command(
+            std::path::Path::new(&self.binary),
+            short_id,
+        ))
     }
     fn attach_command(
         &self,
