@@ -36,12 +36,13 @@ fn a_dispatched_decision_parses_provider_effort_and_weekly_headroom() {
     let outcome = parse_outcome(&dispatched_fixture()).expect("parsed decision");
 
     assert_eq!(outcome.provider, BackendKind::Codex);
-    // Codex leaves the model to codex itself and routes at the highest reasoning effort.
-    assert_eq!(outcome.model, None);
-    assert_eq!(outcome.effort.as_deref(), Some("xhigh"));
+    // The router scales model and effort to the classified complexity; this capture was a
+    // trivial contract, so codex runs the fast tier at low effort.
+    assert_eq!(outcome.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(outcome.effort.as_deref(), Some("low"));
     assert_eq!(outcome.gates, Vec::<String>::new());
-    assert_eq!(outcome.codex_weekly_pct, 87.0);
-    assert_eq!(outcome.claude_weekly_pct, 52.0);
+    assert_eq!(outcome.codex_weekly_pct, 3.0);
+    assert_eq!(outcome.claude_weekly_pct, 47.0);
     assert!(
         outcome.rationale.contains("codex_ready 6/6"),
         "the rationale must survive parsing, got {:?}",
@@ -108,7 +109,7 @@ fn the_footer_notice_is_one_line_naming_the_provider_and_both_headrooms() {
     let notice = outcome.notice();
     assert_eq!(
         notice,
-        "auto: codex effort xhigh job 0199c0de-thread (codex weekly 87%, claude 52%)"
+        "auto: codex gpt-5.6-luna effort low job 0199c0de-thread (codex weekly 3%, claude 47%)"
     );
     assert!(!notice.contains('\n'), "the footer is one line: {notice:?}");
 }
@@ -345,7 +346,7 @@ fn a_multiline_job_name_still_yields_a_one_line_notice() {
     let notice = outcome.notice();
     assert_eq!(
         notice,
-        "auto: codex effort xhigh job Fix the parser then add a test (codex weekly 87%, claude 52%)"
+        "auto: codex gpt-5.6-luna effort low job Fix the parser then add a test (codex weekly 3%, claude 47%)"
     );
     assert!(
         !notice.contains('\n') && !notice.contains('\r'),
@@ -374,8 +375,8 @@ fn write_router(dir: &std::path::Path, name: &str, executable: bool) {
 fn the_router_model_is_reported_when_the_router_chose_one() {
     let claude = dispatched_fixture()
         .replace("\"provider\": \"codex\"", "\"provider\": \"claude\"")
-        .replace("\"model\": null", "\"model\": \"opus[1m]\"")
-        .replace("\"effort\": \"xhigh\"", "\"effort\": null");
+        .replace("\"model\": \"gpt-5.6-luna\"", "\"model\": \"opus[1m]\"")
+        .replace("\"effort\": \"low\"", "\"effort\": null");
     let outcome: RouterOutcome = parse_outcome(&claude).expect("parsed decision");
 
     assert_eq!(outcome.provider, BackendKind::Claude);
@@ -383,7 +384,7 @@ fn the_router_model_is_reported_when_the_router_chose_one() {
     assert_eq!(outcome.effort, None);
     assert_eq!(
         outcome.notice(),
-        "auto: claude opus[1m] job 0199c0de-thread (codex weekly 87%, claude 52%)"
+        "auto: claude opus[1m] job 0199c0de-thread (codex weekly 3%, claude 47%)"
     );
 }
 
