@@ -118,7 +118,7 @@ fn an_unreadable_decision_is_an_error_not_a_panic_and_not_a_fallback() {
 fn the_auto_gate_is_off_when_the_router_binary_is_not_on_the_path() {
     let empty = tempfile::tempdir().expect("temp dir");
     let installed = tempfile::tempdir().expect("temp dir");
-    std::fs::write(installed.path().join(ROUTER_BIN), b"#!/bin/sh\n").expect("write router");
+    write_router(installed.path(), true);
 
     assert_eq!(
         find_on_path(ROUTER_BIN, Some(empty.path().as_os_str())),
@@ -137,6 +137,36 @@ fn the_auto_gate_is_off_when_the_router_binary_is_not_on_the_path() {
         Some(installed.path().join(ROUTER_BIN)),
         "the router must be found in the second PATH entry"
     );
+}
+
+/// A file named `agent-router` that cannot be executed is not a router: offering Auto for it
+/// would put an entry in the Tab cycle whose every submission fails on exec.
+#[test]
+#[cfg(unix)]
+fn the_auto_gate_is_off_for_a_non_executable_file_named_like_the_router() {
+    let unexecutable = tempfile::tempdir().expect("temp dir");
+    write_router(unexecutable.path(), false);
+
+    assert_eq!(
+        find_on_path(ROUTER_BIN, Some(unexecutable.path().as_os_str())),
+        None,
+        "a non-executable agent-router must not offer Auto"
+    );
+}
+
+/// Write a fake router into `dir`, with or without the executable bit (a no-op off unix, where
+/// there is no bit to set).
+fn write_router(dir: &std::path::Path, executable: bool) {
+    let path = dir.join(ROUTER_BIN);
+    std::fs::write(&path, b"#!/bin/sh\n").expect("write router");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set router mode");
+    }
+    let _ = executable;
 }
 
 /// The Auto model entry exists so the picker has something to show; the router owns the real

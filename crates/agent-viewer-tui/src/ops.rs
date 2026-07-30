@@ -8,6 +8,8 @@ use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
+use agent_viewer_core::router::RouterOutcome;
+use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::{Session, SpawnResult, Status, ViewerDb, default_codex_home};
 use agent_viewer_tui::app::App;
 use agent_viewer_tui::mutations::{MutationOutcome, SpawnSelection};
@@ -46,10 +48,12 @@ pub(crate) enum Mutation {
     /// headroom, and dispatches to whichever backend won, so the provider is only known once
     /// it returns. Auto is not a `Backend` (it lists nothing), which is why this variant does
     /// not go through the trait at all.
+    ///
+    /// Deliberately carries NO submission timestamp: the instant a routed row is matched against
+    /// is stamped when the router returns (see `run_spawn_auto`).
     SpawnAuto {
         target: SpawnTarget,
         task: String,
-        spawned_at_ms: i64,
         /// Per-backend session ids as of submission: the winning provider's set is the one the
         /// row selection needs, and which that is cannot be known until the router answers.
         preexisting_ids: HashMap<BackendKind, HashSet<String>>,
@@ -57,16 +61,10 @@ pub(crate) enum Mutation {
 }
 
 impl Mutation {
-    pub(crate) fn spawn_auto(
-        app: &App,
-        target: SpawnTarget,
-        task: String,
-        spawned_at_ms: i64,
-    ) -> Self {
+    pub(crate) fn spawn_auto(app: &App, target: SpawnTarget, task: String) -> Self {
         Self::SpawnAuto {
             target,
             task,
-            spawned_at_ms,
             preexisting_ids: [
                 BackendKind::Codex,
                 BackendKind::Claude,
@@ -319,15 +317,22 @@ fn spawn_directory(
 /// row selection for whichever backend won. Every router failure (missing binary, non-zero
 /// exit, timeout, unreadable json) is an Err the user reads: nothing is spawned, and there is
 /// no fallback to a guessed provider.
+///
+/// `route` is a parameter so the stamping rule below is testable without a router on PATH.
 fn run_spawn_auto(
     target: &SpawnTarget,
     task: &str,
-    spawned_at_ms: i64,
     preexisting_ids: &HashMap<BackendKind, HashSet<String>>,
     opencode_runtime: &OpencodeRuntime,
+    route: impl FnOnce(&std::path::Path, &str) -> Result<RouterOutcome, String>,
 ) -> Result<MutationOutcome, String> {
     let directory = spawn_directory(target, opencode_runtime)?;
-    let outcome = agent_viewer_core::router::route(&directory, task)?;
+    let outcome = route(&directory, task)?;
+    // Stamped HERE, not when Enter was pressed: the classifier call plus the winning backend's
+    // own spawn can burn most of the router's 180s deadline, while `match_spawn` only accepts a
+    // row created within 30s of the stamp. A submission stamp therefore expired before the row
+    // it was meant to select ever appeared.
+    let spawned_at_ms = now_ms();
     Ok(MutationOutcome {
         notice: outcome.notice(),
         spawned: Some(SpawnSelection {
@@ -430,14 +435,13 @@ pub(crate) fn run_mutation_with_opencode(
         Mutation::SpawnAuto {
             target,
             task,
-            spawned_at_ms,
             preexisting_ids,
         } => run_spawn_auto(
             &target,
             &task,
-            spawned_at_ms,
             &preexisting_ids,
             &opencode_runtime,
+            agent_viewer_core::router::route,
         ),
         mutation @ Mutation::Spawn { .. } => {
             let Mutation::Spawn {
@@ -469,14 +473,61 @@ pub(crate) fn run_mutation_with_opencode(
 
 #[cfg(test)]
 mod tests {
-    use super::{Mutation, run_remove, run_spawn_with_backend, spawn_selection_from_mutation};
+    use super::{
+        Mutation, RouterOutcome, run_remove, run_spawn_auto, run_spawn_with_backend,
+        spawn_selection_from_mutation,
+    };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
+    use agent_viewer_core::opencode::OpencodeRuntime;
+    use agent_viewer_core::spawn::now_ms;
     use agent_viewer_core::{Session, SpawnResult};
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// A routed row with no job id is matched by `match_spawn`'s cwd + creation-time rule, and
+    /// that window closes 30s after the stamp. Classification plus dispatch can run for most of
+    /// the router's 180s deadline, so the stamp must be taken when the decision LANDS; taken at
+    /// submission it can be long expired before the row it was meant to select exists.
+    #[test]
+    fn a_routed_spawn_is_stamped_when_the_router_returns_not_when_it_was_submitted() {
+        let submitted_at = now_ms();
+        let routing_ms = 60;
+
+        let outcome = run_spawn_auto(
+            &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_spawn")),
+            "a routed task",
+            &HashMap::new(),
+            &OpencodeRuntime::new(),
+            |_directory, _task| {
+                std::thread::sleep(Duration::from_millis(routing_ms));
+                Ok(RouterOutcome {
+                    provider: BackendKind::Codex,
+                    model: None,
+                    effort: Some("xhigh".to_string()),
+                    job_id: None,
+                    job_name: Some("a routed task".to_string()),
+                    gates: Vec::new(),
+                    rationale: String::new(),
+                    claude_weekly_pct: 0.0,
+                    codex_weekly_pct: 0.0,
+                })
+            },
+        )
+        .expect("a routed decision is a successful mutation");
+
+        let selection = outcome.spawned.expect("a routed spawn selects its row");
+        assert_eq!(selection.backend, BackendKind::Codex);
+        assert!(
+            selection.spawned_at_ms >= submitted_at + routing_ms as i64,
+            "the stamp must be taken after routing: {} is not at least {}",
+            selection.spawned_at_ms,
+            submitted_at + routing_ms as i64
+        );
+    }
 
     fn session(backend: BackendKind, id: &str, hidden: bool) -> Session {
         Session {
