@@ -77,6 +77,10 @@ fn section_from_storage(name: &str) -> Option<Section> {
     }
 }
 
+fn is_hold_title(title: &str) -> bool {
+    title.eq_ignore_ascii_case("hold")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     /// ByState mode. `collapsed` hides this section's session rows; `count` stays the group's
@@ -86,8 +90,8 @@ pub enum Row {
         count: usize,
         collapsed: bool,
     },
-    /// ByProject mode. `collapsed` hides this project's session rows; `count` stays the
-    /// group's total member count (when collapsed, that IS the hidden-row count).
+    /// ByProject mode. `collapsed` hides this project's visible session rows; `count` stays
+    /// the visible session row count after hold titles are excluded.
     ProjectHeader {
         root: PathBuf,
         count: usize,
@@ -661,7 +665,14 @@ impl App {
         };
 
         self.rows = match self.group_mode {
-            GroupMode::ByState => self.build_state_rows(&indices),
+            GroupMode::ByState => {
+                let visible_indices: Vec<usize> = indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| !is_hold_title(&self.sessions[i].title))
+                    .collect();
+                self.build_state_rows(&visible_indices)
+            }
             GroupMode::ByProject => self.build_project_rows(&indices),
         };
         for row in &mut self.rows {
@@ -763,20 +774,25 @@ impl App {
         let mut rows = Vec::new();
         for root in order {
             let members = &by_root[&root];
+            let visible_members: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| !is_hold_title(&self.sessions[i].title))
+                .collect();
             // A blank spacer between project groups (not before the first).
             if !rows.is_empty() {
                 rows.push(Row::Spacer);
             }
-            // A collapsed project still shows its header (count = hidden rows) but omits its
-            // session rows.
+            // A collapsed project retains its header. Its count equals visible non hold session
+            // rows, so a hold only header can show zero.
             let collapsed = self.collapsed.contains(&GroupKey::Project(root.clone()));
             rows.push(Row::ProjectHeader {
                 root: root.clone(),
-                count: members.len(),
+                count: visible_members.len(),
                 collapsed,
             });
             if !collapsed {
-                for &i in members {
+                for i in visible_members {
                     rows.push(Self::session_row(&self.sessions[i], None));
                 }
             }

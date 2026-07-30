@@ -1028,7 +1028,9 @@ pub(crate) mod tests {
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{MutationOutcome, MutationRunner};
-    use agent_viewer_tui::ui::{AttachView, Draw, Mode, Pulses};
+    use agent_viewer_tui::ui::{
+        AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -2016,6 +2018,46 @@ pub(crate) mod tests {
         assert!(matches!(ui.mode, Mode::Normal));
         assert_eq!(ui.app.selected_index(), selected);
         assert_eq!(ui.composer.text(), "draft stays");
+    }
+
+    #[test]
+    fn quickswitcher_omits_hold_session_and_keeps_visible_session_and_action() {
+        let mut hold = sess("hold-id", "/tmp/agentviewer-palette-hold", 200);
+        hold.title = "Hold".to_string();
+        let mut ordinary = sess("ordinary-id", "/tmp/agentviewer-palette-ordinary", 100);
+        ordinary.title = "Ordinary session".to_string();
+        let mut ui = test_ui_with(vec![hold, ordinary]);
+
+        assert!(!press_normal_key(
+            &mut ui,
+            &[],
+            'k',
+            KeyModifiers::CONTROL
+        ));
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("expected quickswitcher palette");
+        };
+
+        assert!(!palette.results().any(|item| {
+            matches!(
+                &item.target,
+                PaletteTarget::Session { id, .. } if id == "hold-id"
+            )
+        }));
+        assert!(palette.results().any(|item| {
+            item.name == "Ordinary session"
+                && matches!(
+                    &item.target,
+                    PaletteTarget::Session { id, .. } if id == "ordinary-id"
+                )
+        }));
+        assert!(palette.results().any(|item| {
+            item.name == "Show all sessions"
+                && matches!(
+                    &item.target,
+                    PaletteTarget::Action(PaletteAction::ShowAll)
+                )
+        }));
     }
 
     #[test]
