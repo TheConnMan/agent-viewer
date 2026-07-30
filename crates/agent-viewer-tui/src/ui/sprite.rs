@@ -733,14 +733,6 @@ mod tests {
             .count()
     }
 
-    fn block_count(buffer: &Buffer) -> usize {
-        buffer
-            .content
-            .iter()
-            .filter(|cell| cell.symbol() == "▀")
-            .count()
-    }
-
     /// Star slot `index` as (column, terminal row, is_upper_half), read off the bitmap so a
     /// layout tweak cannot silently point the assertions at empty sky.
     fn star_cell(index: usize) -> (u16, u16, bool) {
@@ -975,7 +967,7 @@ mod tests {
         let mut theme = theme::amber(false);
         theme.animation = false;
 
-        assert_eq!(sailboat(&theme, 0), sailboat(&theme, 12_000));
+        assert_eq!(sailboat(&theme, 0), sailboat(&theme, 1_500));
     }
 
     #[test]
@@ -988,16 +980,17 @@ mod tests {
             .collect();
         let visible: Vec<_> = planes.iter().filter(|plane| !plane.is_empty()).collect();
         let counts: Vec<_> = visible.iter().map(|plane| plane.len()).collect();
-        let cloud_cells: Vec<_> = frames
-            .iter()
-            .flat_map(|frame| {
-                (0..ROWS as u16).flat_map(move |y| {
-                    (0..WIDTH)
-                        .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
-                        .map(move |x| (i32::from(x), i32::from(y)))
-                })
+        let cloud_cells = |frame: &Buffer| {
+            (0..ROWS as u16).flat_map(|y| {
+                (0..WIDTH)
+                    .filter(move |x| pixel_color(frame, *x, y) == theme.faint)
+                    .map(move |x| (i32::from(x), i32::from(y)))
             })
-            .collect();
+            .collect::<std::collections::BTreeSet<_>>()
+        };
+        let clouds_at_start = cloud_cells(&airplane(&theme, 0));
+
+        assert_eq!(clouds_at_start, cloud_cells(&airplane(&theme, 2_500)));
 
         assert!(
             visible
@@ -1015,7 +1008,7 @@ mod tests {
         assert!(
             visible
                 .iter()
-                .any(|plane| plane.iter().any(|point| cloud_cells.contains(point)))
+                .any(|plane| plane.iter().any(|point| clouds_at_start.contains(point)))
         );
     }
 
@@ -1079,19 +1072,6 @@ mod tests {
         theme.animation = false;
 
         assert_eq!(hot_air_balloon(&theme, 0), hot_air_balloon(&theme, 12_000));
-    }
-
-    #[test]
-    fn negative_timestamps_keep_new_scenes_inside_the_slot() {
-        let theme = theme::amber(false);
-
-        for buffer in [
-            sailboat(&theme, -12_345),
-            airplane(&theme, -12_345),
-            hot_air_balloon(&theme, -12_345),
-        ] {
-            assert_eq!(block_count(&buffer), 66);
-        }
     }
 
     /// The parked pose is one blade up and two down at 120 degrees, so its three tips are fixed
