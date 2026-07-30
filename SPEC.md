@@ -545,9 +545,12 @@ list is a `~/.claude.json` read and effectively free.
 
 ## Claude mutations — CLI subcommands, plus one deliberate state-file write
 
-Spawn is `claude --bg`, attach is `claude attach <short>`, remove is `claude rm <short>`. Rename
-is the single exception to "delegate to a CLI subcommand": Claude ships no `rename` subcommand,
-so agent-viewer does what Claude's own fleet view does and writes the job's state file.
+Spawn is `claude --bg`, attach is `claude attach <short>`, stop is `claude stop <short>` for
+working or needs input background rows, and remove is `claude rm <short>`. Stop retains the
+conversation for later attach. A second press queues removal after stop succeeds. If stop fails,
+removal is discarded and confirmation is cleared, so the next press retries stop. Rename is the
+single exception to "delegate to a CLI subcommand": Claude ships no `rename` subcommand, so
+agent-viewer does what Claude's own fleet view does and writes the job's state file.
 
 **Mechanism.** Read `<jobs root>/<short>/state.json`, set `name`, `nameSource: "user"`, and
 `updatedAt` (Claude's writer stamps all three), write it back atomically (temp file in the same
@@ -581,10 +584,11 @@ protocol — the SDK/bridge control-request schema carried on the subprocess-std
 the remote claude.ai bridge. It was never going to be understood by that socket.
 
 **Consequences.** `rename` is advertised backend-wide but gated per row on the short id
-(`capabilities_for`), since an interactive row has no job dir. Racing a live worker's own state
-write is accepted: the worker re-reads the file immediately before each write, so it merges the
-new name rather than reverting it, which is the same race Claude's own fleet view runs. No
-viewer-local name override is involved, so the list can never disagree with `claude agents`.
+(`capabilities_for`), since an interactive row has no job dir. `stop` is likewise capability
+gated to working or needs input background rows. Racing a live worker's own state write is
+accepted: the worker re-reads the file immediately before each write, so it merges the new name
+rather than reverting it, which is the same race Claude's own fleet view runs. No viewer-local
+name override is involved, so the list can never disagree with `claude agents`.
 
 ## Crate layout
 

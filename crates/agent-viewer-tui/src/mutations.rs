@@ -2,12 +2,14 @@
 //! a self contained closure returning a structured outcome; results are drained without blocking
 //! through `poll()`. In flight keys deduplicate repeated submissions while work is pending.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use agent_viewer_core::BackendKind;
+
+type BackgroundJob<T> = Box<dyn FnOnce() -> Result<T, String> + Send + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnSelection {
@@ -28,6 +30,7 @@ pub struct BackgroundRunner<T> {
     tx: Sender<(String, Result<T, String>)>,
     rx: Receiver<(String, Result<T, String>)>,
     in_flight: HashSet<String>,
+    dependents: HashMap<String, Option<BackgroundJob<T>>>,
 }
 
 pub type MutationRunner = BackgroundRunner<MutationOutcome>;
@@ -46,6 +49,7 @@ impl<T: Send + 'static> BackgroundRunner<T> {
             tx,
             rx,
             in_flight: HashSet::new(),
+            dependents: HashMap::new(),
         }
     }
 
@@ -59,20 +63,52 @@ impl<T: Send + 'static> BackgroundRunner<T> {
             return false;
         }
         self.in_flight.insert(key.clone());
+        self.start(key, Box::new(op));
+        true
+    }
+
+    /// Allow at most one success dependent and seal `key` until the pipeline completes.
+    pub fn submit_after_success<F>(&mut self, key: String, op: F) -> bool
+    where
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        if self.in_flight.contains(&key) {
+            if self.dependents.contains_key(&key) {
+                return false;
+            }
+            self.dependents.insert(key, Some(Box::new(op)));
+            return true;
+        }
+        self.in_flight.insert(key.clone());
+        self.start(key, Box::new(op));
+        true
+    }
+
+    fn start(&self, key: String, op: BackgroundJob<T>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let result = op();
             // A closed receiver just means the TUI is shutting down; drop the result.
             let _ = tx.send((key, result));
         });
-        true
     }
 
-    /// Drain one completed result if ready (non-blocking), clearing its in-flight key.
+    /// Drain one completed result if ready, starting its next dependent only on success.
     pub fn poll(&mut self) -> Option<Result<T, String>> {
         match self.rx.try_recv() {
             Ok((key, result)) => {
-                self.in_flight.remove(&key);
+                if result.is_ok() {
+                    let next = self.dependents.get_mut(&key).and_then(Option::take);
+                    if let Some(op) = next {
+                        self.start(key, op);
+                    } else {
+                        self.dependents.remove(&key);
+                        self.in_flight.remove(&key);
+                    }
+                } else {
+                    self.dependents.remove(&key);
+                    self.in_flight.remove(&key);
+                }
                 Some(result)
             }
             Err(_) => None,
