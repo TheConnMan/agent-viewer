@@ -76,10 +76,9 @@ pub(super) fn draw(
             SpriteKind::Constellation => {
                 frame.render_widget(Constellation::new(theme, fleet(app), now_ms), slot)
             }
-            SpriteKind::Turbine => frame.render_widget(
-                Turbine::new(theme, lamp, app.running_count(), now_ms),
-                slot,
-            ),
+            SpriteKind::Turbine => {
+                frame.render_widget(Turbine::new(theme, lamp, app.running_count(), now_ms), slot)
+            }
         }
     }
 
@@ -181,7 +180,14 @@ mod tests {
         composer_height: u16,
         now_ms: i64,
     ) -> Buffer {
-        render_sprite_header(app, theme, viewport, composer_height, now_ms, SpriteKind::Lighthouse)
+        render_sprite_header(
+            app,
+            theme,
+            viewport,
+            composer_height,
+            now_ms,
+            SpriteKind::Lighthouse,
+        )
     }
 
     fn render_sprite_header(

@@ -1,8 +1,8 @@
 use super::{AttachView, fg, status_glyph, truncate};
 use crate::ui::theme::Theme;
 use agent_viewer_core::pty::TerminalPalette;
-use ratatui::buffer::Buffer;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};

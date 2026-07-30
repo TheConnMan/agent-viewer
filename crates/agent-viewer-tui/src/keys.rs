@@ -1115,9 +1115,7 @@ pub(crate) mod tests {
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
-    use agent_viewer_tui::ui::{
-        AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses,
-    };
+    use agent_viewer_tui::ui::{AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -2156,12 +2154,7 @@ pub(crate) mod tests {
         ordinary.title = "Ordinary session".to_string();
         let mut ui = test_ui_with(vec![hold, ordinary]);
 
-        assert!(!press_normal_key(
-            &mut ui,
-            &[],
-            'k',
-            KeyModifiers::CONTROL
-        ));
+        assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
         let Mode::Palette(palette) = &ui.mode else {
             panic!("expected quickswitcher palette");
         };
@@ -2181,10 +2174,7 @@ pub(crate) mod tests {
         }));
         assert!(palette.results().any(|item| {
             item.name == "Show all sessions"
-                && matches!(
-                    &item.target,
-                    PaletteTarget::Action(PaletteAction::ShowAll)
-                )
+                && matches!(&item.target, PaletteTarget::Action(PaletteAction::ShowAll))
         }));
     }
 

@@ -68,7 +68,10 @@ pub fn extract_pr_refs(text: &str) -> Vec<PrRef> {
 /// transcript, after any PRs it merely read.
 fn push_capped(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) {
     let href = format!("https://github.com/{owner}/{repo}/pull/{number}");
-    if refs.iter().any(|r| r.href.as_deref() == Some(href.as_str())) {
+    if refs
+        .iter()
+        .any(|r| r.href.as_deref() == Some(href.as_str()))
+    {
         return;
     }
     refs.push(PrRef {

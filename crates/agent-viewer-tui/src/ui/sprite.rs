@@ -245,10 +245,15 @@ impl<'a> Constellation<'a> {
 
 impl Widget for Constellation<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        paint(area, buffer, &CONSTELLATION_PIXELS, |pixel, _| match pixel {
-            b'0'..=b'8' => self.star_color(usize::from(pixel - b'0')),
-            _ => self.theme.bg,
-        });
+        paint(
+            area,
+            buffer,
+            &CONSTELLATION_PIXELS,
+            |pixel, _| match pixel {
+                b'0'..=b'8' => self.star_color(usize::from(pixel - b'0')),
+                _ => self.theme.bg,
+            },
+        );
     }
 }
 
@@ -441,7 +446,8 @@ mod tests {
 
     fn stars(theme: &Theme, fleet: Fleet, now_ms: i64) -> Buffer {
         let mut buffer = Buffer::empty(Rect::new(0, 0, WIDTH, HEIGHT));
-        Constellation::new(theme, fleet, now_ms).render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
+        Constellation::new(theme, fleet, now_ms)
+            .render(Rect::new(0, 0, WIDTH, HEIGHT), &mut buffer);
         buffer
     }
 
@@ -675,4 +681,3 @@ mod tests {
         }
     }
 }
-
