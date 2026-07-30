@@ -264,6 +264,7 @@ impl Backend for ClaudeBackend {
         dir: &std::path::Path,
         task: &str,
         model: Option<&str>,
+        _effort: Option<&str>,
     ) -> Result<crate::backend::SpawnResult> {
         // Detach like the other backends so the TUI key handler returns immediately
         // (`claude --bg` still self-detaches; setsid + no wait keeps it off this thread).

@@ -219,7 +219,7 @@ fn run_spawn_at_directory(
     else {
         unreachable!();
     };
-    let result = match backend.spawn(&directory, task, model.as_deref()) {
+    let result = match backend.spawn(&directory, task, model.as_deref(), None) {
         Ok(spawned) => {
             if let Some(pid) = spawned.pid
                 && let Some(db) = db
@@ -510,6 +510,7 @@ mod tests {
             dir: &Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<SpawnResult> {
             self.spawn_directories.borrow_mut().push(dir.to_path_buf());
             Ok(SpawnResult {
@@ -708,6 +709,7 @@ mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<SpawnResult> {
             unreachable!("spawn is not exercised by remove")
         }
@@ -746,6 +748,7 @@ mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<SpawnResult> {
             unreachable!("spawn is not exercised by remove")
         }
@@ -903,6 +906,7 @@ mod attach_resolution_tests {
             _dir: &Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<SpawnResult> {
             unreachable!("spawn is not exercised by attach resolution")
         }

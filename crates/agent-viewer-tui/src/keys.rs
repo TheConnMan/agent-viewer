@@ -1515,6 +1515,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by mouse activation")
         }
@@ -1560,6 +1561,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by attach selection")
         }
@@ -2036,6 +2038,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by the rename key tests")
         }
@@ -2067,6 +2070,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by the archive key tests")
         }
@@ -2108,6 +2112,7 @@ pub(crate) mod tests {
             _dir: &std::path::Path,
             _task: &str,
             _model: Option<&str>,
+            _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
             unreachable!("spawn is not exercised by row scoped archive tests")
         }

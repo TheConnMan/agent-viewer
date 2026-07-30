@@ -109,7 +109,13 @@ impl Backend for OpencodeBackend {
             .clone()
     }
 
-    fn spawn(&self, dir: &Path, task: &str, model: Option<&str>) -> Result<crate::SpawnResult> {
+    fn spawn(
+        &self,
+        dir: &Path,
+        task: &str,
+        model: Option<&str>,
+        _effort: Option<&str>,
+    ) -> Result<crate::SpawnResult> {
         let title = crate::spawn::truncated_title(task);
         let mut command = Command::new("opencode");
         command
