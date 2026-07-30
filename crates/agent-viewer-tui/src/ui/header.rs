@@ -265,17 +265,20 @@ mod tests {
 
     #[test]
     fn sprite_choices_follow_the_exact_six_scene_order() {
-        assert_eq!(
-            SpriteKind::ALL,
-            [
-                SpriteKind::Lighthouse,
-                SpriteKind::Constellation,
-                SpriteKind::Turbine,
-                SpriteKind::Sailboat,
-                SpriteKind::Airplane,
-                SpriteKind::HotAirBalloon,
-            ]
-        );
+        let expected = [
+            SpriteKind::Lighthouse,
+            SpriteKind::Constellation,
+            SpriteKind::Turbine,
+            SpriteKind::Sailboat,
+            SpriteKind::Airplane,
+            SpriteKind::HotAirBalloon,
+        ];
+
+        assert_eq!(SpriteKind::ALL, expected);
+        for pair in expected.windows(2) {
+            assert_eq!(pair[0].next(), pair[1]);
+        }
+        assert_eq!(expected.last().unwrap().next(), expected[0]);
     }
 
     /// Names round-trip through storage: a saved sprite must come back as the same sprite, and
