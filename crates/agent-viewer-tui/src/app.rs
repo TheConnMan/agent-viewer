@@ -713,11 +713,26 @@ impl App {
         ];
         let mut rows = Vec::new();
         for section in order {
-            let members: Vec<usize> = indices
+            let mut members: Vec<usize> = indices
                 .iter()
                 .copied()
                 .filter(|&i| section_of(&self.sessions[i].status) == section)
                 .collect();
+            members.sort_by(|&a, &b| {
+                let backend_key = |backend| match backend {
+                    BackendKind::Codex => 0,
+                    BackendKind::Claude => 1,
+                    BackendKind::Opencode => 2,
+                };
+                self.sessions[a]
+                    .created_at_ms
+                    .cmp(&self.sessions[b].created_at_ms)
+                    .then_with(|| {
+                        backend_key(self.sessions[a].backend)
+                            .cmp(&backend_key(self.sessions[b].backend))
+                    })
+                    .then_with(|| self.sessions[a].id.cmp(&self.sessions[b].id))
+            });
             if members.is_empty() {
                 continue;
             }
