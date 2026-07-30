@@ -22,6 +22,9 @@ pub enum SpriteKind {
     Lighthouse,
     Constellation,
     Turbine,
+    Sailboat,
+    Airplane,
+    HotAirBalloon,
 }
 
 impl SpriteKind {
@@ -29,16 +32,22 @@ impl SpriteKind {
         match self {
             SpriteKind::Lighthouse => SpriteKind::Constellation,
             SpriteKind::Constellation => SpriteKind::Turbine,
-            SpriteKind::Turbine => SpriteKind::Lighthouse,
+            SpriteKind::Turbine => SpriteKind::Sailboat,
+            SpriteKind::Sailboat => SpriteKind::Airplane,
+            SpriteKind::Airplane => SpriteKind::HotAirBalloon,
+            SpriteKind::HotAirBalloon => SpriteKind::Lighthouse,
         }
     }
 
     /// Every sprite, in cycle order. Drives the palette listing so a new sprite shows up there
     /// by adding one variant.
-    pub const ALL: [SpriteKind; 3] = [
+    pub const ALL: [SpriteKind; 6] = [
         SpriteKind::Lighthouse,
         SpriteKind::Constellation,
         SpriteKind::Turbine,
+        SpriteKind::Sailboat,
+        SpriteKind::Airplane,
+        SpriteKind::HotAirBalloon,
     ];
 
     /// Resolve a stored or env-supplied name. `None` for anything unknown, so a stale setting
@@ -57,6 +66,9 @@ impl SpriteKind {
             SpriteKind::Lighthouse => "lighthouse",
             SpriteKind::Constellation => "constellation",
             SpriteKind::Turbine => "turbine",
+            SpriteKind::Sailboat => "sailboat",
+            SpriteKind::Airplane => "airplane",
+            SpriteKind::HotAirBalloon => "hot air balloon",
         }
     }
 
@@ -70,6 +82,9 @@ impl SpriteKind {
                 "header sprite · one star per session, brightest need input"
             }
             SpriteKind::Turbine => "header sprite · spins with the working count, parks when idle",
+            SpriteKind::Sailboat => "header sprite · bobs as the waves advance",
+            SpriteKind::Airplane => "header sprite · crosses a field of clouds",
+            SpriteKind::HotAirBalloon => "header sprite · drifts gently past clouds",
         }
     }
 }
@@ -372,6 +387,216 @@ fn draw_line(grid: &mut Grid, from_x: i32, from_y: i32, to_x: i32, to_y: i32) {
             y += step_y;
         }
     }
+}
+
+const SAILBOAT_PIXELS: [&[u8]; 7] = [
+    b".....T.....",
+    b"....ST.....",
+    b"...SST.....",
+    b"..SSST.....",
+    b".....T.....",
+    b"..HHHHHH...",
+    b"...HHHH....",
+];
+const SAILBOAT_BOB_PERIOD_MS: i64 = 2_400;
+const WAVE_PERIOD_MS: i64 = 600;
+
+pub(super) struct Sailboat<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> Sailboat<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn bob(&self) -> usize {
+        if !self.theme.animation {
+            return 0;
+        }
+        usize::from(self.now_ms.rem_euclid(SAILBOAT_BOB_PERIOD_MS) >= 1_200)
+    }
+
+    fn wave_phase(&self) -> usize {
+        if !self.theme.animation {
+            return 0;
+        }
+        (self.now_ms.rem_euclid(WAVE_PERIOD_MS) / 300) as usize
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'S' => self.theme.warn,
+            b'T' => self.theme.text,
+            b'H' => self.theme.accent,
+            b'W' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for Sailboat<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let grid = sailboat_grid(self.bob(), self.wave_phase());
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn sailboat_grid(bob: usize, wave_phase: usize) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    for (source_y, row) in SAILBOAT_PIXELS.iter().enumerate() {
+        for (x, pixel) in row.iter().enumerate() {
+            if *pixel != b'.' {
+                grid[source_y + bob][x] = *pixel;
+            }
+        }
+    }
+    for (crest, row) in grid[ROWS - 2..].iter_mut().enumerate() {
+        for pixel in row
+            .iter_mut()
+            .skip((crest + wave_phase) % 2)
+            .step_by(2)
+        {
+            *pixel = b'W';
+        }
+    }
+    grid
+}
+
+const AIRPLANE_PIXELS: [&[u8]; 3] = [b"...N...", b"PPPPPPP", b"..PPP.."];
+const AIRPLANE_WIDTH: i32 = 7;
+const AIRPLANE_STEP_MS: i64 = 250;
+const AIRPLANE_PERIOD_MS: i64 =
+    (COLS as i64 + AIRPLANE_WIDTH as i64) * AIRPLANE_STEP_MS;
+
+pub(super) struct Airplane<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> Airplane<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn x(&self) -> i32 {
+        if !self.theme.animation {
+            return 2;
+        }
+        (self.now_ms.rem_euclid(AIRPLANE_PERIOD_MS) / AIRPLANE_STEP_MS) as i32
+            - AIRPLANE_WIDTH
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'N' => self.theme.text,
+            b'P' => self.theme.accent,
+            b'C' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for Airplane<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let grid = airplane_grid(self.x());
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn airplane_grid(x: i32) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    grid[4][1] = b'C';
+    grid[5][0..=2].fill(b'C');
+    grid[8][8..=10].fill(b'C');
+    grid[9][9] = b'C';
+
+    for (source_y, row) in AIRPLANE_PIXELS.iter().enumerate() {
+        for (source_x, pixel) in row.iter().enumerate() {
+            let target_x = x + source_x as i32;
+            if *pixel != b'.' && (0..COLS as i32).contains(&target_x) {
+                grid[source_y + 4][target_x as usize] = *pixel;
+            }
+        }
+    }
+    grid
+}
+
+const BALLOON_PIXELS: [&[u8]; 6] = [
+    b".BBB.",
+    b"BBBBB",
+    b"BBBBB",
+    b".BBB.",
+    b"..R..",
+    b"..K..",
+];
+const BALLOON_WIDTH: i32 = 5;
+const BALLOON_STEP_MS: i64 = 700;
+const BALLOON_PERIOD_MS: i64 =
+    (COLS as i64 + BALLOON_WIDTH as i64) * BALLOON_STEP_MS;
+const BALLOON_DRIFT_PERIOD_MS: i64 = 4_000;
+
+pub(super) struct HotAirBalloon<'a> {
+    theme: &'a Theme,
+    now_ms: i64,
+}
+
+impl<'a> HotAirBalloon<'a> {
+    pub(super) fn new(theme: &'a Theme, now_ms: i64) -> Self {
+        Self { theme, now_ms }
+    }
+
+    fn position(&self) -> (i32, usize) {
+        if !self.theme.animation {
+            return (3, 2);
+        }
+        let x =
+            (self.now_ms.rem_euclid(BALLOON_PERIOD_MS) / BALLOON_STEP_MS) as i32
+                - BALLOON_WIDTH;
+        let y = 2
+            + usize::from(
+                self.now_ms.rem_euclid(BALLOON_DRIFT_PERIOD_MS)
+                    >= BALLOON_DRIFT_PERIOD_MS / 2,
+            );
+        (x, y)
+    }
+
+    fn pixel_color(&self, pixel: u8) -> Color {
+        match pixel {
+            b'B' => self.theme.warn,
+            b'R' => self.theme.muted,
+            b'K' => self.theme.text,
+            b'C' => self.theme.faint,
+            _ => self.theme.bg,
+        }
+    }
+}
+
+impl Widget for HotAirBalloon<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let (x, y) = self.position();
+        let grid = hot_air_balloon_grid(x, y);
+        paint(area, buffer, &grid, |pixel, _| self.pixel_color(pixel));
+    }
+}
+
+fn hot_air_balloon_grid(x: i32, y: usize) -> Grid {
+    let mut grid = [[b'.'; COLS]; ROWS];
+    grid[1][0..=2].fill(b'C');
+    grid[2][1] = b'C';
+    grid[9][8..=10].fill(b'C');
+    grid[10][9] = b'C';
+
+    for (source_y, row) in BALLOON_PIXELS.iter().enumerate() {
+        for (source_x, pixel) in row.iter().enumerate() {
+            let target_x = x + source_x as i32;
+            if *pixel != b'.' && (0..COLS as i32).contains(&target_x) {
+                grid[y + source_y][target_x as usize] = *pixel;
+            }
+        }
+    }
+    grid
 }
 
 // --- Shared rendering -----------------------------------------------------------
