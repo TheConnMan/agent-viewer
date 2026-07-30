@@ -106,7 +106,7 @@ footer. Its metadata row shows the backend, the selected model when it is not th
 and the target folder. The task input is below it, uses the full width, and wraps as it grows.
 Just start typing to describe a task. A bracketed multiline paste remains one draft with its
 line breaks preserved. `Tab` cycles the target agent among Claude, Codex, and opencode (plus
-`auto` when `agent-router` is installed, below);
+`auto` when `agent-router` is installed, below; in that case the composer starts on `auto`);
 `Shift+Tab` cycles that agent's model; and `Enter` explicitly submits the draft and spawns it
 detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
@@ -127,16 +127,18 @@ rows that existed before submission.
 
 ### Auto (agent-router)
 
-When the `agent-router` CLI is on your `PATH`, `Tab` offers a fourth entry after opencode:
-`auto`. It has a single `auto` model, because the
-router chooses the provider, model, and reasoning effort itself: on `Enter` the viewer runs
+Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
+project when its CLI is on your `PATH`: the composer then STARTS on a fourth `auto` entry
+(one `Tab` reaches the concrete agents, and the entry sits after opencode in the cycle). It
+has a single `auto` model, because the router chooses the provider, model, and reasoning
+effort itself, scaled to the task's classified complexity: on `Enter` the viewer runs
 `agent-router run --json --dir <target> --provider auto -- "<task>"`, and the router classifies the task, weighs
 the weekly usage headroom of each subscription, and dispatches the job. The footer then shows
-the decision (for example `auto: codex effort xhigh job 0199… (codex weekly 87%, claude 52%)`),
+the decision (for example `auto: codex gpt-5.6-luna effort low job 0199… (codex weekly 3%, claude 47%)`),
 and the new session appears and is selected through the winning agent's normal listing. Without
-the binary installed the entry never appears at all, and a router that fails (missing, non-zero
-exit, timeout, unreadable output) is a footer error with nothing spawned, never a fallback to a
-guessed provider.
+the binary installed the entry never appears at all and the composer starts on Claude, and a
+router that fails (missing, non-zero exit, timeout, unreadable output) is a footer error with
+nothing spawned, never a fallback to a guessed provider.
 
 An opencode spawn may start a secured loopback server when neither verified candidate is usable.
 It starts from the user home directory and the viewer never stops or restarts it. The viewer uses

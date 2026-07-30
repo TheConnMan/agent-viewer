@@ -601,6 +601,10 @@ The composer's fourth selector entry, `auto`, delegates the provider choice to t
 - **The entry is capability-gated on the binary**, resolved once at startup with a PATH lookup
   (`router::available()`), matching the backends-appear-when-present posture: no router means no
   entry, which is not an error state.
+- **When the router is present, Auto is the composer's STARTING selection**
+  (`Composer::default_to_auto`, called once at startup after the availability probe): routed
+  spawns are the default posture, and one `Tab` reaches the concrete backends. Without the
+  router the composer starts on Claude exactly as before Auto existed.
 - **No model is passed.** The router owns model and reasoning-effort selection, so the picker
   offers a single `auto` entry and the CLI is invoked without `--model`.
 - **Every router failure is a footer error with nothing spawned** — missing binary, non-zero
