@@ -79,12 +79,8 @@ pub(super) fn draw(
             SpriteKind::Turbine => {
                 frame.render_widget(Turbine::new(theme, lamp, app.running_count(), now_ms), slot)
             }
-            SpriteKind::Sailboat => {
-                frame.render_widget(Sailboat::new(theme, now_ms), slot)
-            }
-            SpriteKind::Airplane => {
-                frame.render_widget(Airplane::new(theme, now_ms), slot)
-            }
+            SpriteKind::Sailboat => frame.render_widget(Sailboat::new(theme, now_ms), slot),
+            SpriteKind::Airplane => frame.render_widget(Airplane::new(theme, now_ms), slot),
             SpriteKind::HotAirBalloon => {
                 frame.render_widget(HotAirBalloon::new(theme, now_ms), slot)
             }

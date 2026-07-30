@@ -1553,8 +1553,7 @@ mod tests {
     }
 
     fn osc52_frame(contents: &str) -> Vec<u8> {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(contents.as_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(contents.as_bytes());
         let mut frame = b"\x1b]52;;".to_vec();
         frame.extend_from_slice(encoded.as_bytes());
         frame.push(b'\x07');
@@ -1949,8 +1948,7 @@ mod tests {
     #[test]
     fn write_failure_before_frame_output_attempts_recovery_without_false_success() {
         let frame = osc52_frame("failure λ");
-        let mut writer =
-            RecordingTerminalWriter::with_actions([WriteAction::Fail]);
+        let mut writer = RecordingTerminalWriter::with_actions([WriteAction::Fail]);
 
         assert_failed_copy_is_drained(&mut writer);
 
@@ -1966,10 +1964,8 @@ mod tests {
     fn prefix_then_write_failure_attempts_recovery_and_reports_unknown_state() {
         let frame = osc52_frame("failure λ");
         let prefix = 5;
-        let mut writer = RecordingTerminalWriter::with_actions([
-            WriteAction::Accept(prefix),
-            WriteAction::Fail,
-        ]);
+        let mut writer =
+            RecordingTerminalWriter::with_actions([WriteAction::Accept(prefix), WriteAction::Fail]);
 
         assert_failed_copy_is_drained(&mut writer);
 
@@ -1985,8 +1981,7 @@ mod tests {
     #[test]
     fn zero_write_attempts_recovery_and_drains_the_request() {
         let frame = osc52_frame("failure λ");
-        let mut writer =
-            RecordingTerminalWriter::with_actions([WriteAction::Zero]);
+        let mut writer = RecordingTerminalWriter::with_actions([WriteAction::Zero]);
 
         assert_failed_copy_is_drained(&mut writer);
 
@@ -2018,10 +2013,8 @@ mod tests {
         );
     }
 
-    const MOUSE_ENABLE: &[u8] =
-        b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
-    const MOUSE_DISABLE: &[u8] =
-        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+    const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+    const MOUSE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
     #[test]
     fn partial_mouse_failure_restores_the_prior_mode_with_surface_guidance() {
