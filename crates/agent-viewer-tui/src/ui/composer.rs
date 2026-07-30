@@ -15,8 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 pub(super) const MAX_LINES: u16 = 10;
 const MARK_FIELD: usize = 4;
-/// The Auto entry's mark. Auto is not a backend, so it has no brand glyph and no logo image:
-/// it borrows the textual tag shape so the metadata row keeps its width in every mark mode.
+/// The Auto entry's textual fallback mark, used whenever the logo images are unavailable.
+/// Auto is not a backend, so it has no brand glyph: it borrows the textual tag shape so the
+/// metadata row keeps its width in every mark mode.
 const AUTO_TAG: &str = "[au]";
 const INPUT_GUTTER: usize = MARK_FIELD + 1;
 pub(super) const COMPOSER_HINT: &str = "⇥ agent · ⇧⇥ model · ⏎ spawn";
@@ -276,8 +277,13 @@ pub(super) fn draw(
     let backend = composer.backend();
     let auto = composer.is_auto();
     let provider = composer.provider_name();
+    // Logo mode blanks the Auto slot for the image overlay, mirroring `backend_mark`.
     let mark = if auto {
-        AUTO_TAG
+        if logos.is_some() && logo_marks() {
+            "    "
+        } else {
+            AUTO_TAG
+        }
     } else {
         backend_mark(backend, theme)
     };
@@ -389,10 +395,13 @@ pub(super) fn draw(
 
     if let Some(logos) = logos
         && logo_marks()
-        && !auto
         && inner.width >= 3
     {
-        let image = logos.composer_image(backend);
+        let image = if auto {
+            logos.composer_auto_image()
+        } else {
+            logos.composer_image(backend)
+        };
         let width = image.size().width;
         frame.render_widget(
             Image::new(image),
