@@ -414,6 +414,51 @@ fn stop_route_never_signals_a_daemon_held_pid() {
     );
 }
 
+/// The same hazard one level down. A `codex exec` parent holds its OWN rollout fd plus the
+/// rollout fd of every subagent thread it spawned (measured live 2026-07-27: pid 2910115 held
+/// two), so the scan stamps the parent's pid onto the subagent rows as well. Signalling from a
+/// subagent row would SIGTERM the parent's whole process group - the parent session and every
+/// sibling - to stop one child, so those rows advertise no stop at all.
+#[test]
+fn stop_route_never_signals_a_pid_shared_with_a_subagents_parent() {
+    let mut subagent = routed_session(Status::Working, Some(4242), false);
+    subagent.companion = true;
+    subagent.origin = SessionOrigin::Interactive;
+    assert_eq!(
+        stop_route(&subagent),
+        StopRoute::Unsupported,
+        "a subagent row's pid belongs to the parent process, not to it"
+    );
+
+    // The exec PARENT is a primary session of its own process and keeps its signal.
+    let mut parent = routed_session(Status::Working, Some(4242), false);
+    parent.companion = true;
+    parent.origin = SessionOrigin::Exec;
+    assert_eq!(stop_route(&parent), StopRoute::Signal(4242));
+
+    // A daemon-hosted subagent is still interruptible: turn/interrupt names one thread.
+    let mut hosted = routed_session(Status::Working, None, true);
+    hosted.companion = true;
+    assert_eq!(stop_route(&hosted), StopRoute::Interrupt);
+}
+
+/// The capability must agree with the route, or Ctrl+X is advertised and then fails.
+#[test]
+fn codex_does_not_advertise_stop_on_a_subagent_row() {
+    let backend = CodexBackend::new(PathBuf::from("/tmp/does-not-matter"));
+    let mut subagent = routed_session(Status::Working, Some(4242), false);
+    subagent.companion = true;
+    assert!(
+        !backend.capabilities_for(&subagent).stop,
+        "a subagent row cannot be stopped, so it must not offer stop"
+    );
+
+    let mut parent = routed_session(Status::Working, Some(4242), false);
+    parent.origin = SessionOrigin::Exec;
+    parent.companion = true;
+    assert!(backend.capabilities_for(&parent).stop);
+}
+
 #[test]
 fn stop_route_signals_only_a_pid_this_session_owns() {
     assert_eq!(
