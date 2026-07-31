@@ -208,10 +208,30 @@ impl App {
     /// Replace the session set, keeping the current selection anchored across the refresh to
     /// EITHER the same (backend,id) session row (existing behavior) OR, when a header is
     /// selected, the same group header key (so a header selection is not lost on the 1s
-    /// background refresh); only when neither anchor survives does it clamp.
+    /// background refresh). When a session is retained but no longer visible, prefer the
+    /// nearest surviving selectable row that preceded it. When it was removed, clamp.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
+        enum RowAnchor {
+            Session(BackendKind, String),
+            Header(GroupKey),
+        }
+
         let session_anchor = self.selected().map(|s| (s.backend, s.id.clone()));
         let header_anchor = self.selected_header_key();
+        let preceding_anchors: Vec<RowAnchor> = self.rows[..self.selected.min(self.rows.len())]
+            .iter()
+            .rev()
+            .filter_map(|row| match row {
+                Row::Session { backend, id, .. } => Some(RowAnchor::Session(*backend, id.clone())),
+                Row::ProjectHeader { root, .. } => {
+                    Some(RowAnchor::Header(GroupKey::Project(root.clone())))
+                }
+                Row::SectionHeader { section, .. } => {
+                    Some(RowAnchor::Header(GroupKey::State(*section)))
+                }
+                Row::Spacer => None,
+            })
+            .collect();
         let mut sessions = sessions;
         sanitize_session_titles(&mut sessions);
         self.sessions = sessions;
@@ -221,15 +241,29 @@ impl App {
                 .any(|session| session.backend == *backend && session.id == *id)
         });
         self.rebuild_rows();
-        if let Some(anchor) = session_anchor
-            && self.select_by_key(&anchor)
-        {
-            return;
-        }
+        let retained_hidden_session = if let Some(anchor) = session_anchor {
+            if self.select_by_key(&anchor) {
+                return;
+            }
+            self.find_session(anchor.0, &anchor.1).is_some()
+        } else {
+            false
+        };
         if let Some(key) = header_anchor
             && self.select_header(&key)
         {
             return;
+        }
+        if retained_hidden_session {
+            for anchor in preceding_anchors {
+                let selected = match anchor {
+                    RowAnchor::Session(backend, id) => self.select_by_key(&(backend, id)),
+                    RowAnchor::Header(key) => self.select_header(&key),
+                };
+                if selected {
+                    return;
+                }
+            }
         }
         self.clamp_selection();
     }

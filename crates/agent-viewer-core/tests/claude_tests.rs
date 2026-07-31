@@ -956,15 +956,10 @@ fn claude_stop_invokes_the_native_cli_for_an_idle_row() {
     let directory = tempfile::TempDir::new().expect("create fake cli directory");
     let binary = directory.path().join("claude");
     let args_path = directory.path().join("claude.args");
-    let mut script =
-        tempfile::NamedTempFile::new_in(directory.path()).expect("create fake claude cli");
-    script
-        .write_all(b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\n")
-        .expect("write fake claude cli");
-    let published = script.persist(&binary).expect("publish fake claude cli");
-    drop(published);
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake claude cli executable");
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\n",
+    );
 
     let mut session = session_with_short_id(Some("stop01"));
     session.status = Status::Idle;
