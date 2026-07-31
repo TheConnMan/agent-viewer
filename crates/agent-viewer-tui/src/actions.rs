@@ -697,7 +697,7 @@ mod tests {
     use super::{hide_request, install_attach_plan, kill_request, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
-    use crate::keys::tests::{sess, test_ui_with};
+    use crate::keys::tests::{SpawnBackend, sess, test_ui_with};
     use crate::ops::{Mutation, resolve_attach_with_backend};
     use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session, Status};
@@ -710,42 +710,6 @@ mod tests {
         mpsc::{TryRecvError, channel},
     };
     use std::time::{Duration, Instant};
-
-    struct SpawnCapableBackend;
-
-    impl agent_viewer_core::Backend for SpawnCapableBackend {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Claude
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                spawn: true,
-                ..Capabilities::none()
-            }
-        }
-
-        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("listing is not exercised by composer submission")
-        }
-
-        fn spawn(
-            &self,
-            _dir: &std::path::Path,
-            _task: &str,
-            _model: Option<&str>,
-            _effort: Option<&str>,
-        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
-            unreachable!("the external mutation executor must intercept spawn")
-        }
-
-        fn attach_command(
-            &self,
-            _session: &Session,
-        ) -> Result<std::process::Command, AttachRefusal> {
-            unreachable!("attach is not exercised by composer submission")
-        }
-    }
 
     struct PaletteQueryBackend {
         session: Session,
@@ -1137,7 +1101,7 @@ mod tests {
         assert_eq!(ui.composer.text(), payload);
 
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(SpawnCapableBackend)];
+            vec![Box::new(SpawnBackend { spawn: true })];
         spawn_from_composer(&backends, &inert_refresher(), &mut ui);
 
         assert_eq!(ui.composer.text(), "");
