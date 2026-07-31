@@ -64,7 +64,16 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
     // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
     // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some();
+    // The triage panel is a live child exactly like the attach view is, so Ctrl+C there is an
+    // interrupt for the session being answered, not a request to tear the viewer down (and
+    // with it every other PTY it owns). Without a child in the panel there is nothing to
+    // interrupt, so the chord keeps its global meaning.
+    let triage_target = matches!(ui.mode, Mode::Triage(_))
+        && ui
+            .focused
+            .as_ref()
+            .is_some_and(|key| ui.attached.contains_key(key));
+    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some() || triage_target;
     if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
@@ -5697,6 +5706,109 @@ pub(crate) mod tests {
             "typing into the session must never reach the composer"
         );
         assert_eq!(ui.app.selected_index(), selection_before);
+    }
+
+    /// Ctrl+C in the triage panel is an interrupt for the session being answered. Quitting
+    /// there tears down every PTY the viewer owns while a child is live, which is the opposite
+    /// of what a user stopping a runaway answer is asking for.
+    #[test]
+    fn ctrl_c_in_triage_interrupts_the_session_rather_than_quitting_the_viewer() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        let quit = press_normal_key(&mut ui, &backends, 'c', KeyModifiers::CONTROL);
+
+        assert!(!quit, "Ctrl+C must not tear the viewer down from triage");
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+        // `cat` runs with ISIG on, so 0x03 reaching it is observable as the child dying.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ui.attached.get_mut(&item).expect("panel child").is_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ctrl+C must reach the session in the panel as an interrupt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// With nothing live in the panel there is no child to interrupt, so the chord keeps its
+    /// global meaning rather than becoming a dead key.
+    #[test]
+    fn ctrl_c_in_triage_without_a_live_child_still_quits() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert!(ui.attached.is_empty());
+
+        assert!(press_normal_key(
+            &mut ui,
+            &backends,
+            'c',
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    /// A triage visit lasts exactly as long as the item is in the panel: walking on closes the
+    /// child it left, so a long queue does not accumulate invisible processes.
+    #[test]
+    fn walking_to_the_next_item_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let first = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, first.clone());
+
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        assert!(
+            !ui.attached.contains_key(&first),
+            "the item the queue walked off must not stay connected off screen"
+        );
+        assert!(
+            !ui.detach_trackers.contains_key(&first),
+            "its per-PTY state goes with it"
+        );
+    }
+
+    /// Same on the way back: Ctrl+P is a move like any other.
+    #[test]
+    fn walking_back_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let second = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, second.clone());
+
+        press_triage(&mut ui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(!ui.attached.contains_key(&second));
+    }
+
+    #[test]
+    fn leaving_the_queue_closes_the_child_it_was_showing() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        press_triage(&mut ui, KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&item),
+            "nothing stays connected once the queue is closed"
+        );
     }
 
     #[test]

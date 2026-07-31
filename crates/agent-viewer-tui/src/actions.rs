@@ -288,8 +288,9 @@ pub(crate) fn open_triage(ui: &mut Ui) {
 /// are exactly what triage inherits.
 ///
 /// Attach resolution is off-thread, so this only submits; `install_attach_plan` lands the
-/// child. A session already attached from an earlier visit is reused, not respawned. Nothing
-/// is prefetched: walking a queue of forty costs one attach per item you actually look at.
+/// child. A session that is somehow already connected (the wall holds a tile for it) is
+/// reused rather than respawned. Nothing is prefetched, and leaving an item closes its child,
+/// so walking a queue of forty costs one live connection, not forty.
 pub(crate) fn attach_triage_item(ui: &mut Ui) {
     let Mode::Triage(state) = &ui.mode else {
         return;
@@ -314,29 +315,59 @@ pub(crate) fn attach_triage_item(ui: &mut Ui) {
 
 /// `Ctrl+N` inside the modal — step to the next item; running off the end closes the modal.
 pub(crate) fn skip_triage_item(ui: &mut Ui) {
-    let Mode::Triage(state) = &mut ui.mode else {
-        return;
-    };
-    if state.advance() {
-        attach_triage_item(ui);
+    if !matches!(ui.mode, Mode::Triage(_)) {
         return;
     }
-    close_triage(ui);
+    let Some(leaving) = triage_step(ui, TriageState::advance) else {
+        close_triage(ui);
+        return;
+    };
+    release_triage_attachment(ui, leaving);
+    attach_triage_item(ui);
 }
 
 /// `Ctrl+P` inside the modal — step back to the previous item. A no-op on the first.
 pub(crate) fn back_triage_item(ui: &mut Ui) {
-    let Mode::Triage(state) = &mut ui.mode else {
+    let Some(leaving) = triage_step(ui, TriageState::back) else {
         return;
     };
-    if state.back() {
-        attach_triage_item(ui);
-    }
+    release_triage_attachment(ui, leaving);
+    attach_triage_item(ui);
 }
 
-/// Leave the queue for the list. The children stay alive and stay in `ui.attached`: they are
-/// real sessions, and detaching from a session has never meant stopping it.
+/// Move the queue cursor with `step`, returning the item it left when it actually moved.
+/// `None` means the queue did not move (already at an end).
+fn triage_step(ui: &mut Ui, step: fn(&mut TriageState) -> bool) -> Option<Option<Key>> {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return None;
+    };
+    let leaving = state.current().map(|item| item.key());
+    step(state).then_some(leaving)
+}
+
+/// Close the child of an item that just went off screen. A triage visit is exactly as long as
+/// the item is in the panel: keeping every visited child alive accumulates invisible processes
+/// and reader threads across a long queue, and a retained codex resume client keeps a finished
+/// session reading idle instead of done.
+///
+/// A wall tile is the one exception, as it is everywhere else: the wall owns that connection
+/// and closes it when it closes.
+fn release_triage_attachment(ui: &mut Ui, key: Option<Key>) {
+    let Some(key) = key else {
+        return;
+    };
+    if ui.wall.owns(&key) {
+        return;
+    }
+    ui.remove_pty(&key);
+}
+
+/// Leave the queue for the list, closing the child that was in the panel. The session itself
+/// keeps running — detaching has never meant stopping — but nothing stays connected once it is
+/// off screen, exactly as the attach view and the wall behave.
 pub(crate) fn close_triage(ui: &mut Ui) {
+    let showing = ui.focused.take();
+    release_triage_attachment(ui, showing);
     ui.mode = Mode::Normal;
     ui.focused = None;
     ui.focused_session = None;
