@@ -140,22 +140,47 @@ pub enum StopRoute {
 }
 
 /// PURE: the reason to show for a spawn attempt that did not start a turn.
-fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
+///
+/// `turn/start` answers as soon as the turn is accepted, so an error here means the answer did
+/// not arrive - NOT that the turn did not run. The wording has to carry that: a user told
+/// flatly that the turn failed retries it, and a retry against a thread whose turn did start
+/// runs the task twice.
+pub fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
     match attempt {
         app_server::SpawnAttempt::Started(thread_id) => format!("thread {thread_id} started"),
-        app_server::SpawnAttempt::TurnFailed { thread_id, error } => {
-            format!("thread {thread_id} exists but its first turn failed: {error}")
-        }
+        app_server::SpawnAttempt::TurnFailed { thread_id, error } => format!(
+            "thread {thread_id} exists but its first turn was not confirmed ({error}); the turn \
+             may have started - check the session before retrying"
+        ),
         app_server::SpawnAttempt::NotCreated(error) => error.to_string(),
     }
+}
+
+/// PURE: is this row a SUBAGENT thread rather than a process's own primary session?
+///
+/// `list` folds the registry's serialized `source` enum into two Session fields: `origin` is
+/// `Exec` for `source = exec` alone, and `companion` covers `exec` plus every subagent shape.
+/// A companion that is not an exec row is therefore exactly a subagent thread.
+fn is_subagent_row(session: &Session) -> bool {
+    session.companion && session.origin != SessionOrigin::Exec
 }
 
 /// PURE stop routing. `daemon_hosted` outranks any pid on the row: the daemon holds the
 /// rollout fd of every thread it hosts, so a pid that rode along on such a row is the DAEMON's
 /// pid, and signalling it would kill the daemon and every other session inside it.
+///
+/// A SUBAGENT row is the same hazard one level down and is withheld for the same reason. A
+/// `codex exec` parent holds its own rollout fd AND the rollout fd of every subagent thread it
+/// spawned (measured live 2026-07-27: pid 2910115 held two), so the fd scan stamps the parent's
+/// pid onto the subagent rows too. Signalling from there SIGTERMs the parent's whole process
+/// group - the parent session and every sibling subagent - to stop one child. There is no
+/// separate process to signal instead, so the row advertises no stop at all.
 pub fn stop_route(session: &Session) -> StopRoute {
     if session.daemon_hosted {
         return StopRoute::Interrupt;
+    }
+    if is_subagent_row(session) {
+        return StopRoute::Unsupported;
     }
     match session.pid {
         Some(pid) => StopRoute::Signal(pid),
@@ -246,6 +271,8 @@ fn codex_models_via_registry(home: &Path) -> Vec<String> {
 pub struct CodexBackend {
     codex_home: std::path::PathBuf,
     registry: Option<Registry>,
+    /// Which `state_N.sqlite` `registry` is open on, so a rollover to state_N+1 is noticed.
+    registry_path: Option<std::path::PathBuf>,
     resolver: StatusResolver,
     /// Discovered model catalog, computed once and reused (best-effort; degrades to the
     /// default when both the CLI probe and the registry fallback come up empty).
@@ -260,26 +287,42 @@ impl CodexBackend {
         CodexBackend {
             codex_home,
             registry: None,
+            registry_path: None,
             resolver: StatusResolver::new(),
             models_cache: std::sync::OnceLock::new(),
             pr_scan: pr_scan::PrScanner::new(),
         }
     }
 
-    /// Query threads, reopening the DB once on failure (state_N rollover, transient error).
+    /// Query threads, re-resolving the state DB every listing and reopening it once on failure.
+    ///
+    /// The re-glob is the only thing that notices a Codex upgrade laying down a NEW
+    /// `state_N+1.sqlite`: the previous file stays open, stays readable, and keeps answering
+    /// with its frozen row set, so a registry resolved once at startup showed no new session
+    /// until the viewer was restarted. `find_state_db` is one readdir of `~/.codex`, run once
+    /// per listing tick against a scan that already reads thousands of rollout tails.
     fn query_threads(&mut self) -> Result<Vec<registry::Thread>> {
-        if self.registry.is_none() {
-            let db = registry::find_state_db(&self.codex_home)?;
-            self.registry = Some(Registry::open(&db)?);
+        let db = registry::find_state_db(&self.codex_home)?;
+        if self.registry_path.as_deref() != Some(db.as_path()) {
+            self.registry = None;
         }
-        match self.registry.as_ref().unwrap().threads() {
+        if self.registry.is_none() {
+            self.registry = Some(Registry::open(&db)?);
+            self.registry_path = Some(db.clone());
+        }
+        let opened = self
+            .registry
+            .as_ref()
+            .expect("registry opened immediately above");
+        match opened.threads() {
             Ok(threads) => Ok(threads),
             Err(_) => {
                 self.registry = None;
-                let db = registry::find_state_db(&self.codex_home)?;
+                self.registry_path = None;
                 let reg = Registry::open(&db)?;
                 let threads = reg.threads()?;
                 self.registry = Some(reg);
+                self.registry_path = Some(db);
                 Ok(threads)
             }
         }
@@ -323,7 +366,11 @@ impl Backend for CodexBackend {
         // must never be signalled), and it is stopped with `turn/interrupt` over the socket
         // instead. Gating on the pid alone would gray Ctrl+C out on exactly the rows that are
         // interruptible.
-        capabilities.stop &= session.pid.is_some() || session.daemon_hosted;
+        //
+        // Asking the router keeps the advertisement and the action in lockstep, which is what
+        // the paragraph above is really about: every route that ends in Unsupported is a
+        // promise this backend cannot keep.
+        capabilities.stop &= !matches!(stop_route(session), StopRoute::Unsupported);
         capabilities
     }
 
@@ -395,7 +442,7 @@ impl Backend for CodexBackend {
         else {
             return Ok(Vec::new());
         };
-        let mut events = rollout::read_transcript(path)?;
+        let mut events = rollout::read_transcript_tail(path)?;
         if events.len() > max_events {
             events = events.split_off(events.len() - max_events);
         }

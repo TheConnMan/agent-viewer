@@ -2,9 +2,9 @@ mod common;
 
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
-    ClaudeBackend, SessionRegistryEntry, is_sdk_entrypoint, mark_sdk_companions, parse_agents_json,
-    parse_claude_json_models, parse_job_state, parse_session_registry, read_claude_transcript,
-    sessions_root_from,
+    ClaudeBackend, SessionRegistryEntry, agents_json, is_sdk_entrypoint, mark_sdk_companions,
+    parse_agents_json, parse_claude_json_models, parse_job_state, parse_session_registry,
+    read_claude_transcript, sessions_root_from,
 };
 use agent_viewer_core::{Session, TailEvent};
 use common::rfc3339_at;
@@ -804,8 +804,7 @@ fn claude_list_orders_enriched_updates_ascending_with_stable_ties() {
             "state": "done"
         }
     ]);
-    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", agents)).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
 
     let jobs_root = dir.path().join("jobs");
     for (short_id, updated_at_ms) in [("tie_z", 2000), ("oldest", 1000), ("tie_a", 2000)] {
@@ -879,8 +878,7 @@ fn claude_list_finds_project_transcript_without_job_transcript_path() {
             "state": "working"
         }
     ]);
-    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", agents)).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
 
     let config_root = dir.path().join("config");
     let jobs_root = config_root.join("jobs");
@@ -1068,5 +1066,146 @@ fn claude_delete_capability_is_per_row_and_requires_a_short_id() {
         !backend
             .capabilities_for(&session_with_short_id(Some("")))
             .delete
+    );
+}
+
+/// Same bound as the codex rollout reader: a claude transcript grows without bound while the
+/// session works, and the pane re-reads it every tick, so only the end of the file is parsed.
+#[test]
+fn read_claude_transcript_touches_only_the_end_of_a_multi_megabyte_transcript() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("transcript-huge.jsonl");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = std::io::BufWriter::new(file);
+    let filler = "x".repeat(2_048);
+    for n in 0..1_000 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": format!("early-{n} {filler}")}]}
+            })
+        )
+        .unwrap();
+    }
+    for n in 0..3 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": format!("late-{n}")}]}
+            })
+        )
+        .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
+
+    let events = read_claude_transcript(&path, 10_000).expect("read tail");
+    assert_eq!(
+        events.last(),
+        Some(&agent_viewer_core::TailEvent::Agent("late-2".to_string())),
+        "the newest message must survive"
+    );
+    assert!(
+        events.len() < 1_003,
+        "the whole file was parsed: {} events",
+        events.len()
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            agent_viewer_core::TailEvent::Agent(text) if text.starts_with("early-0 ")
+        )),
+        "a message megabytes back from the end must never be read"
+    );
+}
+
+/// The listing shell-out must have a deadline. `Command::output` waits without bound, so a
+/// wedged `claude` parked the refresh worker for as long as it stayed wedged, and the backend
+/// simply stopped updating with nothing shown to say why.
+#[test]
+fn agents_json_gives_up_on_a_wedged_claude() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    // Hangs only on the real call: `write_stub_claude` probes the stub with no arguments, and
+    // a stub that slept there would stall the harness instead of the code under test.
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\ncase \"$1\" in agents) sleep 30;; esac\n",
+    );
+
+    let started = std::time::Instant::now();
+    let out = agents_json(&binary, Duration::from_millis(300));
+    assert_eq!(
+        out, None,
+        "a hang is the same quiet empty backend as a crash"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline was not enforced: waited {:?}",
+        started.elapsed()
+    );
+}
+
+/// `claude agents` can omit `startedAt`. Parsed as 0 the row sorts at the epoch AND is
+/// invisible to spawn matching, which keys on created_at_ms landing within seconds of the
+/// spawn instant - so the viewer could not select the session it had just created.
+#[test]
+fn claude_list_dates_a_session_whose_started_at_is_missing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    let agents = serde_json::json!([
+        {
+            "id": "nostart1",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "sessionId": "session_no_started_at",
+            "name": "No Started At",
+            "state": "working"
+        },
+        {
+            "id": "dated001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1_700_000_000_000i64,
+            "sessionId": "session_dated",
+            "name": "Dated",
+            "state": "working"
+        }
+    ]);
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
+
+    let jobs_root = dir.path().join("jobs");
+    for short_id in ["nostart1", "dated001"] {
+        let state_path = jobs_root.join(short_id).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, r#"{"detail":"working"}"#).unwrap();
+    }
+
+    let mut backend = ClaudeBackend::with_roots(
+        binary.to_str().unwrap(),
+        jobs_root,
+        dir.path().join("sessions"),
+    );
+    let sessions = backend.list().expect("list claude sessions");
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let undated = by_title(&sessions, "No Started At");
+    assert!(
+        (now_ms - undated.created_at_ms).abs() < 60_000,
+        "a missing startedAt must fall back to a real timestamp, got {}",
+        undated.created_at_ms
+    );
+    // A session that DID publish startedAt keeps it verbatim.
+    assert_eq!(
+        by_title(&sessions, "Dated").created_at_ms,
+        1_700_000_000_000
     );
 }
