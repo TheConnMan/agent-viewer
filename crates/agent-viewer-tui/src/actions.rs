@@ -611,31 +611,34 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
 
 /// Spawn the composed task into the current spawn target, record it for pinning, and
 /// clear the composer. The spawn itself is detached (fast); only its record persists.
+///
+/// Returns whether the task was actually submitted. Every refusal below leaves the composer
+/// holding the draft, and the wall's overlay stays open on a `false` rather than dropping the
+/// user back onto the grid with text they can no longer see.
 pub(crate) fn spawn_from_composer(
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     ui: &mut Ui,
-) {
+) -> bool {
     // Defense-in-depth: never spawn the /model meta-command as a task (Enter routing already
     // avoids this, but keep the spawn path safe).
     if ui.composer.is_model_command() {
-        return;
+        return false;
     }
     let Some(target) = ui.app.spawn_target() else {
         ui.set_notice("no target directory".to_string());
-        return;
+        return false;
     };
     if ui.composer.is_auto() {
-        spawn_through_router(refresher, ui, target);
-        return;
+        return spawn_through_router(refresher, ui, target);
     }
     let backend_kind = ui.composer.backend();
     let Some(backend) = backend_of(backends, backend_kind) else {
-        return;
+        return false;
     };
     if !backend.capabilities().spawn {
         ui.set_notice(format!("{} does not support spawn", backend_kind.name()));
-        return;
+        return false;
     }
     let task = ui.composer.text().to_string();
     // "default" (codex) passes no model flag; any other value is a real model.
@@ -661,19 +664,20 @@ pub(crate) fn spawn_from_composer(
     );
     let executor = ui.mutation_executor.clone();
     if !ui.mutations.submit(key, move || executor(mutation)) {
-        return;
+        return false;
     }
     ui.set_notice(format!("spawning… on {}", backend_kind.name()));
     ui.composer.clear();
     // Hasten the next listing so the spawned row (and its bloom) appears promptly; the
     // notice survives until the 1s clear cadence since apply_snapshot preserves it.
     refresher.force();
+    true
 }
 
 /// The Auto path: hand the task to `agent-router`, which classifies it, weighs weekly usage
 /// headroom, and dispatches to whichever backend won. No backend is consulted here — Auto is
 /// not one — and no model is passed, because the router owns model and effort selection.
-fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget) {
+fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget) -> bool {
     let task = ui.composer.text().to_string();
     // Same dedup shape as a backend spawn, so a double Enter cannot route the same task twice
     // while the first classifier call is still out.
@@ -683,11 +687,12 @@ fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget)
     let mutation = Mutation::spawn_auto(&ui.app, target, task);
     let executor = ui.mutation_executor.clone();
     if !ui.mutations.submit(key, move || executor(mutation)) {
-        return;
+        return false;
     }
     ui.set_notice("routing… via agent-router".to_string());
     ui.composer.clear();
     refresher.force();
+    true
 }
 
 #[cfg(test)]
@@ -695,7 +700,7 @@ mod tests {
     use super::{hide_request, install_attach_plan, kill_request, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
-    use crate::keys::tests::{sess, test_ui_with};
+    use crate::keys::tests::{SpawnBackend, sess, test_ui_with};
     use crate::ops::{Mutation, resolve_attach_with_backend};
     use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session, Status};
@@ -708,42 +713,6 @@ mod tests {
         mpsc::{TryRecvError, channel},
     };
     use std::time::{Duration, Instant};
-
-    struct SpawnCapableBackend;
-
-    impl agent_viewer_core::Backend for SpawnCapableBackend {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Claude
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                spawn: true,
-                ..Capabilities::none()
-            }
-        }
-
-        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("listing is not exercised by composer submission")
-        }
-
-        fn spawn(
-            &self,
-            _dir: &std::path::Path,
-            _task: &str,
-            _model: Option<&str>,
-            _effort: Option<&str>,
-        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
-            unreachable!("the external mutation executor must intercept spawn")
-        }
-
-        fn attach_command(
-            &self,
-            _session: &Session,
-        ) -> Result<std::process::Command, AttachRefusal> {
-            unreachable!("attach is not exercised by composer submission")
-        }
-    }
 
     struct PaletteQueryBackend {
         session: Session,
@@ -1135,7 +1104,7 @@ mod tests {
         assert_eq!(ui.composer.text(), payload);
 
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(SpawnCapableBackend)];
+            vec![Box::new(SpawnBackend { spawn: true })];
         spawn_from_composer(&backends, &inert_refresher(), &mut ui);
 
         assert_eq!(ui.composer.text(), "");
