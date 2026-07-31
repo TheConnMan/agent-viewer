@@ -64,7 +64,12 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
     // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
     // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some();
+    // The compose overlay counts as forwarding too: the tiles under it are still live children
+    // whose Ctrl+C the wall de-armed on purpose, and opening an input box over the grid must
+    // not silently re-arm the chord as a teardown that kills every one of them.
+    let forwarding = matches!(ui.mode, Mode::Attached)
+        || wall_target.is_some()
+        || (matches!(ui.mode, Mode::Compose) && ui.wall.on);
     if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
@@ -306,7 +311,10 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
             }
         }
         Mode::Help => {}
-        Mode::Compose => {}
+        // The overlay has the keyboard, so a pasted task description belongs in it and not in
+        // the tile underneath — the same "text must never vanish" rule the wall guard above
+        // enforces in the other direction.
+        Mode::Compose => ui.composer.push_str(text),
     }
 }
 
@@ -685,7 +693,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     }
 
     // An open composer popup takes Up/Down/Tab/Enter/Esc before the list ever sees them.
-    if !handle_composer_popup_key(key, ui) {
+    if !handle_composer_popup_key(key.code, ui) {
         match key.code {
             // Arrows navigate or act at all times.
             KeyCode::Down => ui.app.move_selection(1),
@@ -756,13 +764,30 @@ fn handle_compose_key(
     // `suggestions_active` against commands scanned for a target that has since moved.
     ensure_completions(ui);
     ensure_models(ui);
-    // Ctrl chords are inert here rather than acting: the wall's own chords aim at the focused
-    // tile, and firing one from behind an input box that has the keyboard would act on a
-    // session the user is no longer typing at. Esc is the way out.
+    // Every ctrl chord below `handle_key`'s own globals (Ctrl+C, handled here, and Ctrl+T,
+    // which toggles mouse capture before the mode dispatch) is inert here rather than acting:
+    // the wall's chords aim at the focused tile, and firing one from behind an input box that
+    // has the keyboard would act on a session the user is no longer typing at. The exceptions
+    // are the exits, because every way out of this box has to keep the draft.
     if ctrl {
+        match key.code {
+            // The wall documents Ctrl+W and Ctrl+] as the unconditional ways back to the list,
+            // and an overlay that swallows them turns the grid into the trap they exist to
+            // prevent. Leave compose first so `toggle_wall` closes the wall it was floating
+            // over. Crossterm folds raw 0x1D onto Char('5'), same as `handle_wall_key`.
+            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+                ui.mode = Mode::Normal;
+                toggle_wall(ui);
+            }
+            // Ctrl+C is the focused tile's on the wall, never the viewer's, so it backs out of
+            // the box exactly like Esc instead of tearing down every tile's child. One rule
+            // for every exit — the draft survives all of them.
+            KeyCode::Char('c') => ui.mode = Mode::Normal,
+            _ => {}
+        }
         return;
     }
-    if !handle_composer_popup_key(key, ui) {
+    if !handle_composer_popup_key(key.code, ui) {
         match key.code {
             // Up/Down deliberately do nothing with no popup open. The wall pins the list
             // selection to the focused tile and `spawn_target()` reads it, so moving it here
@@ -775,10 +800,16 @@ fn handle_compose_key(
             // this avoids; the text is still there the next time the overlay opens.
             KeyCode::Esc => ui.mode = Mode::Normal,
             // An empty composer has nothing to send and no list row underneath to activate, so
-            // Enter simply stays put.
+            // Enter simply stays put. A refused spawn (no target directory, a backend that
+            // cannot spawn, a deduped double Enter) keeps the box open too: leaving would strand
+            // the draft behind the grid, where it is neither drawn nor recoverable.
             KeyCode::Enter if !ui.composer.is_empty() => {
-                spawn_from_composer(backends, refresher, ui);
-                ui.mode = Mode::Normal;
+                // Bound rather than tested inline: the spawn is the side effect, and a match
+                // guard is the wrong place to hide one.
+                let submitted = spawn_from_composer(backends, refresher, ui);
+                if submitted {
+                    ui.mode = Mode::Normal;
+                }
             }
             // Every printable is task text. The list's empty-composer hotkeys ('?' for help,
             // Space on a header) do not apply: there is no list under this box.
@@ -797,11 +828,11 @@ fn handle_compose_key(
 /// so a `/model <no-match>` still swallows Tab and the arrows instead of cycling the backend or
 /// moving the session selection mid-command, and the theme arms have to beat both. A second
 /// copy would drift the first time one of them changed.
-fn handle_composer_popup_key(key: KeyEvent, ui: &mut Ui) -> bool {
+fn handle_composer_popup_key(code: KeyCode, ui: &mut Ui) -> bool {
     let suggesting = ui.composer.suggestions_active();
     let model_cmd = ui.composer.is_model_command();
     let theme_cmd = ui.composer.is_theme_command();
-    match key.code {
+    match code {
         KeyCode::Down if theme_cmd => ui.themes.move_preview(1),
         KeyCode::Up if theme_cmd => ui.themes.move_preview(-1),
         // Safe no-ops when the active list is empty, which is why they can capture the key
@@ -1090,22 +1121,20 @@ fn palette_action_items(
     ]
     .into_iter()
     .collect();
-    // Wall only, and first, because starting a task is the one thing the grid otherwise cannot
-    // do: the composer is not drawn there, so every spawn used to mean leaving the wall and
-    // coming back. Off the wall the composer is already on screen with the keyboard, so the
-    // entry would be a row that does nothing. No chord: the palette is its only entry point,
-    // which is what keeps it from costing the tiles' children another one.
+    // Wall only, because starting a task is the one thing the grid otherwise cannot do: the
+    // composer is not drawn there, so every spawn used to mean leaving the wall and coming
+    // back. Off the wall the composer is already on screen with the keyboard, so the entry
+    // would be a row that does nothing. No chord: the palette is its only entry point, which
+    // is what keeps it from costing the tiles' children another one. Position here is not
+    // rank — `PaletteState::rank` orders the Actions group alphabetically.
     if ui.wall.on {
-        items.insert(
-            0,
-            action_item(
-                PaletteAction::Spawn,
-                "New session",
-                "compose a task and start it on this wall",
-                None,
-                None,
-            ),
-        );
+        items.push(action_item(
+            PaletteAction::Spawn,
+            "New session",
+            "compose a task and start it on this wall",
+            None,
+            None,
+        ));
     }
     items
 }
@@ -2990,6 +3019,320 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
+    /// A pasted task description is how a long prompt actually gets into that box, and the
+    /// overlay owns the keyboard while it is up. Dropping the paste is the same "the text
+    /// vanished" symptom the wall's own paste guard exists to prevent, one mode over.
+    #[test]
+    fn pasting_while_composing_fills_the_composer_and_never_reaches_the_tile() {
+        let mut session = sess("paste-tile", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+
+        handle_paste("pasted-draft", &mut ui);
+        assert_eq!(ui.composer.text(), "pasted-draft");
+
+        // Same ordered-pty barrier the typing test uses: once the sentinel is on the child's
+        // screen, anything forwarded before it would already be there too.
+        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        for character in "SENTINEL".chars() {
+            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
+        }
+        wait_for_pty_screen(&ui, &target, "SENTINEL");
+        assert!(
+            ui.attached[&target].with_screen(|screen| !screen.contents().contains("pasted-draft")),
+            "the pasted draft was typed into the live session"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Ctrl+W is documented as an unconditional way back to the list, so an overlay that
+    /// swallowed it would turn the grid into the trap that guarantee exists to prevent.
+    #[test]
+    fn ctrl_w_while_composing_returns_to_the_list_with_the_draft_intact() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        for character in "half a thought".chars() {
+            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
+        }
+
+        let quit = press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        assert!(
+            !quit,
+            "Ctrl+W leaves the wall, it does not leave the viewer"
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.wall.on,
+            "Ctrl+W has to reach the list, not stop at the overlay"
+        );
+        assert_eq!(
+            ui.composer.text(),
+            "half a thought",
+            "every way out of compose keeps the draft"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// On the wall Ctrl+C belongs to the focused tile, never to the viewer. Opening this box
+    /// must not re-arm it as a teardown: quitting from here would kill every tile's child, and
+    /// the draft with them.
+    #[test]
+    fn ctrl_c_while_composing_returns_to_the_wall_instead_of_quitting() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        for character in "half a thought".chars() {
+            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
+        }
+
+        let quit = press_normal_key(&mut ui, &[], 'c', KeyModifiers::CONTROL);
+
+        assert!(!quit, "Ctrl+C in compose must not tear the viewer down");
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.wall.on, "Ctrl+C backs out to the grid, like Esc");
+        assert_eq!(
+            ui.composer.text(),
+            "half a thought",
+            "every way out of compose keeps the draft"
+        );
+        assert_eq!(
+            ui.attached.len(),
+            2,
+            "the tiles' children must survive backing out of compose"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// The silent one: `spawn_target()` reads the list selection, which the wall pins to the
+    /// focused tile, so an arrow that moved it here would start the new session in a different
+    /// directory than the one on screen — with nothing on screen to say so.
+    #[test]
+    fn arrows_while_composing_leave_the_selection_and_the_wall_focus_alone() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        let selected = ui.app.selected().map(|session| session.id.clone());
+        assert_eq!(selected, Some("wall-retire".to_string()));
+
+        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.clone()),
+            selected,
+            "Down repointed the directory the new session would land in"
+        );
+        press_normal_code(&mut ui, &[], KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.clone()),
+            selected,
+            "Up repointed the directory the new session would land in"
+        );
+        assert_eq!(
+            wall_focus(&ui),
+            1,
+            "the arrows must not move the grid's focus either"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// The editing chords have to belong to the box, not to the child underneath it: a Tab
+    /// forwarded to a live agent mid-turn is an answer the user never typed.
+    #[test]
+    fn tab_and_backspace_while_composing_edit_the_composer_not_the_tile() {
+        let mut session = sess("edit-tile", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        for character in "abc".chars() {
+            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
+        }
+        let backend = ui.composer.backend();
+
+        press_normal_code(&mut ui, &[], KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(ui.composer.text(), "ab", "Backspace must edit the draft");
+        press_normal_code(&mut ui, &[], KeyCode::Tab, KeyModifiers::NONE);
+        assert_ne!(
+            ui.composer.backend(),
+            backend,
+            "Tab must cycle the composer's agent"
+        );
+        press_normal_code(&mut ui, &[], KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(
+            ui.composer.text(),
+            "ab",
+            "Shift+Tab is the model cycle, not text"
+        );
+
+        // The ordered-pty barrier again: nothing typed or edited in the box may have reached
+        // the child, and the sentinel proves anything earlier would already have arrived.
+        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        for character in "SENTINEL".chars() {
+            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
+        }
+        wait_for_pty_screen(&ui, &target, "SENTINEL");
+        assert!(
+            ui.attached[&target].with_screen(|screen| !screen.contents().contains("ab")),
+            "the composed draft was typed into the live session"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// An empty composer has nothing to send and no list row underneath to activate, so Enter
+    /// has to stay put rather than start a session with no task in it.
+    #[test]
+    fn enter_on_an_empty_composer_submits_nothing_and_stays_in_compose() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            seen_tx
+                .send(format!("{:?}", std::mem::discriminant(&mutation)))
+                .expect("report the mutation");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(WallSpawningBackend)];
+
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        press_normal_code(&mut ui, &backends, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "Enter on an empty composer submitted a mutation"
+        );
+        assert!(
+            matches!(ui.mode, Mode::Compose),
+            "Enter with nothing to send must leave the box open"
+        );
+        assert!(ui.wall.on);
+        kill_attached(&mut ui);
+    }
+
+    /// A Claude backend that advertises no spawn, so Enter takes one of the refusal paths.
+    struct WallRefusingBackend;
+
+    impl agent_viewer_core::Backend for WallRefusingBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Claude
+        }
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("list is not exercised by the wall compose tests")
+        }
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("a backend that cannot spawn is never asked to")
+        }
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attach is not exercised by the wall compose tests")
+        }
+    }
+
+    /// The draft is only drawn while composing, so a refusal that closed the box would strand
+    /// text the user can neither see nor recover — with the notice explaining it flashing on a
+    /// grid they were just sent back to.
+    #[test]
+    fn a_refused_spawn_keeps_the_composer_open_with_the_draft() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(WallRefusingBackend)];
+
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        for character in "a task that goes nowhere".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        press_normal_code(&mut ui, &backends, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(
+            matches!(ui.mode, Mode::Compose),
+            "a refused spawn must not drop the user back onto the grid"
+        );
+        assert_eq!(
+            ui.composer.text(),
+            "a task that goes nowhere",
+            "a refused spawn must keep the draft"
+        );
+        assert!(
+            ui.notice.text().contains("does not support spawn"),
+            "the refusal has to say why: {}",
+            ui.notice.text()
+        );
+        kill_attached(&mut ui);
+    }
+
     /// The trap this closes: the Commands group pushes `/<command> ` into a composer that is
     /// not on screen while the wall is on, so the palette used to stuff state the user could
     /// neither see nor finish typing.
@@ -3654,20 +3997,18 @@ pub(crate) mod tests {
 
     /// Open the palette, type `query`, and press Enter on the top hit.
     fn pick_from_palette(ui: &mut Ui, query: &str) {
-        open_palette_with_query(ui, query);
-        handle_palette_key(
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            &[],
-            ui,
-            &mut test_terminal(),
-        )
-        .expect("accept palette selection");
+        pick_palette(ui, query, None);
     }
 
     /// Open the palette, type `query`, walk to the first result whose target is `wanted`, and
     /// press Enter on it. Walking keeps a test about what an entry DOES independent of how the
     /// ranking happens to order that query's other hits.
     fn pick_palette_target(ui: &mut Ui, query: &str, wanted: &PaletteTarget) {
+        pick_palette(ui, query, Some(wanted));
+    }
+
+    /// Open the palette on `query` and Enter on `wanted`, or on the top hit when it is `None`.
+    fn pick_palette(ui: &mut Ui, query: &str, wanted: Option<&PaletteTarget>) {
         fn highlighted_is(ui: &Ui, wanted: &PaletteTarget) -> bool {
             matches!(&ui.mode, Mode::Palette(palette)
                 if palette.highlighted().map(|item| &item.target) == Some(wanted))
@@ -3675,26 +4016,28 @@ pub(crate) mod tests {
 
         open_palette_with_query(ui, query);
         let mut terminal = test_terminal();
-        let count = match &ui.mode {
-            Mode::Palette(palette) => palette.result_count(),
-            _ => panic!("the palette did not open"),
-        };
-        for _ in 0..count {
-            if highlighted_is(ui, wanted) {
-                break;
+        if let Some(wanted) = wanted {
+            let count = match &ui.mode {
+                Mode::Palette(palette) => palette.result_count(),
+                _ => panic!("the palette did not open"),
+            };
+            for _ in 0..count {
+                if highlighted_is(ui, wanted) {
+                    break;
+                }
+                handle_palette_key(
+                    key(KeyCode::Down, KeyModifiers::NONE),
+                    &[],
+                    ui,
+                    &mut terminal,
+                )
+                .expect("walk the palette results");
             }
-            handle_palette_key(
-                key(KeyCode::Down, KeyModifiers::NONE),
-                &[],
-                ui,
-                &mut terminal,
-            )
-            .expect("walk the palette results");
+            assert!(
+                highlighted_is(ui, wanted),
+                "the palette had no {wanted:?} result for {query:?}"
+            );
         }
-        assert!(
-            highlighted_is(ui, wanted),
-            "the palette had no {wanted:?} result for {query:?}"
-        );
         handle_palette_key(
             key(KeyCode::Enter, KeyModifiers::NONE),
             &[],
