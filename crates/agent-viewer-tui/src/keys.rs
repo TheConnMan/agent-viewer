@@ -361,6 +361,20 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     );
 }
 
+/// Ctrl+B opens and closes the tail pane. It is a pure view toggle: the transcript read it
+/// implies happens on a background worker and never starts a process.
+fn toggle_tail(ui: &mut Ui) {
+    ui.tail_open = !ui.tail_open;
+    ui.set_notice(
+        if ui.tail_open {
+            "tail pane on · ⌃B to close"
+        } else {
+            "tail pane off"
+        }
+        .to_string(),
+    );
+}
+
 /// Ctrl+G advances the header mascot; the palette picks one directly. Both land here so the
 /// choice is announced and persisted the same way.
 fn cycle_sprite(ui: &mut Ui) {
@@ -412,6 +426,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('b') => toggle_tail(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
@@ -1245,6 +1260,9 @@ pub(crate) mod tests {
             mouse_capture: true,
             mouse_press: None,
             sprite: Default::default(),
+            tail_open: false,
+            tail: None,
+            tail_pending: None,
         }
     }
 
@@ -1294,6 +1312,7 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        tail: None,
                     },
                 );
             })
@@ -1330,6 +1349,7 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        tail: None,
                     },
                 );
             })
@@ -2170,6 +2190,29 @@ pub(crate) mod tests {
         ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
             unreachable!("attach is not exercised by row scoped archive tests")
         }
+    }
+
+    #[test]
+    fn ctrl_b_toggles_the_tail_pane_and_disturbs_nothing_else() {
+        let mut ui = test_ui_with(vec![
+            sess("first", "/tmp/agentviewer-tail-first", 100),
+            sess("second", "/tmp/agentviewer-tail-second", 200),
+        ]);
+        select_session_row(&mut ui, "first");
+        ui.composer.push_str("draft stays");
+        let selected = ui.app.selected_index();
+
+        assert!(!ui.tail_open);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(ui.tail_open, "ctrl+b opens the pane");
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(!ui.tail_open, "ctrl+b closes it again");
+
+        // The chord belongs to the pane alone: it never reaches the composer (where every
+        // bare letter starts a task), never changes mode, and never moves the selection.
+        assert_eq!(ui.composer.text(), "draft stays");
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.app.selected_index(), selected);
     }
 
     #[test]

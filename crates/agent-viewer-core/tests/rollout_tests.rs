@@ -2,10 +2,9 @@ mod common;
 
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
-    PendingApproval, TailState, TranscriptItem, pending_approval, read_session_meta,
-    read_transcript, tail_state,
+    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript, tail_state,
 };
-use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status};
+use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status, TailEvent};
 use common::rfc3339_at;
 use std::io::Write;
 use std::path::PathBuf;
@@ -93,20 +92,80 @@ fn session_meta_rejects_empty_and_garbage() {
 }
 
 #[test]
-fn transcript_extracts_text_in_order() {
+fn transcript_extracts_text_and_tool_calls_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
     let items = read_transcript(&path).expect("read transcript");
-    // Exactly the user then assistant message; the function_call item is skipped.
+    // The user message, the assistant message, and the function_call the tail pane needs,
+    // in transcript order. `arguments` is an embedded JSON string, so the detail comes out
+    // of its `cmd` key.
     assert_eq!(
         items,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "Reply with exactly the word DONE.".to_string(),
+            TailEvent::User("Reply with exactly the word DONE.".to_string()),
+            TailEvent::Agent("DONE".to_string()),
+            TailEvent::Tool {
+                name: "exec_command".to_string(),
+                detail: "ls -la".to_string(),
             },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "DONE".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn transcript_tool_detail_squashes_multiline_and_survives_unknown_arguments() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tools.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // A multi-line shell script must not eat the pane: it squashes to one line.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{{\"cmd\":\"pwd\\n  wc -l state.md\"}}"}}}}"#
+    )
+    .unwrap();
+    // An argv array joins with spaces.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{{\"command\":[\"bash\",\"-lc\",\"ls\"]}}"}}}}"#
+    )
+    .unwrap();
+    // Arguments with no recognized key still produce a named tool line, not a dropped event.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"update_plan","arguments":"{{\"plan\":[]}}"}}}}"#
+    )
+    .unwrap();
+    // A custom tool call carries its input raw rather than as embedded JSON.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}}}}"#
+    )
+    .unwrap();
+    // A nameless call is not an event.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"","arguments":"{{}}"}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    assert_eq!(
+        read_transcript(&path).expect("read transcript"),
+        vec![
+            TailEvent::Tool {
+                name: "exec_command".to_string(),
+                detail: "pwd wc -l state.md".to_string(),
+            },
+            TailEvent::Tool {
+                name: "shell".to_string(),
+                detail: "bash -lc ls".to_string(),
+            },
+            TailEvent::Tool {
+                name: "update_plan".to_string(),
+                detail: String::new(),
+            },
+            TailEvent::Tool {
+                name: "apply_patch".to_string(),
+                detail: "*** Begin Patch *** End Patch".to_string(),
             },
         ]
     );
@@ -141,14 +200,8 @@ fn transcript_excludes_empty_text_items() {
     assert_eq!(
         items,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "hello".to_string(),
-            },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "world".to_string(),
-            },
+            TailEvent::User("hello".to_string()),
+            TailEvent::Agent("world".to_string()),
         ]
     );
 }

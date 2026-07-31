@@ -1,3 +1,4 @@
+use crate::backend::TailEvent;
 use crate::error::{Error, Result};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -232,16 +233,12 @@ pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval
     Ok(None)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptItem {
-    pub role: String,
-    pub text: String,
-}
-
-/// Full lazy parse for the detail pane. Keep only response_item lines with
-/// payload.role + payload.content[]; concatenate content[].text where
-/// content[].type is "input_text" or "output_text". Skip malformed lines silently.
-pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
+/// Full lazy parse for the tail pane, in transcript order. Two kinds of response_item
+/// survive: a message (payload.role + payload.content[], concatenating content[].text where
+/// content[].type is "input_text" or "output_text") and a tool call (payload.type
+/// "function_call" or "custom_tool_call", whose `arguments` is a JSON *string*). Skip
+/// malformed lines silently.
+pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     let mut items = Vec::new();
@@ -256,6 +253,27 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
         let Some(payload) = value.get("payload") else {
             continue;
         };
+        if matches!(
+            crate::json_str(payload, "type"),
+            Some("function_call") | Some("custom_tool_call")
+        ) {
+            let Some(name) = crate::json_str(payload, "name").filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            // `arguments` holds the input as an embedded JSON string; a custom tool call
+            // carries its raw `input` string instead.
+            let detail = crate::json_str(payload, "arguments")
+                .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
+                .map(|arguments| crate::backend::tool_detail(&arguments))
+                .or_else(|| crate::json_str(payload, "input").map(crate::backend::squash))
+                .unwrap_or_default();
+            items.push(TailEvent::Tool {
+                name: name.to_string(),
+                detail,
+            });
+            continue;
+        }
         let Some(role) = crate::json_str(payload, "role") else {
             continue;
         };
@@ -272,12 +290,12 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
                 text.push_str(t);
             }
         }
-        // Tool-only response_items extract to "" — skip them so peek never shows a
+        // Tool-only response_items extract to "" — skip them so the pane never shows a
         // blank role-only line.
         if !text.is_empty() {
-            items.push(TranscriptItem {
-                role: role.to_string(),
-                text,
+            items.push(match role {
+                "user" => TailEvent::User(text),
+                _ => TailEvent::Agent(text),
             });
         }
     }
