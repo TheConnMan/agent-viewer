@@ -12,14 +12,15 @@ use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
+    TriageState,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
     hide_request, hide_selected, kill_request, kill_selected, open_filter, open_rename,
-    open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
-    toggle_group_if_header,
+    open_rename_request, open_reply, open_triage, send_reply, skip_triage_item,
+    spawn_from_composer, submit_attach, submit_triage_answer, toggle_group_if_header,
 };
 use crate::{Refresher, Ui};
 
@@ -87,6 +88,7 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         }
         Mode::Rename(_) => handle_rename_key(key.code, ui),
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
+        Mode::Triage(_) => handle_triage_key(key.code, backends, ui, terminal)?,
     }
     Ok(false)
 }
@@ -275,6 +277,7 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
         Mode::Rename(modal) => modal.buffer.push_str(&single_line_paste(text)),
         Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
         Mode::Palette(palette) => palette.push_str(&single_line_paste(text)),
+        Mode::Triage(state) => state.push_str(&single_line_paste(text)),
         Mode::Help => {}
     }
 }
@@ -412,6 +415,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('n') => open_triage(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
@@ -1125,6 +1129,71 @@ fn handle_reply_key<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Triage-inbox key handling. Digits submit their quick option outright, Enter submits the
+/// typed answer (or the highlighted option), the arrows walk the queue and the option list, and
+/// Esc leaves the queue — exactly one level, back to the list.
+///
+/// Nothing here touches `ui.composer` or the list selection: walking the inbox is not walking
+/// the list, and the composer must hold whatever was in it when Ctrl+N was pressed.
+fn handle_triage_key<B: ratatui::backend::Backend>(
+    code: KeyCode,
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+) -> io::Result<()> {
+    if let Mode::Triage(state) = &ui.mode
+        && let Some(payload) = triage_payload(state, code)
+    {
+        return submit_triage_answer(backends, ui, terminal, payload);
+    }
+    // A digit that named no option, and Enter on an empty answer, are both non-submissions:
+    // fall through rather than sending a blank into a session that is waiting for a real one.
+    if matches!(code, KeyCode::Enter) {
+        return Ok(());
+    }
+    match code {
+        KeyCode::Esc => ui.mode = Mode::Normal,
+        KeyCode::Right | KeyCode::Tab => skip_triage_item(ui),
+        _ => edit_triage(code, ui),
+    }
+    Ok(())
+}
+
+/// PURE: the payload a triage keystroke submits, or None when the key is not a submission.
+///
+/// `1`..`9` pick their quick option; Enter takes the typed answer, or the highlighted option
+/// when nothing is typed. A digit and the typed label of the same option resolve to the very
+/// same string here, which is what makes the numbered shortcut a shortcut rather than a second
+/// delivery shape.
+fn triage_payload(state: &TriageState, code: KeyCode) -> Option<String> {
+    match code {
+        KeyCode::Char(c) => {
+            let digit = c.to_digit(10).filter(|digit| *digit > 0)?;
+            state.option_payload(digit as usize)
+        }
+        KeyCode::Enter => state.enter_payload(),
+        _ => None,
+    }
+}
+
+/// The pure triage edit/navigation state machine (everything that needs neither the backends
+/// nor the terminal).
+fn edit_triage(code: KeyCode, ui: &mut Ui) {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return;
+    };
+    match code {
+        KeyCode::Left | KeyCode::BackTab => {
+            state.back();
+        }
+        KeyCode::Down => state.move_highlight(1),
+        KeyCode::Up => state.move_highlight(-1),
+        KeyCode::Backspace => state.backspace(),
+        KeyCode::Char(c) => state.push_char(c),
+        _ => {}
+    }
+}
+
 /// The pure reply-compose state machine: Esc cancels, Backspace/Char edit the buffer.
 fn edit_reply(code: KeyCode, ui: &mut Ui) {
     let Mode::Reply(modal) = &mut ui.mode else {
@@ -1145,14 +1214,15 @@ pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
         handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
-        handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette, palette_items,
-        set_mouse_capture,
+        handle_paste, handle_rename_key, handle_triage_key, is_quit_chord, open_filter,
+        open_palette, palette_items, set_mouse_capture, triage_payload,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
+    use agent_viewer_tui::ui::TriageState;
     use agent_viewer_tui::ui::{AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1234,6 +1304,7 @@ pub(crate) mod tests {
             pr_status: agent_viewer_tui::pr_cache::PrStatusCache::new(),
             pending_spawn: None,
             pending_reply: None,
+            triage_context: agent_viewer_tui::mutations::BackgroundRunner::new(),
             pending_copy: None,
             attached: HashMap::new(),
             terminal_palette: None,
@@ -4088,6 +4159,243 @@ pub(crate) mod tests {
             persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
             Some("terminal")
         );
+    }
+
+    // --- Ctrl+N triage inbox --------------------------------------------------------
+
+    /// A blocked session whose `needs` question enumerates two quick options.
+    fn blocked_session(id: &str, updated_at_ms: i64, reason: &str) -> Session {
+        let mut session = sess(id, "/home/me/git/acme/widget", updated_at_ms);
+        session.status = agent_viewer_core::Status::NeedsInput {
+            reason: Some(reason.to_string()),
+        };
+        session
+    }
+
+    fn triage_question() -> &'static str {
+        "Pick a direction.\n1. artifact-first — ship now\n2) prove-the-thing: one case study"
+    }
+
+    fn press_triage_code(
+        ui: &mut Ui,
+        backends: &[Box<dyn agent_viewer_core::Backend>],
+        code: KeyCode,
+    ) {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("fixed terminal");
+        handle_triage_key(code, backends, ui, &mut terminal).expect("triage key routing");
+    }
+
+    fn triage_state(ui: &Ui) -> &TriageState {
+        match &ui.mode {
+            Mode::Triage(state) => state,
+            _ => panic!("expected the triage modal to be open"),
+        }
+    }
+
+    #[test]
+    fn ctrl_n_opens_triage_on_the_needs_input_queue_oldest_first() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("newest", 900, "q"),
+            sess("done", "/tmp", 100),
+            blocked_session("oldest", 100, "q"),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        let state = triage_state(&ui);
+        assert_eq!(state.progress(), (1, 2), "the Done row is not in the queue");
+        assert_eq!(state.current().expect("first item").id, "oldest");
+    }
+
+    #[test]
+    fn ctrl_n_on_an_empty_queue_notices_instead_of_opening_a_modal() {
+        let mut ui = test_ui_with(vec![sess("done", "/tmp", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.notice.text(), "nothing waiting for input");
+    }
+
+    #[test]
+    fn ctrl_n_does_not_collide_with_an_already_claimed_chord() {
+        // Every Ctrl chord the list already owns must still do exactly what it did; Ctrl+N is
+        // the only one that reaches triage.
+        let sessions = || {
+            vec![
+                blocked_session("blocked", 100, "q"),
+                sess("other", "/tmp", 200),
+            ]
+        };
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        let mut ui = test_ui_with(sessions());
+        let grouping = ui.app.group_mode();
+        press_normal_key(&mut ui, &backends, 's', KeyModifiers::CONTROL);
+        assert_ne!(ui.app.group_mode(), grouping, "Ctrl+S still regroups");
+        assert!(matches!(ui.mode, Mode::Normal));
+
+        let mut ui = test_ui_with(sessions());
+        press_normal_key(&mut ui, &backends, 'a', KeyModifiers::CONTROL);
+        assert!(ui.app.show_all(), "Ctrl+A still toggles show-all");
+        assert!(matches!(ui.mode, Mode::Normal));
+
+        let mut ui = test_ui_with(sessions());
+        press_normal_key(&mut ui, &backends, 'f', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Filter), "Ctrl+F still filters");
+
+        let mut ui = test_ui_with(sessions());
+        press_normal_key(&mut ui, &backends, 'k', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Palette(_)), "Ctrl+K still palettes");
+
+        let mut ui = test_ui_with(sessions());
+        press_normal_key(&mut ui, &backends, 'r', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Rename(_)), "Ctrl+R still renames");
+
+        let mut ui = test_ui_with(sessions());
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Triage(_)), "Ctrl+N opens triage");
+    }
+
+    #[test]
+    fn a_digit_and_the_typed_label_resolve_to_one_payload_on_the_key_path() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100, triage_question())]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        let by_digit =
+            triage_payload(triage_state(&ui), KeyCode::Char('2')).expect("the second quick option");
+        assert_eq!(by_digit, "prove-the-thing");
+
+        for character in by_digit.chars() {
+            press_triage_code(&mut ui, &backends, KeyCode::Char(character));
+        }
+        let by_text = triage_payload(triage_state(&ui), KeyCode::Enter).expect("the typed answer");
+
+        assert_eq!(
+            by_digit, by_text,
+            "the numbered shortcut must submit exactly what typing the label submits"
+        );
+    }
+
+    #[test]
+    fn a_digit_that_names_no_option_types_instead_of_submitting() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100, "just prose")]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage_code(&mut ui, &backends, KeyCode::Char('2'));
+
+        assert_eq!(triage_state(&ui).buffer(), "2");
+        assert_eq!(triage_state(&ui).answered(), 0);
+    }
+
+    #[test]
+    fn enter_on_an_empty_answer_with_no_options_does_not_submit() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("a", 100, "just prose"),
+            blocked_session("b", 200, "also prose"),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage_code(&mut ui, &backends, KeyCode::Enter);
+
+        let state = triage_state(&ui);
+        assert_eq!(state.progress(), (1, 2), "still on the first item");
+        assert_eq!(state.answered(), 0);
+    }
+
+    #[test]
+    fn submitting_counts_the_answer_and_advances_the_queue() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("a", 100, triage_question()),
+            blocked_session("b", 200, triage_question()),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage_code(&mut ui, &backends, KeyCode::Char('1'));
+
+        let state = triage_state(&ui);
+        assert_eq!(state.progress(), (2, 2));
+        assert_eq!(state.current().expect("second item").id, "b");
+        assert_eq!(state.answered(), 1);
+    }
+
+    #[test]
+    fn answering_the_last_item_closes_the_modal_without_wrapping() {
+        let mut ui = test_ui_with(vec![blocked_session("only", 100, triage_question())]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage_code(&mut ui, &backends, KeyCode::Char('1'));
+
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "running off the end returns to the list"
+        );
+        // The reply path's own verdict on the answer outranks the queue tally: burying
+        // "reply is not supported" under "triage: 1 answered" would tell the user their
+        // answer was delivered.
+        assert_eq!(ui.notice.text(), "reply is not supported");
+    }
+
+    #[test]
+    fn skipping_past_the_last_item_closes_the_modal() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("a", 100, "q"),
+            blocked_session("b", 200, "q"),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage_code(&mut ui, &backends, KeyCode::Right);
+        assert_eq!(triage_state(&ui).progress(), (2, 2));
+        press_triage_code(&mut ui, &backends, KeyCode::Right);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.notice.text(), "triage: 0 answered");
+    }
+
+    #[test]
+    fn escape_backs_out_one_level_and_leaves_the_composer_and_selection_alone() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("blocked", 100, triage_question()),
+            sess("other", "/tmp", 200),
+            sess("third", "/tmp", 300),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        for character in "half a task".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
+        let composer_before = ui.composer.text().to_string();
+        let selection_before = ui.app.selected_index();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        // Type into the answer box and walk the option list: none of it may reach the list.
+        for character in "an answer".chars() {
+            press_triage_code(&mut ui, &backends, KeyCode::Char(character));
+        }
+        press_triage_code(&mut ui, &backends, KeyCode::Down);
+        press_triage_code(&mut ui, &backends, KeyCode::Esc);
+
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "Esc lands on the list, exactly one level out"
+        );
+        assert_eq!(ui.composer.text(), composer_before);
+        assert_eq!(ui.app.selected_index(), selection_before);
     }
 
     #[test]

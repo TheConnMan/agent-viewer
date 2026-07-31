@@ -191,6 +191,8 @@ its SQLite title still shows the prompt.
 - `Space` — collapse or expand a group when a group header is selected; does nothing on a session row.
 - `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
   pressing it always reports a footer notice that reply is not supported.
+- `Ctrl+N` — open the triage inbox on every session waiting for input, longest wait first
+  (see below). Nothing waiting is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
   Claude row, which has no job dir) is a no-op with a footer notice.
@@ -264,9 +266,34 @@ the session's own process and cannot be joined by anything, including the ChatGP
 Sessions you start in a terminal, and sessions the viewer spawns, are hosted by the shared
 daemon and are joined live.
 
+## Triage inbox
+
+`Ctrl+N` opens a modal over the list that walks every session waiting for input, one at a
+time, longest wait first, with a `3 of 7` progress counter. Each item shows the last few
+turns, the question, the quick options the agent itself enumerated in that question, and a
+free-text answer box, with the next few items listed underneath.
+
+`1`..`9` pick a quick option and submit it, `Enter` submits the typed answer (or the
+highlighted option when nothing is typed), `→` skips, `←` goes back, and `Esc` leaves the
+queue. Running off the end closes the modal and reports how many were answered. The queue is
+snapshotted when the modal opens, so a background refresh cannot reorder it mid-answer, and
+nothing in the modal touches the composer or the list selection.
+
+The queue is read-only over the session list: triage never attaches, spawns, joins, or
+mutates a session. Options are only ever the ones the agent wrote — a numbered pick submits
+that option's label verbatim, exactly as typing the label would, and none are synthesized.
+
+Only Codex sessions have a transcript reader, so only they show real turns; every other
+backend shows its row summary as the single context line. Transcripts are read on a
+background worker, one item at a time, never for the whole queue.
+
+Answers are handed to the reply path below, which means that today they are not delivered.
+
 Reply is deliberately out of scope for this rebuild. `Ctrl+E` is reserved in the key list but
 always reports a footer notice that reply is not supported. Revisiting it is a future,
-separately specified decision.
+separately specified decision. Triage submits through that same path rather than growing a
+second one, so an answer currently reports the same notice; restoring reply delivery lights
+triage up with no further change.
 
 This viewer binds `Space` to group collapse and expand, not to reply, which is a deliberate
 divergence from Fleet View, which binds `space` to reply — noted here so it is not mistaken

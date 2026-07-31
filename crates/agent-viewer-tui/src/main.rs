@@ -76,6 +76,8 @@ type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
 type Snapshot = (Vec<Session>, String, usize);
 type ActivityResult = (BackendKind, String, Option<String>);
+/// Off-thread triage transcript reads: the session the lines belong to, and the lines.
+type ContextRunner = agent_viewer_tui::mutations::BackgroundRunner<(Key, Vec<String>)>;
 
 struct ActivityRequest {
     sessions: Vec<Session>,
@@ -434,6 +436,9 @@ struct Ui {
     /// focused PTY and writes the reply payload once it is safe (in the run, settled).
     /// Cleared on write, timeout, user takeover, or PTY prune.
     pending_reply: Option<PendingReply>,
+    /// Off-thread transcript reads for the triage modal's context panel. A rollout JSONL is
+    /// unbounded, so it is never read on the key or render path.
+    triage_context: ContextRunner,
     /// The exact attached viewport armed by Ctrl+Y and drained once by the outer terminal writer.
     pending_copy: Option<String>,
     /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
@@ -677,6 +682,7 @@ fn main() -> io::Result<()> {
         pr_status: PrStatusCache::new(),
         pending_spawn: None,
         pending_reply: None,
+        triage_context: ContextRunner::new(),
         pending_copy: None,
         attached: HashMap::new(),
         terminal_palette,
@@ -789,6 +795,10 @@ fn run(
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
         actions::install_models(ui);
+
+        // Keep the triage modal's context panel fed, one item at a time, off-thread.
+        actions::install_triage_context(ui);
+        actions::ensure_triage_context(ui);
 
         // Fold in the freshest off-thread listing (a no-op until the worker sends one).
         apply_snapshot(refresher, ui);
@@ -1479,6 +1489,7 @@ mod tests {
             pr_status: PrStatusCache::new(),
             pending_spawn: None,
             pending_reply: None,
+            triage_context: ContextRunner::new(),
             pending_copy: None,
             attached: HashMap::new(),
             focused: None,
