@@ -1,5 +1,28 @@
 use super::source::Source;
 use crate::error::{Error, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+/// The (mtime, len) freshness key every cache in this crate is keyed by.
+pub(crate) type FileKey = (SystemTime, u64);
+
+/// The `session_index.jsonl` overlay, shared so a cache hit copies a pointer, not the map.
+type NameOverlay = Arc<HashMap<String, String>>;
+
+/// `path`'s (mtime, len). A missing or unreadable file keys as (UNIX_EPOCH, 0), so one that
+/// appears later still invalidates.
+pub(crate) fn file_key(path: &std::path::Path) -> FileKey {
+    std::fs::metadata(path)
+        .map(|meta| {
+            (
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.len(),
+            )
+        })
+        .unwrap_or((SystemTime::UNIX_EPOCH, 0))
+}
 
 /// Glob <codex_home>/state_*.sqlite, parse the numeric suffix, return the highest N.
 /// Numeric compare, not lexicographic (state_10 beats state_5). Err(NoStateDb) if none.
@@ -43,6 +66,10 @@ pub struct Thread {
 pub struct Registry {
     conn: rusqlite::Connection,
     session_index_path: std::path::PathBuf,
+    /// The parsed `session_index.jsonl` name overlay, keyed by its (mtime, len) exactly like
+    /// the tail and job-state caches. Without it the whole file is re-read and re-parsed on
+    /// every listing tick even though it changes only when a thread is renamed.
+    names: RefCell<Option<(FileKey, NameOverlay)>>,
 }
 
 impl Registry {
@@ -55,7 +82,23 @@ impl Registry {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(""))
                 .join("session_index.jsonl"),
+            names: RefCell::new(None),
         })
+    }
+
+    /// The `session_index.jsonl` name overlay, re-read only when the file's (mtime, len)
+    /// changes. Shared behind an `Arc` so a cache hit copies a pointer, not the map.
+    fn thread_names(&self) -> NameOverlay {
+        let key = file_key(&self.session_index_path);
+        let mut cached = self.names.borrow_mut();
+        if let Some((cached_key, names)) = cached.as_ref()
+            && *cached_key == key
+        {
+            return Arc::clone(names);
+        }
+        let names = Arc::new(read_thread_names(&self.session_index_path));
+        *cached = Some((key, Arc::clone(&names)));
+        names
     }
 
     /// All rows including archived, ordered by effective updated_at_ms ascending and id
@@ -71,13 +114,21 @@ impl Registry {
         let mut threads = stmt
             .query_map([], |row| {
                 let raw_source = row.get::<_, String>(4)?;
+                let source = Source::parse(&raw_source);
+                // Only a subagent row can carry a spawn parent: every other `source` is one of
+                // the flat `cli`/`exec`/`vscode` strings, which `Source::parse` matches before
+                // it ever reaches JSON. Gating here keeps the JSON parse to once per row
+                // instead of once in each of these two fields.
+                let parent_thread_id = matches!(source, Source::Subagent(_))
+                    .then(|| spawn_parent_thread_id(&raw_source))
+                    .flatten();
                 Ok(Thread {
                     id: row.get(0)?,
                     rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
                     created_at_ms: row.get(2)?,
                     updated_at_ms: row.get(3)?,
-                    source: Source::parse(&raw_source),
-                    parent_thread_id: spawn_parent_thread_id(&raw_source),
+                    source,
+                    parent_thread_id,
                     cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
                     git_branch: row.get(6)?,
                     title: row.get(7)?,
@@ -91,7 +142,7 @@ impl Registry {
                 .cmp(&b.updated_at_ms)
                 .then_with(|| b.id.cmp(&a.id))
         });
-        let names = read_thread_names(&self.session_index_path);
+        let names = self.thread_names();
         for thread in &mut threads {
             if let Some(name) = names.get(&thread.id) {
                 thread.title.clone_from(name);
@@ -126,11 +177,11 @@ fn spawn_parent_thread_id(raw_source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn read_thread_names(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn read_thread_names(path: &std::path::Path) -> HashMap<String, String> {
     let Ok(contents) = std::fs::read_to_string(path) else {
-        return std::collections::HashMap::new();
+        return HashMap::new();
     };
-    let mut names = std::collections::HashMap::new();
+    let mut names = HashMap::new();
     for line in contents.lines() {
         let Some(value) = crate::parse_json_line(line) else {
             continue;
