@@ -10,6 +10,8 @@ use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal};
+use crossterm::event::{MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::keys::set_mouse_capture;
 use crate::ops::{AttachPlan, Mutation};
@@ -31,6 +33,109 @@ pub(crate) fn activate_selected(ui: &mut Ui) {
     if !toggle_group_if_header(ui) {
         attach_selected(ui);
     }
+}
+
+/// Ctrl+W — toggle the video wall. The wall is a flag on the list view, not a mode, so key
+/// routing never leaves `Mode::Normal` and every already-bound chord keeps its meaning.
+pub(crate) fn toggle_wall(ui: &mut Ui) {
+    if ui.wall.on {
+        // Closing the wall closes every connection it opened: nothing stays connected to a
+        // session that is not on screen.
+        ui.wall.on = false;
+        crate::close_wall(ui);
+        ui.set_notice("video wall off".to_string());
+        return;
+    }
+    ui.wall.on = true;
+    ui.wall.clear();
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    match keys.first() {
+        Some(key) => {
+            ui.wall.set_focus(&keys, 0);
+            ui.app.select_by_key(key);
+            let plural = if keys.len() == 1 { "" } else { "s" };
+            ui.set_notice(format!(
+                "video wall: connecting {} session{plural} · type into the focused tile · Ctrl+W to exit",
+                keys.len()
+            ));
+        }
+        None => ui.set_notice("video wall: nothing is running right now".to_string()),
+    }
+}
+
+/// Focus one tile outright, by index. The mouse path: hover or click puts the keyboard on
+/// whatever is under the pointer, so typing lands where you are looking.
+pub(crate) fn focus_wall_tile(ui: &mut Ui, index: usize) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    let Some(key) = keys.get(index).cloned() else {
+        return;
+    };
+    ui.wall.set_focus(&keys, index);
+    ui.app.select_by_key(&key);
+}
+
+/// Rows one wheel tick moves a tile's viewport, matching the attached view's feel.
+const WALL_WHEEL_ROWS: usize = 3;
+
+/// Scroll one tile, by whichever mechanism its child actually honours.
+///
+/// Measured on this box: `claude attach` runs in the alternate screen and requests SGR mouse
+/// tracking, so it owns its own scrollback and the only way to scroll it is to hand it a
+/// wheel report — a local viewport scroll finds an empty normal grid and does nothing. Codex
+/// is the mirror image: it discards native wheel reports, which is why the attach view scrolls
+/// it locally. So the wheel is forwarded when the child is tracking the mouse, and falls back
+/// to moving the viewer's own viewport when it is not.
+///
+/// The report has to be translated into the child's coordinate space first; it thinks it is
+/// alone on a terminal the size of the tile's content area, not offset into a grid.
+pub(crate) fn scroll_wall_tile(ui: &mut Ui, index: usize, event: MouseEvent, content: Rect) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    let Some(key) = keys.get(index).cloned() else {
+        return;
+    };
+    let Some(pty) = ui.attached.get_mut(&key) else {
+        return;
+    };
+    let (mode, encoding) = pty.with_screen(|screen| {
+        (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
+    });
+    let local = MouseEvent {
+        column: event.column.saturating_sub(content.x),
+        row: event.row.saturating_sub(content.y),
+        ..event
+    };
+    if let Some(bytes) = agent_viewer_tui::mouse::encode_mouse_report(local, mode, encoding, 0) {
+        let _ = pty.write_input(&bytes);
+        return;
+    }
+    // The child is not tracking the mouse, so scroll our own viewport over its retained rows.
+    if matches!(event.kind, MouseEventKind::ScrollDown) {
+        pty.scroll_viewport_down(WALL_WHEEL_ROWS);
+    } else {
+        pty.scroll_viewport_up(WALL_WHEEL_ROWS);
+    }
+}
+
+/// Shift+arrow movement inside the wall grid. Clamps at the edges like the list does, and pins
+/// the list selection onto the tile so Ctrl+O zooms the tile that has the keyboard.
+pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    let count = keys.len();
+    if count == 0 {
+        return;
+    }
+    let (cols, rows) = agent_viewer_tui::ui::wall::grid_dims(count);
+    let (cols, rows) = (i32::from(cols), i32::from(rows));
+    let current = ui.wall.focus_index(&keys) as i32;
+    let column = (current % cols + dx).clamp(0, cols - 1);
+    let row = (current / cols + dy).clamp(0, rows - 1);
+    // A short last row clamps back onto its final tile rather than landing on a hole.
+    let selected = ((row * cols + column) as usize).min(count - 1);
+    ui.wall.set_focus(&keys, selected);
+    ui.app.select_by_key(&keys[selected]);
 }
 
 /// Ctrl+F — enter filter mode with a fresh, empty query.
@@ -300,10 +405,11 @@ pub(crate) fn attach_selected(ui: &mut Ui) -> bool {
 pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
     let id = request.id().to_string();
     let executor = ui.attach_executor.clone();
-    if !ui
-        .attaches
-        .submit("attach".to_string(), move || executor(request))
-    {
+    // Single-slot key on purpose: mashing → must not queue a pile of attaches that each take
+    // over the screen in turn. The wall's joins use per-session keys so they can run at once.
+    if !ui.attaches.submit("attach".to_string(), move || {
+        executor(request).map(crate::AttachOutcome::Focus)
+    }) {
         return false;
     }
     ui.set_notice(format!("attaching… {id}"));
@@ -331,8 +437,9 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
         .or(ui.terminal_palette);
 
     if let Some(pty) = ui.attached.get_mut(&key) {
-        // Re-attach: reuse the live PTY, resizing it to the current content area. The
-        // per-PTY detach tracker is preserved so a half-typed input line still gates Left.
+        // The wall already holds a connection to this session and the user is zooming into
+        // that tile: reuse the live PTY, resized to the full content area. This is the only
+        // way a PTY exists here, since leaving a session otherwise closes it.
         pty.set_palette(palette);
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();

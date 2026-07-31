@@ -125,6 +125,8 @@ fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expect
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1524,6 +1526,8 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1637,6 +1641,8 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })

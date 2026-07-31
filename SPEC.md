@@ -412,11 +412,31 @@ of threads: no second sweep, and no per-row daemon query on the render path. Det
 shape-based (a 36-char UUID token), and a false positive costs one tick of Idle instead of Done.
 
 The precise meaning of "attached" is therefore "a `codex resume` process for this thread still
-exists", which is NOT the same as "the user is looking at it". `Ctrl+]` detaches the view but
-the viewer deliberately keeps the PTY child alive so re-attaching is instant, so the row stays
-Idle until that child actually goes away (quitting the viewer, `Ctrl+X` twice, or the child
-exiting on its own). Documented rather than fixed: the alternative is asking the daemon per row
-on the render path.
+exists", which is NOT the same as "the user is looking at it". These now line up much more
+closely than they used to: the viewer closes a session's PTY when it leaves the screen, so the
+child goes away with the view rather than lingering. The gap that remains is only the teardown
+window, plus a child that outlives its kill.
+
+This replaced a deliberate retain-on-detach: the PTY used to be kept alive so re-attaching was
+instant, which left rows reading Idle long after the user had stopped looking at them. The cost
+of closing is a one-to-three second reconnect when a session is opened again; the benefit is
+that "connected" means "on screen", which is both what the status resolver assumes and what the
+user expects. The video wall depends on this too: it opens a connection per tile, and a wall
+that leaked those on close would strand up to nine agent processes per visit.
+
+One consequence worth naming, since the wall now tiles sessions for fifteen minutes after they
+stop: connecting to a Complete Codex thread makes `attached` true for it, which is exactly the
+condition that reads Done as Idle. A tiled Done row therefore shows Idle while the wall holds
+it, which is not a lie — the resume process really does exist — and it cannot pin the row open
+forever, because the recency window is measured against `updated_at_ms`, which the connection
+does not touch. At minute fifteen the tile drops and the connection closes with it.
+
+That last clause is load-bearing and was not free: a tile leaving the wall has to be pruned
+explicitly (`prune_wall_tiles`, run each frame before the join pass). Without it the expired
+session's key stays in `wall.requested` and its child stays in `attached` until the whole wall
+closes — invisible, and steadily pushing the live-process count past `MAX_TILES` as expired
+slots are refilled. Dropping the key from `requested` also invalidates any join still in
+flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawns.
 
 **Known gap, narrowed but not closed: stale-daemon attach targeting.** `attach_route` points a
 daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
