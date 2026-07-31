@@ -2002,7 +2002,7 @@ pub(crate) mod tests {
     /// through `submit_attach`, so a `Wall` outcome here would mean the runner crossed wires.
     fn focus_plan(outcome: crate::AttachOutcome) -> crate::ops::AttachPlan {
         match outcome {
-            crate::AttachOutcome::Focus { plan, .. } => plan,
+            crate::AttachOutcome::Focus { plan, .. } => plan.expect("resolved attach plan"),
             crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
         }
     }
@@ -2021,6 +2021,7 @@ pub(crate) mod tests {
             updated_at_ms,
             hidden: false,
             companion: false,
+            subagent: false,
             summary: String::new(),
             pid: None,
             rollout_path: None,

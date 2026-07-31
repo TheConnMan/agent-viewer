@@ -634,6 +634,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             // The agents output does not publish `entrypoint`; `list()` applies the companion
             // rule afterwards via `mark_sdk_companions`.
             companion: false,
+            subagent: false,
             summary: String::new(),
             pid,
             rollout_path: None,
@@ -1226,6 +1227,7 @@ mod tests {
             updated_at_ms: 0,
             hidden: false,
             companion: false,
+            subagent: false,
             summary: String::new(),
             pid: None,
             rollout_path: None,

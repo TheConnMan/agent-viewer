@@ -30,6 +30,7 @@ fn session_with_cwd(cwd: PathBuf) -> Session {
         updated_at_ms: 0,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path: None,
@@ -128,6 +129,10 @@ fn thread_row(id: &str, source: &str, updated_ms: i64) -> String {
 /// `source == exec` is the ONLY source that becomes SessionOrigin::Exec; every other
 /// source (cli, vscode, a subagent JSON blob) is Interactive. Asserting both branches from
 /// one listing kills a mapping that collapsed every row onto a single origin.
+///
+/// The same listing is where `subagent` is recorded, and it is the field stop routing reads,
+/// so the mapping is pinned here too: ONLY the subagent JSON blob sets it. `exec` does not -
+/// an exec parent is a primary session of its own process.
 #[test]
 fn codex_origin_is_exec_only_for_exec_source() {
     let schema = common::read_fixture("threads_schema.sql");
@@ -162,6 +167,18 @@ fn codex_origin_is_exec_only_for_exec_source() {
     assert_eq!(origin("t_cli"), SessionOrigin::Interactive);
     assert_eq!(origin("t_vscode"), SessionOrigin::Interactive);
     assert_eq!(origin("t_sub"), SessionOrigin::Interactive);
+
+    let subagent = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("no session {id}"))
+            .subagent
+    };
+    assert!(subagent("t_sub"), "the subagent blob is the only subagent");
+    assert!(!subagent("t_exec"), "an exec parent owns its own process");
+    assert!(!subagent("t_cli"));
+    assert!(!subagent("t_vscode"));
 }
 
 // --- per-row stop capability ---
@@ -422,6 +439,7 @@ fn stop_route_never_signals_a_daemon_held_pid() {
 #[test]
 fn stop_route_never_signals_a_pid_shared_with_a_subagents_parent() {
     let mut subagent = routed_session(Status::Working, Some(4242), false);
+    subagent.subagent = true;
     subagent.companion = true;
     subagent.origin = SessionOrigin::Interactive;
     assert_eq!(
@@ -438,8 +456,36 @@ fn stop_route_never_signals_a_pid_shared_with_a_subagents_parent() {
 
     // A daemon-hosted subagent is still interruptible: turn/interrupt names one thread.
     let mut hosted = routed_session(Status::Working, None, true);
+    hosted.subagent = true;
     hosted.companion = true;
     assert_eq!(stop_route(&hosted), StopRoute::Interrupt);
+}
+
+/// THE REGRESSION. Stop routing used to infer subagent-ness from `companion && origin != Exec`,
+/// but `companion` is presentational and `mark_dead_dirs` sets it on EVERY session whose cwd no
+/// longer exists - a routine outcome here, where worktrees are created and removed constantly.
+/// A plain cli/vscode session in a deleted directory was therefore misread as a subagent and
+/// lost its stop entirely, on Ctrl+X and in the palette. Subagent-ness is now the parsed
+/// `source` identity the registry fold recorded, which a deleted directory cannot touch.
+#[test]
+fn stop_route_still_signals_a_primary_row_whose_cwd_was_deleted() {
+    let mut dead_cwd = routed_session(Status::Working, Some(4242), false);
+    // Exactly what mark_dead_dirs does to a live cli/vscode row in a removed worktree.
+    dead_cwd.cwd = PathBuf::from("/tmp/agent-viewer-removed-worktree");
+    dead_cwd.companion = true;
+    dead_cwd.origin = SessionOrigin::Interactive;
+    assert!(!dead_cwd.subagent, "a cli row is not a subagent");
+    assert_eq!(
+        stop_route(&dead_cwd),
+        StopRoute::Signal(4242),
+        "a deleted working directory must not strip a primary session of its stop"
+    );
+
+    let backend = CodexBackend::new(PathBuf::from("/tmp/does-not-matter"));
+    assert!(
+        backend.capabilities_for(&dead_cwd).stop,
+        "the capability must agree with the route"
+    );
 }
 
 /// The capability must agree with the route, or Ctrl+X is advertised and then fails.
@@ -447,6 +493,7 @@ fn stop_route_never_signals_a_pid_shared_with_a_subagents_parent() {
 fn codex_does_not_advertise_stop_on_a_subagent_row() {
     let backend = CodexBackend::new(PathBuf::from("/tmp/does-not-matter"));
     let mut subagent = routed_session(Status::Working, Some(4242), false);
+    subagent.subagent = true;
     subagent.companion = true;
     assert!(
         !backend.capabilities_for(&subagent).stop,

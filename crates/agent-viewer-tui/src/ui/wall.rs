@@ -591,6 +591,7 @@ mod tests {
             updated_at_ms: 1_000,
             hidden: false,
             companion: false,
+            subagent: false,
             summary: String::new(),
             pid: None,
             rollout_path: None,

@@ -20,6 +20,7 @@ fn sess(cwd: PathBuf, companion: bool) -> Session {
         updated_at_ms: 0,
         hidden: false,
         companion,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path: None,

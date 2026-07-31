@@ -224,6 +224,15 @@ pub struct Session {
     /// view. The overlay clears this for viewer-spawned (pinned) sessions so they always
     /// show, even if their backend would otherwise mark them a companion.
     pub companion: bool,
+    /// True when the backend's own source record says this row is a SUBAGENT thread - a
+    /// child a parent process spawned - rather than a process's own primary session.
+    ///
+    /// Kept separate from `companion` on purpose. `companion` is PRESENTATIONAL and anything
+    /// may set it: `mark_dead_dirs` flags every session whose cwd has been deleted, so a
+    /// perfectly ordinary CLI session in a removed worktree becomes a companion. Routing
+    /// decisions (whose process is that pid?) must read this field instead, or a deleted
+    /// directory silently strips a real session of its stop action.
+    pub subagent: bool,
     /// One-line dim summary for the row. codex: threads.preview; claude: state.json needs
     /// (blocked) else detail.
     pub summary: String,

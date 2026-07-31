@@ -158,11 +158,13 @@ pub fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
 
 /// PURE: is this row a SUBAGENT thread rather than a process's own primary session?
 ///
-/// `list` folds the registry's serialized `source` enum into two Session fields: `origin` is
-/// `Exec` for `source = exec` alone, and `companion` covers `exec` plus every subagent shape.
-/// A companion that is not an exec row is therefore exactly a subagent thread.
+/// Reads the identity `list` recorded when it parsed the registry's serialized `source` enum,
+/// never `companion`. This USED to be `companion && origin != Exec`, which was wrong the
+/// moment anything else set `companion`: `mark_dead_dirs` flags every session whose cwd has
+/// been deleted, so an ordinary cli/vscode session in a removed worktree was reclassified as a
+/// subagent and silently lost its stop action.
 fn is_subagent_row(session: &Session) -> bool {
-    session.companion && session.origin != SessionOrigin::Exec
+    session.subagent
 }
 
 /// PURE stop routing. `daemon_hosted` outranks any pid on the row: the daemon holds the
@@ -502,6 +504,10 @@ impl Backend for CodexBackend {
                 self.resolver
                     .resolve_scanned(&thread.rollout_path, &scan, attached);
             let companion = thread.source.is_companion();
+            // The parsed `source` enum is the ONLY authority on subagent-ness. `companion` is
+            // a presentation flag other passes (mark_dead_dirs) also set, so stop routing
+            // reads this instead.
+            let subagent = matches!(thread.source, source::Source::Subagent(_));
             let origin = if matches!(thread.source, source::Source::Exec) {
                 SessionOrigin::Exec
             } else {
@@ -520,6 +526,7 @@ impl Backend for CodexBackend {
                 updated_at_ms: thread.updated_at_ms,
                 hidden: thread.archived,
                 companion,
+                subagent,
                 summary: thread.preview,
                 pid,
                 rollout_path: Some(thread.rollout_path),

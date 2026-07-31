@@ -235,9 +235,13 @@ row takes a different rule set entirely, because its fd carries no liveness info
 of these.
 
 **Stop is gated on the same scan, and subagent rows are withheld.** `stop_route` is a pure
-function: a daemon-hosted row routes to `turn/interrupt`, a subagent row (a companion whose
-origin is not `Exec`) returns `Unsupported`, and everything else signals its pid or, with no
-pid, is `Unsupported` too. The subagent case is the same hazard as the daemon one, one level
+function: a daemon-hosted row routes to `turn/interrupt`, a subagent row returns `Unsupported`,
+and everything else signals its pid or, with no pid, is `Unsupported` too. Subagent-ness is the
+`subagent` field the listing records from the parsed `source` enum, never `companion`. It was
+`companion && origin != Exec` and that was wrong: `companion` is presentational and
+`mark_dead_dirs` sets it on every session whose cwd has been deleted, so an ordinary cli or
+vscode session in a removed worktree was reclassified as a subagent and lost its stop action.
+The subagent case is the same hazard as the daemon one, one level
 down: a `codex exec` parent holds the rollout fd of every subagent thread it spawned (measured
 live 2026-07-27, pid 2910115 held two), so the fd scan stamps the PARENT's pid onto the
 subagent rows. Signalling from there SIGTERMs the parent's whole process group to stop one
