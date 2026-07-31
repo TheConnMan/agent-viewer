@@ -1,6 +1,7 @@
 # agent-viewer — build spec
 
-Terminal viewer for OpenAI Codex sessions, in the spirit of Claude Code's `claude agents`.
+Terminal viewer for OpenAI Codex and Claude Code sessions, in the spirit of Claude Code's
+`claude agents`.
 This spec is the contract. Every fact below was verified on this box (Codex 0.144.1,
 Rust 1.95.0) during research; where a fact needs live re-verification during the build it
 is called out explicitly. Stop after the naive correct solution — do not add abstractions,
