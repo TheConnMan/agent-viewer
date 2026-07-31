@@ -478,7 +478,8 @@ fn submit_kill_mutation(
 }
 
 /// Route a blocking mutation to the runner with a backend+id+op dedup key and an
-/// immediate "<verb>… <title>" notice (a duplicate keypress while pending is a no-op).
+/// immediate "<verb>… <title>" notice. A duplicate keypress while the first is still pending
+/// says so rather than looking like a dead key.
 fn submit_mutation(
     ui: &mut Ui,
     request: TargetRequest,
@@ -492,6 +493,8 @@ fn submit_mutation(
     let executor = ui.mutation_executor.clone();
     if ui.mutations.submit(key, move || executor(mutation)) {
         ui.set_notice(format!("{verb}… {title}"));
+    } else {
+        ui.set_notice(format!("still {verb} {title}"));
     }
 }
 
@@ -688,7 +691,7 @@ fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget)
 
 #[cfg(test)]
 mod tests {
-    use super::{install_attach_plan, kill_request, spawn_from_composer};
+    use super::{hide_request, install_attach_plan, kill_request, spawn_from_composer};
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{sess, test_ui_with};
@@ -1056,6 +1059,52 @@ mod tests {
         );
         drop(ui);
         assert_eq!(stop_started_rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    /// A second press while the first archive is still out is deduplicated, and the footer has
+    /// to say so: a silent no-op reads as a dead key, and it is also the only symptom a row
+    /// whose worker died would ever show.
+    #[test]
+    fn a_repeated_archive_while_one_is_pending_reports_that_it_is_still_working() {
+        let session = sess("dedup_hide", "/tmp/agentviewer_dedup_hide", 100);
+        let request = TargetRequest::from(&session);
+        let mut ui = test_ui_with(vec![session]);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        ui.mutation_executor = Arc::new(move |mutation| {
+            let Mutation::Hide(_) = mutation else {
+                panic!("archive must only ever hide");
+            };
+            started_tx.send(()).expect("report archive start");
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("release archive");
+            Ok(MutationOutcome {
+                notice: "archived".to_string(),
+                spawned: None,
+            })
+        });
+
+        hide_request(&mut ui, request.clone(), "dedup hide".to_string(), true);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("archive started");
+        assert_eq!(ui.notice.text, "archiving… dedup hide");
+
+        hide_request(&mut ui, request, "dedup hide".to_string(), true);
+
+        assert_eq!(ui.notice.text, "still archiving dedup hide");
+        release_tx.send(()).expect("finish archive");
+        assert_eq!(
+            poll_mutation(&mut ui),
+            Ok(MutationOutcome {
+                notice: "archived".to_string(),
+                spawned: None,
+            })
+        );
     }
 
     #[test]

@@ -215,8 +215,15 @@ pub(crate) fn drive_pending_reply(ui: &mut Ui) {
             }
         }
         ReplyStep::Write => {
-            if let Some(pty) = ui.attached.get_mut(&state.key) {
-                let _ = pty.write_input(&state.payload);
+            // A failed write is the one outcome that must not be silent: every other arm ends
+            // in a notice, and swallowing this one leaves the user believing an answer was
+            // delivered that the session never received.
+            if let Some(pty) = ui.attached.get_mut(&state.key)
+                && let Err(error) = pty.write_input(&state.payload)
+            {
+                ui.set_notice(format!(
+                    "reply not delivered ({error}); type it in the session"
+                ));
             }
             ui.pending_reply = None;
         }
