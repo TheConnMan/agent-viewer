@@ -8,8 +8,11 @@ viewer.
 
 The header identifies the viewer as `[av] Agent Viewer` with its version, the full
 launch workspace, and live totals for sessions awaiting input, working, and completed
-(including errors). The terminal tab title is `Agent Viewer · <launch directory name>`;
-when the launch directory cannot be determined, it falls back safely to `Agent Viewer`.
+(including errors). On a comfortably sized terminal it also names the active theme and
+draws an animated sprite beside all of that; both drop out on a narrow or short terminal
+rather than crowding the totals. The terminal tab title is
+`Agent Viewer · <launch directory name>`; when the launch directory cannot be determined,
+it falls back safely to `Agent Viewer`.
 
 ## Backends
 
@@ -48,9 +51,12 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✗` error — exited with an error.
 - `?` unknown — the backend cannot say; never shown as a false idle.
 
-Each row is prefixed by its backend's mark in the backend's color — by default the textual
-tag `[cc]` Claude (terracotta), `[cx]` Codex (teal) — followed by
-the title. Titles share a visible column sized to the widest title, capped at 40 terminal
+Each row is prefixed by its backend's mark, followed by
+the title. On a terminal that answers the graphics probe the mark is the backend's own inline
+brand logo; the viewer always attempts this at startup, so it is what you get on kitty, iTerm2,
+Sixel, and half-block terminals alike. When the probe fails (a terminal with no graphics
+support, or no tty at all) the mark falls back to the textual tag in the backend's color,
+`[cc]` Claude (terracotta) and `[cx]` Codex (teal). Titles share a visible column sized to the widest title, capped at 40 terminal
 columns. The state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`,
 `Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
 summary and any pull request badge. Elapsed time alone sits flush right. Sessions with
@@ -68,9 +74,13 @@ from its own recursive subagent subtree, so a parent remains visibly active whil
 work. A child row shows only its own subtree.
 
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
-`✳` Claude, `◆` Codex (only if your terminal font renders them).
+`✳` Claude, `◆` Codex (only if your terminal font renders them). This applies to the fallback
+only; when the logo probe succeeds the inline images win over both text modes.
 
-The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by creation time. After sanitization, the exact whole title `hold` is matched without regard to ASCII letter case as a TUI presentation convention. Thus `hold`, `Hold`, and `HOLD` session rows are omitted in either grouping, while whitespace and substring variants remain visible. Project headers count rendered non hold sessions, so a project with only matching sessions remains with count zero. State section counts include only rendered rows. `Ctrl+K` quickswitcher session entries use the same visible row model, so matching sessions are omitted while ordinary sessions and independent quickswitcher actions remain. This does not change backend data or mutation behavior.
+The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by creation time. A session whose whole title is
+exactly `hold` (in any letter case) is not drawn as a row, is not counted in its group's
+header, and does not appear in the `Ctrl+K` palette; it is a presentation filter only, and
+touches no backend data. `SPEC.md` carries the exact rule.
 The list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
@@ -169,9 +179,20 @@ its SQLite title still shows the prompt.
   (Claude and Codex).
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
-- `Space` — collapse or expand a group when a group header is selected; does nothing on a session row.
-- `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
-  pressing it always reports a footer notice that reply is not supported.
+- `Space` / `Enter` — collapse or expand a group when a group header is selected (the collapse
+  is persisted); on a session row `Space` does nothing and `Enter` attaches.
+- `/theme` — open the theme picker: `↑`/`↓` preview a theme against the whole screen, `Enter`
+  commits and persists it, `Esc` reverts to the one you started on.
+- `Ctrl+K` — command palette. It carries every action in this list (each with its chord, and
+  unavailable ones shown as such), plus the header sprites, every visible session to jump to,
+  every discovered model for each backend, and the slash commands for the composer's backend.
+- `Ctrl+B` — toggle the tail pane, the last 12 turns of the selected session beside the list.
+  It needs at least 100 columns; below that opening it is a footer notice naming the width.
+- `Ctrl+W` — video wall (see below). `Ctrl+O` zooms the focused tile to the full attach view.
+- `Ctrl+G` — cycle the header sprite; the choice is announced and persisted.
+- `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below); on a
+  selected session it reports a footer notice that reply is not supported, and with nothing
+  selected it does nothing at all.
 - `Ctrl+N` — open the triage inbox on every session waiting for input, longest wait first
   (see below). Nothing waiting is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
@@ -183,7 +204,9 @@ its SQLite title still shows the prompt.
   retaining it for later attach.
   A Codex session hosted by the app-server daemon is stopped by interrupting its current turn,
   never by signalling a process: the daemon runs every session it hosts, so a signal would take
-  all of them down with it.
+  all of them down with it. A Codex subagent row advertises no stop at all and reports
+  `codex does not support stop`, because the only pid on that row is its parent's and
+  signalling it would take the parent and every sibling down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
@@ -204,7 +227,9 @@ its SQLite title still shows the prompt.
 - `Ctrl+C` — quit.
 
 Renames, stops, removes, and archives run on a background worker so a slow backend call
-never freezes the list; a `…` notice shows while the action is in flight.
+never freezes the list; a `…` notice shows while the action is in flight, and pressing the
+same action again on the same row while it is still running reports `still <verb>` rather
+than queueing a second call.
 
 ## Embedded attach
 
@@ -218,7 +243,9 @@ input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always
 A session is connected exactly while it is on screen: leaving it closes that connection, so
 there is never a session still connected in the background. Opening it again reconnects, which
 takes a second or two. Conversation state lives in each backend's own store, so nothing is lost
-by closing.
+by closing. Resolving an attach can take those seconds, so if you have moved on by the time it
+lands the viewer drops it rather than yanking you into a session you left: the footer reads
+`attach cancelled: <title> is no longer in focus` and nothing was spawned.
 New attached PTYs use the active viewer theme's text and background as their terminal defaults;
 explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
 uses the captured host foreground and background. Because a session reconnects when you open it,
@@ -279,15 +306,6 @@ plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the fo
 attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
 is not drawn while the wall is up, since the tiles have the keyboard.
 
-When a Linux viewer is displayed remotely through Windows Terminal or another terminal with
-OSC 52 support, `Ctrl+Y` sends the exact visible PTY viewport to that client terminal. The
-request includes only `screen.contents()`, so scrolling first sends the visible historical
-viewport rather than text outside it. The chord leaves mouse capture unchanged and is not
-forwarded to the child. A complete output write means only `copy request sent to terminal`,
-because OSC 52 has no acknowledgement; an output failure means the terminal clipboard state is
-unknown. Terminal policy may still reject the request. Use `Ctrl+T` to disable capture and select
-text in the host terminal when OSC 52 is unavailable.
-
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
 `codex resume` process replays the transcript, finds it ends mid-turn, and writes a synthesized
@@ -318,10 +336,13 @@ resumes the same thread; Codex goes through the app-server daemon) and invents n
 to reach a session. Sessions are attached one at a time as you reach them, never prefetched
 for the whole queue, and leaving the modal detaches without stopping anything. The queue is
 snapshotted when the modal opens, so a background refresh cannot reorder it mid-answer, and
-nothing in the modal touches the composer or the list selection.
+nothing in the modal touches the composer or the list selection. A visit lasts exactly as long
+as the item is on screen: moving to the next or previous item closes the one you left, and so
+does closing the queue, so a walk through seven sessions never leaves seven children running
+behind it.
 
 Reply is deliberately out of scope for this rebuild. `Ctrl+E` is reserved in the key list but
-always reports a footer notice that reply is not supported. Revisiting it is a future,
+only reports a footer notice that reply is not supported. Revisiting it is a future,
 separately specified decision. The triage inbox does not depend on it: it delivers an answer
 by typing into the attached session, which is the agent's own input path, not a reply API.
 
@@ -336,8 +357,68 @@ If a child exits while you are attached, its final screen stays visible. `Ctrl+Y
 available to send that retained visible screen, and `Ctrl+T` remains available for host
 selection. Any other key returns you to the list.
 
-Viewer-local presentation state is kept in a SQLite database at
-`~/.local/state/agent-viewer/viewer.db`, separate from every backend's own store.
+## Themes
+
+Eleven themes ship: `analog amber` (the default), `terminal match`, `paper light`, `mono 16`,
+`aubergine`, `hoth`, `catppuccin mocha`, `tokyo night`, `gruvbox dark`, `rose pine`, and `nord`.
+Type `/theme` in the composer to open the picker; `↑`/`↓` preview each one against the whole
+screen, `Enter` commits, `Esc` reverts. The choice is persisted, so the next launch opens on it.
+Marks and motion travel with the theme: `terminal match` builds itself from your terminal's own
+palette, and a theme with animation off holds colors solid instead of blinking or shimmering.
+
+Your own themes go in `~/.config/agent-viewer/themes` as `*.theme` files, one `key=#rrggbb` per
+line, `#` comments allowed. They join the picker alongside the built-ins. The active user theme
+is reloaded whenever its file's timestamp changes, so you can edit one with the viewer running
+and watch each save land. A malformed line is skipped with a footer notice rather than failing
+the file.
+
+## Sprites
+
+The header carries one of six animated sprites: `lighthouse` (the default), `constellation`,
+`turbine`, `sailboat`, `airplane`, and `hot air balloon`. `Ctrl+G` cycles to the next one and
+persists it, and the `Ctrl+K` palette picks one directly. `AV_SPRITE=<name>` opens on that
+sprite for one run without overwriting the saved choice; an unknown name falls back rather than
+erroring.
+
+## Configuration
+
+There is no config file. The viewer reads:
+
+- `AGENT_VIEWER_GLYPH_MARKS=1` uses the brand glyphs `✳`/`◆` instead of the `[cc]`/`[cx]` text
+  tags when the inline logo marks are unavailable.
+- `AV_SPRITE=<name>` opens on that header sprite for one run.
+- `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` spawns Codex sessions with `codex exec` instead of the
+  app-server daemon. Those sessions can never be attached to, which is why it is opt-in.
+- `CODEX_HOME` is where the Codex registry and rollouts live. Defaults to `~/.codex`.
+- `CLAUDE_CONFIG_DIR` is where Claude's `jobs/` and `sessions/` live. Defaults to `~/.claude`.
+- `~/.config/agent-viewer/themes/*.theme` holds your own themes, as described above.
+- `~/.local/state/agent-viewer/viewer.db` is the only database the viewer writes, holding
+  presentation state only: the theme, the sprite, the age ramp, which groups are collapsed, the
+  cached model catalogs, the shared listing cache, and the record of sessions this viewer
+  spawned (which is what keeps your own spawns from being filtered away as companions). Deleting
+  it resets all of that to defaults and costs nothing else: no conversation, session, or backend
+  state lives here.
+
+## Troubleshooting
+
+- **The list is empty.** Each backend fails quietly and independently. A missing
+  `~/.codex/state_*.sqlite` shows `codex: no state_*.sqlite found under <path>` in the footer
+  with an empty Codex list; if no backend can be listed at all, the viewer exits with
+  `agent-viewer: no backend could be listed` rather than showing a blank screen. A CLI that is
+  not on `PATH` simply drops out of the composer's `Tab` cycle.
+- **A Codex session refuses to attach.** `codex exec` sessions (background jobs and plugin
+  dispatches) host their app server inside their own process, so nothing can join them. Joining
+  one mid-turn would write a fake interruption into its transcript, so the viewer refuses and
+  says so in the footer. Sessions started in a terminal, and sessions this viewer spawns, are
+  hosted by the shared daemon and attach normally.
+- **Rows show `[cc]`/`[cx]` instead of logos.** The startup graphics probe needs a real terminal
+  that answers it. On one that does not, the text tags are the fallback; set
+  `AGENT_VIEWER_GLYPH_MARKS=1` for the glyphs instead.
+- **`Ctrl+]` seems to do nothing.** Terminals send it as the raw byte `0x1D`, which some parsers
+  report as `Ctrl+5`. Both encodings are accepted everywhere `Ctrl+]` is documented, so if it
+  still does not detach, the chord is being swallowed before the viewer sees it.
+- **`Ctrl+B` will not open.** The tail pane needs 100 columns; below that it reports the width
+  it has instead of opening.
 
 Built in Rust. See `SPEC.md` for the full architecture and the evidence behind it.
 
