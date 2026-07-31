@@ -316,8 +316,22 @@ pub enum SpawnAttempt {
     /// The thread exists but its first turn did not start. There is a row either way, so this
     /// must be surfaced against that thread, never retried as a second spawn.
     TurnFailed { thread_id: String, error: Error },
-    /// Nothing was created (no daemon, no connection, no thread).
+    /// Nothing was created, or nothing that could be confirmed: no daemon, no connection, no
+    /// thread id. A request whose RESPONSE was lost lands here too, which is why
+    /// `lost_response` words it as indeterminate rather than as "nothing happened".
     NotCreated(Error),
+}
+
+/// PURE: an RPC whose request went out and whose response never came back.
+///
+/// The daemon may well have acted on it, so this must NOT read as a flat failure: a user told
+/// "the spawn failed" retries it, and a retry of a thread/start that already landed runs the
+/// task twice. Naming the uncertainty is the whole content of the message.
+fn lost_response(method: &str, error: &Error) -> Error {
+    Error::Command(format!(
+        "app-server {method} was sent but its response was lost ({error}); it may have taken \
+         effect - check the session before retrying"
+    ))
 }
 
 /// IMPURE: start a thread on `daemon` and kick off its first turn. The turn keeps running after
@@ -337,7 +351,7 @@ pub fn try_spawn_thread(
         Err(error) => return SpawnAttempt::NotCreated(error),
     };
     let thread_id = match client.request(2, &thread_start_request(2, cwd, model), deadline) {
-        Err(error) => return SpawnAttempt::NotCreated(error),
+        Err(error) => return SpawnAttempt::NotCreated(lost_response("thread/start", &error)),
         Ok(line) => match parse_thread_id(&line, 2) {
             Some(thread_id) => thread_id,
             // A response with no thread id means no thread: nothing to double up on.
@@ -524,7 +538,8 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Daemon, interrupt_thread, parse_in_progress_turn, spawn_thread, thread_read_request,
+        Daemon, Error, interrupt_thread, lost_response, parse_in_progress_turn, spawn_thread,
+        thread_read_request,
     };
     use std::path::{Path, PathBuf};
 
@@ -591,5 +606,29 @@ mod tests {
         ] {
             assert_eq!(parse_in_progress_turn(line, 2), None, "must reject: {line}");
         }
+    }
+
+    /// A request that went out and got no answer back is NOT proof that nothing happened: the
+    /// daemon may have created the thread and lost only the reply. Reporting it as a flat
+    /// failure invites a retry that runs the task twice.
+    #[test]
+    fn a_lost_response_is_reported_as_indeterminate() {
+        let message = lost_response(
+            "thread/start",
+            &Error::Command("app-server request timed out".to_string()),
+        )
+        .to_string();
+        assert!(
+            message.contains("thread/start"),
+            "must name the call: {message}"
+        );
+        assert!(
+            message.contains("may have taken effect"),
+            "must not read as a flat failure: {message}"
+        );
+        assert!(
+            message.contains("app-server request timed out"),
+            "must keep the underlying error: {message}"
+        );
     }
 }

@@ -140,12 +140,18 @@ pub enum StopRoute {
 }
 
 /// PURE: the reason to show for a spawn attempt that did not start a turn.
-fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
+///
+/// `turn/start` answers as soon as the turn is accepted, so an error here means the answer did
+/// not arrive - NOT that the turn did not run. The wording has to carry that: a user told
+/// flatly that the turn failed retries it, and a retry against a thread whose turn did start
+/// runs the task twice.
+pub fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
     match attempt {
         app_server::SpawnAttempt::Started(thread_id) => format!("thread {thread_id} started"),
-        app_server::SpawnAttempt::TurnFailed { thread_id, error } => {
-            format!("thread {thread_id} exists but its first turn failed: {error}")
-        }
+        app_server::SpawnAttempt::TurnFailed { thread_id, error } => format!(
+            "thread {thread_id} exists but its first turn was not confirmed ({error}); the turn \
+             may have started - check the session before retrying"
+        ),
         app_server::SpawnAttempt::NotCreated(error) => error.to_string(),
     }
 }
