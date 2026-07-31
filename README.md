@@ -268,9 +268,18 @@ footer reads `showing 9 of N` rather than dropping the rest silently, and still-
 sessions take the slots ahead of recently-stopped ones so a busy agent is never the one pushed
 into the overflow. Each tile carries its
 state glyph, backend mark, title, project, and elapsed time, dropping the project then the
-elapsed as tiles get narrower. The focused tile is marked with a caret and an accent border; a
-tile awaiting input turns its own border and header amber without disturbing the rest of the
-wall, and the grid never reorders itself, so you keep your place in whatever you were reading.
+elapsed as tiles get narrower.
+
+Every tile outlines itself in the colour of what its session is doing, so the wall sorts itself
+at a glance: a session waiting on you flashes its border in the theme's attention colour (pink
+in most themes, and the same colour as the `◐` glyph everywhere else in the viewer), a session
+that has finished goes solid green, one that broke goes red, and one that is still working
+keeps the plain border — most of a busy wall is working, and a wall that shouts everywhere
+shouts nowhere. Focus is a separate channel: the tile with the keyboard takes a thick, bold
+border plus the caret in its header, so pointing at a tile never hides what that tile is doing.
+Only the border of a blocked tile moves; the rest of the wall holds still, and the grid never
+reorders itself, so you keep your place in whatever you were reading. A theme with animation
+off holds the attention colour solid instead of flashing.
 
 Hover or click a tile to focus it, or move with `Shift+↑↓←→`. The mouse wheel scrolls the tile
 under the pointer back through what it has already printed, without moving the focus — that is
