@@ -2,7 +2,9 @@
 //! a self contained closure returning a structured outcome; results are drained without blocking
 //! through `poll()`. In flight keys deduplicate repeated submissions while work is pending.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -10,6 +12,18 @@ use std::thread;
 use agent_viewer_core::BackendKind;
 
 type BackgroundJob<T> = Box<dyn FnOnce() -> Result<T, String> + Send + 'static>;
+
+/// The footer text for a panicked job, keeping whatever the panic itself said.
+fn panic_message(payload: &Box<dyn Any + Send>) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match detail {
+        Some(detail) => format!("background operation panicked: {detail}"),
+        None => "background operation panicked".to_string(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnSelection {
@@ -94,7 +108,13 @@ impl<T: Send + 'static> BackgroundRunner<T> {
     fn start(&self, key: String, op: BackgroundJob<T>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = op();
+            // A panicking op must still report: `in_flight` is cleared only when a result is
+            // received, so a lost one seals its key forever and that row silently stops
+            // accepting archive, rename or stop for the rest of the run.
+            let result = match catch_unwind(AssertUnwindSafe(op)) {
+                Ok(result) => result,
+                Err(payload) => Err(panic_message(&payload)),
+            };
             // A closed receiver just means the TUI is shutting down; drop the result.
             let _ = tx.send((key, result));
         });
@@ -173,5 +193,37 @@ mod attach_runner_tests {
         };
         assert_eq!(completed, worker);
         assert!(!runner.in_flight("claude:target:attach"));
+    }
+
+    /// A job that panics must still land as a result. Without that its key stays in flight
+    /// forever, and `submit` returning false is a silent no-op, so the row it belongs to never
+    /// accepts another archive, rename or stop for the rest of the run.
+    #[test]
+    fn a_panicking_job_reports_an_error_and_frees_its_key() {
+        let key = "claude:sealed:archive";
+        let mut runner = AttachRunner::<()>::new();
+
+        assert!(runner.submit(key.to_string(), || panic!("backend blew up")));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = runner.poll() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a panicking job never reported, so its key is sealed"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(
+            result.err().as_deref(),
+            Some("background operation panicked: backend blew up")
+        );
+        assert!(!runner.in_flight(key));
+        assert!(
+            runner.submit(key.to_string(), || Ok(())),
+            "the row must accept work again after a panicked job"
+        );
     }
 }

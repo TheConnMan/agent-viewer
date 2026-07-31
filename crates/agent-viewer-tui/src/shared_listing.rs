@@ -136,6 +136,14 @@ where
             );
             let outcome = match source_result {
                 Ok(sessions) => {
+                    // A fence means the scope was invalidated while this listing was in
+                    // flight — an archive, rename or stop landed — so what came back is a
+                    // PRE-mutation snapshot. It is already refused for the shared cache; it
+                    // must be refused for the display too, or the row the user just archived
+                    // reappears until the next tick republishes. `Unchanged` keeps whatever
+                    // the UI already has, and the cleared cursor makes the next tick re-claim
+                    // and re-list immediately.
+                    let mut fenced = false;
                     match ListingCacheSnapshot::from_sessions(sessions.clone()) {
                         Ok(snapshot) => {
                             match db.publish_listing(&lease, snapshot, source_completed_at_ms) {
@@ -143,7 +151,12 @@ where
                                     cursor.published_generation =
                                         Some(lease.next_published_generation());
                                 }
-                                Ok(agent_viewer_core::ListingCacheWrite::Fenced) | Err(_) => {
+                                Ok(agent_viewer_core::ListingCacheWrite::Fenced) => {
+                                    cursor.published_generation = None;
+                                    fenced = true;
+                                }
+                                Err(_) => {
+                                    // Only the shared write failed; the listing itself is fine.
                                     cursor.published_generation = None;
                                 }
                             }
@@ -153,7 +166,11 @@ where
                             let _ = db.fail_listing_refresh(&lease);
                         }
                     }
-                    (RefreshOutcome::Authoritative { sessions }, false)
+                    if fenced {
+                        (RefreshOutcome::Unchanged, true)
+                    } else {
+                        (RefreshOutcome::Authoritative { sessions }, false)
+                    }
                 }
                 Err(error) => {
                     let _ = db.fail_listing_refresh(&lease);

@@ -36,7 +36,9 @@ use composer::{
 };
 pub use list::activity_ribbon;
 use list::{rename_buffer, rename_row_item, row_to_item};
-pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
+pub use palette::{
+    PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState, PaletteTarget,
+};
 pub use sprite::SpriteKind;
 pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
