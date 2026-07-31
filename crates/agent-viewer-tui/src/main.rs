@@ -513,8 +513,14 @@ impl NoticeState {
 /// What a resolved attach plan is for. Both kinds ride the same runner and the same backend
 /// resolution; only what happens when they land differs.
 enum AttachOutcome {
-    /// A user attach: take over the screen with this session.
-    Focus(ops::AttachPlan),
+    /// A user attach: take over the screen with this session. `key` and `triage` record what
+    /// the user was looking at when it was submitted, so a plan that lands after they moved
+    /// on can be dropped instead of stealing the keyboard for the wrong session.
+    Focus {
+        key: Key,
+        triage: bool,
+        plan: ops::AttachPlan,
+    },
     /// A wall tile joining. Carries its own key so a failure can be reported against the
     /// right tile, which is why the failure is an `Ok` here rather than a runner-level `Err`.
     Wall {
@@ -943,19 +949,13 @@ fn run(
         }
 
         while let Some(result) = ui.attaches.poll() {
-            match result {
-                Ok(AttachOutcome::Focus(plan)) => {
-                    install_completed_attach_plan(
-                        ui,
-                        terminal,
-                        plan,
-                        &mut io::stdout(),
-                        applied_mouse_capture,
-                    )?;
-                }
-                Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
-                Err(notice) => ui.set_notice(notice),
-            }
+            apply_attach_result(
+                ui,
+                terminal,
+                result,
+                &mut io::stdout(),
+                applied_mouse_capture,
+            )?;
         }
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
@@ -1088,6 +1088,56 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
             }
         )
     })
+}
+
+/// Land one completed attach resolution.
+///
+/// Resolution runs off the render thread and can take seconds (a codex attach dials the
+/// app-server daemon). In that time the user can walk to another row, or close the view the
+/// attach was submitted from, so a landed plan is applied only while it still targets what
+/// they are looking at — the same ownership rule `install_wall_join` applies to a tile.
+fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    result: Result<AttachOutcome, String>,
+    writer: &mut W,
+    applied_mouse_capture: &mut bool,
+) -> io::Result<()> {
+    match result {
+        Ok(AttachOutcome::Focus { key, triage, plan }) => {
+            if !focus_attach_still_current(ui, &key, triage) {
+                // The plan is only a resolved command: nothing has been spawned for it yet, so
+                // dropping it here is the whole teardown.
+                drop(plan);
+                ui.set_notice(format!("attach cancelled: {} is no longer in focus", key.1));
+                return Ok(());
+            }
+            install_completed_attach_plan(ui, terminal, plan, writer, applied_mouse_capture)?;
+        }
+        Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
+        Err(notice) => ui.set_notice(notice),
+    }
+    Ok(())
+}
+
+/// Whether a completed focus attach still targets what the user is looking at: the same triage
+/// item in a still-open queue, or the still-selected row on the list. Anything else means the
+/// keystrokes it would capture belong to another session, or that it would reopen a view the
+/// user has already left.
+fn focus_attach_still_current(ui: &Ui, key: &Key, triage: bool) -> bool {
+    if triage {
+        let Mode::Triage(state) = &ui.mode else {
+            return false;
+        };
+        return state.current().map(|item| item.key()).as_ref() == Some(key);
+    }
+    matches!(ui.mode, Mode::Normal)
+        && ui
+            .app
+            .selected()
+            .map(|session| (session.backend, session.id.clone()))
+            .as_ref()
+            == Some(key)
 }
 
 /// Land a wall tile's connection. A failure is recorded against its tile rather than shown as
@@ -2791,7 +2841,7 @@ mod tests {
                 // A user attach always resolves to Focus; a Wall join here would mean the
                 // runner crossed wires, so fail loudly rather than skip.
                 match result.expect("resolve event bridge attach") {
-                    AttachOutcome::Focus(plan) => break plan,
+                    AttachOutcome::Focus { plan, .. } => break plan,
                     AttachOutcome::Wall { .. } => panic!("expected a focus attach"),
                 }
             }

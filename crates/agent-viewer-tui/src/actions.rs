@@ -481,11 +481,23 @@ pub(crate) fn attach_selected(ui: &mut Ui) -> bool {
 
 pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
     let id = request.id().to_string();
+    let key: Key = (request.backend(), id.clone());
+    // Triage hosts its child in the modal's panel rather than the whole screen, so a plan
+    // resolved for the queue must be able to tell that apart when it lands.
+    let triage = matches!(ui.mode, Mode::Triage(_));
     let executor = ui.attach_executor.clone();
-    // Single-slot key on purpose: mashing → must not queue a pile of attaches that each take
-    // over the screen in turn. The wall's joins use per-session keys so they can run at once.
-    if !ui.attaches.submit("attach".to_string(), move || {
-        executor(request).map(crate::AttachOutcome::Focus)
+    // Keyed per session: mashing → on one row still dedups, but a request for a DIFFERENT row
+    // must not be silently swallowed because an earlier one is still resolving. Which landed
+    // plan is still the one the user is looking at is decided on completion, by the ownership
+    // guard in the run loop, exactly as the wall's per-session joins are.
+    let runner_key = format!("attach:{}:{}", key.0.name(), key.1);
+    let outcome_key = key;
+    if !ui.attaches.submit(runner_key, move || {
+        executor(request).map(|plan| crate::AttachOutcome::Focus {
+            key: outcome_key,
+            triage,
+            plan,
+        })
     }) {
         return false;
     }
@@ -1425,15 +1437,54 @@ mod tests {
 
 #[cfg(test)]
 mod async_attach_tests {
-    use super::{install_attach_plan, submit_attach};
+    use super::{close_triage, install_attach_plan, open_triage, skip_triage_item, submit_attach};
     use crate::keys::tests::{sess, test_ui_with};
     use crate::ops::AttachPlan;
-    use agent_viewer_core::BackendKind;
+    use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::shared_listing::TargetRequest;
     use agent_viewer_tui::ui::Mode;
     use std::sync::{Arc, Mutex, mpsc::channel};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// A session already waiting on the user, so `open_triage` has a queue to walk.
+    fn blocked(id: &str, updated_at_ms: i64) -> Session {
+        let mut session = sess(id, "/tmp/agentviewer_triage_attach", updated_at_ms);
+        session.status = Status::NeedsInput {
+            reason: Some("Pick a direction.".to_string()),
+        };
+        session
+    }
+
+    fn sleeping_plan(session: &Session) -> AttachPlan {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        AttachPlan {
+            session: session.clone(),
+            command,
+        }
+    }
+
+    fn poll_attach(ui: &mut crate::Ui) -> Result<crate::AttachOutcome, String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = ui.attaches.poll() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "attach worker did not finish");
+            thread::yield_now();
+        }
+    }
+
+    /// Drive one landed attach result through the exact path the run loop uses.
+    fn land_attach(ui: &mut crate::Ui, result: Result<crate::AttachOutcome, String>) {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("test terminal");
+        let mut output = Vec::new();
+        let mut applied = true;
+        crate::apply_attach_result(ui, &mut terminal, result, &mut output, &mut applied)
+            .expect("apply attach result");
+    }
 
     #[test]
     fn attach_submission_returns_before_authority_finishes_and_deduplicates_the_target() {
@@ -1547,5 +1598,114 @@ mod async_attach_tests {
             .get_mut(&key)
             .expect("fresh attached child")
             .kill();
+    }
+
+    /// The control for the two drop tests below: a plan that lands while its row is still the
+    /// selected one is installed exactly as before.
+    #[test]
+    fn a_landed_focus_attach_is_installed_while_its_row_is_still_selected() {
+        let first = sess("still_selected", "/tmp/agentviewer_still_selected", 100);
+        let other = sess("elsewhere", "/tmp/agentviewer_elsewhere", 200);
+        let mut ui = test_ui_with(vec![first.clone(), other]);
+        let planned = first.clone();
+        ui.attach_executor = Arc::new(move |_| Ok(sleeping_plan(&planned)));
+        let key = (BackendKind::Claude, first.id.clone());
+        assert!(ui.app.select_by_key(&key));
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        land_attach(&mut ui, result);
+
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert_eq!(ui.focused.as_ref(), Some(&key));
+        ui.attached.get_mut(&key).expect("attached child").kill();
+    }
+
+    /// The interleaving the review found: the resolution blocks, the user walks to another
+    /// row, and the late plan arrives. Installing it there hands every following keystroke to
+    /// a session the user is not looking at.
+    #[test]
+    fn a_landed_focus_attach_is_dropped_when_the_selection_moved_on() {
+        let first = sess("left_behind", "/tmp/agentviewer_left_behind", 100);
+        let second = sess("moved_to", "/tmp/agentviewer_moved_to", 200);
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        let planned = first.clone();
+        ui.attach_executor = Arc::new(move |_| Ok(sleeping_plan(&planned)));
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, first.id.clone()))
+        );
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, second.id.clone()))
+        );
+        land_attach(&mut ui, result);
+
+        assert!(
+            ui.attached.is_empty(),
+            "a late attach must not spawn a child for the row the user left"
+        );
+        assert!(ui.focused.is_none());
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "the list must not be taken over by a session the user moved off"
+        );
+        assert_eq!(
+            ui.notice.text, "attach cancelled: left_behind is no longer in focus",
+            "a dropped attach says so rather than vanishing"
+        );
+    }
+
+    /// A triage attach that lands after the queue closed must not reopen as a full-screen
+    /// attach: the user already left that view.
+    #[test]
+    fn a_landed_triage_attach_is_dropped_after_the_queue_closed() {
+        let waiting = blocked("closed_queue", 100);
+        let mut ui = test_ui_with(vec![waiting.clone()]);
+        let planned = waiting.clone();
+        ui.attach_executor = Arc::new(move |_| Ok(sleeping_plan(&planned)));
+
+        open_triage(&mut ui);
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+        let result = poll_attach(&mut ui);
+        close_triage(&mut ui);
+        land_attach(&mut ui, result);
+
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "a closed queue must not reopen as an attach view"
+        );
+        assert!(ui.attached.is_empty());
+        assert!(ui.focused.is_none());
+    }
+
+    /// The same guard inside the queue: walking on before the first item's attach resolves
+    /// must not put that child in the panel the second item now owns.
+    #[test]
+    fn a_landed_triage_attach_is_dropped_after_the_queue_moved_on() {
+        let first = blocked("queue_first", 100);
+        let second = blocked("queue_second", 200);
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        let planned = first.clone();
+        ui.attach_executor = Arc::new(move |_| Ok(sleeping_plan(&planned)));
+
+        open_triage(&mut ui);
+        let result = poll_attach(&mut ui);
+        skip_triage_item(&mut ui);
+        land_attach(&mut ui, result);
+
+        assert!(
+            !ui.attached
+                .contains_key(&(BackendKind::Claude, first.id.clone())),
+            "the item the queue walked off must not land in the panel"
+        );
+        assert_eq!(
+            ui.focused.as_ref(),
+            Some(&(BackendKind::Claude, second.id.clone())),
+            "the panel stays pointed at the item the queue is actually on"
+        );
     }
 }
