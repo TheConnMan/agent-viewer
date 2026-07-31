@@ -111,7 +111,10 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         let Ok(entries) = std::fs::read_dir(&fd_dir) else {
             continue;
         };
-        let mut held: Vec<PathBuf> = Vec::new();
+        // A set, not a list: the shared daemon holds the rollout fd of EVERY thread it hosts,
+        // so a linear `contains` over the fds already seen made this pass quadratic in the fd
+        // count on exactly the process that has the most of them.
+        let mut held: HashSet<PathBuf> = HashSet::new();
         let mut holds_a_listening_socket = false;
         for entry in entries.flatten() {
             let Ok(target) = std::fs::read_link(entry.path()) else {
@@ -123,10 +126,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
                 continue;
             }
             let stripped = display.strip_suffix(" (deleted)").unwrap_or(&display);
-            let path = PathBuf::from(stripped);
-            if !held.contains(&path) {
-                held.push(path);
-            }
+            held.insert(PathBuf::from(stripped));
         }
         let owner = RolloutOwner {
             pid: pid.as_u32(),

@@ -513,6 +513,66 @@ fn codex_turn_activity_includes_only_requested_subtree() {
     );
 }
 
+/// `turn_activity` runs once per visible session on every activity refresh, so the registry's
+/// spawn edges are scanned once and reused across those calls instead of rescanning every row
+/// per session. A subagent spawned AFTER the first call must still join its parent's ribbon on
+/// the next one - a cache that never expired would hide it for the life of the process.
+#[test]
+fn codex_turn_activity_sees_a_subagent_spawned_after_the_first_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let root_path = dir.path().join("root.jsonl");
+    write_codex_activity(&root_path, now - 4);
+
+    let db_path = dir.path().join("state_5.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).expect("open registry");
+    conn.execute_batch(&common::read_fixture("threads_schema.sql"))
+        .expect("create registry schema");
+    insert_codex_activity_thread(&conn, "root", &root_path, "cli", (now - 4) * 1_000);
+    conn.close().expect("close registry");
+
+    let backend = CodexBackend::new(dir.path().to_path_buf());
+    let activity = || {
+        backend
+            .turn_activity(
+                &codex_activity_session("root", root_path.clone()),
+                Duration::from_secs(60),
+            )
+            .expect("root subtree activity")
+    };
+    assert_eq!(activity(), vec![(now - 4) * 1_000]);
+
+    let child_path = dir.path().join("child.jsonl");
+    write_codex_activity(&child_path, now - 2);
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen registry");
+    insert_codex_activity_thread(
+        &conn,
+        "child",
+        &child_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}"#,
+        (now - 2) * 1_000,
+    );
+    conn.close().expect("close registry");
+    // The insert already moved the db's mtime; pushing it forward makes the freshness key
+    // differ by seconds, so the assertion below cannot ride on filesystem timestamp
+    // granularity (a one-row insert need not change the file's length at all).
+    std::fs::File::options()
+        .write(true)
+        .open(&db_path)
+        .expect("open db for a timestamp bump")
+        .set_modified(SystemTime::now() + Duration::from_secs(2))
+        .expect("bump the db mtime");
+
+    assert_eq!(
+        activity(),
+        vec![(now - 4) * 1_000, (now - 2) * 1_000],
+        "a subagent inserted after the first call must invalidate the cached spawn edges"
+    );
+}
+
 // --- v2 tail_state contract (tests 1-5) ---
 
 #[test]
