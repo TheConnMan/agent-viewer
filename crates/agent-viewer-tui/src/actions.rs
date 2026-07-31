@@ -234,9 +234,10 @@ pub(crate) fn submit_triage_answer<B: ratatui::backend::Backend>(
 
 /// Queue an off-thread transcript read for the triage item under the cursor, once.
 ///
-/// Only Codex sessions have a transcript reader in `-core` (`codex::rollout::read_transcript`),
-/// and writing a second parser for the other backends is out of scope here — they record an
-/// empty context immediately so the modal renders its summary fallback and stops asking.
+/// Codex and Claude both have a transcript reader in `-core`
+/// (`codex::rollout::read_transcript` and `claude::read_claude_transcript`); opencode's is
+/// keyed by (db path, session id) rather than a transcript file, which this item does not
+/// carry, so it records an empty context immediately and falls back to the summary line.
 /// Nothing is prefetched: a queue of forty blocked sessions costs one read, not forty.
 pub(crate) fn ensure_triage_context(ui: &mut Ui) {
     let Mode::Triage(state) = &ui.mode else {
@@ -247,8 +248,8 @@ pub(crate) fn ensure_triage_context(ui: &mut Ui) {
     };
     let key: Key = (item.backend, item.id.clone());
     let path = match item.backend {
-        BackendKind::Codex => item.rollout_path.clone(),
-        BackendKind::Claude | BackendKind::Opencode => None,
+        BackendKind::Codex | BackendKind::Claude => item.rollout_path.clone(),
+        BackendKind::Opencode => None,
     };
     let Some(path) = path else {
         if let Mode::Triage(state) = &mut ui.mode {
@@ -257,8 +258,9 @@ pub(crate) fn ensure_triage_context(ui: &mut Ui) {
         return;
     };
     let job = format!("{}:{}:triage-context", key.0.name(), key.1);
+    let backend = key.0;
     ui.triage_context
-        .submit(job, move || Ok((key, read_context(&path))));
+        .submit(job, move || Ok((key, read_context(backend, &path))));
 }
 
 /// Fold landed transcript reads into the open modal. A read that lands after the user has

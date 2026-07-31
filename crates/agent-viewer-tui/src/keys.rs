@@ -684,6 +684,16 @@ fn palette_action_items(
             Some("unavailable · reply is not supported".to_string()),
         ),
         action_item(
+            PaletteAction::Triage,
+            "Triage sessions waiting for input",
+            "walk the needs-input queue, longest wait first",
+            Some("⌃N"),
+            // Not gated on the selected row: triage is a queue over every session, so the
+            // only thing that can disable it is an empty queue, which the action reports
+            // itself as a footer notice.
+            None,
+        ),
+        action_item(
             PaletteAction::StopOrRemove,
             "Stop or remove session",
             "stop once, remove on the next press",
@@ -953,6 +963,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::Unarchive => hide_selected(backends, ui, false),
             PaletteAction::Rename => open_rename(backends, ui),
             PaletteAction::Reply => open_reply(backends, ui),
+            PaletteAction::Triage => open_triage(ui),
             PaletteAction::StopOrRemove => kill_selected(backends, ui),
             PaletteAction::ShowAll => ui.app.toggle_show_all(),
             PaletteAction::Group => ui.app.toggle_group_mode(),
@@ -4192,6 +4203,23 @@ pub(crate) mod tests {
         handle_triage_key(code, backends, ui, &mut terminal).expect("triage key routing");
     }
 
+    fn press_palette_code(
+        ui: &mut Ui,
+        backends: &[Box<dyn agent_viewer_core::Backend>],
+        code: KeyCode,
+    ) {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("fixed terminal");
+        handle_palette_key(key(code, KeyModifiers::NONE), backends, ui, &mut terminal)
+            .expect("palette key routing");
+    }
+
     fn triage_state(ui: &Ui) -> &TriageState {
         match &ui.mode {
             Mode::Triage(state) => state,
@@ -4264,6 +4292,36 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(sessions());
         press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
         assert!(matches!(ui.mode, Mode::Triage(_)), "Ctrl+N opens triage");
+    }
+
+    #[test]
+    fn the_command_palette_offers_triage_and_opens_it() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100, triage_question())]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'k', KeyModifiers::CONTROL);
+        let listed = match &ui.mode {
+            Mode::Palette(state) => state
+                .results()
+                .find(|item| item.target == PaletteTarget::Action(PaletteAction::Triage))
+                .cloned(),
+            _ => panic!("Ctrl+K opens the palette"),
+        }
+        .expect("triage is offered in the palette");
+        assert!(
+            listed.enabled,
+            "triage is a queue over every session, so no selected row can disable it"
+        );
+
+        for character in "triage".chars() {
+            press_palette_code(&mut ui, &backends, KeyCode::Char(character));
+        }
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert!(
+            matches!(ui.mode, Mode::Triage(_)),
+            "running the palette entry opens the same modal Ctrl+N does"
+        );
     }
 
     #[test]

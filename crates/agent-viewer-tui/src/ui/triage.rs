@@ -25,6 +25,9 @@ use agent_viewer_core::{BackendKind, Session, Status};
 const UP_NEXT_ROWS: usize = 4;
 /// How many transcript turns the context panel shows.
 pub(crate) const CONTEXT_TURNS: usize = 3;
+/// Rows one turn may occupy. Three unbounded turns would push the question and the answer box
+/// off the screen, and the question outranks the history.
+const CONTEXT_ROWS_PER_TURN: usize = 4;
 /// The digit keys are the affordance, so there is no tenth quick option.
 const MAX_OPTIONS: usize = 9;
 
@@ -47,8 +50,8 @@ pub struct TriageItem {
     /// The question, with any enumerated option lines lifted out into `options`.
     pub question: String,
     pub options: Vec<TriageOption>,
-    /// Codex rollout JSONL, when this session has one. The only transcript source with a
-    /// reader in `-core`; every other backend renders its summary instead.
+    /// The session's transcript: the codex rollout JSONL, or the claude session JSONL. Both
+    /// have a reader in `-core`; opencode carries none here and renders its summary instead.
     pub rollout_path: Option<PathBuf>,
     /// The row summary, the fallback context line when no transcript can be read.
     pub summary: String,
@@ -339,28 +342,40 @@ impl TriageState {
     }
 }
 
-/// Read the last few turns of a Codex rollout, formatted one line each.
+/// Read the last few conversational turns of a session — the exchange that led to the
+/// question, so the answer can be given from the actual dialogue rather than a one-line
+/// summary of it.
 ///
-/// Runs on a background worker, never on the render or key path — a rollout JSONL is
-/// unbounded. Uses the existing `-core` transcript reader; there is deliberately no second
-/// parser here.
-pub fn read_context(path: &Path) -> Vec<String> {
-    let Ok(items) = agent_viewer_core::codex::rollout::read_transcript(path) else {
-        return Vec::new();
+/// Runs on a background worker, never on the render or key path: a transcript is unbounded.
+/// Both readers already live in `-core` and are tested there; nothing is parsed here.
+/// Tool calls, tool results, and thinking blocks are dropped by both readers, so what is left
+/// is the human's messages and the agent's prose.
+pub fn read_context(backend: BackendKind, path: &Path) -> Vec<String> {
+    let items = match backend {
+        BackendKind::Codex => agent_viewer_core::codex::rollout::read_transcript(path)
+            .map(|items| {
+                let start = items.len().saturating_sub(CONTEXT_TURNS);
+                items[start..].to_vec()
+            })
+            .unwrap_or_default(),
+        BackendKind::Claude => {
+            agent_viewer_core::claude::read_claude_transcript(path, CONTEXT_TURNS)
+                .unwrap_or_default()
+        }
+        // opencode's reader is keyed by (db path, session id) rather than a transcript file,
+        // which this item does not carry; it falls back to the summary line.
+        BackendKind::Opencode => Vec::new(),
     };
-    let start = items.len().saturating_sub(CONTEXT_TURNS);
-    items[start..]
+    items
         .iter()
-        .map(|item| {
-            let text = item
-                .text
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or("");
-            format!("{} · {}", item.role, text)
-        })
+        .map(|item| format!("{} · {}", item.role, collapse_whitespace(&item.text)))
         .collect()
+}
+
+/// Flatten a turn to a single logical string; the renderer wraps it. Keeps the words, drops
+/// the blank lines and indentation that would otherwise waste modal rows.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &Theme) {
@@ -376,10 +391,42 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
     // The question is the whole reason the modal exists, so it wraps to as many lines as it
     // needs instead of being truncated to one. Everything else is fixed height, so the modal
     // grows with the question rather than hiding it.
-    let question = wrap_question(&item.question, full);
+    let question = wrap_to_width(&item.question, full);
+    // Each turn of the exchange wraps too, but is capped: three unbounded turns would push the
+    // question and the answer box off the screen, and the question outranks the history.
+    // Each row carries whether it STARTS a turn, so only that row's leading `role · ` is
+    // treated as a role label. Sniffing every row for a separator would mangle a turn whose
+    // own text happens to contain one.
+    let context_lines: Vec<(bool, String)> = if context.is_empty() {
+        // No transcript could be read; the row summary is the honest fallback, and an absent
+        // one says so rather than rendering a blank. A blocked claude job's summary IS its
+        // question, so echoing it here would print the same sentence twice.
+        if item.summary.trim().is_empty() || item.summary == item.question {
+            vec![(
+                false,
+                "no transcript available for this session".to_string(),
+            )]
+        } else {
+            clamp_lines(wrap_to_width(&item.summary, full), CONTEXT_ROWS_PER_TURN)
+                .into_iter()
+                .map(|line| (false, line))
+                .collect()
+        }
+    } else {
+        context
+            .iter()
+            .flat_map(|turn| {
+                clamp_lines(wrap_to_width(turn, full), CONTEXT_ROWS_PER_TURN)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| (index == 0, line))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
     let fixed_rows = 2                                       // header + rule
         + 1                                                  // item header
-        + 1 + context.len().max(1)                           // LAST N TURNS + lines
+        + 1 + context_lines.len()                            // LAST N TURNS + lines
         + item.options.len()
         + 3                                                  // answer box
         + 1 + state.upcoming().len()                         // UP NEXT + rows
@@ -468,27 +515,28 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
             fg(theme.faint),
         )),
     );
-    if context.is_empty() {
-        // No transcript reader exists for this backend; the row summary is the honest
-        // fallback, and an absent one says so rather than rendering a blank. A blocked claude
-        // job's summary IS its question, so echoing it here would print the same sentence
-        // twice and read as a bug.
-        let (text, color) = if item.summary.trim().is_empty() || item.summary == item.question {
-            ("no transcript available for this session", theme.faint)
+    for (starts_turn, line) in &context_lines {
+        // The `role ·` head of each turn is dimmed so the eye lands on what was said, and a
+        // fallback line stays faint so it never reads as something the agent actually said.
+        let (head, said) = match line.split_once(" · ") {
+            Some((role, said)) if *starts_turn => (format!("  {role} · "), said),
+            _ => ("  ".to_string(), line.as_str()),
+        };
+        let body_color = if context.is_empty() {
+            theme.faint
         } else {
-            (item.summary.as_str(), theme.text)
+            theme.text
         };
         rows.line(
             frame,
-            Line::from(Span::styled(field(text, full), fg(color))),
+            Line::from(vec![
+                Span::styled(head.clone(), fg(theme.faint)),
+                Span::styled(
+                    field(said, full.saturating_sub(display(&head))),
+                    fg(body_color),
+                ),
+            ]),
         );
-    } else {
-        for line in context {
-            rows.line(
-                frame,
-                Line::from(Span::styled(field(line, full), fg(theme.text))),
-            );
-        }
     }
 
     // `? ` marks the first line; continuations indent under it so a wrapped question still
@@ -635,10 +683,10 @@ impl Rows {
     }
 }
 
-/// PURE: the question wrapped to the modal's inner width, allowing for the `? ` marker on the
+/// PURE: text wrapped to the modal's inner width, allowing for the `? ` marker on the
 /// first line and the matching indent on continuations. Reuses the composer's wrapper rather
 /// than growing a second one; the agent's own line breaks are paragraph breaks.
-fn wrap_question(question: &str, full: usize) -> Vec<String> {
+fn wrap_to_width(question: &str, full: usize) -> Vec<String> {
     let budget = full.saturating_sub(2).max(1);
     let lines = super::composer::wrap_by_width(question, budget, budget);
     if lines.is_empty() {
@@ -933,6 +981,40 @@ mod tests {
         );
         assert_eq!(project_label(Path::new("/solo")), "solo");
         assert_eq!(project_label(Path::new("/")), "");
+    }
+
+    #[test]
+    fn claude_sessions_get_their_real_turns_not_an_empty_context() {
+        // The exchange that led to the question is what makes the question answerable, and
+        // claude is the backend most of these sessions are. Its reader lives in `-core`; this
+        // pins that triage actually dispatches to it.
+        let dir = tempfile::tempdir().expect("transcript dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"I'm not sure this is what I expected."}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Should I drop\n\n  the detach?"}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("write transcript");
+
+        assert_eq!(
+            read_context(BackendKind::Claude, &path),
+            vec![
+                "user · I'm not sure this is what I expected.".to_string(),
+                "assistant · Should I drop the detach?".to_string(),
+            ],
+            "thinking, tool_use and tool_result carry no dialogue and must be dropped"
+        );
     }
 
     #[test]
