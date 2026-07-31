@@ -1,0 +1,7 @@
+{
+  "state": "working",
+  "tempo": "active",
+  "detail": "walking GETTING_STARTED.md step by step",
+  "inFlight": { "tasks": 0, "queued": 0, "kinds": [] },
+  "linkScanPath": "/home/user/.claude/jobs/live0001/transcript.jsonl"
+}

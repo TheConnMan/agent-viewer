@@ -205,6 +205,13 @@ impl Backend for ClaudeBackend {
                     session.summary = detail.summary;
                     session.rollout_path = detail.transcript_path;
                     session.pr_refs = detail.prs;
+                    // `claude agents --json` echoes the stale `working` label verbatim, so the
+                    // demotion has to happen here, against the state.json the agents output
+                    // does not publish `tempo` from. Idle is still a LIVE state: the row keeps
+                    // its stop/attach capabilities, it just leaves the working group.
+                    if detail.idle_despite_working && matches!(session.status, Status::Working) {
+                        session.status = Status::Idle;
+                    }
                     if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
                         session.updated_at_ms = since.as_millis() as i64;
                     }
@@ -542,6 +549,8 @@ pub fn mark_sdk_companions(
 /// state: "working" -> Working, "blocked" -> NeedsInput, "idle" -> Idle,
 /// "done" -> Done, "failed" -> Error, "stopped" -> Done,
 /// missing or unknown -> Unknown. pid: entry "pid" as u32 when present.
+/// The agents output does not publish `tempo`, so a `working` here may still be demoted to
+/// `Idle` by `list()` from the job's state.json (see `parse_job_state`).
 /// The SHORT id (entry "id") the caller needs for the jobs path is folded into
 /// `Session.short_id`. Entries missing sessionId/cwd/name are SKIPPED. Non-array top
 /// level -> Err(Json).
@@ -656,14 +665,33 @@ pub struct JobDetail {
     pub transcript_path: Option<std::path::PathBuf>,
     /// `children[].id` where `kind == "pr"` — the associated pull requests.
     pub prs: Vec<PrRef>,
+    /// `state == "working" && tempo == "idle"`: the job labelled itself working and then
+    /// stopped running turns. `list()` demotes such a row to `Idle`; see `parse_job_state`.
+    pub idle_despite_working: bool,
 }
 
-/// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath;
+/// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath, tempo;
 /// blocked jobs carry needs, working/done carry detail).
+///
+/// `state` is a self-report written when a turn ends, and it describes what the session
+/// believed it was doing, not whether it is running. A session that finished a turn saying
+/// "6 bg threads spawned; awaiting PRs" is recorded `working` and stays that way for as long
+/// as no further turn runs, because nothing rewrites the label. `tempo` is the field that
+/// tracks execution, so `working` + `idle` is the stale pair and sets `idle_despite_working`.
+///
+/// Measured on this box 2026-07-31 across 21 live jobs: `working`+`active` occurred only on a
+/// job whose state.json had been rewritten 90 seconds earlier, while both `working`+`idle`
+/// jobs had been quiet for over an hour. `inFlight.tasks` is deliberately NOT part of the
+/// rule, because it counts subagent tasks: a genuinely running job read 0 while a finished
+/// one read 3, which is backwards as a liveness signal.
 pub fn parse_job_state(text: &str) -> JobDetail {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return JobDetail::default();
     };
+    // Both halves must be present and explicit: a missing `tempo` is absent evidence, never an
+    // inferred demotion.
+    let idle_despite_working = crate::json_str(&value, "state") == Some("working")
+        && crate::json_str(&value, "tempo") == Some("idle");
     let needs = crate::json_str(&value, "needs");
     let summary = if crate::json_str(&value, "state") == Some("blocked")
         && let Some(needs) = needs
@@ -696,6 +724,7 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         summary,
         transcript_path,
         prs,
+        idle_despite_working,
     }
 }
 
