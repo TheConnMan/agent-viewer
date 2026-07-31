@@ -21,9 +21,9 @@ use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use std::collections::{HashMap, HashSet};
 
 /// Hard cap on tiles. Each tile is a live child being resized and re-parsed, so this is a
@@ -276,6 +276,61 @@ pub fn tile_content(rect: Rect) -> Rect {
     }
 }
 
+// --- Tile borders ---------------------------------------------------------------
+
+/// Half-period of the blocked-tile flash. Long enough to read as a deliberate pulse rather
+/// than a glitch, short enough that a glance at the wall lands inside one.
+const FLASH_MS: i64 = 500;
+
+/// The border a tile wears, as `(color, weight)`.
+///
+/// **Two channels, deliberately orthogonal.** Colour says what the SESSION is doing; weight
+/// says where the KEYBOARD is. One border cannot encode both in hue without one answer hiding
+/// the other, and the previous scheme did exactly that: focus painted the border `accent`,
+/// which sits a few points from `warn` in most themes, so a tile waiting on you and a tile you
+/// happened to be pointing at looked the same.
+///
+/// Colour:
+/// - waiting on you -> `attn`, flashing (the only moving border on the wall)
+/// - finished -> `ok`, solid. `Idle` reads as finished here on purpose: a Claude job that ends
+///   its turn reports `idle` with the process alive, and Codex maps complete-and-held the same
+///   way. Both mean "it stopped and it is yours to pick up".
+/// - broken -> `err`
+/// - working -> the plain `border` token, because most of a busy wall is this and a wall that
+///   shouts everywhere shouts nowhere
+///
+/// Weight: the focused tile takes a thick, bold border, alongside the caret in its header.
+pub(super) fn tile_border(
+    status: &Status,
+    selected: bool,
+    now_ms: i64,
+    theme: &Theme,
+) -> (Color, BorderType) {
+    let color = match status {
+        Status::NeedsInput { .. } => flash(now_ms, theme),
+        Status::Idle | Status::Done => theme.ok,
+        Status::Error => theme.err,
+        Status::Working | Status::Unknown => theme.border,
+    };
+    let weight = if selected {
+        BorderType::Thick
+    } else {
+        BorderType::Plain
+    };
+    (color, weight)
+}
+
+/// The blocked border's colour at `now_ms`: `attn` and `faint` in alternation, so the flash
+/// survives themes built from named ANSI colors (nothing to interpolate there). A theme with
+/// animation off gets the solid attention colour rather than a still frame of the blink.
+fn flash(now_ms: i64, theme: &Theme) -> Color {
+    if !theme.animation || (now_ms.max(0) / FLASH_MS) % 2 == 0 {
+        theme.attn
+    } else {
+        theme.faint
+    }
+}
+
 // --- Tile chrome ----------------------------------------------------------------
 
 /// What survives in a tile header at a given width. An empty `project` or `elapsed` means
@@ -387,20 +442,19 @@ fn draw_tile(
     theme: &Theme,
     rect: Rect,
 ) {
-    let needs_input = matches!(tile.session.status, Status::NeedsInput { .. });
-    // A blocked tile owns its own border and header and nothing else: no full-surface
-    // repaint, no flash, and no reordering the grid to float it forward. Grid stability is
-    // what lets you keep your place in the tile you were reading.
-    let border_color = if needs_input {
-        theme.warn
-    } else if selected {
-        theme.accent
+    // A blocked tile owns its own border and header and nothing else: the flash stays on the
+    // outline, with no full-surface repaint and no reordering the grid to float the tile
+    // forward. Grid stability is what lets you keep your place in the tile you were reading.
+    let (border_color, weight) = tile_border(&tile.session.status, selected, now_ms, theme);
+    let border_style = if selected {
+        fg(border_color).add_modifier(Modifier::BOLD)
     } else {
-        theme.border
+        fg(border_color)
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(fg(border_color))
+        .border_type(weight)
+        .border_style(border_style)
         .style(Style::default().bg(theme.surface));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -861,8 +915,106 @@ mod tests {
         pty.kill();
     }
 
+    /// Colour is the session's state, and every state that is not "still working" gets its own
+    /// token. This is the whole point of the scheme: a glance at the wall sorts the tiles.
     #[test]
-    fn selected_and_blocked_tiles_carry_their_own_border_token() {
+    fn each_state_paints_the_border_its_own_colour() {
+        // Mid-flash-on frame, so the blocked tile is at its attention colour.
+        let theme = crate::ui::theme::amber(false);
+        let on = 0;
+        assert_eq!(
+            tile_border(&Status::Working, false, on, &theme).0,
+            theme.border,
+            "working"
+        );
+        assert_eq!(
+            tile_border(&Status::Done, false, on, &theme).0,
+            theme.ok,
+            "done"
+        );
+        assert_eq!(
+            tile_border(&Status::Idle, false, on, &theme).0,
+            theme.ok,
+            "idle reads as finished, not as a fourth colour"
+        );
+        assert_eq!(
+            tile_border(&Status::Error, false, on, &theme).0,
+            theme.err,
+            "error"
+        );
+        assert_eq!(
+            tile_border(&Status::NeedsInput { reason: None }, false, on, &theme).0,
+            theme.attn,
+            "needs input"
+        );
+        // And the attention colour is genuinely its own hue, not a near-neighbour of the
+        // colours it has to be told apart from at a glance.
+        assert_ne!(theme.attn, theme.accent);
+        assert_ne!(theme.attn, theme.warn);
+        assert_ne!(theme.attn, theme.ok);
+    }
+
+    /// The blocked border moves and nothing else does, so "which one wants me" survives even
+    /// when the tile is off in the corner of the eye.
+    #[test]
+    fn the_blocked_border_flashes_and_every_other_state_holds_still() {
+        let theme = crate::ui::theme::amber(false);
+        let blocked = Status::NeedsInput { reason: None };
+        let on = tile_border(&blocked, false, 0, &theme).0;
+        let off = tile_border(&blocked, false, FLASH_MS, &theme).0;
+        assert_eq!(on, theme.attn);
+        assert_eq!(off, theme.faint);
+        assert_eq!(
+            tile_border(&blocked, false, 2 * FLASH_MS, &theme).0,
+            theme.attn,
+            "the flash must cycle back, not latch"
+        );
+        assert_eq!(
+            tile_border(&blocked, false, FLASH_MS - 1, &theme).0,
+            theme.attn,
+            "the phase boundary is FLASH_MS"
+        );
+        // A working tile is the same colour in both phases.
+        assert_eq!(
+            tile_border(&Status::Working, false, 0, &theme).0,
+            tile_border(&Status::Working, false, FLASH_MS, &theme).0
+        );
+    }
+
+    /// Animation off is a theme-wide contract (mono16, screenshots, recordings): the blocked
+    /// tile still reads as blocked, it just stops moving.
+    #[test]
+    fn a_theme_with_animation_off_holds_the_attention_colour_solid() {
+        let mut theme = crate::ui::theme::amber(false);
+        theme.animation = false;
+        let blocked = Status::NeedsInput { reason: None };
+        assert_eq!(tile_border(&blocked, false, 0, &theme).0, theme.attn);
+        assert_eq!(tile_border(&blocked, false, FLASH_MS, &theme).0, theme.attn);
+    }
+
+    /// Focus rides on weight, not colour, so it cannot mask the state colour — including on
+    /// the one tile where knowing both at once matters most.
+    #[test]
+    fn focus_thickens_the_border_without_taking_its_colour() {
+        let theme = crate::ui::theme::amber(false);
+        let blocked = Status::NeedsInput { reason: None };
+        assert_eq!(
+            tile_border(&blocked, true, 0, &theme),
+            (theme.attn, BorderType::Thick),
+            "a focused blocked tile must keep saying it is blocked"
+        );
+        assert_eq!(
+            tile_border(&Status::Working, true, 0, &theme),
+            (theme.border, BorderType::Thick)
+        );
+        assert_eq!(
+            tile_border(&Status::Working, false, 0, &theme).1,
+            BorderType::Plain
+        );
+    }
+
+    #[test]
+    fn the_drawn_border_carries_the_colour_and_the_weight() {
         let theme = crate::ui::theme::amber(false);
         let mut working = live_pty();
         let mut blocked = live_pty();
@@ -889,63 +1041,22 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10));
+                draw(frame, &view, 0, &theme, Rect::new(0, 0, 40, 10));
             })
             .expect("draw wall");
 
         let buffer = terminal.backend().buffer();
         let rects = tile_rects(Rect::new(0, 0, 40, 10), 2);
-        // Top-left corner cell of each tile's border.
-        assert_eq!(
-            buffer[(rects[0].x, rects[0].y)].fg,
-            theme.accent,
-            "selected tile border"
-        );
-        assert_eq!(
-            buffer[(rects[1].x, rects[1].y)].fg,
-            theme.warn,
-            "needs-input tile border"
-        );
+        // Top-left corner cell of each tile's border: colour, then the glyph that proves the
+        // weight actually reached the widget.
+        let focused = &buffer[(rects[0].x, rects[0].y)];
+        assert_eq!(focused.fg, theme.border, "focused working tile colour");
+        assert_eq!(focused.symbol(), "┏", "focused tile drew a plain corner");
+        let waiting = &buffer[(rects[1].x, rects[1].y)];
+        assert_eq!(waiting.fg, theme.attn, "blocked tile colour");
+        assert_eq!(waiting.symbol(), "┌", "unfocused tile drew a thick corner");
         working.kill();
         blocked.kill();
-    }
-
-    #[test]
-    fn an_unselected_working_tile_uses_the_plain_border_token() {
-        let theme = crate::ui::theme::amber(false);
-        let mut first = live_pty();
-        let mut second = live_pty();
-        let a = session("a", Status::Working);
-        let b = session("b", Status::Working);
-        let view = WallView {
-            tiles: vec![
-                WallTile {
-                    session: &a,
-                    project: String::new(),
-                    pty: Some(&first),
-                    error: None,
-                },
-                WallTile {
-                    session: &b,
-                    project: String::new(),
-                    pty: Some(&second),
-                    error: None,
-                },
-            ],
-            selected: 0,
-            overflow: 0,
-        };
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10));
-            })
-            .expect("draw wall");
-        let buffer = terminal.backend().buffer();
-        let rects = tile_rects(Rect::new(0, 0, 40, 10), 2);
-        assert_eq!(buffer[(rects[1].x, rects[1].y)].fg, theme.border);
-        first.kill();
-        second.kill();
     }
 
     #[test]
