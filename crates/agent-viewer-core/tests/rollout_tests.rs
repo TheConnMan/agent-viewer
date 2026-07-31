@@ -741,3 +741,72 @@ fn pending_approval_none_when_resolved() {
     drop(f);
     assert_eq!(pending_approval(&path).expect("pending_approval"), None);
 }
+
+/// Codex opens every thread with a `role: "user"` item that is not the user's: the plugin
+/// catalogue, the whole of AGENTS.md, and an `<environment_context>` block. It wears the user's
+/// role, so the developer/system filter does not catch it, and on a fresh thread it IS the
+/// tail — measured live 2026-07-31, the pane opened on a plugin list instead of the task.
+#[test]
+fn the_codex_environment_preamble_is_dropped_from_the_tail() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("preamble.jsonl");
+    let preamble = "<recommended_plugins>\\n- Slack (slack@openai-curated-remote)\\n\
+</recommended_plugins># AGENTS.md instructions\\n<INSTRUCTIONS>be concise</INSTRUCTIONS>\
+<environment_context>\\n  <cwd>/tmp/x</cwd>\\n  <shell>bash</shell>\\n</environment_context>";
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{preamble}"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"fix the drift"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"on it"}}]}}}}"#
+    )
+    .unwrap();
+
+    let events = read_transcript(&path).unwrap();
+    assert_eq!(
+        events,
+        [
+            TailEvent::User("fix the drift".to_string()),
+            TailEvent::Agent("on it".to_string()),
+        ],
+        "the scaffolding blob must not reach the pane"
+    );
+}
+
+/// The filter deletes conversation, so a false positive eats the user's own words. It is narrow
+/// on BOTH axes: the tag codex composes, and only at the head of the thread. A human quoting
+/// that tag mid-conversation keeps their message; showing a preamble is the smaller failure.
+#[test]
+fn a_later_message_carrying_the_environment_tag_is_kept() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoting.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"first, a real prompt"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"why does <environment_context> say bash here?"}}]}}}}"#
+    )
+    .unwrap();
+
+    let events = read_transcript(&path).unwrap();
+    assert_eq!(
+        events,
+        [
+            TailEvent::User("first, a real prompt".to_string()),
+            TailEvent::User("why does <environment_context> say bash here?".to_string()),
+        ],
+        "only the LEADING scaffolding item may be dropped"
+    );
+}

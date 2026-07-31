@@ -233,6 +233,26 @@ pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval
     Ok(None)
 }
 
+/// Codex opens every thread with a `role: "user"` item that is not the user's: the plugin
+/// catalogue, the whole of AGENTS.md, and an `<environment_context>` block naming the cwd,
+/// shell and date. It is scaffolding wearing the user's role, so the `developer`/`system`
+/// filter below does not catch it.
+///
+/// Measured on this box 2026-07-31: the blob was ~11 KB and was the FIRST tail item of a fresh
+/// thread, so the pane opened on a plugin list instead of the task.
+///
+/// Narrow on BOTH axes, because this filter deletes conversation and a false positive eats the
+/// user's own words:
+///
+/// - the signature is the `<environment_context>` tag codex composes itself, not "looks long"
+///   or "mentions AGENTS.md";
+/// - and only the LEADING item counts. The measurement found the blob at the head of the
+///   thread and nowhere else, so a later message carrying that tag is a human quoting it, and
+///   showing a preamble is a far smaller failure than silently swallowing a real prompt.
+fn is_environment_preamble(text: &str, emitted_so_far: usize) -> bool {
+    emitted_so_far == 0 && text.contains("<environment_context>")
+}
+
 /// Full lazy parse for the tail pane, in transcript order. Two kinds of response_item
 /// survive: a message (payload.role + payload.content[], concatenating content[].text where
 /// content[].type is "input_text" or "output_text") and a tool call (payload.type
@@ -298,7 +318,7 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
         }
         // Tool-only response_items extract to "" — skip them so the pane never shows a
         // blank role-only line.
-        if !text.is_empty() {
+        if !text.is_empty() && !is_environment_preamble(&text, items.len()) {
             items.push(if role == "user" {
                 TailEvent::User(text)
             } else {
