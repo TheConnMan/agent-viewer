@@ -460,6 +460,13 @@ struct Ui {
     /// The header mascot on screen. Ctrl+G cycles it so the candidate sprites can be compared
     /// live in one build.
     sprite: ui::SpriteKind,
+    /// Video wall (Ctrl+W): tiles the live PTYs already in `attached` over the list region.
+    /// A flag on the list view rather than a `Mode`, so every already-bound chord keeps
+    /// meaning what it meant.
+    wall: ui::WallState,
+    /// Latest wall geometry, written by `draw` each frame and read by the run loop to size
+    /// each tile's child (`PtySession::resize` needs `&mut`; draw is `&`-only).
+    wall_area: RefCell<ratatui::layout::Rect>,
 }
 
 impl Ui {
@@ -688,6 +695,8 @@ fn main() -> io::Result<()> {
         mouse_capture: true,
         mouse_press: None,
         sprite: startup_sprite,
+        wall: ui::WallState::default(),
+        wall_area: RefCell::new(ratatui::layout::Rect::default()),
     };
 
     // The composer's Auto entry is capability-gated on the router binary, resolved once here:
@@ -814,8 +823,14 @@ fn run(
         // Drive any armed one-shot reply injection once we are safely in the attached run.
         pending_reply::drive_pending_reply(ui);
 
+        // Size every wall tile's child to the cell it will occupy. Off the render path
+        // because resize needs `&mut`, and using last frame's geometry (one frame of lag on
+        // entry, invisible in practice).
+        resize_wall_tiles(ui);
+
         // Build the attach view (if focused) before borrowing the frame.
         let attach = build_attach_view(ui);
+        let wall = build_wall_view(ui);
         terminal.draw(|frame| {
             ui::draw(
                 frame,
@@ -833,6 +848,8 @@ fn run(
                     list_hit: &ui.list_hit,
                     themes: &ui.themes,
                     sprite: ui.sprite,
+                    wall,
+                    wall_area: &ui.wall_area,
                 },
             );
         })?;
@@ -901,6 +918,59 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
                 ..
             }
         )
+    })
+}
+
+/// Resize each wall tile's PTY to the cell it will occupy, using the region the previous
+/// frame published. Only when a size actually changed — a SIGWINCH per tile per frame would
+/// keep every child redrawing forever. Never spawns anything: a tile with no PTY was already
+/// excluded upstream by `wall::tile_keys`.
+fn resize_wall_tiles(ui: &mut Ui) {
+    if !ui.wall.on {
+        return;
+    }
+    let area = *ui.wall_area.borrow();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let keys = ui::wall::tile_keys(&ui.app, &ui.attached);
+    for (key, rect) in keys.iter().zip(ui::wall::tile_rects(area, keys.len())) {
+        let size = ui::wall::tile_inner(rect);
+        if ui.wall.sized.get(key) == Some(&size) {
+            continue;
+        }
+        if let Some(pty) = ui.attached.get_mut(key) {
+            let _ = pty.resize(size.0, size.1);
+            ui.wall.sized.insert(key.clone(), size);
+        }
+    }
+    ui.wall.sized.retain(|key, _| keys.contains(key));
+}
+
+/// Assemble the wall's tiles for this frame: the capped, list-ordered eligible sessions
+/// paired with the live PTYs they already have. None when the wall is off.
+fn build_wall_view(ui: &Ui) -> Option<ui::WallView<'_>> {
+    if !ui.wall.on {
+        return None;
+    }
+    let keys = ui::wall::tile_keys(&ui.app, &ui.attached);
+    let overflow = ui::wall::overflow(keys.len());
+    let tiles = keys
+        .iter()
+        .take(ui::wall::MAX_TILES)
+        .filter_map(|key| {
+            let session = ui.app.session_for(key)?;
+            Some(ui::WallTile {
+                project: agent_viewer_tui::app::project_label(&session.cwd),
+                session,
+                pty: ui.attached.get(key)?,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(ui::WallView {
+        selected: ui.wall.selected.min(tiles.len().saturating_sub(1)),
+        tiles,
+        overflow,
     })
 }
 
@@ -1490,6 +1560,8 @@ mod tests {
             mouse_press: None,
             terminal_palette: None,
             sprite: ui::SpriteKind::default(),
+            wall: ui::WallState::default(),
+            wall_area: RefCell::new(ratatui::layout::Rect::default()),
         }
     }
 
@@ -2356,6 +2428,8 @@ mod tests {
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
                             sprite: ui.sprite,
+                            wall: None,
+                            wall_area: &ui.wall_area,
                         },
                     );
                 })

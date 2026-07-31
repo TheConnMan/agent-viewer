@@ -41,9 +41,9 @@ pub(super) fn draw(frame: &mut Frame, av: AttachView, notice: &str, now_ms: i64,
     );
 }
 
-struct ThemedPseudoTerminal<'a> {
-    screen: &'a vt100::Screen,
-    palette: Option<TerminalPalette>,
+pub(super) struct ThemedPseudoTerminal<'a> {
+    pub(super) screen: &'a vt100::Screen,
+    pub(super) palette: Option<TerminalPalette>,
 }
 
 impl Widget for ThemedPseudoTerminal<'_> {

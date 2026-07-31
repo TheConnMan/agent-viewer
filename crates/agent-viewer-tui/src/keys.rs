@@ -17,9 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
-    hide_request, hide_selected, kill_request, kill_selected, open_filter, open_rename,
-    open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
-    toggle_group_if_header,
+    hide_request, hide_selected, kill_request, kill_selected, move_wall_selection, open_filter,
+    open_rename, open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
+    toggle_group_if_header, toggle_wall,
 };
 use crate::{Refresher, Ui};
 
@@ -412,6 +412,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('w') => toggle_wall(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
@@ -432,6 +433,12 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
         KeyCode::Up if theme_cmd => ui.themes.move_preview(-1),
         KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
         KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
+        // On the wall the arrows walk the grid (and pin the list selection to the tile), so
+        // Right moves rather than attaching; Enter is the attach there.
+        KeyCode::Down if ui.wall.on => move_wall_selection(ui, 0, 1),
+        KeyCode::Up if ui.wall.on => move_wall_selection(ui, 0, -1),
+        KeyCode::Left if ui.wall.on => move_wall_selection(ui, -1, 0),
+        KeyCode::Right if ui.wall.on => move_wall_selection(ui, 1, 0),
         // Arrows navigate or act at all times.
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
@@ -458,6 +465,8 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             ui.composer.clear();
         }
         KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
+        // Esc backs out exactly one level: a half-typed task first, then the wall.
+        KeyCode::Esc if ui.wall.on && ui.composer.text().is_empty() => toggle_wall(ui),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
             if theme_cmd {
@@ -1245,6 +1254,8 @@ pub(crate) mod tests {
             mouse_capture: true,
             mouse_press: None,
             sprite: Default::default(),
+            wall: agent_viewer_tui::ui::WallState::default(),
+            wall_area: std::cell::RefCell::new(ratatui::layout::Rect::default()),
         }
     }
 
@@ -1294,6 +1305,8 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        wall: None,
+                        wall_area: &ui.wall_area,
                     },
                 );
             })
@@ -1330,6 +1343,8 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        wall: None,
+                        wall_area: &ui.wall_area,
                     },
                 );
             })
@@ -1695,6 +1710,141 @@ pub(crate) mod tests {
         }
 
         assert_eq!(ui.composer.model_suggestions(), vec!["kimi-k3".to_string()]);
+    }
+
+    /// A live working session with a real PTY already in `attached` — the only shape that
+    /// earns a wall tile.
+    fn wall_tile_pty() -> PtySession {
+        PtySession::spawn(PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("wall tile child")
+    }
+
+    fn kill_attached(ui: &mut Ui) {
+        for (_, mut pty) in std::mem::take(&mut ui.attached) {
+            pty.kill();
+        }
+    }
+
+    fn wall_ui_with_one_live_tile() -> Ui {
+        let mut session = sess("live-tile", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let key = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(key, wall_tile_pty());
+        ui
+    }
+
+    #[test]
+    fn ctrl_w_toggles_the_video_wall() {
+        let mut ui = wall_ui_with_one_live_tile();
+        assert!(!ui.wall.on);
+
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on, "Ctrl+W did not turn the wall on");
+        assert!(ui.notice.text().contains("video wall"));
+
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(!ui.wall.on, "Ctrl+W did not turn the wall off");
+        kill_attached(&mut ui);
+    }
+
+    #[test]
+    fn esc_leaves_the_wall_only_once_the_composer_is_empty() {
+        let mut ui = wall_ui_with_one_live_tile();
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        ui.composer.push_char('x');
+
+        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.wall.on, "Esc must clear the composer before the wall");
+        assert_eq!(ui.composer.text(), "");
+
+        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!ui.wall.on, "a second Esc must back out of the wall");
+        kill_attached(&mut ui);
+    }
+
+    /// The wall is a flag on the list view, not a mode, precisely so this stays true.
+    #[test]
+    fn every_previously_bound_chord_still_acts_with_the_wall_on() {
+        let mut ui = wall_ui_with_one_live_tile();
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        let group_mode = ui.app.group_mode();
+        press_normal_key(&mut ui, &[], 's', KeyModifiers::CONTROL);
+        assert_ne!(ui.app.group_mode(), group_mode, "Ctrl+S regroup");
+
+        let show_all = ui.app.show_all();
+        press_normal_key(&mut ui, &[], 'a', KeyModifiers::CONTROL);
+        assert_ne!(ui.app.show_all(), show_all, "Ctrl+A show-all");
+
+        press_normal_key(&mut ui, &[], 'f', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Filter), "Ctrl+F filter");
+        ui.mode = Mode::Normal;
+
+        press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Palette(_)), "Ctrl+K palette");
+        ui.mode = Mode::Normal;
+
+        let sprite = ui.sprite;
+        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
+        assert_eq!(ui.sprite, sprite.next(), "Ctrl+G sprite");
+
+        // Typing still lands in the composer rather than being swallowed by the wall.
+        press_normal_key(&mut ui, &[], 'z', KeyModifiers::NONE);
+        assert_eq!(ui.composer.text(), "z");
+
+        assert!(ui.wall.on, "none of those chords should have left the wall");
+        kill_attached(&mut ui);
+    }
+
+    #[test]
+    fn wall_arrows_walk_the_grid_and_pin_the_list_selection() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let keys = [
+            (first.backend, first.id.clone()),
+            (second.backend, second.id.clone()),
+        ];
+        let mut ui = test_ui_with(vec![first, second]);
+        for key in &keys {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert_eq!(ui.wall.selected, 0);
+        let ordered = agent_viewer_tui::ui::wall::tile_keys(&ui.app, &ui.attached);
+        assert_eq!(ordered.len(), 2);
+
+        // Two tiles are a 2x1 row, so Right moves and Down does not.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(ui.wall.selected, 1);
+        assert_eq!(
+            ui.app.selected().map(|s| s.id.clone()),
+            Some(ordered[1].1.clone()),
+            "the tile selection must pin the list selection"
+        );
+
+        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(ui.wall.selected, 1, "a 2x1 grid has no second row");
+
+        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(
+            ui.app.selected().map(|s| s.id.clone()),
+            Some(ordered[0].1.clone())
+        );
+        kill_attached(&mut ui);
     }
 
     #[test]

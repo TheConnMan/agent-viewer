@@ -59,6 +59,8 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    wall: None,
+                    wall_area: &std::cell::RefCell::new(ratatui::layout::Rect::default()),
                 },
             );
         })

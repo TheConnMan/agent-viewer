@@ -8,6 +8,7 @@ mod overlay;
 mod palette;
 mod sprite;
 pub mod theme;
+pub mod wall;
 
 use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
@@ -35,6 +36,7 @@ use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use sprite::SpriteKind;
 pub use theme::{Theme, ThemeState};
+pub use wall::{WallState, WallTile, WallView};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
 pub type Pulses = HashMap<(BackendKind, String), i64>;
@@ -292,6 +294,13 @@ pub struct Draw<'a> {
     /// Which header mascot to draw. Cycled live with Ctrl+G while the candidates are being
     /// compared.
     pub sprite: SpriteKind,
+    /// The video wall (Ctrl+W), when on. Present means the list region becomes a grid of
+    /// live PTY tiles; the header, composer, and footer stay exactly where they were.
+    pub wall: Option<WallView<'a>>,
+    /// Sink for the region the wall occupied this frame. `PtySession::resize` needs `&mut`
+    /// and draw is `&`-only, so the run loop reads this back and sizes each tile's child.
+    /// Zeroed on any frame without a wall. Same pattern as `list_hit`.
+    pub wall_area: &'a RefCell<Rect>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -363,17 +372,29 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
     // below, floating over the list's bottom) shadows part of it, so record that hole too.
-    let mut hit = draw_list(
-        frame,
-        d.app,
-        d.pulses,
-        d.now_ms,
-        d.pr_status,
-        deco,
-        d.logos,
-        theme,
-        vertical[1],
-    );
+    // The wall replaces the list region and nothing else, so it publishes that region for the
+    // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
+    let mut hit = match &d.wall {
+        Some(view) => {
+            *d.wall_area.borrow_mut() = vertical[1];
+            wall::draw(frame, view, d.now_ms, theme, vertical[1]);
+            ListHit::default()
+        }
+        None => {
+            *d.wall_area.borrow_mut() = Rect::default();
+            draw_list(
+                frame,
+                d.app,
+                d.pulses,
+                d.now_ms,
+                d.pr_status,
+                deco,
+                d.logos,
+                theme,
+                vertical[1],
+            )
+        }
+    };
     if matches!(d.mode, Mode::Normal) {
         hit.blocked = overlay::popup_area(d.composer, d.themes, vertical[3]);
     }
@@ -398,7 +419,16 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             matches!(d.mode, Mode::Normal) && caret_visible(d.now_ms, theme.animation),
         );
     }
-    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, theme, vertical[4]);
+    draw_footer(
+        frame,
+        d.app,
+        d.mode,
+        d.notice,
+        d.now_ms,
+        theme,
+        d.wall.as_ref(),
+        vertical[4],
+    );
 
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup.
@@ -654,6 +684,7 @@ fn draw_list(
 
 // --- Footer ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn draw_footer(
     frame: &mut Frame,
     app: &App,
@@ -661,8 +692,35 @@ fn draw_footer(
     notice: &str,
     now_ms: i64,
     theme: &Theme,
+    wall: Option<&WallView>,
     area: Rect,
 ) {
+    // The wall owns the footer while it is on (except for a live notice), because its keys
+    // differ from the list's and the overflow count has nowhere else to go.
+    if let Some(view) = wall
+        && matches!(mode, Mode::Normal)
+        && notice.is_empty()
+    {
+        let overflow = if view.overflow > 0 {
+            format!(
+                "showing {} of {} · ",
+                view.tiles.len(),
+                view.tiles.len() + view.overflow
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "{overflow}video wall · ↑↓←→ pick tile · Enter attach · Ctrl+W or Esc back to the list"
+                ),
+                fg(theme.muted),
+            ))),
+            area,
+        );
+        return;
+    }
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
         Mode::Palette(_) => Line::from(""),
@@ -808,6 +866,8 @@ mod tests {
                         list_hit: &list_hit,
                         themes,
                         sprite: Default::default(),
+                        wall: None,
+                        wall_area: &RefCell::new(Rect::default()),
                     },
                 );
             })
@@ -1760,6 +1820,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    wall: None,
+                    wall_area: &RefCell::new(Rect::default()),
                 },
             );
         })
@@ -1866,6 +1928,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    wall: None,
+                    wall_area: &RefCell::new(Rect::default()),
                 },
             );
         })
@@ -1974,6 +2038,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    wall: None,
+                    wall_area: &RefCell::new(Rect::default()),
                 },
             );
         })

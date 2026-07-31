@@ -873,7 +873,9 @@ fn section_of(status: &Status) -> Section {
     }
 }
 
-fn project_label(root: &Path) -> String {
+/// The short label for a directory: `~/git`-relative when it lives there, else the full
+/// path. Used by the ByProject group headers and by the video wall's tile chrome.
+pub fn project_label(root: &Path) -> String {
     let home = agent_viewer_core::home_dir();
     if !home.as_os_str().is_empty() {
         let git_root = home.join("git");

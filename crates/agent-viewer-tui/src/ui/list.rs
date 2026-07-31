@@ -35,7 +35,7 @@ pub(super) fn rename_buffer(
     truncate_display_width(buffer, buffer_width)
 }
 
-fn truncate_display_width(text: &str, width: usize) -> String {
+pub(super) fn truncate_display_width(text: &str, width: usize) -> String {
     let mut end = 0;
     for (index, character) in text.char_indices() {
         let next = index + character.len_utf8();
