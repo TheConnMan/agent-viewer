@@ -46,13 +46,13 @@ pub(crate) fn toggle_wall(ui: &mut Ui) {
     }
     ui.wall.on = true;
     ui.wall.clear();
-    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
     match keys.first() {
         Some(key) => {
             ui.app.select_by_key(key);
             let plural = if keys.len() == 1 { "" } else { "s" };
             ui.set_notice(format!(
-                "video wall: connecting {} live session{plural} · Ctrl+W or Esc to exit",
+                "video wall: connecting {} session{plural} · type into the focused tile · Ctrl+W to exit",
                 keys.len()
             ));
         }
@@ -62,8 +62,19 @@ pub(crate) fn toggle_wall(ui: &mut Ui) {
 
 /// Arrow movement inside the wall grid. Clamps at the edges like the list does, and pins the
 /// list selection onto the tile so Ctrl+R/Ctrl+X/Ctrl+E/Enter all act on the tile in view.
+/// Focus one tile outright, by index. The mouse path: hover or click puts the keyboard on
+/// whatever is under the pointer, so typing lands where you are looking.
+pub(crate) fn focus_wall_tile(ui: &mut Ui, index: usize) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    let Some(key) = keys.get(index) else {
+        return;
+    };
+    ui.wall.selected = index;
+    ui.app.select_by_key(key);
+}
+
 pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
-    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
     let count = keys.len();
     if count == 0 {
         return;

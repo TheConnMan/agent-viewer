@@ -208,6 +208,8 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Enter/Space", "toggle group on a header"),
         // Paired onto one line: the popup already fills an 80x24 terminal, and a 23rd entry
         // pushes Ctrl+C off the bottom.
+        // The wall's own keys are in the footer while it is up; a longer line here wraps and
+        // pushes Ctrl+C off the bottom of an 80x24 popup.
         ("Ctrl+K / Ctrl+W", "command palette / video wall"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),

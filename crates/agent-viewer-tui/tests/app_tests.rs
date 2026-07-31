@@ -124,7 +124,7 @@ fn assert_title_is_safe_in_storage_and_rendering(app: &mut App, id: &str, expect
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &std::cell::RefCell::new(ratatui::layout::Rect::default()),
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1523,7 +1523,7 @@ fn main_view_renders_shared_columns_secondary_styles_and_flush_elapsed() {
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &std::cell::RefCell::new(ratatui::layout::Rect::default()),
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1636,7 +1636,7 @@ fn main_view_shrinks_title_column_to_keep_a_complete_pr_badge() {
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &std::cell::RefCell::new(ratatui::layout::Rect::default()),
+                    wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
             );
         })
