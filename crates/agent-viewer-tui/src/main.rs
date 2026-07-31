@@ -477,13 +477,14 @@ struct Ui {
     /// The header mascot on screen. Ctrl+G cycles it so the candidate sprites can be compared
     /// live in one build.
     sprite: ui::SpriteKind,
-    /// Video wall (Ctrl+W): tiles the live PTYs already in `attached` over the list region.
-    /// A flag on the list view rather than a `Mode`, so every already-bound chord keeps
-    /// meaning what it meant.
+    /// Video wall (Ctrl+W): tiles every live session over the list region and gives the
+    /// keyboard to the focused tile. A flag on the list view rather than a `Mode`, because
+    /// everything outside the wall's own reserved chords is forwarded, not rebound.
     wall: ui::WallState,
-    /// Latest wall geometry, written by `draw` each frame and read by the run loop to size
-    /// each tile's child (`PtySession::resize` needs `&mut`; draw is `&`-only).
-    wall_area: RefCell<ratatui::layout::Rect>,
+    /// Rect of each wall tile as of the last frame, in tile order. Written by `draw` and read
+    /// by the run loop to size each tile's child (`PtySession::resize` needs `&mut`; draw is
+    /// `&`-only) and by the mouse handler to hit-test the pointer onto a tile.
+    wall_rects: RefCell<Vec<ratatui::layout::Rect>>,
 }
 
 impl Ui {
@@ -713,7 +714,7 @@ fn main() -> io::Result<()> {
         mouse_press: None,
         sprite: startup_sprite,
         wall: ui::WallState::default(),
-        wall_area: RefCell::new(ratatui::layout::Rect::default()),
+        wall_rects: RefCell::new(Vec::new()),
     };
 
     // The composer's Auto entry is capability-gated on the router binary, resolved once here:
@@ -846,12 +847,12 @@ fn run(
         // size every connected child to the cell it will occupy. Both are off the render
         // path (resize needs `&mut`) and use last frame's geometry: one frame of lag on
         // entry, invisible in practice.
-        request_wall_joins(ui);
-        resize_wall_tiles(ui);
+        request_wall_joins(ui, now);
+        resize_wall_tiles(ui, now);
 
         // Build the attach view (if focused) before borrowing the frame.
         let attach = build_attach_view(ui);
-        let wall = build_wall_view(ui);
+        let wall = build_wall_view(ui, now);
         terminal.draw(|frame| {
             ui::draw(
                 frame,
@@ -870,7 +871,7 @@ fn run(
                     themes: &ui.themes,
                     sprite: ui.sprite,
                     wall,
-                    wall_area: &ui.wall_area,
+                    wall_rects: &ui.wall_rects,
                 },
             );
         })?;
@@ -986,11 +987,11 @@ fn install_wall_join(ui: &mut Ui, key: Key, plan: Result<ops::AttachPlan, String
 /// key the user attach path uses (which deliberately drops a second request while one is in
 /// flight). `requested` makes this once-per-session-per-visit: without it a failed join would
 /// be retried on every tick forever.
-fn request_wall_joins(ui: &mut Ui) {
+fn request_wall_joins(ui: &mut Ui, now_ms: i64) {
     if !ui.wall.on {
         return;
     }
-    for key in ui::wall::tile_keys(&ui.app) {
+    for key in ui::wall::tile_keys(&ui.app, now_ms) {
         if ui.wall.requested.contains(&key) {
             continue;
         }
@@ -1027,21 +1028,20 @@ fn close_wall(ui: &mut Ui) {
     ui.wall.clear();
 }
 
-/// Resize each wall tile's PTY to the cell it will occupy, using the region the previous
-/// frame published. Only when a size actually changed — a SIGWINCH per tile per frame would
-/// keep every child redrawing forever. Never spawns anything: a tile with no PTY was already
+/// Resize each wall tile's PTY to the cell it will occupy, using the rects the previous frame
+/// published. Only when a size actually changed — a SIGWINCH per tile per frame would keep
+/// every child redrawing forever. Never spawns anything: a tile with no PTY was already
 /// excluded upstream by `wall::tile_keys`.
-fn resize_wall_tiles(ui: &mut Ui) {
+///
+/// A frame where the tile set just changed has one stale rect per tile; the zip drops the
+/// excess and the next frame corrects the rest.
+fn resize_wall_tiles(ui: &mut Ui, now_ms: i64) {
     if !ui.wall.on {
         return;
     }
-    let area = *ui.wall_area.borrow();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let keys = ui::wall::tile_keys(&ui.app);
-    let eligible = ui::wall::wall_sessions(&ui.app).len();
-    for (key, rect) in keys.iter().zip(ui::wall::tile_rects(area, eligible)) {
+    let rects = ui.wall_rects.borrow().clone();
+    let keys = ui::wall::tile_keys(&ui.app, now_ms);
+    for (key, rect) in keys.iter().zip(rects) {
         let size = ui::wall::tile_inner(rect);
         if ui.wall.sized.get(key) == Some(&size) {
             continue;
@@ -1056,12 +1056,12 @@ fn resize_wall_tiles(ui: &mut Ui) {
 
 /// Assemble the wall's tiles for this frame: the capped, list-ordered live sessions, each
 /// with its connection if one has landed yet. None when the wall is off.
-fn build_wall_view(ui: &Ui) -> Option<ui::WallView<'_>> {
+fn build_wall_view(ui: &Ui, now_ms: i64) -> Option<ui::WallView<'_>> {
     if !ui.wall.on {
         return None;
     }
-    let overflow = ui::wall::overflow(ui::wall::wall_sessions(&ui.app).len());
-    let tiles = ui::wall::tile_keys(&ui.app)
+    let overflow = ui::wall::overflow(ui::wall::wall_sessions(&ui.app, now_ms).len());
+    let tiles = ui::wall::tile_keys(&ui.app, now_ms)
         .into_iter()
         .filter_map(|key| {
             let session = ui.app.session_for(&key)?;
@@ -1658,7 +1658,7 @@ mod tests {
         ui.wall.on = true;
 
         for _ in 0..5 {
-            request_wall_joins(&mut ui);
+            request_wall_joins(&mut ui, now_ms());
         }
         // Drain so nothing is left "in flight" masking a re-request behind the runner's dedup.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1671,7 +1671,7 @@ mod tests {
         }
         assert!(!ui.attaches.in_flight("wall:codex:one"), "join not drained");
         for _ in 0..5 {
-            request_wall_joins(&mut ui);
+            request_wall_joins(&mut ui, now_ms());
         }
 
         // `submit` marks its key in flight synchronously, so this reads the decision itself
@@ -1759,7 +1759,7 @@ mod tests {
             terminal_palette: None,
             sprite: ui::SpriteKind::default(),
             wall: ui::WallState::default(),
-            wall_area: RefCell::new(ratatui::layout::Rect::default()),
+            wall_rects: RefCell::new(Vec::new()),
         }
     }
 
@@ -2632,7 +2632,7 @@ mod tests {
                             themes: &ui.themes,
                             sprite: ui.sprite,
                             wall: None,
-                            wall_area: &ui.wall_area,
+                            wall_rects: &ui.wall_rects,
                         },
                     );
                 })

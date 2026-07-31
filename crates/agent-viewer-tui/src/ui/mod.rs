@@ -295,12 +295,14 @@ pub struct Draw<'a> {
     /// compared.
     pub sprite: SpriteKind,
     /// The video wall (Ctrl+W), when on. Present means the list region becomes a grid of
-    /// live PTY tiles; the header, composer, and footer stay exactly where they were.
+    /// live PTY tiles and the composer is not drawn at all (the focused tile owns the
+    /// keyboard); the header and footer stay exactly where they were.
     pub wall: Option<WallView<'a>>,
-    /// Sink for the region the wall occupied this frame. `PtySession::resize` needs `&mut`
-    /// and draw is `&`-only, so the run loop reads this back and sizes each tile's child.
-    /// Zeroed on any frame without a wall. Same pattern as `list_hit`.
-    pub wall_area: &'a RefCell<Rect>,
+    /// Sink for the rect of each tile this frame, in tile order. The run loop reads it back
+    /// to size each tile's child (`PtySession::resize` needs `&mut` and draw is `&`-only) and
+    /// to hit-test the pointer. Emptied on any frame without a wall. Same pattern as
+    /// `list_hit`.
+    pub wall_rects: &'a RefCell<Vec<Rect>>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -320,22 +322,28 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // a long task description stays visible. Reply mode sizes its prompt prefixed box to the
     // reply buffer.
     let inner_w = input_inner_width(frame.area().width);
-    let composer_h = match &d.mode {
-        Mode::Reply(m) => {
-            let title = d
-                .app
-                .session_for(&(m.backend, m.id.clone()))
-                .map(|s| s.title.clone())
-                .unwrap_or_default();
-            let title_seg = if title.is_empty() {
-                String::new()
-            } else {
-                format!("{title} ")
-            };
-            let prefix = format!("↳ reply {title_seg}❯ ");
-            input_box_height(display_width(&prefix), &m.buffer, inner_w)
+    // The wall owns the keyboard, so the composer is not drawn while it is on: an input box
+    // that cannot receive your input is a lie, and those rows are better spent on tiles.
+    let composer_h = if d.wall.is_some() {
+        0
+    } else {
+        match &d.mode {
+            Mode::Reply(m) => {
+                let title = d
+                    .app
+                    .session_for(&(m.backend, m.id.clone()))
+                    .map(|s| s.title.clone())
+                    .unwrap_or_default();
+                let title_seg = if title.is_empty() {
+                    String::new()
+                } else {
+                    format!("{title} ")
+                };
+                let prefix = format!("↳ reply {title_seg}❯ ");
+                input_box_height(display_width(&prefix), &m.buffer, inner_w)
+            }
+            _ => composer_box_height(d.composer.text(), inner_w, frame.area().height),
         }
-        _ => composer_box_height(d.composer.text(), inner_w, frame.area().height),
     };
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
@@ -376,12 +384,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
     let mut hit = match &d.wall {
         Some(view) => {
-            *d.wall_area.borrow_mut() = vertical[1];
-            wall::draw(frame, view, d.now_ms, theme, vertical[1]);
+            *d.wall_rects.borrow_mut() = wall::draw(frame, view, d.now_ms, theme, vertical[1]);
             ListHit::default()
         }
         None => {
-            *d.wall_area.borrow_mut() = Rect::default();
+            d.wall_rects.borrow_mut().clear();
             draw_list(
                 frame,
                 d.app,
@@ -395,13 +402,15 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             )
         }
     };
-    if matches!(d.mode, Mode::Normal) {
+    if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
         hit.blocked = overlay::popup_area(d.composer, d.themes, vertical[3]);
     }
     *d.list_hit.borrow_mut() = hit;
     // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
     // the persistent spawn composer.
-    if let Mode::Reply(m) = d.mode {
+    if d.wall.is_some() {
+        // No composer on the wall: `composer_h` is zero, so there is nothing to draw into.
+    } else if let Mode::Reply(m) = d.mode {
         let title = d
             .app
             .session_for(&(m.backend, m.id.clone()))
@@ -431,8 +440,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     );
 
     // Completion popup floating just above the composer box: the /model picker when a /model
-    // command is being typed, else the slash-command popup.
-    if matches!(d.mode, Mode::Normal) {
+    // command is being typed, else the slash-command popup. Never on the wall — the composer
+    // it belongs to is not on screen.
+    if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
         let highlight = d.composer.suggestion_highlight();
         if d.themes.picker_open() {
             overlay::draw_theme_picker(frame, d.themes, vertical[3]);
@@ -713,7 +723,7 @@ fn draw_footer(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "{overflow}video wall · ↑↓←→ pick tile · Enter attach · Ctrl+W or Esc back to the list"
+                    "{overflow}wall · keys go to the focused tile · Ctrl+↑↓←→ move · Ctrl+O zoom · Ctrl+W exit"
                 ),
                 fg(theme.muted),
             ))),
@@ -867,7 +877,7 @@ mod tests {
                         themes,
                         sprite: Default::default(),
                         wall: None,
-                        wall_area: &RefCell::new(Rect::default()),
+                        wall_rects: &RefCell::new(Vec::new()),
                     },
                 );
             })
@@ -1821,7 +1831,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &RefCell::new(Rect::default()),
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1846,6 +1856,89 @@ mod tests {
             .collect();
         let pos = term.get_cursor_position().unwrap();
         (rows, (pos.x, pos.y))
+    }
+
+    /// The wall owns the keyboard, so the composer must not be on screen claiming to. Its
+    /// rows go to the grid instead: the tile has to reach further down the frame than the
+    /// list region ever did.
+    #[test]
+    fn the_composer_is_not_drawn_while_the_wall_is_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Cell;
+
+        let session = Session {
+            backend: BackendKind::Codex,
+            id: "walled".to_string(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "walled".to_string(),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        };
+        let app = App::new(vec![session.clone()]);
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(Cell::symbol).collect();
+
+        assert!(
+            !rendered.contains('❯'),
+            "the composer prompt is still on screen with the wall up"
+        );
+        let tile = rects.borrow()[0];
+        assert!(
+            tile.bottom() >= 22,
+            "the tile stopped at row {}, so the composer rows were not reclaimed",
+            tile.bottom()
+        );
     }
 
     #[test]
@@ -1929,7 +2022,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &RefCell::new(Rect::default()),
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })
@@ -2039,7 +2132,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     wall: None,
-                    wall_area: &RefCell::new(Rect::default()),
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })

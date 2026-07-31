@@ -1,9 +1,13 @@
 //! Video wall (Ctrl+W): the session list is replaced by a grid of live PTY tiles.
 //!
 //! This is a real attach, not transcript parsing. Ctrl+W shows everything that is running:
-//! the wall connects each working session through the same attach path a manual attach uses,
-//! and closes every one of those connections when the wall closes. Nothing stays connected
-//! off screen. Only live sessions are ever joined, so no finished session is resurrected.
+//! the wall connects each session through the same attach path a manual attach uses, and
+//! closes every one of those connections when the wall closes. Nothing stays connected off
+//! screen.
+//!
+//! The wall is an input surface, not a viewing one — the focused tile takes the keyboard (see
+//! `keys::handle_wall_key`), which is why membership keeps a session for `RECENT_MS` after it
+//! stops rather than dropping it the instant it becomes worth replying to.
 //!
 //! Geometry lives here as pure functions because two call sites need identical answers: the
 //! render path (which draws the tiles) and the run loop (which resizes each tile's child,
@@ -26,12 +30,17 @@ use std::collections::{HashMap, HashSet};
 /// process budget, not a rendering one. Above the cap the footer carries the overflow count.
 pub const MAX_TILES: usize = 9;
 
+/// How long a session that has stopped working keeps its tile. A tile vanishing the instant a
+/// run finishes is jarring, and that moment is exactly when the wall is most useful: the reply
+/// you want to type is the one that follows the result you just watched arrive.
+pub const RECENT_MS: i64 = 15 * 60 * 1000;
+
 /// Columns spent on the selection caret, reserved on every tile so nothing shifts when the
 /// selection moves.
 const CARET_COLS: usize = 2;
 
-/// Wall state carried on the run loop's `Ui`. The wall is a flag on the list view rather
-/// than a `Mode`, which is what keeps every already-bound chord meaning what it meant.
+/// Wall state carried on the run loop's `Ui`. A flag on the list view rather than a `Mode`,
+/// because outside its own reserved chords the wall forwards keys rather than rebinding them.
 #[derive(Default)]
 pub struct WallState {
     pub on: bool,
@@ -90,31 +99,46 @@ pub struct WallView<'a> {
 /// Every session the wall should tile, in `visible()` order so the wall reads in the same
 /// sequence as the list it replaced.
 ///
-/// Membership is state alone: `Working` or `NeedsInput`. The wall connects whatever is not
-/// connected yet rather than showing only what happened to be connected already — the whole
-/// point is that one keypress shows you everything that is running. `NeedsInput` is included
-/// because a session blocked for an answer is the most useful thing the wall can show.
+/// Membership is state plus recency. The wall connects whatever is not connected yet rather
+/// than showing only what happened to be connected already — the whole point is that one
+/// keypress shows you everything that is running.
 ///
 /// Never iterate `attached` here — `HashMap` order is unspecified and the grid would shuffle
 /// between frames.
-pub fn wall_sessions(app: &App) -> Vec<(BackendKind, String)> {
+pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
     app.visible()
         .iter()
         .filter_map(|row| match row {
             Row::Session {
                 backend,
                 id,
-                status: Status::Working | Status::NeedsInput { .. },
+                status,
+                updated_at_ms,
                 ..
-            } => Some((*backend, id.clone())),
+            } if tiled(status, *updated_at_ms, now_ms) => Some((*backend, id.clone())),
             _ => None,
         })
         .collect()
 }
 
+/// Whether one session earns a tile.
+///
+/// A session that has stopped keeps its tile for `RECENT_MS`, because that is the moment it
+/// becomes worth typing into. `Idle` is the load-bearing state here, not `Done`: a Claude
+/// background job that finishes its turn reports `idle` with its process still alive, and
+/// Codex maps complete-and-still-held to `Idle` too. `Error` is in for the same reason
+/// `NeedsInput` is — a run that just failed is the most useful thing a wall can show.
+fn tiled(status: &Status, updated_at_ms: i64, now_ms: i64) -> bool {
+    match status {
+        Status::Working | Status::NeedsInput { .. } => true,
+        Status::Idle | Status::Done | Status::Error => now_ms - updated_at_ms <= RECENT_MS,
+        Status::Unknown => false,
+    }
+}
+
 /// The sessions the wall should be connected to right now: the capped tile set.
-pub fn tile_keys(app: &App) -> Vec<(BackendKind, String)> {
-    let mut keys = wall_sessions(app);
+pub fn tile_keys(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
+    let mut keys = wall_sessions(app, now_ms);
     keys.truncate(MAX_TILES);
     keys
 }
@@ -247,15 +271,32 @@ pub(super) fn header_plan(
 
 // --- Render ---------------------------------------------------------------------
 
-pub(super) fn draw(frame: &mut Frame, view: &WallView, now_ms: i64, theme: &Theme, area: Rect) {
+/// Draw the grid and return the rect of each tile, in tile order. The run loop reads these
+/// back to size each child and to hit-test the pointer, so the geometry the user sees and the
+/// geometry the viewer reasons about are the same numbers.
+pub(super) fn draw(
+    frame: &mut Frame,
+    view: &WallView,
+    now_ms: i64,
+    theme: &Theme,
+    area: Rect,
+) -> Vec<Rect> {
     if view.tiles.is_empty() {
         draw_empty(frame, theme, area);
-        return;
+        return Vec::new();
     }
     let rects = tile_rects(area, view.tiles.len() + view.overflow);
-    for (index, (tile, rect)) in view.tiles.iter().zip(rects).enumerate() {
-        draw_tile(frame, tile, index == view.selected, now_ms, theme, rect);
+    for (index, (tile, rect)) in view.tiles.iter().zip(&rects).enumerate() {
+        draw_tile(frame, tile, index == view.selected, now_ms, theme, *rect);
     }
+    rects
+}
+
+/// The tile under a pointer cell, given the rects the last frame published.
+pub fn tile_at(rects: &[Rect], column: u16, row: u16) -> Option<usize> {
+    rects
+        .iter()
+        .position(|rect| rect.contains(ratatui::layout::Position { x: column, y: row }))
 }
 
 fn draw_empty(frame: &mut Frame, theme: &Theme, area: Rect) {
@@ -419,6 +460,10 @@ mod tests {
     use agent_viewer_core::pty::PtySpec;
     use ratatui::backend::TestBackend;
 
+    /// Fixture clock. Sessions are stamped at 1_000, so at NOW everything is well inside the
+    /// recency window unless a test moves the clock forward itself.
+    const NOW: i64 = 2_000;
+
     fn session(id: &str, status: Status) -> Session {
         Session {
             backend: BackendKind::Codex,
@@ -507,7 +552,7 @@ mod tests {
             session("not-connected-yet", Status::Working),
         ]);
 
-        let mut ids: Vec<String> = tile_keys(&app).into_iter().map(|(_, id)| id).collect();
+        let mut ids: Vec<String> = tile_keys(&app, NOW).into_iter().map(|(_, id)| id).collect();
         ids.sort();
 
         assert_eq!(
@@ -516,19 +561,60 @@ mod tests {
         );
     }
 
+    /// A session that just stopped is exactly when the wall earns its keep — that is the
+    /// moment you want to type the follow-up — so it keeps its tile for `RECENT_MS`.
     #[test]
-    fn only_live_states_are_tiled() {
+    fn a_session_that_just_stopped_keeps_its_tile() {
         let app = App::new(vec![
             session("working", Status::Working),
             session("blocked", Status::NeedsInput { reason: None }),
             session("finished", Status::Done),
             session("resting", Status::Idle),
+            session("broke", Status::Error),
+            session("mystery", Status::Unknown),
         ]);
 
-        let mut ids: Vec<String> = tile_keys(&app).into_iter().map(|(_, id)| id).collect();
+        let mut ids: Vec<String> = tile_keys(&app, NOW).into_iter().map(|(_, id)| id).collect();
+        ids.sort();
+
+        assert_eq!(
+            ids,
+            vec![
+                "blocked".to_string(),
+                "broke".to_string(),
+                "finished".to_string(),
+                "resting".to_string(),
+                "working".to_string(),
+            ],
+            "a session that stopped a second ago must still be tiled"
+        );
+    }
+
+    /// The window is what stops the wall silting up with everything that ever ran. Working
+    /// and blocked sessions have no window at all: a run that has been going for hours is
+    /// still running.
+    #[test]
+    fn a_session_that_stopped_long_ago_is_dropped_but_a_long_run_is_not() {
+        let app = App::new(vec![
+            session("working", Status::Working),
+            session("blocked", Status::NeedsInput { reason: None }),
+            session("finished", Status::Done),
+            session("resting", Status::Idle),
+            session("broke", Status::Error),
+        ]);
+        // One millisecond past the window, measured from the fixture's 1_000 stamp.
+        let later = 1_000 + RECENT_MS + 1;
+
+        let mut ids: Vec<String> = tile_keys(&app, later)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
         ids.sort();
 
         assert_eq!(ids, vec!["blocked".to_string(), "working".to_string()]);
+        // And one millisecond inside it still counts, so the boundary is the window and not
+        // some other cutoff that happens to be nearby.
+        assert_eq!(tile_keys(&app, 1_000 + RECENT_MS).len(), 5);
     }
 
     /// The cap is a live-child budget, so it has to bind the set the wall CONNECTS, not just
@@ -540,9 +626,9 @@ mod tests {
             .collect();
         let app = App::new(sessions);
 
-        assert_eq!(wall_sessions(&app).len(), 11);
-        assert_eq!(tile_keys(&app).len(), MAX_TILES);
-        assert_eq!(overflow(wall_sessions(&app).len()), 2);
+        assert_eq!(wall_sessions(&app, NOW).len(), 11);
+        assert_eq!(tile_keys(&app, NOW).len(), MAX_TILES);
+        assert_eq!(overflow(wall_sessions(&app, NOW).len()), 2);
     }
 
     #[test]
@@ -570,7 +656,9 @@ mod tests {
         };
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 80, 10)))
+            .draw(|frame| {
+                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 80, 10));
+            })
             .expect("draw wall");
         let rendered: String = terminal
             .backend()
@@ -673,7 +761,9 @@ mod tests {
         };
         let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10)))
+            .draw(|frame| {
+                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10));
+            })
             .expect("draw wall");
 
         let buffer = terminal.backend().buffer();
@@ -720,7 +810,9 @@ mod tests {
         };
         let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10)))
+            .draw(|frame| {
+                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 40, 10));
+            })
             .expect("draw wall");
         let buffer = terminal.backend().buffer();
         let rects = tile_rects(Rect::new(0, 0, 40, 10), 2);
@@ -745,7 +837,9 @@ mod tests {
         };
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &view, 0, &theme, Rect::new(0, 0, 80, 6)))
+            .draw(|frame| {
+                draw(frame, &view, 0, &theme, Rect::new(0, 0, 80, 6));
+            })
             .expect("draw empty wall");
         let buffer = terminal.backend().buffer();
         let rendered: String = buffer

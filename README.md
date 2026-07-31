@@ -249,23 +249,31 @@ external opencode selection behavior follow the `Ctrl+T` controls above.
 
 ### Video wall
 
-`Ctrl+W` replaces the session list with a grid of everything that is running. It connects each
-working (and awaiting-input) session for you through the same path a manual attach uses, so
-there is nothing to set up first; a tile shows `connecting…` until its session is live, or the
-reason it could not be joined. `Ctrl+W` again, or `Esc` with an empty composer, closes the wall
-and every connection it opened.
+`Ctrl+W` replaces the session list with a grid of everything that is running, and gives the
+keyboard to one tile so you can answer a session without leaving the grid. It connects each
+session for you through the same path a manual attach uses, so there is nothing to set up
+first; a tile shows `connecting…` until its session is live, or the reason it could not be
+joined. `Ctrl+W` again closes the wall and every connection it opened.
+
+A session earns a tile while it is working or awaiting input, and keeps it for fifteen minutes
+after it stops. A run that just finished is exactly when the wall is most useful — the reply
+you want to type is the one that follows the result you watched arrive — so the tile stays put
+instead of vanishing at that moment.
 
 The grid is 1x1 for one session, 2x1 for two, 2x2 for three or four, 3x2 for five or six, and
 3x3 up to nine. Nine is the cap, because every tile is a live child process; beyond that the
 footer reads `showing 9 of N` rather than dropping the rest silently. Each tile carries its
 state glyph, backend mark, title, project, and elapsed time, dropping the project then the
-elapsed as tiles get narrower.
+elapsed as tiles get narrower. The focused tile is marked with a caret and an accent border; a
+tile awaiting input turns its own border and header amber without disturbing the rest of the
+wall, and the grid never reorders itself, so you keep your place in whatever you were reading.
 
-Arrows move between tiles and also move the list selection, so `Ctrl+R`, `Ctrl+X`, `Ctrl+E`, and
-`Enter` all act on the tile you are looking at. The selected tile is marked with a caret and an
-accent border; a tile awaiting input turns its own border and header amber without disturbing
-the rest of the wall. Typing still goes to the composer, and every other chord keeps its usual
-meaning, because the wall is a view of the list rather than a separate mode.
+Hover or click a tile to focus it, or move with `Ctrl+↑↓←→`. `Ctrl+O` zooms the focused tile to
+the full attach view, reusing the connection the wall already holds. Everything else you type —
+plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:
+`Esc` interrupts it and `Ctrl+C` clears its input line, exactly as they would if you had
+attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
+is not drawn while the wall is up, since the tiles have the keyboard.
 
 When a Linux viewer is displayed remotely through Windows Terminal or another terminal with
 OSC 52 support, `Ctrl+Y` sends the exact visible PTY viewport to that client terminal. The

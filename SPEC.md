@@ -424,6 +424,13 @@ that "connected" means "on screen", which is both what the status resolver assum
 user expects. The video wall depends on this too: it opens a connection per tile, and a wall
 that leaked those on close would strand up to nine agent processes per visit.
 
+One consequence worth naming, since the wall now tiles sessions for fifteen minutes after they
+stop: connecting to a Complete Codex thread makes `attached` true for it, which is exactly the
+condition that reads Done as Idle. A tiled Done row therefore shows Idle while the wall holds
+it, which is not a lie — the resume process really does exist — and it cannot pin the row open
+forever, because the recency window is measured against `updated_at_ms`, which the connection
+does not touch. At minute fifteen the tile drops and the connection closes with it.
+
 **Known gap, narrowed but not closed: stale-daemon attach targeting.** `attach_route` points a
 daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
 it is the same process that holds the row's fd. If a daemon were restarted (the viewer never

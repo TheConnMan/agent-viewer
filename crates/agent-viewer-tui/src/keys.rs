@@ -17,9 +17,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
-    hide_request, hide_selected, kill_request, kill_selected, move_wall_selection, open_filter,
-    open_rename, open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
-    toggle_group_if_header, toggle_wall,
+    focus_wall_tile, hide_request, hide_selected, kill_request, kill_selected, move_wall_selection,
+    open_filter, open_rename, open_rename_request, open_reply, send_reply, spawn_from_composer,
+    submit_attach, toggle_group_if_header, toggle_wall,
 };
 use crate::{Refresher, Ui};
 
@@ -55,11 +55,15 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
 ) -> io::Result<bool> {
     ui.mouse_press = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl+C kills the whole viewer (like `claude agents`) from every mode except an active
-    // attach — there Ctrl+C must reach the child as an interrupt (0x03) so a runaway agent can
-    // be stopped without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as
-    // copy and never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    if is_quit_chord(key, ctrl, &ui.mode) {
+    // The wall tile that has the keyboard, if it has a live child to give keys to.
+    let wall_target = wall_input_target(ui);
+    // Ctrl+C kills the whole viewer (like `claude agents`) unless a child is taking our keys —
+    // an active attach, or a wall tile with the focus. There Ctrl+C must reach the child as an
+    // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
+    // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
+    // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
+    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some();
+    if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
     }
@@ -71,6 +75,13 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     }
     if matches!(ui.mode, Mode::Attached) && is_copy_chord(key, ctrl) {
         copy_attached_transcript(ui);
+        return Ok(false);
+    }
+    // The wall is a live input surface, not a viewing one: everything outside its own few
+    // reserved chords goes to the focused tile's child, so a session can be answered without
+    // leaving the grid.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        handle_wall_key(key, ctrl, wall_target, ui);
         return Ok(false);
     }
     match &mut ui.mode {
@@ -105,6 +116,22 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     }
     if !matches!(ui.mode, Mode::Normal) {
         ui.mouse_press = None;
+    }
+    // On the wall the pointer picks the tile that has the keyboard: point at a session and
+    // type into it. Events are not forwarded into tile children — clicking around inside an
+    // embedded TUI belongs in the zoomed view.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        ui.mouse_press = None;
+        let hit = matches!(
+            me.kind,
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
+        )
+        .then(|| agent_viewer_tui::ui::wall::tile_at(&ui.wall_rects.borrow(), me.column, me.row))
+        .flatten();
+        if let Some(index) = hit {
+            focus_wall_tile(ui, index);
+        }
+        return MouseAction::None;
     }
     match &ui.mode {
         Mode::Attached => {
@@ -378,11 +405,87 @@ fn set_sprite(ui: &mut Ui, sprite: SpriteKind) {
     ui.set_notice(format!("sprite: {} · ⌃G for the next", sprite.name()));
 }
 
-/// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
-/// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
-/// decision is unit-testable without a live terminal.
-fn is_quit_chord(key: KeyEvent, ctrl: bool, mode: &Mode) -> bool {
-    ctrl && matches!(key.code, KeyCode::Char('c')) && !matches!(mode, Mode::Attached)
+/// Ctrl+C is the app-wide "kill the viewer" chord, except when a child is taking our keys
+/// (`forwarding`) — there it is sent on as a raw interrupt instead. Kept as a pure predicate
+/// so the quit decision is unit-testable without a live terminal.
+fn is_quit_chord(key: KeyEvent, ctrl: bool, forwarding: bool) -> bool {
+    ctrl && matches!(key.code, KeyCode::Char('c')) && !forwarding
+}
+
+/// The wall tile that should receive keystrokes: the focused one, once it has a live child.
+///
+/// `None` while the wall is off, when the focused tile is still connecting, and when its
+/// child has exited — in all of those the viewer keeps its own keys, so Ctrl+C still quits
+/// rather than vanishing into a tile that cannot use it.
+fn wall_input_target(ui: &mut Ui) -> Option<(BackendKind, String)> {
+    if !ui.wall.on || !matches!(ui.mode, Mode::Normal) {
+        return None;
+    }
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+    let key = keys
+        .get(ui.wall.selected.min(keys.len().checked_sub(1)?))?
+        .clone();
+    let live = ui
+        .attached
+        .get_mut(&key)
+        .is_some_and(|pty| !pty.is_exited());
+    live.then_some(key)
+}
+
+/// Keys on the wall. The wall reserves the few chords it needs to be navigable and escapable
+/// and forwards everything else — plain arrows, Enter, Esc, Ctrl+C — to the focused tile.
+///
+/// Esc and Ctrl+C reaching the child is the point, not an oversight: Esc interrupts Claude and
+/// Ctrl+C abandons a half-typed line, and a wall you cannot interrupt from is worse than no
+/// wall. `Ctrl+W` and `Ctrl+]` are the unconditional exits that keep this from being a trap.
+fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, String)>, ui: &mut Ui) {
+    if ctrl {
+        match key.code {
+            // Ctrl+] leaves too, matching the attach view. Terminals send it as raw 0x1D,
+            // which crossterm's legacy unix parser folds onto Char('5')+CTRL; the kitty
+            // protocol delivers the literal Char(']')+CTRL. Accept both.
+            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+                toggle_wall(ui);
+                return;
+            }
+            KeyCode::Up => {
+                move_wall_selection(ui, 0, -1);
+                return;
+            }
+            KeyCode::Down => {
+                move_wall_selection(ui, 0, 1);
+                return;
+            }
+            KeyCode::Left => {
+                move_wall_selection(ui, -1, 0);
+                return;
+            }
+            KeyCode::Right => {
+                move_wall_selection(ui, 1, 0);
+                return;
+            }
+            // Zoom the focused tile to the full attach view. It reuses the wall's live PTY
+            // rather than spawning a second child.
+            KeyCode::Char('o') => {
+                attach_selected(ui);
+                return;
+            }
+            _ => {}
+        }
+    }
+    let Some(fkey) = target else {
+        return;
+    };
+    // The user is typing into this tile, so a queued reply injection aimed at it must not be
+    // typed in behind them. A reply armed at some other tile is untouched.
+    if ui.pending_reply.as_ref().map(|pending| &pending.key) == Some(&fkey) {
+        ui.pending_reply = None;
+    }
+    if let Some(bytes) = key_to_bytes(key)
+        && let Some(pty) = ui.attached.get_mut(&fkey)
+    {
+        let _ = pty.write_input(&bytes);
+    }
 }
 
 fn handle_normal_key<B: ratatui::backend::Backend>(
@@ -433,12 +536,6 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
         KeyCode::Up if theme_cmd => ui.themes.move_preview(-1),
         KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
         KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
-        // On the wall the arrows walk the grid (and pin the list selection to the tile), so
-        // Right moves rather than attaching; Enter is the attach there.
-        KeyCode::Down if ui.wall.on => move_wall_selection(ui, 0, 1),
-        KeyCode::Up if ui.wall.on => move_wall_selection(ui, 0, -1),
-        KeyCode::Left if ui.wall.on => move_wall_selection(ui, -1, 0),
-        KeyCode::Right if ui.wall.on => move_wall_selection(ui, 1, 0),
         // Arrows navigate or act at all times.
         KeyCode::Down => ui.app.move_selection(1),
         KeyCode::Up => ui.app.move_selection(-1),
@@ -465,8 +562,6 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             ui.composer.clear();
         }
         KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
-        // Esc backs out exactly one level: a half-typed task first, then the wall.
-        KeyCode::Esc if ui.wall.on && ui.composer.text().is_empty() => toggle_wall(ui),
         KeyCode::Esc => ui.composer.clear(),
         KeyCode::Enter => {
             if theme_cmd {
@@ -1166,9 +1261,9 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
-        handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
+        handle_attached_key, handle_key, handle_mouse, handle_mouse_event, handle_palette_key,
         handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette, palette_items,
-        set_mouse_capture,
+        set_mouse_capture, wall_input_target,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
@@ -1218,9 +1313,11 @@ pub(crate) mod tests {
         )
         .expect("fixed terminal");
 
-        handle_normal_key(
+        // Routes through `handle_key`, not `handle_normal_key`: the wall and the quit chord
+        // are decided before mode dispatch, so a harness that skipped it would test a path
+        // no keystroke ever takes.
+        handle_key(
             key(code, modifiers),
-            modifiers.contains(KeyModifiers::CONTROL),
             backends,
             &refresher,
             ui,
@@ -1268,7 +1365,7 @@ pub(crate) mod tests {
             mouse_press: None,
             sprite: Default::default(),
             wall: agent_viewer_tui::ui::WallState::default(),
-            wall_area: std::cell::RefCell::new(ratatui::layout::Rect::default()),
+            wall_rects: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1319,7 +1416,7 @@ pub(crate) mod tests {
                         themes: &ui.themes,
                         sprite: ui.sprite,
                         wall: None,
-                        wall_area: &ui.wall_area,
+                        wall_rects: &ui.wall_rects,
                     },
                 );
             })
@@ -1357,7 +1454,7 @@ pub(crate) mod tests {
                         themes: &ui.themes,
                         sprite: ui.sprite,
                         wall: None,
-                        wall_area: &ui.wall_area,
+                        wall_rects: &ui.wall_rects,
                     },
                 );
             })
@@ -1765,6 +1862,107 @@ pub(crate) mod tests {
         ui
     }
 
+    /// The whole point of the rework: what you type on the wall reaches the session you are
+    /// looking at. `cat` echoes through the tty line discipline, so the bytes showing up on
+    /// the child's screen is proof they were written to the child's pty and not somewhere
+    /// else (the composer, a notice, the void).
+    #[test]
+    fn typing_on_the_wall_reaches_the_focused_tile() {
+        let mut session = sess("typed-into", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        for c in "hello".chars() {
+            press_normal_key(&mut ui, &[], c, KeyModifiers::NONE);
+        }
+
+        wait_for_pty_screen(&ui, &target, "hello");
+        assert_eq!(
+            ui.composer.text(),
+            "",
+            "the keystrokes must not have gone to the composer as well"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Hover puts the keyboard on whatever is under the pointer, which is what makes "point
+    /// at a session and type into it" work.
+    #[test]
+    fn hovering_a_tile_focuses_it() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let keys = [
+            (first.backend, first.id.clone()),
+            (second.backend, second.id.clone()),
+        ];
+        let mut ui = test_ui_with(vec![first, second]);
+        for key in &keys {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        // Two tiles side by side, as the last frame would have published them.
+        *ui.wall_rects.borrow_mut() = vec![
+            ratatui::layout::Rect::new(0, 0, 40, 10),
+            ratatui::layout::Rect::new(40, 0, 40, 10),
+        ];
+        assert_eq!(ui.wall.selected, 0);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 55,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.wall.selected, 1, "hover must focus the tile under it");
+
+        // A click on the first tile focuses it back, for terminals that report no motion.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.wall.selected, 0);
+
+        // Off every tile, the focus stays where it was rather than jumping to a default.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 5,
+                row: 40,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.wall.selected, 0);
+        kill_attached(&mut ui);
+    }
+
     #[test]
     fn ctrl_w_toggles_the_video_wall() {
         let mut ui = wall_ui_with_one_live_tile();
@@ -1779,58 +1977,55 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
+    /// Esc belongs to the child: it is how you interrupt Claude, and a wall you cannot
+    /// interrupt from is worse than no wall. Ctrl+W and Ctrl+] are the exits.
     #[test]
-    fn esc_leaves_the_wall_only_once_the_composer_is_empty() {
+    fn esc_reaches_the_tile_and_does_not_leave_the_wall() {
         let mut ui = wall_ui_with_one_live_tile();
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
-        ui.composer.push_char('x');
 
         press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
-        assert!(ui.wall.on, "Esc must clear the composer before the wall");
-        assert_eq!(ui.composer.text(), "");
+        assert!(ui.wall.on, "Esc must go to the tile, not close the wall");
 
-        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
-        assert!(!ui.wall.on, "a second Esc must back out of the wall");
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(!ui.wall.on, "Ctrl+W is the exit");
         kill_attached(&mut ui);
     }
 
-    /// The wall is a flag on the list view, not a mode, precisely so this stays true.
+    /// The wall reserves four things and forwards the rest. A viewer chord that still acted
+    /// here would be a chord the session could never receive — Ctrl+A is "start of line" while
+    /// you are typing a reply, not "show all".
     #[test]
-    fn every_previously_bound_chord_still_acts_with_the_wall_on() {
+    fn viewer_chords_go_to_the_tile_instead_of_acting() {
         let mut ui = wall_ui_with_one_live_tile();
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
         assert!(ui.wall.on);
 
         let group_mode = ui.app.group_mode();
-        press_normal_key(&mut ui, &[], 's', KeyModifiers::CONTROL);
-        assert_ne!(ui.app.group_mode(), group_mode, "Ctrl+S regroup");
-
         let show_all = ui.app.show_all();
-        press_normal_key(&mut ui, &[], 'a', KeyModifiers::CONTROL);
-        assert_ne!(ui.app.show_all(), show_all, "Ctrl+A show-all");
-
-        press_normal_key(&mut ui, &[], 'f', KeyModifiers::CONTROL);
-        assert!(matches!(ui.mode, Mode::Filter), "Ctrl+F filter");
-        ui.mode = Mode::Normal;
-
-        press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL);
-        assert!(matches!(ui.mode, Mode::Palette(_)), "Ctrl+K palette");
-        ui.mode = Mode::Normal;
-
         let sprite = ui.sprite;
-        press_normal_key(&mut ui, &[], 'g', KeyModifiers::CONTROL);
-        assert_eq!(ui.sprite, sprite.next(), "Ctrl+G sprite");
+        for chord in ['s', 'a', 'f', 'k', 'g', 'r', 'e'] {
+            press_normal_key(&mut ui, &[], chord, KeyModifiers::CONTROL);
+        }
 
-        // Typing still lands in the composer rather than being swallowed by the wall.
+        assert_eq!(ui.app.group_mode(), group_mode, "Ctrl+S must not regroup");
+        assert_eq!(ui.app.show_all(), show_all, "Ctrl+A must not show all");
+        assert_eq!(ui.sprite, sprite, "Ctrl+G must not cycle the sprite");
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "no chord may open a modal over the wall"
+        );
+
+        // Typing goes to the tile, not the composer — the composer is not even on screen.
         press_normal_key(&mut ui, &[], 'z', KeyModifiers::NONE);
-        assert_eq!(ui.composer.text(), "z");
+        assert_eq!(ui.composer.text(), "");
 
         assert!(ui.wall.on, "none of those chords should have left the wall");
         kill_attached(&mut ui);
     }
 
     #[test]
-    fn wall_arrows_walk_the_grid_and_pin_the_list_selection() {
+    fn ctrl_arrows_walk_the_grid_and_pin_the_list_selection() {
         let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
         first.status = Status::Working;
         let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
@@ -1845,11 +2040,20 @@ pub(crate) mod tests {
         }
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
         assert_eq!(ui.wall.selected, 0);
-        let ordered = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
+        let ordered =
+            agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
         assert_eq!(ordered.len(), 2);
 
-        // Two tiles are a 2x1 row, so Right moves and Down does not.
+        // A plain arrow is the child's, not the wall's — that is what makes the tile a real
+        // input surface.
         press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            ui.wall.selected, 0,
+            "a bare arrow must go to the tile, not move the focus"
+        );
+
+        // Two tiles are a 2x1 row, so Ctrl+Right moves and Ctrl+Down does not.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::CONTROL);
         assert_eq!(ui.wall.selected, 1);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),
@@ -1857,10 +2061,10 @@ pub(crate) mod tests {
             "the tile selection must pin the list selection"
         );
 
-        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::CONTROL);
         assert_eq!(ui.wall.selected, 1, "a 2x1 grid has no second row");
 
-        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::NONE);
+        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::CONTROL);
         assert_eq!(ui.wall.selected, 0);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),
@@ -4093,19 +4297,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_from_the_list_and_transient_modes() {
+    fn ctrl_c_quits_when_no_child_is_taking_our_keys() {
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        // The list and every transient modal treat Ctrl+C as "kill the viewer".
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Normal));
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Filter));
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Help));
+        assert!(is_quit_chord(ctrl_c, true, false));
     }
 
     #[test]
-    fn ctrl_c_does_not_quit_while_attached() {
-        // Attached, Ctrl+C must reach the child as an interrupt, not tear down the viewer.
+    fn ctrl_c_does_not_quit_while_a_child_is_taking_our_keys() {
+        // Attached, or focused on a live wall tile, Ctrl+C must reach the child as an
+        // interrupt rather than tearing down the viewer.
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(!is_quit_chord(ctrl_c, true, &Mode::Attached));
+        assert!(!is_quit_chord(ctrl_c, true, true));
+    }
+
+    /// The wall must not swallow the only quit chord. With the wall open but no live child
+    /// focused (nothing running, or a tile still connecting) Ctrl+C still tears the viewer
+    /// down, because there is nothing there to send an interrupt to.
+    #[test]
+    fn ctrl_c_still_quits_on_a_wall_with_no_live_tile() {
+        let mut ui = test_ui_with(vec![sess("idle-only", "/tmp/agentviewer-wall", 100)]);
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        assert!(
+            wall_input_target(&mut ui).is_none(),
+            "no tile has a live child, so nothing should be taking keys"
+        );
+        assert!(press_normal_key(&mut ui, &[], 'c', KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -4337,8 +4555,8 @@ pub(crate) mod tests {
     fn plain_c_and_other_ctrl_chords_are_not_quit() {
         // A bare 'c' types into the composer; other Ctrl-chords keep their own actions.
         let plain_c = key(KeyCode::Char('c'), KeyModifiers::NONE);
-        assert!(!is_quit_chord(plain_c, false, &Mode::Normal));
+        assert!(!is_quit_chord(plain_c, false, false));
         let ctrl_x = key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(!is_quit_chord(ctrl_x, true, &Mode::Normal));
+        assert!(!is_quit_chord(ctrl_x, true, false));
     }
 }
