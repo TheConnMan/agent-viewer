@@ -764,6 +764,20 @@ fn draw_footer(
         && matches!(mode, Mode::Normal)
         && notice.is_empty()
     {
+        // The arm window has to be visible here, not just in the list. Ctrl+X on a tile that
+        // has already finished produces no mutation on its first press — it only arms — so
+        // without this the chord would look like it did nothing and the second press would
+        // land as a removal the user never saw coming.
+        if app.is_armed(now_ms) {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "[press Ctrl+X again to remove]",
+                    fg(theme.err),
+                ))),
+                area,
+            );
+            return;
+        }
         let overflow = if view.overflow > 0 {
             format!(
                 "showing {} of {} · ",
@@ -776,7 +790,7 @@ fn draw_footer(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "{overflow}wall · Shift+↑↓←→ move · wheel scrolls · Ctrl+O zoom · Ctrl+W exit"
+                    "{overflow}wall · Shift+↑↓←→ move · wheel scrolls · Ctrl+O zoom · Ctrl+X stop/remove · Ctrl+K palette · Ctrl+W exit"
                 ),
                 fg(theme.muted),
             ))),
@@ -2082,6 +2096,91 @@ mod tests {
             tile.bottom() >= 22,
             "the tile stopped at row {}, so the composer rows were not reclaimed",
             tile.bottom()
+        );
+    }
+
+    /// Render the wall footer for `app` at `now_ms`, as one string.
+    fn wall_footer(app: &App, now_ms: i64) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let session = walled_test_session();
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        // The footer is the last row of the frame.
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect()
+    }
+
+    /// The arm window has to be visible on the wall, not only in the list. Ctrl+X on a tile
+    /// whose session has already finished submits nothing on its first press — it only arms —
+    /// so a wall footer that kept advertising its chords would make the chord look dead and
+    /// turn the second press into a removal out of nowhere.
+    #[test]
+    fn the_wall_footer_shows_the_kill_arm_hint() {
+        let mut session = walled_test_session();
+        session.status = Status::Done;
+        let mut app = App::new(vec![session]);
+
+        let before = wall_footer(&app, 1_000);
+        assert!(
+            before.contains("Ctrl+X stop/remove"),
+            "the wall footer must advertise the chord: {before}"
+        );
+        assert!(
+            before.contains("Ctrl+K palette"),
+            "the wall footer must advertise the palette: {before}"
+        );
+
+        // A finished session: the first press arms and submits nothing at all.
+        assert_eq!(app.kill_stage(1_000), crate::app::KillStage::Noop);
+        assert!(app.is_armed(1_000), "the first press must arm removal");
+
+        let armed = wall_footer(&app, 1_000);
+        assert!(
+            armed.contains("press Ctrl+X again to remove"),
+            "the wall footer swallowed the arm hint: {armed}"
         );
     }
 
