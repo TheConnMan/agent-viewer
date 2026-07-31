@@ -266,16 +266,20 @@ fn build_tail_view(ui: &Ui) -> Option<ui::TailView<'_>> {
     if !ui.tail_open || matches!(ui.mode, Mode::Attached) {
         return None;
     }
-    let session = ui.app.selected()?;
-    let key = (session.backend, session.id.clone());
+    // A group header (or an empty list) has no session, but the pane still mounts: taking
+    // its columns away mid-arrow would re-lay the whole list out and then undo that on the
+    // next session row.
+    let session = ui.app.selected();
+    let key = session.map(|session| (session.backend, session.id.clone()));
     Some(ui::TailView {
         session,
-        events: ui
-            .tail
-            .as_ref()
-            .filter(|entry| entry.key == key)
-            .map(|entry| entry.events.as_slice()),
-        live: ui.attached.get(&key),
+        events: key.as_ref().and_then(|key| {
+            ui.tail
+                .as_ref()
+                .filter(|entry| &entry.key == key)
+                .map(|entry| entry.events.as_slice())
+        }),
+        live: key.as_ref().and_then(|key| ui.attached.get(key)),
     })
 }
 

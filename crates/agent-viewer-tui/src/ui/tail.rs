@@ -36,7 +36,10 @@ pub const TAIL_EVENTS: usize = 12;
 const TOOL_PREFIX: &str = "⎿";
 
 pub struct TailView<'a> {
-    pub session: &'a agent_viewer_core::Session,
+    /// `None` when the cursor sits on a group header or the list is empty. The pane still
+    /// renders: unmounting it would hand its 46 columns back to the list and re-lay every
+    /// row out mid-arrow, then take them away again on the next session row.
+    pub session: Option<&'a agent_viewer_core::Session>,
     /// `None` until the background read for this session lands; `Some(&[])` once it has
     /// landed and there was nothing to show.
     pub events: Option<&'a [TailEvent]>,
@@ -70,19 +73,25 @@ pub(super) fn draw(frame: &mut Frame, view: &TailView, theme: &Theme, area: Rect
     } else {
         "transcript"
     };
+    let (title, title_color, subhead) = match view.session {
+        Some(session) => (
+            session.title.clone(),
+            theme.text,
+            format!("{source} · last {TAIL_EVENTS} turns"),
+        ),
+        None => (
+            "no session selected".to_string(),
+            theme.faint,
+            String::new(),
+        ),
+    };
     let head = vec![
         Line::from(vec![
             Span::styled("tail", fg(theme.accent)),
             Span::styled(" · ", fg(theme.muted)),
-            Span::styled(
-                truncate(&view.session.title, width.saturating_sub(7)),
-                fg(theme.text),
-            ),
+            Span::styled(truncate(&title, width.saturating_sub(7)), fg(title_color)),
         ]),
-        Line::from(Span::styled(
-            truncate(&format!("{source} · last {TAIL_EVENTS} turns"), width),
-            fg(theme.faint),
-        )),
+        Line::from(Span::styled(truncate(&subhead, width), fg(theme.faint))),
         Line::from(""),
     ];
     frame.render_widget(
@@ -118,6 +127,11 @@ pub(super) fn draw(frame: &mut Frame, view: &TailView, theme: &Theme, area: Rect
     }
 
     let mut lines = match view.events {
+        // A header row has nothing to tail, and saying so beats a stale "reading…".
+        _ if view.session.is_none() => vec![Line::from(Span::styled(
+            "arrow onto a session to tail it",
+            fg(theme.faint),
+        ))],
         None => vec![Line::from(Span::styled(
             "reading transcript…",
             fg(theme.faint),
@@ -229,7 +243,7 @@ mod tests {
             TailEvent::User("pin the clock first".to_string()),
         ];
         let view = TailView {
-            session: &session,
+            session: Some(&session),
             events: Some(&events),
             // A done session has no live process, and the pane must never make one.
             live: None,
@@ -268,7 +282,7 @@ mod tests {
             TailEvent::User("user prose".to_string()),
         ];
         let view = TailView {
-            session: &session,
+            session: Some(&session),
             events: Some(&events),
             live: None,
         };
@@ -299,7 +313,7 @@ mod tests {
             .map(|n| TailEvent::Agent(format!("line {n}")))
             .collect::<Vec<_>>();
         let view = TailView {
-            session: &session,
+            session: Some(&session),
             events: Some(&events),
             live: None,
         };
@@ -317,18 +331,42 @@ mod tests {
     }
 
     #[test]
+    fn a_header_row_keeps_the_pane_mounted_instead_of_collapsing_the_list() {
+        let theme = crate::ui::theme::amber(false);
+        // No session: the cursor is on a group header. The pane must still paint its rule
+        // and header, because unmounting it would give its 46 columns back to the list and
+        // re-lay every row out mid-arrow.
+        let view = TailView {
+            session: None,
+            events: None,
+            live: None,
+        };
+        let buffer = render(&view, &theme, TAIL_WIDTH, 8);
+
+        assert_eq!(
+            buffer[(0, 3)].symbol(),
+            "│",
+            "the rule still holds the column"
+        );
+        assert!(row(&buffer, 0).contains("tail · no session selected"));
+        assert!(row(&buffer, 3).contains("arrow onto a session to tail it"));
+        // Not "reading transcript…": there is nothing being read.
+        assert!(!row(&buffer, 3).contains("reading transcript"));
+    }
+
+    #[test]
     fn an_unread_session_says_so_instead_of_claiming_it_is_empty() {
         let theme = crate::ui::theme::amber(false);
         let session = done_session();
         let unread = TailView {
-            session: &session,
+            session: Some(&session),
             events: None,
             live: None,
         };
         assert!(row(&render(&unread, &theme, TAIL_WIDTH, 6), 3).contains("reading transcript"));
 
         let empty = TailView {
-            session: &session,
+            session: Some(&session),
             events: Some(&[]),
             live: None,
         };
