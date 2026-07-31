@@ -89,9 +89,6 @@ fn claude_capabilities_advertise_native_mutations() {
     assert!(caps.attach);
     assert!(!caps.archive);
     assert!(caps.stop);
-    assert!(caps.needs_input);
-    assert!(caps.pr_refs);
-    assert!(caps.live_status);
     // Rename is a bg-job state.json write, gated per row on the short id (see rename_tests).
     assert!(caps.rename);
 }
@@ -103,14 +100,6 @@ fn portable_codex_capabilities_disable_unsafe_process_actions() {
         assert!(!caps.spawn, "{platform:?} cannot safely spawn Codex");
         assert!(!caps.attach, "{platform:?} cannot safely attach Codex");
         assert!(!caps.stop, "{platform:?} cannot safely stop Codex");
-        assert!(
-            !caps.needs_input,
-            "{platform:?} cannot prove live approval state"
-        );
-        assert!(
-            !caps.live_status,
-            "{platform:?} has no rollout process evidence"
-        );
         assert!(caps.rename);
         assert!(caps.archive);
         assert!(caps.delete);

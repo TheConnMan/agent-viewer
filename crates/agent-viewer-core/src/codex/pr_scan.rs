@@ -51,18 +51,6 @@ fn scan_pr_keys(text: &str, mut on_key: impl FnMut(String, String, u64)) {
     }
 }
 
-/// PURE: every distinct github PR link in `text`, canonicalized to
-/// `https://github.com/<owner>/<repo>/pull/<n>` so a deep link (`/pull/12/files`) and a bare
-/// one dedupe to a single ref. Non-github hosts, non-pull paths, and `api.github.com` are
-/// skipped by `parse_pr_url`'s shape check.
-pub fn extract_pr_refs(text: &str) -> Vec<PrRef> {
-    let mut refs: Vec<PrRef> = Vec::new();
-    scan_pr_keys(text, |owner, repo, number| {
-        push_capped(&mut refs, owner, repo, number)
-    });
-    refs
-}
-
 /// Append a ref unless its canonical href is already present, holding the list at
 /// `MAX_REFS_PER_SESSION` by dropping the oldest — the PR a session opened lands late in the
 /// transcript, after any PRs it merely read.

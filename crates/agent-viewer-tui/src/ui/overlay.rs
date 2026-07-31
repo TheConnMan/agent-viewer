@@ -169,7 +169,7 @@ pub(super) fn draw_theme_picker(frame: &mut Frame, themes: &ThemeState, composer
             .saturating_sub(footer_y),
     };
     frame.render_widget(
-        Paragraph::new("⏎ commit · esc revert · marks, density and motion travel with the theme")
+        Paragraph::new("⏎ commit · esc revert · marks and motion travel with the theme")
             .style(fg(active.faint))
             .wrap(Wrap { trim: false }),
         footer,

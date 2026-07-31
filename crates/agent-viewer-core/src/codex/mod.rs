@@ -650,9 +650,6 @@ pub const fn capabilities_for_platform(platform: Platform) -> Capabilities {
             archive: true,
             delete: true,
             stop: true,
-            needs_input: true,
-            pr_refs: true,
-            live_status: true,
         },
         Platform::Macos | Platform::Windows => Capabilities {
             spawn: false,
@@ -661,9 +658,6 @@ pub const fn capabilities_for_platform(platform: Platform) -> Capabilities {
             archive: true,
             delete: true,
             stop: false,
-            needs_input: false,
-            pr_refs: true,
-            live_status: false,
         },
     }
 }

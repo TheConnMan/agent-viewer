@@ -285,29 +285,14 @@ impl SpawnTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetResolution {
-    Permitted,
-    Refused { notice: String },
     Missing { notice: String },
     SourceError { notice: String },
 }
 
 impl TargetResolution {
-    pub fn permitted() -> Self {
-        Self::Permitted
-    }
-
-    pub fn refused(notice: impl Into<String>) -> Self {
-        Self::Refused {
-            notice: notice.into(),
-        }
-    }
-
     pub fn notice(&self) -> Option<&str> {
         match self {
-            Self::Permitted => None,
-            Self::Refused { notice } | Self::Missing { notice } | Self::SourceError { notice } => {
-                Some(notice)
-            }
+            Self::Missing { notice } | Self::SourceError { notice } => Some(notice),
         }
     }
 }
