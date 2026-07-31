@@ -83,7 +83,7 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     // reserved chords goes to the focused tile's child, so a session can be answered without
     // leaving the grid.
     if matches!(ui.mode, Mode::Normal) && ui.wall.on {
-        handle_wall_key(key, ctrl, wall_target, ui);
+        handle_wall_key(key, ctrl, wall_target, backends, ui);
         return Ok(false);
     }
     match &mut ui.mode {
@@ -524,13 +524,41 @@ fn wall_input_target(ui: &mut Ui) -> Option<(BackendKind, String)> {
     live.then_some(key)
 }
 
-/// Keys on the wall. The wall reserves the few chords it needs to be navigable and escapable
-/// and forwards everything else — plain arrows, Enter, Esc, Ctrl+C — to the focused tile.
+/// Pin the list selection onto the tile the wall is showing as focused.
+///
+/// The wall tracks its focus by key, separately from `app.selected()`, and every
+/// session-scoped action (`kill_selected`, `palette_items`) reads the selection. Today the two
+/// are already in step — `toggle_wall` pins on open, `focus_wall_tile` on hover and click, and
+/// `move_wall_selection` on `Shift+arrows` — which is why `Ctrl+O` zooms correctly without
+/// this. It is called anyway for the two destructive chords, because `focus_index` falls back
+/// to a clamped `last_index` when the focused session stops being tiled, and that fallback
+/// resolves to a DIFFERENT session. Zooming the wrong panel is a keystroke to undo; removing
+/// the wrong session is not, so these two do not inherit an invariant maintained elsewhere.
+fn pin_selection_to_focused_tile(ui: &mut Ui) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+    focus_wall_tile(ui, ui.wall.focus_index(&keys));
+}
+
+/// Keys on the wall. The wall reserves the few chords it needs to be navigable, escapable, and
+/// closeable-out, and forwards everything else — plain arrows, Enter, Esc, Ctrl+C — to the
+/// focused tile.
 ///
 /// Esc and Ctrl+C reaching the child is the point, not an oversight: Esc interrupts Claude and
 /// Ctrl+C abandons a half-typed line, and a wall you cannot interrupt from is worse than no
 /// wall. `Ctrl+W` and `Ctrl+]` are the unconditional exits that keep this from being a trap.
-fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, String)>, ui: &mut Ui) {
+///
+/// `Ctrl+X` and `Ctrl+K` are reserved for the same reason `Ctrl+O` is: the tile you are
+/// watching finish is the one you want to retire, and walking back to the list to do it is the
+/// step that makes the wall feel like a viewer instead of a workspace. Both aim at the focused
+/// tile, and both cost the child a chord it can no longer receive — an accepted trade, since
+/// neither is load-bearing in any backend's input line.
+fn handle_wall_key(
+    key: KeyEvent,
+    ctrl: bool,
+    target: Option<(BackendKind, String)>,
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+) {
     // Shift+arrows walk the grid. Ctrl+arrows were tried first and never arrived — the host
     // terminal keeps them — so the modifier that actually reaches us is the one that wins.
     // Bare arrows stay the child's; the wall would be useless if it took them.
@@ -568,6 +596,23 @@ fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, Strin
             // rather than spawning a second child.
             KeyCode::Char('o') => {
                 attach_selected(ui);
+                return;
+            }
+            // Retire the focused tile in place: the list's two-stage chord, unchanged. Stop
+            // once, then remove on the next press inside the arm window. A finished tile arms
+            // silently on the first press, which is why the wall's footer shows the same
+            // countdown hint the list does.
+            KeyCode::Char('x') => {
+                pin_selection_to_focused_tile(ui);
+                kill_selected(backends, ui);
+                return;
+            }
+            // The palette, scoped to the focused tile — the wall's menu for everything the
+            // grid has no chord for (archive, rename, stop or remove, jumping to another
+            // session). It floats over the wall, which keeps rendering underneath.
+            KeyCode::Char('k') => {
+                pin_selection_to_focused_tile(ui);
+                open_palette(backends, ui);
                 return;
             }
             _ => {}
@@ -2484,9 +2529,10 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
-    /// The wall reserves four things and forwards the rest. A viewer chord that still acted
+    /// The wall reserves what it needs and forwards the rest. A viewer chord that still acted
     /// here would be a chord the session could never receive — Ctrl+A is "start of line" while
-    /// you are typing a reply, not "show all".
+    /// you are typing a reply, not "show all". Ctrl+X and Ctrl+K are the deliberate exceptions
+    /// and have their own tests; everything below must still reach the child.
     #[test]
     fn viewer_chords_go_to_the_tile_instead_of_acting() {
         let mut ui = wall_ui_with_one_live_tile();
@@ -2496,7 +2542,7 @@ pub(crate) mod tests {
         let group_mode = ui.app.group_mode();
         let show_all = ui.app.show_all();
         let sprite = ui.sprite;
-        for chord in ['s', 'a', 'f', 'k', 'g', 'r', 'e'] {
+        for chord in ['s', 'a', 'f', 'g', 'r', 'e'] {
             press_normal_key(&mut ui, &[], chord, KeyModifiers::CONTROL);
         }
 
@@ -2513,6 +2559,114 @@ pub(crate) mod tests {
         assert_eq!(ui.composer.text(), "");
 
         assert!(ui.wall.on, "none of those chords should have left the wall");
+        kill_attached(&mut ui);
+    }
+
+    /// Drain one finished mutation, exactly as the run loop's per-tick poll does. The removal
+    /// queued behind a stop is a dependent job: it does not start until the stop's success has
+    /// been drained, so a test that skips this never sees the second stage run.
+    fn drain_one_mutation(ui: &mut Ui) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background mutation never finished"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Two live tiles with the focus moved onto the second one. The pair the wall's own
+    /// session-scoped chords have to aim at.
+    fn wall_ui_focused_on_the_second_tile() -> Ui {
+        let mut first = sess("wall-keep", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("wall-retire", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let keys = [
+            (first.backend, first.id.clone()),
+            (second.backend, second.id.clone()),
+        ];
+        let mut ui = test_ui_with(vec![first, second]);
+        for key in &keys {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(
+            wall_focus(&ui),
+            1,
+            "Shift+Right did not move the wall focus"
+        );
+        ui
+    }
+
+    /// The point of the chord: retire a panel you are finished with without walking back to
+    /// the list. It has to hit the tile the grid is showing as focused — `kill_stage` reads
+    /// `app.selected()`, which the wall tracks separately, so a missing selection pin would
+    /// stop or remove a session the user is not even looking at.
+    #[test]
+    fn ctrl_x_on_the_wall_stops_then_removes_the_focused_tile() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let seen = match &mutation {
+                crate::ops::Mutation::Stop(request) => format!("stop:{}", request.id()),
+                crate::ops::Mutation::Remove { request, .. } => format!("remove:{}", request.id()),
+                other => panic!("Ctrl+X submitted {:?}", std::mem::discriminant(other)),
+            };
+            seen_tx.send(seen).expect("report the mutation");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+
+        press_normal_key(&mut ui, &[], 'x', KeyModifiers::CONTROL);
+        assert_eq!(
+            seen_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok("stop:wall-retire".to_string()),
+            "the first Ctrl+X must stop the FOCUSED tile, not the list's parked row"
+        );
+        assert!(ui.wall.on, "Ctrl+X must not leave the wall");
+        assert!(
+            ui.app.is_armed(agent_viewer_core::spawn::now_ms()),
+            "the first press must arm removal so the footer can show the countdown"
+        );
+        drain_one_mutation(&mut ui);
+
+        press_normal_key(&mut ui, &[], 'x', KeyModifiers::CONTROL);
+        assert_eq!(
+            seen_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok("remove:wall-retire".to_string()),
+            "the second Ctrl+X must remove the same tile"
+        );
+        assert!(ui.wall.on, "removing a tile must not close the wall");
+        kill_attached(&mut ui);
+    }
+
+    /// Ctrl+K is the wall's menu for everything the grid has no chord for. It must open over
+    /// the wall (not close it) with the focused tile as the target its action items act on.
+    #[test]
+    fn ctrl_k_on_the_wall_opens_the_palette_for_the_focused_tile() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+
+        press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(ui.mode, Mode::Palette(_)),
+            "Ctrl+K must open the palette on the wall"
+        );
+        assert!(
+            ui.wall.on,
+            "the palette floats over the wall; it must not close it"
+        );
+        assert_eq!(
+            ui.app.selected().map(|session| session.id.clone()),
+            Some("wall-retire".to_string()),
+            "the palette must be aimed at the focused tile"
+        );
         kill_attached(&mut ui);
     }
 
