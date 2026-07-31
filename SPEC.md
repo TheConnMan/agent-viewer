@@ -486,8 +486,8 @@ experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`, `thread/lis
 it is labeled experimental, its control socket is already contended on this box, and it reads
 the same SQLite + files we read directly. Leave a comment marking it as the v2 upgrade path."
 
-**Correction.** The contention half of that rejection was wrong. Research decision D-008
-(`specs/001-fleet-view-unification/research.md`) traced the claim to a misread log line: the
+**Correction.** The contention half of that rejection was wrong. Live investigation traced the
+claim to a misread log line: the
 failure is a **bind** failure from a second would-be *server*, not client contention. `lsof`
 shows a single LISTEN holder, and three simultaneous client connections all initialized and
 served different requests concurrently, reproduced independently with a stdlib WebSocket client

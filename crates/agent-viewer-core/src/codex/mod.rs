@@ -353,9 +353,8 @@ impl Backend for CodexBackend {
 
     fn capabilities_for(&self, session: &Session) -> Capabilities {
         let mut capabilities = self.capabilities();
-        // DELIBERATE DIVERGENCE from the capability table in
-        // specs/001-fleet-view-unification/data-model.md, which marks codex `stop` as an
-        // unconditional yes. Reason: `stop` below already
+        // DELIBERATE DIVERGENCE: codex `stop` is not an unconditional yes at the backend
+        // level, it is resolved per row. Reason: `stop` below already
         // returns Unsupported for a row with no pid, because with no pid there is no
         // process to signal. Advertising stop there would be a promise this backend
         // cannot keep, and a capability that is advertised and then fails at press time is
