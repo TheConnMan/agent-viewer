@@ -18,11 +18,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
-    hide_request, hide_selected, kill_request, kill_selected, open_filter, open_rename,
-    open_rename_request, open_reply, send_reply, spawn_from_composer, submit_attach,
-    toggle_group_if_header,
+    focus_wall_tile, hide_request, hide_selected, kill_request, kill_selected, move_wall_selection,
+    open_filter, open_rename, open_rename_request, open_reply, scroll_wall_tile, send_reply,
+    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
 };
-use crate::{Refresher, Ui};
+use crate::{Key, Refresher, Ui};
 
 const ATTACHED_CODEX_WHEEL_ROWS: usize = 3;
 
@@ -56,11 +56,15 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
 ) -> io::Result<bool> {
     ui.mouse_press = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Ctrl+C kills the whole viewer (like `claude agents`) from every mode except an active
-    // attach — there Ctrl+C must reach the child as an interrupt (0x03) so a runaway agent can
-    // be stopped without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as
-    // copy and never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    if is_quit_chord(key, ctrl, &ui.mode) {
+    // The wall tile that has the keyboard, if it has a live child to give keys to.
+    let wall_target = wall_input_target(ui);
+    // Ctrl+C kills the whole viewer (like `claude agents`) unless a child is taking our keys —
+    // an active attach, or a wall tile with the focus. There Ctrl+C must reach the child as an
+    // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
+    // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
+    // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
+    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some();
+    if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
     }
@@ -72,6 +76,13 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     }
     if matches!(ui.mode, Mode::Attached) && is_copy_chord(key, ctrl) {
         copy_attached_transcript(ui);
+        return Ok(false);
+    }
+    // The wall is a live input surface, not a viewing one: everything outside its own few
+    // reserved chords goes to the focused tile's child, so a session can be answered without
+    // leaving the grid.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        handle_wall_key(key, ctrl, wall_target, ui);
         return Ok(false);
     }
     match &mut ui.mode {
@@ -106,6 +117,34 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     }
     if !matches!(ui.mode, Mode::Normal) {
         ui.mouse_press = None;
+    }
+    // On the wall the pointer drives the tile under it: hover or click gives it the keyboard,
+    // and the wheel scrolls back through what it has already printed. Pointer events are not
+    // forwarded into tile children — clicking around inside an embedded TUI belongs in the
+    // zoomed view — so the wheel moves OUR viewport onto the child's retained output, which
+    // works the same for every backend regardless of what the child does with mouse reports.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        ui.mouse_press = None;
+        let hit = {
+            let rects = ui.wall_rects.borrow();
+            agent_viewer_tui::ui::wall::tile_at(&rects, me.column, me.row)
+                .map(|index| (index, rects[index]))
+        };
+        let Some((index, rect)) = hit else {
+            return MouseAction::None;
+        };
+        match me.kind {
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                focus_wall_tile(ui, index)
+            }
+            // Scrolling does not steal the focus: the wheel reads, it does not select.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let content = agent_viewer_tui::ui::wall::tile_content(rect);
+                scroll_wall_tile(ui, index, me, content);
+            }
+            _ => {}
+        }
+        return MouseAction::None;
     }
     match &ui.mode {
         Mode::Attached => {
@@ -224,6 +263,15 @@ pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
 
 /// Route one terminal paste without interpreting embedded newlines as key presses.
 pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
+    // A paste on the wall belongs to the focused tile, exactly like a keystroke. Without this
+    // it would land in the composer that is not even drawn, so the text would appear to
+    // vanish and could then be spawned as a task after leaving the wall.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        if let Some(fkey) = wall_input_target(ui) {
+            paste_into_pty(text, &fkey, ui);
+        }
+        return;
+    }
     match &mut ui.mode {
         Mode::Normal => ui.composer.push_str(text),
         Mode::Attached => {
@@ -231,42 +279,7 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
             let Some(fkey) = ui.focused.clone() else {
                 return;
             };
-            let bracketed_paste = ui
-                .attached
-                .get(&fkey)
-                .is_some_and(|pty| pty.with_screen(|screen| screen.bracketed_paste()));
-            if let Some(tracker) = ui.detach_trackers.get_mut(&fkey) {
-                if bracketed_paste {
-                    for _ in text.chars() {
-                        tracker.on_char();
-                    }
-                } else {
-                    let mut chars = text.chars().peekable();
-                    while let Some(c) = chars.next() {
-                        match c {
-                            '\r' => {
-                                tracker.on_enter();
-                                if chars.peek() == Some(&'\n') {
-                                    chars.next();
-                                }
-                            }
-                            '\n' => tracker.on_enter(),
-                            '\u{8}' | '\u{7f}' => tracker.on_backspace(),
-                            _ => tracker.on_char(),
-                        }
-                    }
-                }
-            }
-            if let Some(pty) = ui.attached.get_mut(&fkey) {
-                if bracketed_paste {
-                    let mut bytes = b"\x1b[200~".to_vec();
-                    bytes.extend_from_slice(text.as_bytes());
-                    bytes.extend_from_slice(b"\x1b[201~");
-                    let _ = pty.write_input(&bytes);
-                } else {
-                    let _ = pty.write_input(text.as_bytes());
-                }
-            }
+            paste_into_pty(text, &fkey, ui);
         }
         Mode::Filter => {
             let mut filter = ui.app.filter().to_string();
@@ -277,6 +290,49 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
         Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
         Mode::Palette(palette) => palette.push_str(&single_line_paste(text)),
         Mode::Help => {}
+    }
+}
+
+/// Write pasted text into one PTY, keeping its Left-gate tracker in step. Shared by the
+/// attach view and the wall so both honour the child's bracketed-paste mode.
+fn paste_into_pty(text: &str, fkey: &Key, ui: &mut Ui) {
+    {
+        let bracketed_paste = ui
+            .attached
+            .get(fkey)
+            .is_some_and(|pty| pty.with_screen(|screen| screen.bracketed_paste()));
+        if let Some(tracker) = ui.detach_trackers.get_mut(fkey) {
+            if bracketed_paste {
+                for _ in text.chars() {
+                    tracker.on_char();
+                }
+            } else {
+                let mut chars = text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\r' => {
+                            tracker.on_enter();
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                        }
+                        '\n' => tracker.on_enter(),
+                        '\u{8}' | '\u{7f}' => tracker.on_backspace(),
+                        _ => tracker.on_char(),
+                    }
+                }
+            }
+        }
+        if let Some(pty) = ui.attached.get_mut(fkey) {
+            if bracketed_paste {
+                let mut bytes = b"\x1b[200~".to_vec();
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                let _ = pty.write_input(&bytes);
+            } else {
+                let _ = pty.write_input(text.as_bytes());
+            }
+        }
     }
 }
 
@@ -430,11 +486,104 @@ pub(crate) fn toggle_age_ramp(ui: &mut Ui) {
     ui.set_notice(format!("age ramp: {state}"));
 }
 
-/// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
-/// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
-/// decision is unit-testable without a live terminal.
-fn is_quit_chord(key: KeyEvent, ctrl: bool, mode: &Mode) -> bool {
-    ctrl && matches!(key.code, KeyCode::Char('c')) && !matches!(mode, Mode::Attached)
+/// Ctrl+C is the app-wide "kill the viewer" chord, except when a child is taking our keys
+/// (`forwarding`) — there it is sent on as a raw interrupt instead. Kept as a pure predicate
+/// so the quit decision is unit-testable without a live terminal.
+fn is_quit_chord(key: KeyEvent, ctrl: bool, forwarding: bool) -> bool {
+    ctrl && matches!(key.code, KeyCode::Char('c')) && !forwarding
+}
+
+/// The wall tile that should receive keystrokes: the focused one, once it has a live child.
+///
+/// `None` while the wall is off, when the focused tile is still connecting, and when its
+/// child has exited — in all of those the viewer keeps its own keys, so Ctrl+C still quits
+/// rather than vanishing into a tile that cannot use it.
+fn wall_input_target(ui: &mut Ui) -> Option<(BackendKind, String)> {
+    if !ui.wall.on || !matches!(ui.mode, Mode::Normal) {
+        return None;
+    }
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+    let key = keys.get(ui.wall.focus_index(&keys))?.clone();
+    let live = ui
+        .attached
+        .get_mut(&key)
+        .is_some_and(|pty| !pty.is_exited());
+    live.then_some(key)
+}
+
+/// Keys on the wall. The wall reserves the few chords it needs to be navigable and escapable
+/// and forwards everything else — plain arrows, Enter, Esc, Ctrl+C — to the focused tile.
+///
+/// Esc and Ctrl+C reaching the child is the point, not an oversight: Esc interrupts Claude and
+/// Ctrl+C abandons a half-typed line, and a wall you cannot interrupt from is worse than no
+/// wall. `Ctrl+W` and `Ctrl+]` are the unconditional exits that keep this from being a trap.
+fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, String)>, ui: &mut Ui) {
+    // Shift+arrows walk the grid. Ctrl+arrows were tried first and never arrived — the host
+    // terminal keeps them — so the modifier that actually reaches us is the one that wins.
+    // Bare arrows stay the child's; the wall would be useless if it took them.
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => {
+                move_wall_selection(ui, 0, -1);
+                return;
+            }
+            KeyCode::Down => {
+                move_wall_selection(ui, 0, 1);
+                return;
+            }
+            KeyCode::Left => {
+                move_wall_selection(ui, -1, 0);
+                return;
+            }
+            KeyCode::Right => {
+                move_wall_selection(ui, 1, 0);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if ctrl {
+        match key.code {
+            // Ctrl+] leaves too, matching the attach view. Terminals send it as raw 0x1D,
+            // which crossterm's legacy unix parser folds onto Char('5')+CTRL; the kitty
+            // protocol delivers the literal Char(']')+CTRL. Accept both.
+            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+                toggle_wall(ui);
+                return;
+            }
+            // Zoom the focused tile to the full attach view. It reuses the wall's live PTY
+            // rather than spawning a second child.
+            KeyCode::Char('o') => {
+                attach_selected(ui);
+                return;
+            }
+            _ => {}
+        }
+    }
+    let Some(fkey) = target else {
+        return;
+    };
+    // The user is typing into this tile, so a queued reply injection aimed at it must not be
+    // typed in behind them. A reply armed at some other tile is untouched.
+    if ui.pending_reply.as_ref().map(|pending| &pending.key) == Some(&fkey) {
+        ui.pending_reply = None;
+    }
+    // Feed the same Left-gate tracker the attach view keeps. Zooming in with Ctrl+O reuses
+    // this PTY, and without this the reused session would start with an "empty input line"
+    // tracker — so the first Left after typing on the wall would back out instead of moving
+    // the cursor, mid-edit.
+    let tracker = ui.detach_trackers.entry(fkey.clone()).or_default();
+    match key.code {
+        KeyCode::Char(_) => tracker.on_char(),
+        KeyCode::Backspace => tracker.on_backspace(),
+        KeyCode::Enter => tracker.on_enter(),
+        _ => {}
+    }
+    if let Some(bytes) = key_to_bytes(key)
+        && let Some(pty) = ui.attached.get_mut(&fkey)
+    {
+        let _ = pty.write_input(&bytes);
+    }
 }
 
 fn handle_normal_key<B: ratatui::backend::Backend>(
@@ -465,6 +614,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
             KeyCode::Char('b') => toggle_tail(ui),
+            KeyCode::Char('w') => toggle_wall(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
@@ -1076,13 +1226,13 @@ fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
     ui.composer.set_models(models, backend);
 }
 
-/// While attached: Ctrl+] always detaches; Left detaches when the input line is empty
-/// (else it is forwarded); a dead child detaches on any key; everything else is encoded
+/// While attached: Ctrl+] always leaves; Left leaves when the input line is empty (else it
+/// is forwarded); a dead child leaves on any key; everything else is encoded
 /// to bytes and written to the PTY.
 fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let Some(fkey) = ui.focused.clone() else {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     };
 
@@ -1090,12 +1240,12 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     // attach (do not type our queued reply in behind the user's own input).
     ui.pending_reply = None;
 
-    // Ctrl+] always detaches (PTY lives on in the map). Terminals send Ctrl+] as raw byte
+    // Ctrl+] always leaves, closing the connection. Terminals send Ctrl+] as raw byte
     // 0x1D, which crossterm's legacy unix parser maps to Char('5')+CTRL (it folds 0x1C..=0x1F
     // onto Ctrl+'4'..'7'); the kitty keyboard protocol delivers the literal Char(']')+CTRL.
     // Match both so the header/help "ctrl+]" is honored under either encoding.
     if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
@@ -1107,19 +1257,19 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         .unwrap_or(true);
     if exited {
         ui.remove_pty(&fkey);
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
-    // Left detaches only when this PTY's input line is empty; otherwise forward it as cursor
-    // motion. The tracker is per-PTY so a re-attach preserves any half-typed line.
+    // Left leaves only when this PTY's input line is empty; otherwise forward it as cursor
+    // motion. The tracker dies with its PTY, so each visit to a session starts clean.
     if matches!(key.code, KeyCode::Left)
         && ui
             .detach_trackers
             .get(&fkey)
             .is_none_or(|t| t.detach_on_left())
     {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
@@ -1140,10 +1290,23 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     }
 }
 
-/// Detach the focused PTY back to the list (the PTY keeps running in the map).
-fn detach_to_list(ui: &mut Ui) {
+/// Leave the attached session and close its connection.
+///
+/// A session is connected exactly while it is on screen; there is no "running but not shown"
+/// state to reason about. The one exception is a wall tile you zoomed into: the wall still
+/// owns that connection and is about to draw it again, so it stays open and the wall closes
+/// it with the rest when it closes.
+fn close_attached(ui: &mut Ui) {
+    if let Some(key) = ui.focused.take() {
+        if ui.wall.owns(&key) {
+            // Zooming resized this child to the full screen. Forget the recorded tile size so
+            // the wall's next frame resizes it back down instead of matching a stale entry.
+            ui.wall.sized.remove(&key);
+        } else {
+            ui.remove_pty(&key);
+        }
+    }
     ui.mode = Mode::Normal;
-    ui.focused = None;
     set_mouse_capture(ui, true);
 }
 
@@ -1226,9 +1389,9 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
-        handle_attached_key, handle_mouse_event, handle_normal_key, handle_palette_key,
+        handle_attached_key, handle_key, handle_mouse, handle_mouse_event, handle_palette_key,
         handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette, palette_items,
-        set_mouse_capture,
+        set_mouse_capture, wall_input_target,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
@@ -1278,9 +1441,11 @@ pub(crate) mod tests {
         )
         .expect("fixed terminal");
 
-        handle_normal_key(
+        // Routes through `handle_key`, not `handle_normal_key`: the wall and the quit chord
+        // are decided before mode dispatch, so a harness that skipped it would test a path
+        // no keystroke ever takes.
+        handle_key(
             key(code, modifiers),
-            modifiers.contains(KeyModifiers::CONTROL),
             backends,
             &refresher,
             ui,
@@ -1331,6 +1496,8 @@ pub(crate) mod tests {
             tail_open: false,
             tail: None,
             tail_pending: None,
+            wall: agent_viewer_tui::ui::WallState::default(),
+            wall_rects: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1382,6 +1549,8 @@ pub(crate) mod tests {
                         sprite: ui.sprite,
                         age_ramp: ui.age_ramp,
                         tail: None,
+                        wall: None,
+                        wall_rects: &ui.wall_rects,
                     },
                 );
             })
@@ -1420,6 +1589,8 @@ pub(crate) mod tests {
                         sprite: ui.sprite,
                         age_ramp: ui.age_ramp,
                         tail: None,
+                        wall: None,
+                        wall_rects: &ui.wall_rects,
                     },
                 );
             })
@@ -1469,6 +1640,27 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// A child that turns on SGR mouse tracking and then echoes every byte it receives,
+    /// with escapes visible (`cat -v` renders ESC as `^[`). Unlike `mouse_recording_pty`
+    /// there is no capture window to race, so an assertion here is about routing rather
+    /// than timing.
+    fn mouse_echoing_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; cat -v".to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("mouse echoing child")
     }
 
     fn mouse_recording_pty() -> agent_viewer_core::pty::PtySession {
@@ -1598,6 +1790,15 @@ pub(crate) mod tests {
             scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
         })
         .expect("Codex restricted viewport child")
+    }
+
+    /// Unwrap a drained attach result as a user attach. Every attach these tests submit goes
+    /// through `submit_attach`, so a `Wall` outcome here would mean the runner crossed wires.
+    fn focus_plan(outcome: crate::AttachOutcome) -> crate::ops::AttachPlan {
+        match outcome {
+            crate::AttachOutcome::Focus(plan) => plan,
+            crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
+        }
     }
 
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
@@ -1785,6 +1986,493 @@ pub(crate) mod tests {
         }
 
         assert_eq!(ui.composer.model_suggestions(), vec!["kimi-k3".to_string()]);
+    }
+
+    /// A live working session with a real PTY already in `attached` — the only shape that
+    /// earns a wall tile.
+    fn wall_tile_pty() -> PtySession {
+        PtySession::spawn(PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("wall tile child")
+    }
+
+    fn kill_attached(ui: &mut Ui) {
+        for (_, mut pty) in std::mem::take(&mut ui.attached) {
+            pty.kill();
+        }
+    }
+
+    /// The index the wall's focus currently resolves to. The focus is stored by key, so a
+    /// test must ask the same question the input path does rather than reading a field.
+    fn wall_focus(ui: &Ui) -> usize {
+        let keys =
+            agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+        ui.wall.focus_index(&keys)
+    }
+
+    fn wall_ui_with_one_live_tile() -> Ui {
+        let mut session = sess("live-tile", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let key = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(key, wall_tile_pty());
+        ui
+    }
+
+    /// The whole point of the rework: what you type on the wall reaches the session you are
+    /// looking at. `cat` echoes through the tty line discipline, so the bytes showing up on
+    /// the child's screen is proof they were written to the child's pty and not somewhere
+    /// else (the composer, a notice, the void).
+    #[test]
+    fn typing_on_the_wall_reaches_the_focused_tile() {
+        let mut session = sess("typed-into", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        for c in "hello".chars() {
+            press_normal_key(&mut ui, &[], c, KeyModifiers::NONE);
+        }
+
+        wait_for_pty_screen(&ui, &target, "hello");
+        assert_eq!(
+            ui.composer.text(),
+            "",
+            "the keystrokes must not have gone to the composer as well"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Hover puts the keyboard on whatever is under the pointer, which is what makes "point
+    /// at a session and type into it" work.
+    #[test]
+    fn hovering_a_tile_focuses_it() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let keys = [
+            (first.backend, first.id.clone()),
+            (second.backend, second.id.clone()),
+        ];
+        let mut ui = test_ui_with(vec![first, second]);
+        for key in &keys {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        // Two tiles side by side, as the last frame would have published them.
+        *ui.wall_rects.borrow_mut() = vec![
+            ratatui::layout::Rect::new(0, 0, 40, 10),
+            ratatui::layout::Rect::new(40, 0, 40, 10),
+        ];
+        assert_eq!(wall_focus(&ui), 0);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 55,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(wall_focus(&ui), 1, "hover must focus the tile under it");
+
+        // A click on the first tile focuses it back, for terminals that report no motion.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(wall_focus(&ui), 0);
+
+        // Off every tile, the focus stays where it was rather than jumping to a default.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 5,
+                row: 40,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+        assert_eq!(wall_focus(&ui), 0);
+        kill_attached(&mut ui);
+    }
+
+    /// A tile that ages out of the recency window must take its connection with it. Left
+    /// alone, the child sits there invisible until the wall closes, and the MAX_TILES process
+    /// budget drifts upward as expired slots are refilled.
+    #[test]
+    fn a_tile_leaving_the_wall_closes_its_connection() {
+        let mut staying = sess("staying", "/tmp/agentviewer-wall", 100);
+        staying.status = Status::Working;
+        let mut leaving = sess("leaving", "/tmp/agentviewer-wall", 200);
+        leaving.status = Status::Working;
+        let leaving_key = (leaving.backend, leaving.id.clone());
+        let mut ui = test_ui_with(vec![staying, leaving.clone()]);
+        for key in [
+            (BackendKind::Claude, "staying".to_string()),
+            leaving_key.clone(),
+        ] {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+            ui.wall.requested.insert(key);
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        ui.wall.requested.insert(leaving_key.clone());
+        assert!(ui.attached.contains_key(&leaving_key));
+
+        // The session stops and its last activity ages past the window, so it is no longer
+        // tiled. Everything else about the wall is unchanged.
+        let mut stopped = leaving;
+        stopped.status = Status::Done;
+        stopped.updated_at_ms =
+            agent_viewer_core::spawn::now_ms() - agent_viewer_tui::ui::wall::RECENT_MS - 60_000;
+        let staying_session = ui
+            .app
+            .session_for(&(BackendKind::Claude, "staying".to_string()))
+            .cloned()
+            .expect("staying session");
+        ui.app.set_sessions(vec![staying_session, stopped]);
+        crate::prune_wall_tiles(&mut ui, agent_viewer_core::spawn::now_ms());
+
+        assert!(
+            !ui.attached.contains_key(&leaving_key),
+            "an expired tile kept its child alive"
+        );
+        assert!(
+            !ui.wall.requested.contains(&leaving_key),
+            "an expired tile stayed in the ownership set, so a join could still land"
+        );
+        assert!(
+            ui.attached
+                .contains_key(&(BackendKind::Claude, "staying".to_string())),
+            "pruning must not touch a tile that is still on the wall"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Paste is input too. On the wall it must reach the focused tile, not the composer that
+    /// is not even drawn — text landing there vanishes, then spawns as a task later.
+    #[test]
+    fn pasting_on_the_wall_reaches_the_focused_tile() {
+        let mut session = sess("pasted-into", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        handle_paste("pasted", &mut ui);
+
+        wait_for_pty_screen(&ui, &target, "pasted");
+        assert_eq!(
+            ui.composer.text(),
+            "",
+            "the paste must not have gone into the hidden composer"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Zooming in with Ctrl+O reuses the wall's PTY, so the Left-gate tracker has to already
+    /// know the line is mid-edit. Otherwise the first Left backs out instead of moving the
+    /// cursor, right after you typed something.
+    #[test]
+    fn typing_on_the_wall_arms_the_left_gate_for_the_zoomed_view() {
+        let mut ui = wall_ui_with_one_live_tile();
+        let key = (BackendKind::Claude, "live-tile".to_string());
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        press_normal_key(&mut ui, &[], 'x', KeyModifiers::NONE);
+
+        assert!(
+            ui.detach_trackers
+                .get(&key)
+                .is_some_and(|tracker| !tracker.detach_on_left()),
+            "a half-typed wall line must not read as an empty input line"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// The wheel scrolls the tile under the pointer back over its retained output, and does
+    /// not steal the focus while doing it — reading a tile is not selecting it.
+    #[test]
+    fn the_wheel_scrolls_the_tile_under_the_pointer_without_focusing_it() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let second_key = (second.backend, second.id.clone());
+        let mut ui = test_ui_with(vec![first, second]);
+        // A child that prints far more than the tile is tall, so there is history to scroll.
+        for key in [
+            (BackendKind::Claude, "tile-a".to_string()),
+            second_key.clone(),
+        ] {
+            ui.attached.insert(
+                key,
+                PtySession::spawn(PtySpec {
+                    program: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done; sleep 30"
+                            .to_string(),
+                    ],
+                    cwd: None,
+                    envs: Vec::new(),
+                    rows: 6,
+                    cols: 40,
+                    palette: None,
+                    scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+                })
+                .expect("scrollable tile child"),
+            );
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        wait_for_pty_screen(&ui, &second_key, "line-59");
+        *ui.wall_rects.borrow_mut() = vec![
+            ratatui::layout::Rect::new(0, 0, 40, 10),
+            ratatui::layout::Rect::new(40, 0, 40, 10),
+        ];
+
+        // Wheel up over the SECOND tile while the FIRST has the focus. This child does not
+        // track the mouse, so the fallback path moves the viewer's own viewport.
+        assert_eq!(wall_focus(&ui), 0);
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 55,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+
+        assert_eq!(
+            wall_focus(&ui),
+            0,
+            "the wheel must not move the keyboard focus"
+        );
+        let scrolled = ui.attached[&second_key].with_screen(|screen| screen.contents());
+        assert!(
+            !scrolled.contains("line-59"),
+            "the tile did not scroll back off the live tail: {scrolled:?}"
+        );
+
+        // Wheel back down returns it to the live tail.
+        for _ in 0..3 {
+            handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 55,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut ui,
+            );
+        }
+        let live = ui.attached[&second_key].with_screen(|screen| screen.contents());
+        assert!(live.contains("line-59"), "the tile did not return to live");
+        kill_attached(&mut ui);
+    }
+
+    /// The case that matters in practice: `claude attach` runs in the alternate screen and
+    /// tracks the mouse, so it owns its scrollback and only a forwarded wheel report scrolls
+    /// it. The report must arrive in the CHILD's coordinates, not the wall's — a tile is
+    /// offset into the grid, and the child thinks it is alone on a terminal its own size.
+    #[test]
+    fn a_mouse_tracking_tile_gets_a_wheel_report_in_its_own_coordinates() {
+        let mut session = sess("tracks-mouse", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        // Turn on SGR mouse tracking, then echo whatever reports arrive back onto the screen.
+        ui.attached.insert(target.clone(), mouse_echoing_pty());
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        let rect = ratatui::layout::Rect::new(40, 6, 40, 12);
+        *ui.wall_rects.borrow_mut() = vec![rect];
+        let content = agent_viewer_tui::ui::wall::tile_content(rect);
+        assert_eq!((content.x, content.y), (41, 8));
+        // The fixture only records once it has enabled tracking and started reading.
+        wait_for_pty_screen(&ui, &target, "READY");
+
+        // Wheel up three cells right and two cells down inside the child's own area.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: content.x + 3,
+                row: content.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+
+        // The fixture echoes the raw bytes as hex. SGR wheel-up is button 64 and the child's
+        // own 1-based cell is (4, 3), so it must receive ESC [ < 6 4 ; 4 ; 3 — proof the
+        // report was both forwarded and translated out of the wall's coordinates.
+        // `cat -v` shows ESC as `^[`. SGR wheel-up is button 64 and the child's own 1-based
+        // cell is (4, 3) — proof the report was forwarded AND translated out of the wall's
+        // coordinates into the child's.
+        wait_for_pty_screen(&ui, &target, "^[[<64;4;3M");
+        kill_attached(&mut ui);
+        kill_attached(&mut ui);
+    }
+
+    #[test]
+    fn ctrl_w_toggles_the_video_wall() {
+        let mut ui = wall_ui_with_one_live_tile();
+        assert!(!ui.wall.on);
+
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on, "Ctrl+W did not turn the wall on");
+        assert!(ui.notice.text().contains("video wall"));
+
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(!ui.wall.on, "Ctrl+W did not turn the wall off");
+        kill_attached(&mut ui);
+    }
+
+    /// Esc belongs to the child: it is how you interrupt Claude, and a wall you cannot
+    /// interrupt from is worse than no wall. Ctrl+W and Ctrl+] are the exits.
+    #[test]
+    fn esc_reaches_the_tile_and_does_not_leave_the_wall() {
+        let mut ui = wall_ui_with_one_live_tile();
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.wall.on, "Esc must go to the tile, not close the wall");
+
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(!ui.wall.on, "Ctrl+W is the exit");
+        kill_attached(&mut ui);
+    }
+
+    /// The wall reserves four things and forwards the rest. A viewer chord that still acted
+    /// here would be a chord the session could never receive — Ctrl+A is "start of line" while
+    /// you are typing a reply, not "show all".
+    #[test]
+    fn viewer_chords_go_to_the_tile_instead_of_acting() {
+        let mut ui = wall_ui_with_one_live_tile();
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        let group_mode = ui.app.group_mode();
+        let show_all = ui.app.show_all();
+        let sprite = ui.sprite;
+        for chord in ['s', 'a', 'f', 'k', 'g', 'r', 'e'] {
+            press_normal_key(&mut ui, &[], chord, KeyModifiers::CONTROL);
+        }
+
+        assert_eq!(ui.app.group_mode(), group_mode, "Ctrl+S must not regroup");
+        assert_eq!(ui.app.show_all(), show_all, "Ctrl+A must not show all");
+        assert_eq!(ui.sprite, sprite, "Ctrl+G must not cycle the sprite");
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "no chord may open a modal over the wall"
+        );
+
+        // Typing goes to the tile, not the composer — the composer is not even on screen.
+        press_normal_key(&mut ui, &[], 'z', KeyModifiers::NONE);
+        assert_eq!(ui.composer.text(), "");
+
+        assert!(ui.wall.on, "none of those chords should have left the wall");
+        kill_attached(&mut ui);
+    }
+
+    #[test]
+    fn shift_arrows_walk_the_grid_and_pin_the_list_selection() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let keys = [
+            (first.backend, first.id.clone()),
+            (second.backend, second.id.clone()),
+        ];
+        let mut ui = test_ui_with(vec![first, second]);
+        for key in &keys {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert_eq!(wall_focus(&ui), 0);
+        let ordered =
+            agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+        assert_eq!(ordered.len(), 2);
+
+        // A plain arrow is the child's, not the wall's — that is what makes the tile a real
+        // input surface.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            wall_focus(&ui),
+            0,
+            "a bare arrow must go to the tile, not move the focus"
+        );
+
+        // Nor is Ctrl+arrow the wall's: the host terminal keeps it and it never reaches the
+        // viewer, so binding it would be a key that silently does nothing.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(wall_focus(&ui), 0);
+
+        // Two tiles are a 2x1 row, so Shift+Right moves and Shift+Down does not.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(wall_focus(&ui), 1);
+        assert_eq!(
+            ui.app.selected().map(|s| s.id.clone()),
+            Some(ordered[1].1.clone()),
+            "the tile selection must pin the list selection"
+        );
+
+        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(wall_focus(&ui), 1, "a 2x1 grid has no second row");
+
+        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(wall_focus(&ui), 0);
+        assert_eq!(
+            ui.app.selected().map(|s| s.id.clone()),
+            Some(ordered[0].1.clone())
+        );
+        kill_attached(&mut ui);
     }
 
     #[test]
@@ -2310,6 +2998,8 @@ pub(crate) mod tests {
                         sprite: ui.sprite,
                         age_ramp: ui.age_ramp,
                         tail: None,
+                        wall: None,
+                        wall_rects: &ui.wall_rects,
                     },
                 );
             })
@@ -2845,7 +3535,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install selected session")
             );
 
@@ -2864,6 +3554,77 @@ pub(crate) mod tests {
             ],
             "attach capture defaults must match each backend"
         );
+    }
+
+    /// True until the pid is gone from the process table, polled briefly because the reader
+    /// thread teardown is not instantaneous.
+    fn pid_alive(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if std::time::Instant::now() > deadline {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The core of the no-persistence rule: a session is connected exactly while it is on
+    /// screen. Leaving it must kill the child, not park it for a later re-attach.
+    #[test]
+    fn leaving_an_attached_session_closes_its_connection() {
+        let mut ui = test_ui_with(Vec::new());
+        let target = (BackendKind::Codex, "closes-on-exit".to_string());
+        let pty = wall_tile_pty();
+        let pid = pty.pid().expect("child pid");
+        ui.attached.insert(target.clone(), pty);
+        ui.detach_trackers
+            .insert(target.clone(), DetachTracker::new());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+
+        handle_attached_key(key(KeyCode::Char(']'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&target),
+            "the connection must not survive leaving the session"
+        );
+        assert!(
+            !ui.detach_trackers.contains_key(&target),
+            "the per-PTY input gate must die with its PTY"
+        );
+        assert!(!pid_alive(pid), "child {pid} outlived the session view");
+    }
+
+    /// The one exception: the wall owns its tiles, and zooming into one then backing out
+    /// returns you to the wall, which is about to draw that same connection again.
+    #[test]
+    fn zooming_out_of_a_wall_tile_keeps_the_wall_connection() {
+        let mut ui = test_ui_with(Vec::new());
+        let target = (BackendKind::Codex, "wall-tile".to_string());
+        let pty = wall_tile_pty();
+        let pid = pty.pid().expect("child pid");
+        ui.attached.insert(target.clone(), pty);
+        ui.wall.on = true;
+        ui.wall.requested.insert(target.clone());
+        ui.wall.sized.insert(target.clone(), (10, 40));
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+
+        handle_attached_key(key(KeyCode::Char(']'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            ui.attached.contains_key(&target),
+            "the wall still owns this connection"
+        );
+        assert!(
+            !ui.wall.sized.contains_key(&target),
+            "the recorded tile size must be dropped so the wall resizes the zoomed child back down"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        kill_attached(&mut ui);
     }
 
     #[test]
@@ -3189,7 +3950,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install clicked session")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3297,7 +4058,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install pressed session after reflow")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3551,7 +4312,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install reused session")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3878,7 +4639,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install selected session")
             );
             assert!(matches!(ui.mode, Mode::Attached));
@@ -3954,7 +4715,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install retained session")
             );
             assert!(
@@ -4032,7 +4793,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install external opencode session")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -4149,19 +4910,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_from_the_list_and_transient_modes() {
+    fn ctrl_c_quits_when_no_child_is_taking_our_keys() {
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        // The list and every transient modal treat Ctrl+C as "kill the viewer".
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Normal));
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Filter));
-        assert!(is_quit_chord(ctrl_c, true, &Mode::Help));
+        assert!(is_quit_chord(ctrl_c, true, false));
     }
 
     #[test]
-    fn ctrl_c_does_not_quit_while_attached() {
-        // Attached, Ctrl+C must reach the child as an interrupt, not tear down the viewer.
+    fn ctrl_c_does_not_quit_while_a_child_is_taking_our_keys() {
+        // Attached, or focused on a live wall tile, Ctrl+C must reach the child as an
+        // interrupt rather than tearing down the viewer.
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(!is_quit_chord(ctrl_c, true, &Mode::Attached));
+        assert!(!is_quit_chord(ctrl_c, true, true));
+    }
+
+    /// The wall must not swallow the only quit chord. With the wall open but no live child
+    /// focused (nothing running, or a tile still connecting) Ctrl+C still tears the viewer
+    /// down, because there is nothing there to send an interrupt to.
+    #[test]
+    fn ctrl_c_still_quits_on_a_wall_with_no_live_tile() {
+        let mut ui = test_ui_with(vec![sess("idle-only", "/tmp/agentviewer-wall", 100)]);
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        assert!(ui.wall.on);
+
+        assert!(
+            wall_input_target(&mut ui).is_none(),
+            "no tile has a live child, so nothing should be taking keys"
+        );
+        assert!(press_normal_key(&mut ui, &[], 'c', KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -4393,8 +5168,8 @@ pub(crate) mod tests {
     fn plain_c_and_other_ctrl_chords_are_not_quit() {
         // A bare 'c' types into the composer; other Ctrl-chords keep their own actions.
         let plain_c = key(KeyCode::Char('c'), KeyModifiers::NONE);
-        assert!(!is_quit_chord(plain_c, false, &Mode::Normal));
+        assert!(!is_quit_chord(plain_c, false, false));
         let ctrl_x = key(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(!is_quit_chord(ctrl_x, true, &Mode::Normal));
+        assert!(!is_quit_chord(ctrl_x, true, false));
     }
 }

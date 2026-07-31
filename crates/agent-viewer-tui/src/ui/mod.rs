@@ -10,6 +10,7 @@ mod palette;
 mod sprite;
 mod tail;
 pub mod theme;
+pub mod wall;
 
 use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
@@ -38,6 +39,7 @@ pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, Palett
 pub use sprite::SpriteKind;
 pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
+pub use wall::{WallState, WallTile, WallView};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
 pub type Pulses = HashMap<(BackendKind, String), i64>;
@@ -305,8 +307,18 @@ pub struct Draw<'a> {
     /// toggled from the command palette, and a no-op under a non-truecolor theme.
     pub age_ramp: bool,
     /// The Ctrl+B tail pane, present only while it is open and a session is selected. It
-    /// takes its columns off the right of the list.
+    /// takes its columns off the right of the list. Not drawn while the wall is up: it is a
+    /// panel beside the list, and the wall replaces the list.
     pub tail: Option<TailView<'a>>,
+    /// The video wall (Ctrl+W), when on. Present means the list region becomes a grid of
+    /// live PTY tiles and the composer is not drawn at all (the focused tile owns the
+    /// keyboard); the header and footer stay exactly where they were.
+    pub wall: Option<WallView<'a>>,
+    /// Sink for the rect of each tile this frame, in tile order. The run loop reads it back
+    /// to size each tile's child (`PtySession::resize` needs `&mut` and draw is `&`-only) and
+    /// to hit-test the pointer. Emptied on any frame without a wall. Same pattern as
+    /// `list_hit`.
+    pub wall_rects: &'a RefCell<Vec<Rect>>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -326,22 +338,28 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // a long task description stays visible. Reply mode sizes its prompt prefixed box to the
     // reply buffer.
     let inner_w = input_inner_width(frame.area().width);
-    let composer_h = match &d.mode {
-        Mode::Reply(m) => {
-            let title = d
-                .app
-                .session_for(&(m.backend, m.id.clone()))
-                .map(|s| s.title.clone())
-                .unwrap_or_default();
-            let title_seg = if title.is_empty() {
-                String::new()
-            } else {
-                format!("{title} ")
-            };
-            let prefix = format!("↳ reply {title_seg}❯ ");
-            input_box_height(display_width(&prefix), &m.buffer, inner_w)
+    // The wall owns the keyboard, so the composer is not drawn while it is on: an input box
+    // that cannot receive your input is a lie, and those rows are better spent on tiles.
+    let composer_h = if d.wall.is_some() {
+        0
+    } else {
+        match &d.mode {
+            Mode::Reply(m) => {
+                let title = d
+                    .app
+                    .session_for(&(m.backend, m.id.clone()))
+                    .map(|s| s.title.clone())
+                    .unwrap_or_default();
+                let title_seg = if title.is_empty() {
+                    String::new()
+                } else {
+                    format!("{title} ")
+                };
+                let prefix = format!("↳ reply {title_seg}❯ ");
+                input_box_height(display_width(&prefix), &m.buffer, inner_w)
+            }
+            _ => composer_box_height(d.composer.text(), inner_w, frame.area().height),
         }
-        _ => composer_box_height(d.composer.text(), inner_w, frame.area().height),
     };
 
     // header (blank gap + title/status + blank gaps) · list · blank gap · bordered composer box
@@ -379,9 +397,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
     // below, floating over the list's bottom) shadows part of it, so record that hole too.
     // The tail pane takes a fixed slice off the right of the list area; the list keeps the
-    // rest and re-lays itself out at the narrower width.
+    // rest and re-lays itself out at the narrower width. The wall stands the tail down: the
+    // tail is a panel beside the list, the wall replaces the list outright, and every tile
+    // already shows the live session the tail would be tailing.
     let (list_area, tail_area) = match &d.tail {
-        Some(_) if vertical[1].width >= TAIL_MIN_TOTAL_WIDTH => {
+        Some(_) if d.wall.is_none() && vertical[1].width >= TAIL_MIN_TOTAL_WIDTH => {
             let split = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -393,28 +413,41 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         }
         _ => (vertical[1], None),
     };
-    let mut hit = draw_list(
-        frame,
-        d.app,
-        d.pulses,
-        d.now_ms,
-        d.pr_status,
-        deco,
-        d.logos,
-        theme,
-        d.age_ramp,
-        list_area,
-    );
+    // The wall replaces the list region and nothing else, so it publishes that region for the
+    // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
+    let mut hit = match &d.wall {
+        Some(view) => {
+            *d.wall_rects.borrow_mut() = wall::draw(frame, view, d.now_ms, theme, vertical[1]);
+            ListHit::default()
+        }
+        None => {
+            d.wall_rects.borrow_mut().clear();
+            draw_list(
+                frame,
+                d.app,
+                d.pulses,
+                d.now_ms,
+                d.pr_status,
+                deco,
+                d.logos,
+                theme,
+                d.age_ramp,
+                list_area,
+            )
+        }
+    };
     if let (Some(view), Some(area)) = (&d.tail, tail_area) {
         tail::draw(frame, view, theme, area);
     }
-    if matches!(d.mode, Mode::Normal) {
+    if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
         hit.blocked = overlay::popup_area(d.composer, d.themes, vertical[3]);
     }
     *d.list_hit.borrow_mut() = hit;
     // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
     // the persistent spawn composer.
-    if let Mode::Reply(m) = d.mode {
+    if d.wall.is_some() {
+        // No composer on the wall: `composer_h` is zero, so there is nothing to draw into.
+    } else if let Mode::Reply(m) = d.mode {
         let title = d
             .app
             .session_for(&(m.backend, m.id.clone()))
@@ -432,11 +465,21 @@ pub fn draw(frame: &mut Frame, d: Draw) {
             matches!(d.mode, Mode::Normal) && caret_visible(d.now_ms, theme.animation),
         );
     }
-    draw_footer(frame, d.app, d.mode, d.notice, d.now_ms, theme, vertical[4]);
+    draw_footer(
+        frame,
+        d.app,
+        d.mode,
+        d.notice,
+        d.now_ms,
+        theme,
+        d.wall.as_ref(),
+        vertical[4],
+    );
 
     // Completion popup floating just above the composer box: the /model picker when a /model
-    // command is being typed, else the slash-command popup.
-    if matches!(d.mode, Mode::Normal) {
+    // command is being typed, else the slash-command popup. Never on the wall — the composer
+    // it belongs to is not on screen.
+    if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
         let highlight = d.composer.suggestion_highlight();
         if d.themes.picker_open() {
             overlay::draw_theme_picker(frame, d.themes, vertical[3]);
@@ -691,6 +734,7 @@ fn draw_list(
 
 // --- Footer ---------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn draw_footer(
     frame: &mut Frame,
     app: &App,
@@ -698,8 +742,35 @@ fn draw_footer(
     notice: &str,
     now_ms: i64,
     theme: &Theme,
+    wall: Option<&WallView>,
     area: Rect,
 ) {
+    // The wall owns the footer while it is on (except for a live notice), because its keys
+    // differ from the list's and the overflow count has nowhere else to go.
+    if let Some(view) = wall
+        && matches!(mode, Mode::Normal)
+        && notice.is_empty()
+    {
+        let overflow = if view.overflow > 0 {
+            format!(
+                "showing {} of {} · ",
+                view.tiles.len(),
+                view.tiles.len() + view.overflow
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "{overflow}wall · Shift+↑↓←→ move · wheel scrolls · Ctrl+O zoom · Ctrl+W exit"
+                ),
+                fg(theme.muted),
+            ))),
+            area,
+        );
+        return;
+    }
     let line = match mode {
         Mode::Filter => Line::from(format!("/{}", app.filter())),
         Mode::Palette(_) => Line::from(""),
@@ -847,6 +918,8 @@ mod tests {
                         sprite: Default::default(),
                         age_ramp: false,
                         tail: None,
+                        wall: None,
+                        wall_rects: &RefCell::new(Vec::new()),
                     },
                 );
             })
@@ -1807,6 +1880,8 @@ mod tests {
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })
@@ -1831,6 +1906,169 @@ mod tests {
             .collect();
         let pos = term.get_cursor_position().unwrap();
         (rows, (pos.x, pos.y))
+    }
+
+    /// The wall owns the keyboard, so the composer must not be on screen claiming to. Its
+    /// rows go to the grid instead: the tile has to reach further down the frame than the
+    /// list region ever did.
+    /// A plain working session for the wall render tests.
+    fn walled_test_session() -> Session {
+        Session {
+            backend: BackendKind::Codex,
+            id: "walled".to_string(),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title: "walled".to_string(),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            status: Status::Working,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    /// The tail pane is a panel beside the list; the wall replaces the list outright, and
+    /// every tile already shows the live session the tail would be tailing. So the wall takes
+    /// the whole region and the tail stands down rather than both fighting for the columns.
+    #[test]
+    fn the_tail_pane_stands_down_while_the_wall_is_up() {
+        let session = walled_test_session();
+        let app = App::new(vec![session.clone()]);
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    age_ramp: false,
+                    // The pane is open, and wide enough that it would take its columns.
+                    tail: Some(TailView {
+                        session: Some(&session),
+                        events: None,
+                        live: None,
+                    }),
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        // The wall owns the full width...
+        assert_eq!(rects.borrow()[0].width, 160);
+        // ...and, more to the point, the pane is not painted over the top of it. The wall
+        // draws into the whole region either way, so overpainting is the failure mode here,
+        // not a narrower grid.
+        assert!(
+            !rendered.contains("tail"),
+            "the tail pane rendered on top of the wall"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_not_drawn_while_the_wall_is_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Cell;
+
+        let session = walled_test_session();
+        let app = App::new(vec![session.clone()]);
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(Cell::symbol).collect();
+
+        assert!(
+            !rendered.contains('❯'),
+            "the composer prompt is still on screen with the wall up"
+        );
+        let tile = rects.borrow()[0];
+        assert!(
+            tile.bottom() >= 22,
+            "the tile stopped at row {}, so the composer rows were not reclaimed",
+            tile.bottom()
+        );
     }
 
     #[test]
@@ -1917,6 +2155,8 @@ mod tests {
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })
@@ -2027,6 +2267,8 @@ mod tests {
                     sprite: Default::default(),
                     age_ramp: false,
                     tail: None,
+                    wall: None,
+                    wall_rects: &RefCell::new(Vec::new()),
                 },
             );
         })

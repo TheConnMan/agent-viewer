@@ -41,7 +41,8 @@ pub(super) fn draw(frame: &mut Frame, av: AttachView, notice: &str, now_ms: i64,
     );
 }
 
-/// Shared with the tail pane, which renders an already-attached PTY the same themed way.
+/// Shared with the tail pane and the video wall, which both render an already-attached PTY
+/// the same themed way.
 pub(super) struct ThemedPseudoTerminal<'a> {
     pub(super) screen: &'a vt100::Screen,
     pub(super) palette: Option<TerminalPalette>,
@@ -104,7 +105,7 @@ fn draw_header(
     let right = if exited {
         "ctrl+y send copy request to terminal · process exited · press any key"
     } else {
-        "ctrl+y send copy request to terminal · ← back · ctrl+] detach"
+        "ctrl+y send copy request to terminal · ← back · ctrl+] close"
     };
     let left = format!(
         " {glyph} {} {}  {}",

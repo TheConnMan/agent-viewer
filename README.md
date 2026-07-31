@@ -234,16 +234,51 @@ credentials, while an external opencode session runs `opencode -s`;
 Claude runs `claude attach`, which resumes the same thread for both a running background
 job and a finished one (waking it in place); a row with no background-job id falls back to
 `claude -r`. `←` returns to the list when the
-input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always detaches.
-The attached PTY stays alive in the background so re-attaching is instant.
+input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always returns.
+A session is connected exactly while it is on screen: leaving it closes that connection, so
+there is never a session still connected in the background. Opening it again reconnects, which
+takes a second or two. Conversation state lives in each backend's own store, so nothing is lost
+by closing.
 New attached PTYs use the active viewer theme's text and background as their terminal defaults;
 explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
-uses the captured host foreground and background. Because attached PTYs are reused, changing
-the theme then reentering a retained session refreshes its default foreground and background
-without restarting the child.
+uses the captured host foreground and background. Because a session reconnects when you open it,
+a theme change applies to the next session you open.
 Codex and Claude attached transcripts scroll immediately: Codex scrolls the viewer's retained
 transcript, while Claude receives the wheel in its attached terminal. Their capture behavior and
 external opencode selection behavior follow the `Ctrl+T` controls above.
+
+### Video wall
+
+`Ctrl+W` replaces the session list with a grid of everything that is running, and gives the
+keyboard to one tile so you can answer a session without leaving the grid. It connects each
+session for you through the same path a manual attach uses, so there is nothing to set up
+first; a tile shows `connecting…` until its session is live, or the reason it could not be
+joined. `Ctrl+W` again closes the wall and every connection it opened.
+
+A session earns a tile while it is working or awaiting input, and keeps it for fifteen minutes
+after it stops. A run that just finished is exactly when the wall is most useful — the reply
+you want to type is the one that follows the result you watched arrive — so the tile stays put
+instead of vanishing at that moment.
+
+The grid is 1x1 for one session, 2x1 for two, 2x2 for three or four, 3x2 for five or six, and
+3x3 up to nine. Nine is the cap, because every tile is a live child process; beyond that the
+footer reads `showing 9 of N` rather than dropping the rest silently, and still-running
+sessions take the slots ahead of recently-stopped ones so a busy agent is never the one pushed
+into the overflow. Each tile carries its
+state glyph, backend mark, title, project, and elapsed time, dropping the project then the
+elapsed as tiles get narrower. The focused tile is marked with a caret and an accent border; a
+tile awaiting input turns its own border and header amber without disturbing the rest of the
+wall, and the grid never reorders itself, so you keep your place in whatever you were reading.
+
+Hover or click a tile to focus it, or move with `Shift+↑↓←→`. The mouse wheel scrolls the tile
+under the pointer back through what it has already printed, without moving the focus — that is
+the viewer's own viewport over the session's retained output, so it works the same whatever the
+backend does with mouse reports. `Ctrl+O` zooms the focused tile to the full attach view,
+reusing the connection the wall already holds. Everything else you type —
+plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:
+`Esc` interrupts it and `Ctrl+C` clears its input line, exactly as they would if you had
+attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
+is not drawn while the wall is up, since the tiles have the keyboard.
 
 When a Linux viewer is displayed remotely through Windows Terminal or another terminal with
 OSC 52 support, `Ctrl+Y` sends the exact visible PTY viewport to that client terminal. The
