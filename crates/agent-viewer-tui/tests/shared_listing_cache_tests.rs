@@ -82,6 +82,56 @@ impl Backend for CountedBackend {
     }
 }
 
+/// A backend whose listing races a mutation: another viewer invalidates the scope while
+/// `list()` is running, so what it returns is a pre-mutation snapshot and its publish fences.
+struct FencedBackend {
+    kind: BackendKind,
+    scope: ListingCacheScope,
+    sessions: Vec<Session>,
+    database: PathBuf,
+    fence_next: bool,
+    calls: usize,
+}
+
+impl Backend for FencedBackend {
+    fn kind(&self) -> BackendKind {
+        self.kind
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::none()
+    }
+
+    fn listing_scope(&self) -> Option<ListingCacheScope> {
+        Some(self.scope.clone())
+    }
+
+    fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+        self.calls += 1;
+        if self.fence_next {
+            let other = ViewerDb::open(&self.database).expect("mutating viewer database");
+            other
+                .invalidate_listing_scope(Some(&self.scope))
+                .expect("invalidate the scope mid listing");
+        }
+        Ok(self.sessions.clone())
+    }
+
+    fn spawn(
+        &self,
+        _dir: &std::path::Path,
+        _task: &str,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+    ) -> agent_viewer_core::Result<SpawnResult> {
+        unreachable!("spawn is not exercised by listing tests")
+    }
+
+    fn attach_command(&self, _session: &Session) -> Result<std::process::Command, AttachRefusal> {
+        unreachable!("attach is not exercised by listing tests")
+    }
+}
+
 fn open_viewers() -> (TempDir, ViewerDb, ViewerDb) {
     let directory = tempfile::tempdir().expect("temporary viewer database directory");
     let path = directory.path().join("viewer.sqlite");
@@ -354,4 +404,44 @@ fn authoritative_target_reports_a_source_error() {
         matches!(result, Err(TargetResolution::SourceError { notice }) if notice == "claude: command failed: source unavailable")
     );
     assert_eq!(backend.calls, 1);
+}
+
+/// A listing that started before a mutation landed is a pre-mutation snapshot: the cache
+/// already fences it, and the display must refuse it too. Applying it puts the row the user
+/// just archived back on screen until the next tick republishes.
+#[test]
+fn a_fenced_publication_is_not_applied_to_the_display() {
+    let directory = tempfile::tempdir().expect("temporary viewer database directory");
+    let path = directory.path().join("viewer.sqlite");
+    let db = ViewerDb::open(&path).expect("viewer database");
+    let scope = scope(BackendKind::Codex);
+    let stale = session(BackendKind::Codex, "archived_thread", Some(101), false);
+    let last_good = vec![session(BackendKind::Codex, "kept_thread", Some(102), false)];
+    let mut backend = FencedBackend {
+        kind: BackendKind::Codex,
+        scope: scope.clone(),
+        sessions: vec![stale.clone()],
+        database: path.clone(),
+        fence_next: true,
+        calls: 0,
+    };
+    let mut cursor = RefreshCursor::default();
+
+    let fenced = refresh_backend(Some(&db), &mut backend, &last_good, &mut cursor, 1_000);
+
+    assert_eq!(backend.calls, 1);
+    assert!(
+        matches!(fenced, RefreshOutcome::Unchanged),
+        "a fenced listing must leave the display on what it already shows, got {fenced:?}"
+    );
+
+    // The very next refresh re-lists and publishes normally, so the fence costs one tick.
+    backend.fence_next = false;
+    backend.sessions = last_good.clone();
+    let republished = refresh_backend(Some(&db), &mut backend, &last_good, &mut cursor, 2_000);
+
+    assert_eq!(backend.calls, 2);
+    assert!(
+        matches!(republished, RefreshOutcome::Authoritative { sessions } if sessions == last_good)
+    );
 }
