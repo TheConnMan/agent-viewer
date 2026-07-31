@@ -23,9 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
 
       - name: Cache cargo and target
@@ -41,8 +42,9 @@ jobs:
         run: cargo build --workspace
 
       # Live e2e tests are #[ignore] by default; a plain test run skips them.
+      # The suite has timing-sensitive tests that flake under full parallelism.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=2
 
   native-build:
     name: build / ${{ matrix.target }}
