@@ -207,7 +207,9 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         // fills an 80x24 popup, and a 23rd line pushes Ctrl+C off the bottom.
         ("← / Ctrl+]", "back to the list (input line empty / always)"),
         ("Enter/Space", "toggle group on a header"),
-        ("Ctrl+K", "command palette"),
+        // Kept short deliberately: at 80x24 the popup is 58 columns wide, and a description
+        // that wraps to a second line costs a row exactly like a 23rd entry would.
+        ("Ctrl+K / Ctrl+N", "palette / triage queue"),
         ("Ctrl+B / Ctrl+W", "tail pane / video wall"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),

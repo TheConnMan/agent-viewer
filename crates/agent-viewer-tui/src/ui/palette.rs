@@ -41,6 +41,7 @@ pub enum PaletteAction {
     Unarchive,
     Rename,
     Reply,
+    Triage,
     StopOrRemove,
     ShowAll,
     Group,

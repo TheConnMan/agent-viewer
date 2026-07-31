@@ -239,6 +239,12 @@ impl App {
         &self.rows
     }
 
+    /// Every known session, before the filter/show-all/grouping that shapes `visible()`.
+    /// The triage queue is built from this so its length matches `needs_input_count`.
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
     pub fn set_activity_ribbon(&mut self, backend: BackendKind, id: &str, ribbon: Option<String>) {
         let key = (backend, id.to_string());
         match ribbon {

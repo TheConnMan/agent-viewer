@@ -80,7 +80,6 @@ type Key = (BackendKind, String);
 /// A backend-listing snapshot handed from the refresh worker to the UI thread.
 type Snapshot = (Vec<Session>, String, usize);
 type ActivityResult = (BackendKind, String, Option<String>);
-
 struct ActivityRequest {
     sessions: Vec<Session>,
     now_ms: i64,
@@ -395,8 +394,15 @@ fn process_event<B: ratatui::backend::Backend, W: io::Write>(
                 let size = terminal
                     .size()
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                let rows = size.height.saturating_sub(ui::ATTACHED_CHROME_ROWS).max(1);
-                let _ = pty.resize(rows, size.width.max(1));
+                let (rows, cols) = if matches!(ui.mode, Mode::Triage(_)) {
+                    ui::panel_pty_size(size.into()).unwrap_or((1, 1))
+                } else {
+                    (
+                        size.height.saturating_sub(ui::ATTACHED_CHROME_ROWS).max(1),
+                        size.width.max(1),
+                    )
+                };
+                let _ = pty.resize(rows, cols);
             }
             false
         }
@@ -1263,8 +1269,10 @@ fn build_wall_view(ui: &Ui, now_ms: i64) -> Option<ui::WallView<'_>> {
 }
 
 /// Assemble the `AttachView` for the focused session, if any.
+/// The live child for whichever surface wants one: the full-screen attach view, or the triage
+/// inbox's panel. Both render the same `PtySession` from `ui.attached`; only the rect differs.
 fn build_attach_view(ui: &Ui) -> Option<AttachView<'_>> {
-    if !matches!(ui.mode, Mode::Attached) {
+    if !matches!(ui.mode, Mode::Attached | Mode::Triage(_)) {
         return None;
     }
     let key = ui.focused.as_ref()?;
@@ -2174,6 +2182,51 @@ mod tests {
         ui.detach_trackers.insert(key.clone(), DetachTracker::new());
         ui.attached.insert(key.clone(), pty);
         (ui, key)
+    }
+
+    /// Landing an attach while the triage modal is up must keep the modal AND size the child
+    /// to the panel. Flipping to `Mode::Attached` here would eject the user from the queue the
+    /// instant the session came up, and a full-screen-sized child wraps its output at a column
+    /// the panel is not wide enough to show.
+    #[test]
+    fn an_attach_landing_under_triage_keeps_the_modal_and_sizes_the_child_to_the_panel() {
+        let mut blocked = session(BackendKind::Claude, "blocked", 1_000, false);
+        blocked.status = agent_viewer_core::Status::NeedsInput {
+            reason: Some("pick one".to_string()),
+        };
+        let mut ui = test_ui(vec![blocked.clone()]);
+        ui.mode = Mode::Triage(agent_viewer_tui::ui::TriageState::new(
+            agent_viewer_tui::ui::triage_queue(&[blocked.clone()]),
+        ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+
+        let installed = actions::install_attach_plan(
+            &mut ui,
+            &mut terminal,
+            ops::AttachPlan {
+                session: blocked.clone(),
+                command,
+            },
+        )
+        .expect("install the attach");
+
+        assert!(installed, "the child must land");
+        assert!(
+            matches!(ui.mode, Mode::Triage(_)),
+            "the queue must survive its own attach"
+        );
+        let key: Key = (blocked.backend, blocked.id.clone());
+        let size = ui.attached[&key].with_screen(|screen| screen.size());
+        let expected = ui::panel_pty_size(ratatui::layout::Rect::new(0, 0, 100, 40))
+            .expect("a 100x40 frame hosts a panel");
+        assert_eq!(
+            size, expected,
+            "the child must be sized to the panel it is drawn into, not the whole screen"
+        );
+        ui.attached.get_mut(&key).expect("the child").kill();
     }
 
     #[test]
