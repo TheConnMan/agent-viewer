@@ -1,9 +1,9 @@
 //! Video wall (Ctrl+W): the session list is replaced by a grid of live PTY tiles.
 //!
-//! This is a real attach, not transcript parsing. Every tile renders a `PtySession` that
-//! already exists in the run loop's `attached` map, so the wall never spawns a child, never
-//! dials the Codex app-server, and never resurrects a finished session. A session with no
-//! live PTY is simply not tiled.
+//! This is a real attach, not transcript parsing. Ctrl+W shows everything that is running:
+//! the wall connects each working session through the same attach path a manual attach uses,
+//! and closes every one of those connections when the wall closes. Nothing stays connected
+//! off screen. Only live sessions are ever joined, so no finished session is resurrected.
 //!
 //! Geometry lives here as pure functions because two call sites need identical answers: the
 //! render path (which draws the tiles) and the run loop (which resizes each tile's child,
@@ -20,7 +20,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Hard cap on tiles. Each tile is a live child being resized and re-parsed, so this is a
 /// process budget, not a rendering one. Above the cap the footer carries the overflow count.
@@ -40,14 +40,41 @@ pub struct WallState {
     /// Last size each tile's PTY was resized to, so the run loop does not SIGWINCH every
     /// child on every frame.
     pub sized: HashMap<(BackendKind, String), (u16, u16)>,
+    /// Sessions the wall has asked to connect this visit. Doubles as the ownership set: a
+    /// PTY in here belongs to the wall and is closed when the wall closes. Membership also
+    /// stops a join being re-requested every frame, including one that failed.
+    pub requested: HashSet<(BackendKind, String)>,
+    /// Why a tile could not be connected, keyed by session. Rendered in the tile instead of
+    /// a live screen, so a failure is visible rather than a permanently blank box.
+    pub failed: HashMap<(BackendKind, String), String>,
 }
 
-/// One tile: a session snapshot plus the live PTY behind it.
+impl WallState {
+    /// Whether the wall owns this session's connection. Zooming into a tile must not close
+    /// it on the way back out, and closing the wall must close every one of these.
+    pub fn owns(&self, key: &(BackendKind, String)) -> bool {
+        self.on && self.requested.contains(key)
+    }
+
+    /// Forget everything about a visit. The caller closes the PTYs; this only drops the
+    /// bookkeeping, so it must run alongside that, never instead of it.
+    pub fn clear(&mut self) {
+        self.selected = 0;
+        self.sized.clear();
+        self.requested.clear();
+        self.failed.clear();
+    }
+}
+
+/// One tile: a session snapshot and its connection, once there is one.
 pub struct WallTile<'a> {
     pub session: &'a Session,
     /// Pre-rendered project label (computed off the tile so draw stays allocation-light).
     pub project: String,
-    pub pty: &'a PtySession,
+    /// The live child, or None while the join is still in flight or has failed.
+    pub pty: Option<&'a PtySession>,
+    /// Why this tile has no connection, when the join failed outright.
+    pub error: Option<&'a str>,
 }
 
 /// Everything the wall needs for a frame.
@@ -60,20 +87,17 @@ pub struct WallView<'a> {
 
 // --- Membership -----------------------------------------------------------------
 
-/// Keys eligible for a tile, in `visible()` order so the wall reads in the same sequence as
-/// the list it replaced.
+/// Every session the wall should tile, in `visible()` order so the wall reads in the same
+/// sequence as the list it replaced.
 ///
-/// A session earns a tile only when it is live (`Working` or `NeedsInput`) AND a PTY for it
-/// already exists. **Nothing is ever spawned to fill a tile.** `NeedsInput` is included
-/// deliberately: a session that blocks for an answer is the most interesting thing the wall
-/// can show, and dropping it the instant it becomes worth looking at would defeat the point.
+/// Membership is state alone: `Working` or `NeedsInput`. The wall connects whatever is not
+/// connected yet rather than showing only what happened to be connected already — the whole
+/// point is that one keypress shows you everything that is running. `NeedsInput` is included
+/// because a session blocked for an answer is the most useful thing the wall can show.
 ///
-/// Never iterate `attached` directly here — `HashMap` order is unspecified and the grid
-/// would shuffle between frames.
-pub fn tile_keys(
-    app: &App,
-    attached: &HashMap<(BackendKind, String), PtySession>,
-) -> Vec<(BackendKind, String)> {
+/// Never iterate `attached` here — `HashMap` order is unspecified and the grid would shuffle
+/// between frames.
+pub fn wall_sessions(app: &App) -> Vec<(BackendKind, String)> {
     app.visible()
         .iter()
         .filter_map(|row| match row {
@@ -82,13 +106,17 @@ pub fn tile_keys(
                 id,
                 status: Status::Working | Status::NeedsInput { .. },
                 ..
-            } => {
-                let key = (*backend, id.clone());
-                attached.contains_key(&key).then_some(key)
-            }
+            } => Some((*backend, id.clone())),
             _ => None,
         })
         .collect()
+}
+
+/// The sessions the wall should be connected to right now: the capped tile set.
+pub fn tile_keys(app: &App) -> Vec<(BackendKind, String)> {
+    let mut keys = wall_sessions(app);
+    keys.truncate(MAX_TILES);
+    keys
 }
 
 // --- Geometry -------------------------------------------------------------------
@@ -234,7 +262,7 @@ fn draw_empty(frame: &mut Frame, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let text = "no live tiles · attach a working session with → first";
+    let text = "nothing is running · a session appears here as soon as it starts";
     let width = (display_width(text) as u16).min(area.width);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, fg(theme.muted)))),
@@ -295,11 +323,31 @@ fn draw_tile(
         height: inner.height - 1,
         ..inner
     };
-    tile.pty.with_screen(|screen| {
+    let Some(pty) = tile.pty else {
+        // No connection yet. A joining tile says so rather than sitting blank, and a failed
+        // one says why — the wall connects on its own, so a silent empty box would read as
+        // a broken session rather than a broken join.
+        let (text, color) = match tile.error {
+            Some(error) => (format!("could not connect · {error}"), theme.err),
+            None => ("connecting…".to_string(), theme.faint),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_display(&text, content.width as usize),
+                fg(color),
+            ))),
+            Rect {
+                height: 1,
+                ..content
+            },
+        );
+        return;
+    };
+    pty.with_screen(|screen| {
         frame.render_widget(
             super::attach::ThemedPseudoTerminal {
                 screen,
-                palette: tile.pty.palette(),
+                palette: pty.palette(),
             },
             content,
         );
@@ -450,23 +498,22 @@ mod tests {
         }
     }
 
+    /// Membership is state alone. A working session earns a tile whether or not anything is
+    /// connected to it yet; the wall does the connecting.
     #[test]
-    fn a_session_without_a_live_pty_is_excluded_rather_than_spawned() {
+    fn every_working_session_is_tiled_not_just_connected_ones() {
         let app = App::new(vec![
-            session("attached-one", Status::Working),
-            session("no-pty", Status::Working),
+            session("already-live", Status::Working),
+            session("not-connected-yet", Status::Working),
         ]);
-        let mut attached: HashMap<(BackendKind, String), PtySession> = HashMap::new();
-        attached.insert((BackendKind::Codex, "attached-one".to_string()), live_pty());
 
-        let keys = tile_keys(&app, &attached);
+        let mut ids: Vec<String> = tile_keys(&app).into_iter().map(|(_, id)| id).collect();
+        ids.sort();
 
-        assert_eq!(keys, vec![(BackendKind::Codex, "attached-one".to_string())]);
-        // Asking for the tile list must not have created a connection for `no-pty`.
-        assert_eq!(attached.len(), 1);
-        for (_, mut pty) in attached {
-            pty.kill();
-        }
+        assert_eq!(
+            ids,
+            vec!["already-live".to_string(), "not-connected-yet".to_string()]
+        );
     }
 
     #[test]
@@ -477,21 +524,64 @@ mod tests {
             session("finished", Status::Done),
             session("resting", Status::Idle),
         ]);
-        let mut attached: HashMap<(BackendKind, String), PtySession> = HashMap::new();
-        for id in ["working", "blocked", "finished", "resting"] {
-            attached.insert((BackendKind::Codex, id.to_string()), live_pty());
-        }
 
-        let mut ids: Vec<String> = tile_keys(&app, &attached)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
+        let mut ids: Vec<String> = tile_keys(&app).into_iter().map(|(_, id)| id).collect();
         ids.sort();
 
         assert_eq!(ids, vec!["blocked".to_string(), "working".to_string()]);
-        for (_, mut pty) in attached {
-            pty.kill();
-        }
+    }
+
+    /// The cap is a live-child budget, so it has to bind the set the wall CONNECTS, not just
+    /// the set it draws.
+    #[test]
+    fn the_connect_set_is_capped_even_though_membership_is_not() {
+        let sessions: Vec<Session> = (0..11)
+            .map(|i| session(&format!("live-{i:02}"), Status::Working))
+            .collect();
+        let app = App::new(sessions);
+
+        assert_eq!(wall_sessions(&app).len(), 11);
+        assert_eq!(tile_keys(&app).len(), MAX_TILES);
+        assert_eq!(overflow(wall_sessions(&app).len()), 2);
+    }
+
+    #[test]
+    fn a_tile_without_a_connection_says_connecting_and_a_failed_one_says_why() {
+        let theme = crate::ui::theme::amber(false);
+        let joining = session("joining", Status::Working);
+        let broken = session("broken", Status::Working);
+        let view = WallView {
+            tiles: vec![
+                WallTile {
+                    session: &joining,
+                    project: String::new(),
+                    pty: None,
+                    error: None,
+                },
+                WallTile {
+                    session: &broken,
+                    project: String::new(),
+                    pty: None,
+                    error: Some("no rollout path"),
+                },
+            ],
+            selected: 0,
+            overflow: 0,
+        };
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 80, 10)))
+            .expect("draw wall");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(rendered.contains("connecting…"), "{rendered:?}");
+        assert!(rendered.contains("no rollout path"), "{rendered:?}");
     }
 
     #[test]
@@ -539,7 +629,8 @@ mod tests {
         let tile = WallTile {
             session: &session("Opencode daemon probe", Status::Working),
             project: "theconnman/agent-viewer".to_string(),
-            pty: &pty,
+            pty: Some(&pty),
+            error: None,
         };
         let line = header_line(&tile, false, 2_000, 20, &theme);
         let rendered: String = line
@@ -567,12 +658,14 @@ mod tests {
                 WallTile {
                     session: &working_session,
                     project: String::new(),
-                    pty: &working,
+                    pty: Some(&working),
+                    error: None,
                 },
                 WallTile {
                     session: &blocked_session,
                     project: String::new(),
-                    pty: &blocked,
+                    pty: Some(&blocked),
+                    error: None,
                 },
             ],
             selected: 0,
@@ -612,12 +705,14 @@ mod tests {
                 WallTile {
                     session: &a,
                     project: String::new(),
-                    pty: &first,
+                    pty: Some(&first),
+                    error: None,
                 },
                 WallTile {
                     session: &b,
                     project: String::new(),
-                    pty: &second,
+                    pty: Some(&second),
+                    error: None,
                 },
             ],
             selected: 0,
@@ -648,9 +743,9 @@ mod tests {
             selected: 0,
             overflow: 0,
         };
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(60, 6)).unwrap();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &view, 0, &theme, Rect::new(0, 0, 60, 6)))
+            .draw(|frame| draw(frame, &view, 0, &theme, Rect::new(0, 0, 80, 6)))
             .expect("draw empty wall");
         let buffer = terminal.backend().buffer();
         let rendered: String = buffer
@@ -658,7 +753,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(rendered.contains("no live tiles"), "{rendered:?}");
+        assert!(rendered.contains("nothing is running"), "{rendered:?}");
         assert!(!rendered.contains('┌'), "an empty wall drew a tile border");
     }
 }

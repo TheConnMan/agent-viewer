@@ -1003,13 +1003,13 @@ fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
     ui.composer.set_models(models, backend);
 }
 
-/// While attached: Ctrl+] always detaches; Left detaches when the input line is empty
-/// (else it is forwarded); a dead child detaches on any key; everything else is encoded
+/// While attached: Ctrl+] always leaves; Left leaves when the input line is empty (else it
+/// is forwarded); a dead child leaves on any key; everything else is encoded
 /// to bytes and written to the PTY.
 fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let Some(fkey) = ui.focused.clone() else {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     };
 
@@ -1017,12 +1017,12 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     // attach (do not type our queued reply in behind the user's own input).
     ui.pending_reply = None;
 
-    // Ctrl+] always detaches (PTY lives on in the map). Terminals send Ctrl+] as raw byte
+    // Ctrl+] always leaves, closing the connection. Terminals send Ctrl+] as raw byte
     // 0x1D, which crossterm's legacy unix parser maps to Char('5')+CTRL (it folds 0x1C..=0x1F
     // onto Ctrl+'4'..'7'); the kitty keyboard protocol delivers the literal Char(']')+CTRL.
     // Match both so the header/help "ctrl+]" is honored under either encoding.
     if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
@@ -1034,19 +1034,19 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
         .unwrap_or(true);
     if exited {
         ui.remove_pty(&fkey);
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
-    // Left detaches only when this PTY's input line is empty; otherwise forward it as cursor
-    // motion. The tracker is per-PTY so a re-attach preserves any half-typed line.
+    // Left leaves only when this PTY's input line is empty; otherwise forward it as cursor
+    // motion. The tracker dies with its PTY, so each visit to a session starts clean.
     if matches!(key.code, KeyCode::Left)
         && ui
             .detach_trackers
             .get(&fkey)
             .is_none_or(|t| t.detach_on_left())
     {
-        detach_to_list(ui);
+        close_attached(ui);
         return;
     }
 
@@ -1067,10 +1067,23 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     }
 }
 
-/// Detach the focused PTY back to the list (the PTY keeps running in the map).
-fn detach_to_list(ui: &mut Ui) {
+/// Leave the attached session and close its connection.
+///
+/// A session is connected exactly while it is on screen; there is no "running but not shown"
+/// state to reason about. The one exception is a wall tile you zoomed into: the wall still
+/// owns that connection and is about to draw it again, so it stays open and the wall closes
+/// it with the rest when it closes.
+fn close_attached(ui: &mut Ui) {
+    if let Some(key) = ui.focused.take() {
+        if ui.wall.owns(&key) {
+            // Zooming resized this child to the full screen. Forget the recorded tile size so
+            // the wall's next frame resizes it back down instead of matching a stale entry.
+            ui.wall.sized.remove(&key);
+        } else {
+            ui.remove_pty(&key);
+        }
+    }
     ui.mode = Mode::Normal;
-    ui.focused = None;
     set_mouse_capture(ui, true);
 }
 
@@ -1525,6 +1538,15 @@ pub(crate) mod tests {
         .expect("Codex restricted viewport child")
     }
 
+    /// Unwrap a drained attach result as a user attach. Every attach these tests submit goes
+    /// through `submit_attach`, so a `Wall` outcome here would mean the runner crossed wires.
+    fn focus_plan(outcome: crate::AttachOutcome) -> crate::ops::AttachPlan {
+        match outcome {
+            crate::AttachOutcome::Focus(plan) => plan,
+            crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
+        }
+    }
+
     pub(crate) fn sess(id: &str, cwd: &str, updated_at_ms: i64) -> Session {
         Session {
             backend: BackendKind::Claude,
@@ -1823,7 +1845,7 @@ pub(crate) mod tests {
         }
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
         assert_eq!(ui.wall.selected, 0);
-        let ordered = agent_viewer_tui::ui::wall::tile_keys(&ui.app, &ui.attached);
+        let ordered = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
         assert_eq!(ordered.len(), 2);
 
         // Two tiles are a 2x1 row, so Right moves and Down does not.
@@ -2696,7 +2718,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install selected session")
             );
 
@@ -2715,6 +2737,77 @@ pub(crate) mod tests {
             ],
             "attach capture defaults must match each backend"
         );
+    }
+
+    /// True until the pid is gone from the process table, polled briefly because the reader
+    /// thread teardown is not instantaneous.
+    fn pid_alive(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if std::time::Instant::now() > deadline {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The core of the no-persistence rule: a session is connected exactly while it is on
+    /// screen. Leaving it must kill the child, not park it for a later re-attach.
+    #[test]
+    fn leaving_an_attached_session_closes_its_connection() {
+        let mut ui = test_ui_with(Vec::new());
+        let target = (BackendKind::Codex, "closes-on-exit".to_string());
+        let pty = wall_tile_pty();
+        let pid = pty.pid().expect("child pid");
+        ui.attached.insert(target.clone(), pty);
+        ui.detach_trackers
+            .insert(target.clone(), DetachTracker::new());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+
+        handle_attached_key(key(KeyCode::Char(']'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&target),
+            "the connection must not survive leaving the session"
+        );
+        assert!(
+            !ui.detach_trackers.contains_key(&target),
+            "the per-PTY input gate must die with its PTY"
+        );
+        assert!(!pid_alive(pid), "child {pid} outlived the session view");
+    }
+
+    /// The one exception: the wall owns its tiles, and zooming into one then backing out
+    /// returns you to the wall, which is about to draw that same connection again.
+    #[test]
+    fn zooming_out_of_a_wall_tile_keeps_the_wall_connection() {
+        let mut ui = test_ui_with(Vec::new());
+        let target = (BackendKind::Codex, "wall-tile".to_string());
+        let pty = wall_tile_pty();
+        let pid = pty.pid().expect("child pid");
+        ui.attached.insert(target.clone(), pty);
+        ui.wall.on = true;
+        ui.wall.requested.insert(target.clone());
+        ui.wall.sized.insert(target.clone(), (10, 40));
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+
+        handle_attached_key(key(KeyCode::Char(']'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            ui.attached.contains_key(&target),
+            "the wall still owns this connection"
+        );
+        assert!(
+            !ui.wall.sized.contains_key(&target),
+            "the recorded tile size must be dropped so the wall resizes the zoomed child back down"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        kill_attached(&mut ui);
     }
 
     #[test]
@@ -3040,7 +3133,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install clicked session")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3148,7 +3241,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install pressed session after reflow")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3402,7 +3495,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install reused session")
         );
         assert!(matches!(ui.mode, Mode::Attached));
@@ -3729,7 +3822,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install selected session")
             );
             assert!(matches!(ui.mode, Mode::Attached));
@@ -3805,7 +3898,7 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             };
             assert!(
-                crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+                crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                     .expect("install retained session")
             );
             assert!(
@@ -3883,7 +3976,7 @@ pub(crate) mod tests {
             std::thread::yield_now();
         };
         assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, plan)
+            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
                 .expect("install external opencode session")
         );
         assert!(matches!(ui.mode, Mode::Attached));

@@ -103,7 +103,7 @@ fn draw_header(
     let right = if exited {
         "ctrl+y send copy request to terminal · process exited · press any key"
     } else {
-        "ctrl+y send copy request to terminal · ← back · ctrl+] detach"
+        "ctrl+y send copy request to terminal · ← back · ctrl+] close"
     };
     let left = format!(
         " {glyph} {} {}  {}",
