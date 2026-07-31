@@ -1,4 +1,4 @@
-use agent_viewer_core::platform::{Platform, home_from, opencode_db_from};
+use agent_viewer_core::platform::{Platform, home_from};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -45,16 +45,5 @@ fn windows_home_drive_and_path_are_last_fallback() {
     assert_eq!(
         home_from(Platform::Windows, None, None, Some(OsStr::new("D:")), None,),
         PathBuf::new()
-    );
-}
-
-#[test]
-fn opencode_db_honors_xdg_data_home() {
-    assert_eq!(
-        opencode_db_from(
-            Some(OsStr::new("/var/lib/brian data")),
-            PathBuf::from("/home/brian").as_path(),
-        ),
-        PathBuf::from("/var/lib/brian data/opencode/opencode.db")
     );
 }

@@ -36,7 +36,9 @@ use composer::{
 };
 pub use list::activity_ribbon;
 use list::{rename_buffer, rename_row_item, row_to_item};
-pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
+pub use palette::{
+    PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState, PaletteTarget,
+};
 pub use sprite::SpriteKind;
 pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
@@ -47,7 +49,7 @@ pub use wall::{WallState, WallTile, WallView};
 pub type Pulses = HashMap<(BackendKind, String), i64>;
 
 /// Startup-read (once, never per-frame): when true, list rows + composer use the brand
-/// glyphs (✳/◆/■) instead of the DEFAULT textual `[cc]`/`[cx]`/`[oc]` tags — an opt-in for
+/// glyphs (✳/◆) instead of the DEFAULT textual `[cc]`/`[cx]` tags — an opt-in for
 /// terminals whose font renders them. Set from `AGENT_VIEWER_GLYPH_MARKS=1`.
 static GLYPH_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -76,7 +78,7 @@ pub fn logo_marks() -> bool {
 }
 
 /// The mark for a backend on list rows + the composer (single source of truth for every
-/// mark call site): by DEFAULT the textual `[cc]`/`[cx]`/`[oc]` tag, or the brand glyph when
+/// mark call site): by DEFAULT the textual `[cc]`/`[cx]` tag, or the brand glyph when
 /// `AGENT_VIEWER_GLYPH_MARKS=1`. `BackendKind::tag()` is also used directly for help/notices.
 fn backend_mark(backend: BackendKind, theme: &Theme) -> &'static str {
     // Logo mode blanks the slot for the image overlay; it wins over glyph mode.
@@ -95,7 +97,6 @@ fn mark_for(backend: BackendKind, glyph: bool) -> &'static str {
     match backend {
         BackendKind::Claude => "✳",
         BackendKind::Codex => "◆",
-        BackendKind::Opencode => "■",
     }
 }
 
@@ -104,7 +105,6 @@ fn backend_mark_color(backend: BackendKind, theme: &Theme) -> ratatui::style::Co
     match backend {
         BackendKind::Claude => theme.cc,
         BackendKind::Codex => theme.cx,
-        BackendKind::Opencode => theme.oc,
     }
 }
 
@@ -1182,11 +1182,9 @@ mod tests {
         // Default (glyph = false): the textual tags.
         assert_eq!(mark_for(BackendKind::Claude, false), "[cc]");
         assert_eq!(mark_for(BackendKind::Codex, false), "[cx]");
-        assert_eq!(mark_for(BackendKind::Opencode, false), "[oc]");
         // Opt-in (glyph = true): the brand glyphs.
         assert_eq!(mark_for(BackendKind::Claude, true), "✳");
         assert_eq!(mark_for(BackendKind::Codex, true), "◆");
-        assert_eq!(mark_for(BackendKind::Opencode, true), "■");
     }
 
     #[test]
@@ -1194,11 +1192,7 @@ mod tests {
         set_logo_marks(true);
         assert!(logo_marks());
         let theme = theme::amber(false);
-        for b in [
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Opencode,
-        ] {
+        for b in [BackendKind::Claude, BackendKind::Codex] {
             assert_eq!(backend_mark(b, &theme), "    ");
             assert_eq!(mark_width(backend_mark(b, &theme)), 4);
         }

@@ -9,7 +9,7 @@ pub fn now_ms() -> i64 {
 }
 
 /// The spawn "name"/"title" derived from a task prompt: the first 40 chars (char-, not
-/// byte-bounded). Shared by the claude `--name` and opencode `--title` spawn flags.
+/// byte-bounded). Used by the claude `--name` spawn flag.
 pub fn truncated_title(task: &str) -> String {
     task.chars().take(40).collect()
 }
@@ -24,8 +24,7 @@ pub fn viewer_log_path(prefix: &str) -> std::path::PathBuf {
 }
 
 /// Run a command to completion; non-zero exit -> Err(Error::Command(stderr)).
-/// The shared shape for every shell-out mutation (codex archive/unarchive,
-/// opencode delete/rename).
+/// The shared shape for every shell-out mutation (codex archive/unarchive).
 pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
     let output = cmd.output()?;
     if output.status.success() {
@@ -37,16 +36,16 @@ pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
     }
 }
 
-/// How long a model-discovery shell-out (`codex debug models`, `opencode models`) may take.
-/// Generous because these run on a worker thread, never the render loop: `opencode models`
-/// alone takes ~3.8s cold on this box, and a deadline it can lose silently empties the
-/// composer's picker down to the built-in default.
+/// How long a model-discovery shell-out (`codex debug models`) may take.
+/// Generous because these run on a worker thread, never the render loop: a cold probe can
+/// take seconds on this box, and a deadline it can lose silently empties the composer's
+/// picker down to the built-in default.
 pub const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run `cmd`, returning captured stdout as a String if it exits 0 within `timeout`.
 /// On timeout the child is killed; any failure (spawn error, non-zero exit, timeout,
 /// non-utf8 stdout) returns None. Used to bound the best-effort model-discovery shell-outs
-/// (`codex debug models`, `opencode models`) so a hung CLI cannot freeze the caller
+/// (`codex debug models`) so a hung CLI cannot freeze the caller
 /// indefinitely: there, every failure means the same thing (no catalog today), so the reason
 /// is genuinely not worth carrying.
 pub(crate) fn run_with_timeout(
@@ -209,13 +208,7 @@ fn describe(cmd: &std::process::Command) -> String {
 /// Standard input is null and output is appended to the log path. The child is not waited.
 /// Returns the child PID.
 pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path) -> Result<u32> {
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
+    let log = open_spawn_log(log_path)?;
     let log_err = log.try_clone()?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
@@ -244,12 +237,65 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    let child = cmd.spawn()?;
-    Ok(child.id())
+    Ok(reap_detached(cmd.spawn()?))
+}
+
+/// Create (or reopen) a spawn log, readable only by its owner on unix.
+///
+/// These logs are the backend's raw stdout/stderr: the task prompt, file contents it printed,
+/// occasionally a token it echoed. Created under the default umask they landed 0644 inside a
+/// 0755 directory, i.e. readable by every account on the box, so the mode is set explicitly at
+/// creation time (an existing file/dir keeps whatever mode it already has).
+#[cfg(unix)]
+fn open_spawn_log(log_path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    if let Some(parent) = log_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)?)
+}
+
+#[cfg(not(unix))]
+fn open_spawn_log(log_path: &std::path::Path) -> Result<std::fs::File> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?)
+}
+
+/// Hand a detached child to a thread that blocks in `wait()`, returning its pid.
+///
+/// `setsid` detaches the SESSION, not the parent-child relationship: this process stays the
+/// child's parent, so dropping the `Child` never collects its exit status and the kernel keeps
+/// the entry as a zombie for the whole life of the viewer (two accumulated in 22 minutes of
+/// ordinary use). The thread costs one stack and lives exactly as long as the child.
+///
+/// Reaping does free the pid for reuse, which is why `terminate` re-checks `/proc/<pid>/comm`
+/// before signalling anything.
+fn reap_detached(mut child: std::process::Child) -> u32 {
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    pid
 }
 
 /// SIGTERM with a pid-reuse guard: read /proc/<pid>/comm; it must start with
-/// `expected_comm_prefix` ("codex" / "opencode"), else Err(Command("comm mismatch")).
+/// `expected_comm_prefix` ("codex"), else Err(Command("comm mismatch")).
 /// If getpgid(pid) == pid (process leads its own group) send SIGTERM to the group
 /// (-pid), else to the single pid. ESRCH (already gone) -> Ok(()). Never SIGKILL in v2.
 #[cfg(target_os = "linux")]
@@ -291,6 +337,57 @@ mod tests {
     use super::{run_reporting_failure, run_with_timeout};
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// A detached spawn must not leave a zombie. `setsid` detaches the session, not the parent
+    /// relationship, so a dropped `Child` is never waited on and the process table keeps the
+    /// entry forever (measured live: two zombies in 22 minutes). Polling `/proc/<pid>` is the
+    /// direct evidence — a zombie still HAS a `/proc` entry, so the assertion is that the entry
+    /// disappears, not merely that the child exited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_reaps_its_child_instead_of_leaving_a_zombie() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let log = dir.path().join("logs/child.log");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        let pid = super::spawn_detached(cmd, &log).expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} still in the process table after 5s: {stat}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Spawn logs carry the backend's raw output (the task prompt, whatever it printed), so they
+    /// are owner-only. Under the default umask they were created 0644 in a 0755 directory.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_logs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let log = dir.path().join("logs/child.log");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        super::spawn_detached(cmd, &log).expect("spawn");
+
+        let file_mode = std::fs::metadata(&log)
+            .expect("log exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "log file mode {file_mode:o}");
+        let dir_mode = std::fs::metadata(log.parent().expect("log dir"))
+            .expect("log dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "log dir mode {dir_mode:o}");
+    }
 
     #[test]
     fn run_with_timeout_captures_stdout_on_success() {

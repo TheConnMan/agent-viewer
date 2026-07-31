@@ -656,14 +656,16 @@ impl App {
         &self.filter
     }
 
-    /// Substring filter over title + cwd, case-insensitive (matches rebuild_rows).
-    fn passes_filter(&self, s: &Session) -> bool {
-        let needle = self.filter.to_lowercase();
+    /// Substring filter over title + cwd, case-insensitive, with the needle ALREADY
+    /// lowercased so a whole-list pass lowercases the filter once instead of once per session.
+    /// An empty needle matches everything, which is what keeps an unfiltered rebuild from
+    /// lowercasing a title at all.
+    fn matches_needle(needle: &str, s: &Session) -> bool {
         if needle.is_empty() {
             return true;
         }
-        s.title.to_lowercase().contains(&needle)
-            || s.cwd.to_string_lossy().to_lowercase().contains(&needle)
+        s.title.to_lowercase().contains(needle)
+            || s.cwd.to_string_lossy().to_lowercase().contains(needle)
     }
 
     /// Memoized project_root(cwd).
@@ -702,6 +704,8 @@ impl App {
         // hidden/companion exclusion therefore applies only when the filter is empty.
         let filtering = !self.filter.is_empty();
         let include_all = self.show_all || filtering;
+        // Once per rebuild, not once per session: this runs over the whole fleet twice below.
+        let needle = self.filter.to_lowercase();
 
         // Visible session indices (exclusion + filter), recency ASC.
         let mut indices: Vec<usize> = self
@@ -709,19 +713,21 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, s)| include_all || !(s.hidden || s.companion))
-            .filter(|(_, s)| self.passes_filter(s))
+            .filter(|(_, s)| Self::matches_needle(&needle, s))
             .map(|(i, _)| i)
             .collect();
         indices.sort_by_key(|&i| self.sessions[i].updated_at_ms);
 
         // Cache the suppressed-row count alongside the rows (same inputs, same lifetime).
-        // While filtering, every match is shown, so nothing that matches is hidden.
+        // While filtering, every match is shown, so nothing that matches is hidden. This
+        // branch is therefore reached only with an EMPTY filter (`include_all` is
+        // `show_all || filtering`), which is why it counts without re-running the match.
         self.hidden_rows = if include_all {
             0
         } else {
             self.sessions
                 .iter()
-                .filter(|s| (s.hidden || s.companion) && self.passes_filter(s))
+                .filter(|s| s.hidden || s.companion)
                 .count()
         };
 
@@ -769,7 +775,6 @@ impl App {
                 let backend_key = |backend| match backend {
                     BackendKind::Codex => 0,
                     BackendKind::Claude => 1,
-                    BackendKind::Opencode => 2,
                 };
                 self.sessions[a]
                     .created_at_ms

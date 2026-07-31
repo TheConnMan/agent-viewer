@@ -1,6 +1,7 @@
 # agent-viewer — build spec
 
-Terminal viewer for OpenAI Codex sessions, in the spirit of Claude Code's `claude agents`.
+Terminal viewer for OpenAI Codex and Claude Code sessions, in the spirit of Claude Code's
+`claude agents`.
 This spec is the contract. Every fact below was verified on this box (Codex 0.144.1,
 Rust 1.95.0) during research; where a fact needs live re-verification during the build it
 is called out explicitly. Stop after the naive correct solution — do not add abstractions,
@@ -20,8 +21,7 @@ config surfaces, or features not requested.
   primary deliverable because the killer feature (one keystroke attach/resume into a session)
   is inherently terminal. Linux is the fully measured runtime platform. Native release archives
   also target macOS Intel, macOS Apple Silicon, and Windows x64; those platforms enumerate and
-  render sessions but do not claim Linux process status, Codex daemon controls, or secure
-  managed OpenCode behavior.
+  render sessions but do not claim Linux process status or Codex daemon controls.
 - **Out of scope for v1:** a web/Tailscale surface. It is a natural v2 (an `axum` binary
   sharing `-core`, deployed like the `bonus-drain`/`bg-schedule` viewers with token-guarded
   write routes) but do NOT build it now. Leave `-core` cleanly separable so v2 can reuse it.
@@ -38,9 +38,13 @@ Codex maintains a global session registry. Read it and its name index read only.
   `id TEXT PK`, `rollout_path TEXT`, `created_at`, `updated_at` / `updated_at_ms`,
   `source TEXT`, `cwd TEXT`, `title TEXT`, `archived INTEGER DEFAULT 0`, `archived_at`,
   `model TEXT` (read only for the model-picker fallback via `distinct_models`, not per row),
-  `preview TEXT`. Order by `updated_at_ms ASC`, retaining the existing `id DESC` tie break. Other columns exist in the schema
-  (`git_branch`, `git_origin_url`, `first_user_message`, `thread_source`, `agent_nickname`,
-  `agent_role`) but the reader does not load them.
+  `git_branch TEXT`, `preview TEXT`. Order by `updated_at_ms ASC`, retaining the existing
+  `id DESC` tie break. The remaining schema columns (`git_origin_url`, `first_user_message`,
+  `thread_source`, `agent_nickname`, `agent_role`) are not loaded.
+- **`parent_thread_id` is derived, not selected.** No such column exists. The reader parses the
+  raw `source` text as JSON and reads `subagent.thread_spawn.parent_thread_id`, trimmed and
+  dropped when empty (`spawn_parent_thread_id`). That derived value is what links a subagent row
+  to its parent for the activity ribbon's recursive subtree.
 - `source` is a **serialized enum, not a flat string**. Observed values: `cli`, `exec`,
   `vscode`, and JSON blobs like `{"subagent":"review"}` or nested `thread_spawn` objects.
   Parse defensively: match `cli`/`exec`/`vscode` prefixes; anything else → treat as subagent.
@@ -62,56 +66,15 @@ check is the fast path for readers. Successful empty listings are snapshots too.
 wait for the lease holder and then read its snapshot rather than independently listing.
 
 This cache is display only. Attach, mutations, and session derived spawn directories always
-relist their authoritative source. Default viewer managed OpenCode credentials use one shared
-noncredential scope. Explicit configured or environment OpenCode passwords bypass sharing.
+relist their authoritative source.
 
-## Enumeration and runtime: opencode
+## Removed backends
 
-The primary OpenCode authority is a secured loopback server. The viewer probes fixed candidates
-`127.0.0.1:4097`, then `127.0.0.1:4098`. It never stops or restarts a server. Spawn alone may
-start `opencode serve --hostname 127.0.0.1 --port <port>`, always from the user home directory.
-The child inherits the normal environment and overrides only `OPENCODE_SERVER_USERNAME` and
-`OPENCODE_SERVER_PASSWORD`. Task shells receive neither credential.
-
-Credentials use nonempty environment overrides when supplied, otherwise a generated stable
-secret in owner only credential files. SQLite stores only viewer presentation state. `~/.local/share/opencode/opencode.db`
-is opened read only as compatibility enumeration when no secure server is available.
-That fallback retains parent and run mode companion classification through the stored `permission`
-field.
-
-Before any credential bearing request, a fresh stream is connected without writing. The viewer
-verifies the listener owner is the pinned process, sends unauthenticated `GET /global/health`
-with keep alive, and requires `401` on a reusable connection. It finds the accepted connection
-inode for that exact local ephemeral tuple and verifies pid, start time, effective uid, exact
-argv, listener inode, and runtime generation. It revalidates after the test hook, then writes
-the authorized request with close on that same `TcpStream`; it never reconnects for auth. This
-same stream requirement is load bearing because Linux `TCP_DEFER_ACCEPT` delayed acceptance
-until the initial health write.
-
-The pin contains pid, start time, listener inode, effective uid, and exact argv. Runtime state
-contains a generation, pin, healthy state, and managed ids. Process shared ownership uses only
-`flock`; each viewer process serializes its own work locally. An occupied listener that returns `200` to unauthenticated
-health is insecure and rejected, never stopped or restarted. Spawn may use `4098` if it is free.
-
-The HTTP client is bounded HTTP/1.1 over `TcpStream`, with strict content framing, bodyless
-`204` handling, no redirects, and bounded headers, body, and timeouts.
-
-Global listing is `GET /experimental/session?limit=10000&archived=true`, following
-`X-Next-Cursor`. Repeated or malformed cursors, or a full page without a cursor, are errors.
-The only managed marker is the exact permission rule
-`{"permission":"agent-viewer.background","pattern":"*","action":"allow"}`. Metadata is
-not a valid marker.
-
-Only exact marked rows are managed. Only they receive `daemon_hosted`, live status, pending input,
-managed capabilities, and server mutations. The managed id cache includes archived marked rows
-so archive and unarchive work, but archived marked rows are not status polled. Status, permission,
-and question are fetched once per unique active managed directory. A failure affects only that
-directory's rows, including external rows, which become `Unknown`. Otherwise external server
-enumerated rows use compatibility `Idle` status.
-
-Server mutations apply only to exact managed rows. Managed attach is refused because it would
-expose credentials. External rows use `opencode -s <session_id>`. External deletion remains local
-`opencode session delete <id>`.
+opencode support was removed before 1.0 by owner decision: the viewer ships as Codex plus
+Claude Code, and a cleaner integration can be built later. The managed-server design
+(credential pinning, the same-stream authorization rule, and the measured Linux
+`TCP_DEFER_ACCEPT` evidence behind it) lives in git history at commit `30ed871`, the last one
+carrying the "Enumeration and runtime: opencode" section.
 
 ## Enumeration — claude, and the nested `claude -p` companion rule
 
@@ -185,7 +148,7 @@ $ cat ~/.claude/sessions/2054075.json
 Rows with no `pid` are skipped without touching the disk: a pid is absent exactly for finished
 background jobs, which are real fleet members. The sessions root follows the same
 `$CLAUDE_CONFIG_DIR` precedence as the jobs root. A missing or unreadable registry file parses
-to "real session", the same safe direction as the opencode rule, and the same two escapes keep
+to "real session", the same safe direction as the codex rule, and the same two escapes keep
 this from swallowing anything: the viewer-state overlay clears `companion` for sessions the
 viewer itself spawned, and `Ctrl+A` and `Ctrl+F` both surface companion rows.
 
@@ -200,15 +163,24 @@ ribbon, which renders complete streamed Codex history including named tool activ
 Activity ribbons cover one hour and aggregate a row with its recursive descendant subtree. Codex
 reads `parent_thread_id` from a subagent `thread_spawn` source. Claude treats the root's flat
 transcripts under its transcript stem `subagents` directory as descendants, then isolates child
-subtrees through sibling `.meta.json` `parentAgentId` links. OpenCode follows `session.parent_id`
-with a recursive read only SQLite query. A child row remains isolated to its own subtree. Missing
+subtrees through sibling `.meta.json` `parentAgentId` links. A child row remains isolated to
+its own subtree. Missing
 or malformed child data is best effort and never removes readable root activity. The hierarchy
 cache rereads every thirty seconds.
 
 - Message content: `type:"response_item"`, `payload.role`, `payload.content[].text`
   (assistant text is `content[].type == "output_text"`).
-- Terminal marker: an `event_msg` with `type:"task_complete"`, preceded by a `token_count`
-  event. Its presence near the tail = the session's last turn finished cleanly.
+- Terminal marker: an `event_msg` whose `payload.type` is `task_complete` **or**
+  `turn_aborted`. Both end a turn and neither is followed by a `task_started`, so scoring only
+  `task_complete` left every interrupted session reading as mid-turn forever: a turn stopped by
+  `turn/interrupt` (or `Esc` in a TUI) writes `turn_aborted` and nothing after it.
+- Approval marker: any `event_msg` whose `payload.type` **ends with** `_approval_request`
+  (`exec_approval_request`, `apply_patch_approval_request`). The suffix match rather than a
+  fixed list is deliberate, so a future approval variant classifies correctly without a code
+  change. An approval that is the most recent event after the last `task_started`, with no
+  terminal marker behind it, is `TailState::AwaitingApproval`.
+- The status classifier reads a 64 KiB tail window. The tail *pane* reads a wider one; see
+  "Bounded transcript tails".
 
 ## PR refs — codex reads them out of the transcript
 
@@ -241,13 +213,36 @@ threads, 1.8 GB of rollouts, of which 1.3 GB is `archived_sessions`):
 The file signal alone is insufficient: during research 66/383 rollouts lacked `task_complete`
 yet **zero** `codex` processes were running, i.e. those are crashed/abandoned, not live.
 
-Resolve per thread on Linux:
-1. **running** — a live `codex`/`codex exec` PID holds this thread's `rollout_path` open.
-   Enumerate PIDs (`sysinfo`), then read `/proc/<pid>/fd/*` (readable for same-user procs;
-   use `procfs` or `std::fs::read_link`) and match an open path to `threads.rollout_path`.
-2. **done** — not running AND `task_complete` in the tail.
-3. **errored/abandoned** — not running AND no `task_complete` (ends mid-turn).
-4. **hidden** — `archived=1` (orthogonal; applies on top of 1-3).
+Resolve per thread on Linux. The fd signal is three-valued, not a boolean: `Held(owner)` when a
+live `codex`/`codex exec` PID holds this thread's `rollout_path` open (enumerate PIDs with
+`sysinfo`, read `/proc/<pid>/fd/*`, match an open path to `threads.rollout_path`), `Closed` when
+the scan ran and nobody holds it, and `Unavailable` when the scan could not run at all. Crossed
+with the tail, `status_from` produces six outcomes for a row the daemon does not host:
+
+| fd signal | tail | status |
+| --- | --- | --- |
+| Held | AwaitingApproval | NeedsInput (`awaiting approval`) |
+| Held | Complete | Idle |
+| Held | MidTurn, or unreadable | Working |
+| Closed | Complete | Done |
+| Closed | anything else | Error |
+| Unavailable | anything | Unknown (Done if the tail proves Complete) |
+
+`Unavailable` is the non-Linux and failed-scan case, and it is why the resolver never infers a
+false Idle: absent process evidence resolves to Unknown, never to a live state. A daemon-hosted
+row takes a different rule set entirely, because its fd carries no liveness information; see
+"Codex attach/resume". `archived=1` is the hidden set and is orthogonal, applying on top of any
+of these.
+
+**Stop is gated on the same scan, and subagent rows are withheld.** `stop_route` is a pure
+function: a daemon-hosted row routes to `turn/interrupt`, a subagent row (a companion whose
+origin is not `Exec`) returns `Unsupported`, and everything else signals its pid or, with no
+pid, is `Unsupported` too. The subagent case is the same hazard as the daemon one, one level
+down: a `codex exec` parent holds the rollout fd of every subagent thread it spawned (measured
+live 2026-07-27, pid 2910115 held two), so the fd scan stamps the PARENT's pid onto the
+subagent rows. Signalling from there SIGTERMs the parent's whole process group to stop one
+child, and there is no separate process to signal instead, so the row advertises no stop at all
+and the footer reads `codex does not support stop`.
 
 On macOS and Windows, `/proc` file descriptor evidence is unavailable. A `task_complete` tail
 proves `Done`; every other tail is `Unknown`, never inferred as live, idle, or errored. Actions
@@ -305,8 +300,14 @@ All verified present in `codex --help` (0.144.1):
   reached. The sandbox posture is unchanged and carried onto the new path: `thread/start` pins
   `sandbox: danger-full-access` and `approvalPolicy: never` for exactly the evidence above.
   See "Codex attach/resume" below.
-- **Hide (req 3):** `codex archive <id>`; **unhide:** `codex unarchive <id>`;
-  hard-delete (optional, guard behind a confirm): `codex delete <id>`.
+- **Hide (req 3):** `codex archive <id>`; **unhide:** `codex unarchive <id>`.
+- **Remove is archive, deliberately.** The optional `codex delete <id>` hard-delete this spec
+  once contemplated was not built: `CodexBackend::remove` calls `cli::archive`, the same
+  `codex archive <id>` that `Ctrl+D` runs. So the second `Ctrl+X` press on a Codex row hides it
+  rather than destroying its transcript, and `Ctrl+U` brings it back. Claude's `remove` is a
+  real delete (`claude rm <short>`, which also removes the job's worktree), so the two backends
+  genuinely differ here and the row's capabilities, not a shared assumption, decide what a
+  remove costs.
 - **Attach/resume (superseded, kept for the record):** `codex resume <id>` (or
   `codex exec resume <id>`), exec'd into the user's terminal from the TUI. This is still the
   command for a session with no live turn, but it is NOT how a live session is joined; see
@@ -528,8 +529,8 @@ experimental `codex app-server` JSON-RPC daemon (`thread/subscribe`, `thread/lis
 it is labeled experimental, its control socket is already contended on this box, and it reads
 the same SQLite + files we read directly. Leave a comment marking it as the v2 upgrade path."
 
-**Correction.** The contention half of that rejection was wrong. Research decision D-008
-(`specs/001-fleet-view-unification/research.md`) traced the claim to a misread log line: the
+**Correction.** The contention half of that rejection was wrong. Live investigation traced the
+claim to a misread log line: the
 failure is a **bind** failure from a second would-be *server*, not client contention. `lsof`
 shows a single LISTEN holder, and three simultaneous client connections all initialized and
 served different requests concurrently, reproduced independently with a stdlib WebSocket client
@@ -569,17 +570,16 @@ that process. Only spawn may start; attach and stop probe. See "Codex attach/res
 ## Model discovery: probe off-thread, cache on disk
 
 Every backend advertises its spawnable models through `available_models()` (default first).
-Two of the three discover them by shelling out, and those shell-outs are slow enough to shape
-the design. Measured on this box, three consecutive runs: `opencode models` takes 3.72s /
-3.81s / 3.82s and prints 378 ids (12,991 bytes); `codex debug models` is comparable; Claude's
-list is a `~/.claude.json` read and effectively free.
+Codex discovers them by shelling out, and that shell-out is slow enough to shape the design.
+Measured on this box, `codex debug models` takes seconds on a cold run; Claude's list is a
+`~/.claude.json` read and effectively free.
 
 - **The probe never runs on the render thread.** The composer's key path reads memory only.
   `ModelCache` (TUI) spawns discovery on a worker thread, results drain non-blocking via
   `poll()`, and a backend is probed at most once per viewer session, including when that probe
   found nothing. A probe deadline lost to a slow CLI is silent: the picker degrades to the
   single built-in default with no error, which is exactly the bug this replaced (the old
-  3s deadline was under `opencode models`' real 3.8s, so opencode never had a picker).
+  3s deadline was under a real cold probe's 3.8s, so that backend never had a picker).
 - **`MODEL_PROBE_TIMEOUT` is 15s.** Generous on purpose: it only bounds a worker thread, and
   losing the race costs a whole catalog.
 - **Catalogs persist in the viewer DB** (`model_cache` table: backend, newline-joined ids,
@@ -673,32 +673,168 @@ palette, model cache seed, and model probes include only providers with an insta
 
 ## Crate layout
 
-- `agent-viewer-core` (lib): registry reader (rusqlite), rollout parser (serde_json),
-  status resolver (sysinfo/procfs + `/proc/fd`), spawner (Command+setsid), and thin wrappers
-  around `codex archive`/`unarchive`/`resume`. No UI. Unit-tested.
-- `agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`.
+Cargo workspace, two crates plus one vendored dependency. Live-refresh the registry every ~1-2s.
 
-Cargo workspace. Live-refresh the registry every ~1-2s.
+`agent-viewer-core` (lib), no UI, unit-tested:
+
+- `backend.rs` holds the `Backend` trait, `BackendKind`, `Session`, `Status`, `Capabilities`,
+  and the listing-cache scope: the whole cross-backend contract.
+- `codex/` is the Codex backend, split by concern. `registry.rs` is the read-only
+  `state_*.sqlite` reader; `rollout.rs` does JSONL tail parsing, `TailState`, pending approvals,
+  and activity timestamps; `source.rs` parses the serialized `source` enum; `status.rs` owns the
+  procfs sweep, `FdSignal`, `RolloutOwner`, and the six-state resolver; `pr_scan.rs` scans PR
+  refs out of rollouts; `cli.rs` wraps the `codex archive`/`unarchive`/`resume` shell-outs;
+  `app_server.rs` is the JSON-RPC client for the `codex app-server` daemon (discovery, the pure
+  request builders, and the blocking WebSocket exchange that starts and interrupts threads); and
+  `mod.rs` carries the `Backend` impl plus the three pure routing seams (`spawn_route`,
+  `attach_route`, `stop_route`).
+- `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
+  trust bootstrap, and spawn/attach/stop/remove/rename.
+- `router.rs` is the `agent-router` shell-out behind the composer's Auto entry. Deliberately not
+  a `Backend`: it enumerates nothing and owns no sessions.
+- `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
+  badge color.
+- `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the
+  bounded scrollback and the palette replies.
+- `spawn.rs` owns detached spawn, the reaper, and the shell-out wrappers (`run_checked`,
+  `run_with_timeout`).
+- `state.rs` is the viewer-owned SQLite (the only database this tool writes) plus the pure
+  overlay and spawn-matching functions.
+- `platform.rs` carries the `Platform` enum and the cross-platform home resolution that gates
+  every Linux-only claim.
+- `group.rs` folds a cwd to its project root, `lib.rs` holds `mark_dead_dirs`, `open_readonly`,
+  `home_dir`, and the bounded tail reader, and `error.rs` holds `Error` and `AttachRefusal`.
+
+`agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`. `main.rs` owns the run loop and
+the refresh tick; `app.rs` the row model and grouping; `keys.rs` the per-mode key routing;
+`actions.rs` what those keys do; `composer.rs`, `attach.rs`, and `mouse.rs` the input encodings;
+`ops.rs` and `mutations.rs` the background mutation worker; `model_cache.rs`, `pr_cache.rs`, and
+`shared_listing.rs` the off-thread caches; `logos.rs` the inline brand marks; `terminal_title.rs`
+the tab title. Rendering lives under `ui/`: `list.rs`, `header.rs`, `composer.rs`, `overlay.rs`,
+`palette.rs`, `wall.rs`, `triage.rs`, `tail.rs`, `theme.rs`, `sprite.rs`, `age.rs`.
+
+`vendor/vt100` is a patched fork of the published crate; see "Vendored vt100".
+
+## Vendored vt100
+
+`vendor/vt100` is vt100 0.16.2 with exactly one behavioral change, wired in by
+`[patch.crates-io] vt100 = { path = "vendor/vt100" }`. In `Grid::scroll_up`, the guard deciding
+whether a scrolled-off row enters the scrollback was `!self.scroll_region_active()`; it is now
+`self.scroll_top == 0`. The now-unused helper is deleted, and nothing else in the crate differs
+from the published source.
+
+The bug it fixes: Codex sets a **top-anchored** scroll region (`scroll_top == 0`,
+`scroll_bottom` short of the last row) to pin its own status area. Upstream treats any region at
+all as "not the main screen" and drops every row that scrolls out of it, so the viewer's PTY
+scrollback stayed empty for the entire life of a Codex attach and the wheel had nothing to
+scroll back through. Anchoring the test at the top instead keeps history for a region that
+starts at row 0, which is the case where the rows leaving the region really are leaving the
+screen, and still discards it for a region that starts lower down, where they are not.
+
+Both candidate upstreams carry the bug: the published vt100 0.16.2 and the `vt100-ctt` 0.17.1
+fork both still read `!self.scroll_region_active()`. Coverage is the four viewport tests in
+`crates/agent-viewer-core/tests/pty_tests.rs`
+(`pty_viewport_follows_live_output_and_preserves_a_scrolled_view`,
+`pty_codex_top_anchored_scroll_region_preserves_global_history`,
+`pty_scroll_region_below_top_does_not_create_global_history`, and
+`pty_viewport_retains_exactly_two_thousand_history_rows`); the third is the one that proves the
+patch did not simply disable the check. The exit condition is an upstream release that fixes
+restricted-region scrolling, at which point the `[patch.crates-io]` entry and the whole
+`vendor/` tree can be dropped. Until then a source build pulls the repo rather than the
+published crate, which is why `cargo install` targets the git URL.
+
+## Runtime mechanics
+
+### Viewer state, and why the listing payload lives in its own table
+
+`state.rs` owns the only SQLite this tool writes: `spawned` (the spawn records that keep a
+viewer-started session from being filtered away as a companion), `collapsed_groups` (which also
+carries the persisted theme under a `theme:` key), `settings` (sprite, age ramp), `model_cache`,
+and the two listing-cache tables.
+
+Those are two tables on purpose. The listing payload used to sit in `backend_listing_cache`
+beside the lease columns, and that is not free: SQLite rewrites a row's entire record, overflow
+pages included, whenever the record's size changes, so every lease take, renewal, release, and
+invalidation dragged the whole snapshot back through the write-ahead log. Measured on this box
+with a 24 MB snapshot, one metadata-only UPDATE cost **48 MB of WAL, against 4 KB** once the
+payload moved into `backend_listing_snapshot`. The legacy column is cleared rather than dropped,
+so an older viewer binary running against the same file sees a cache miss and refreshes instead
+of erroring on a column that vanished.
+
+### Bounded transcript tails
+
+`TRANSCRIPT_TAIL_BYTES` is 512 KiB: the most a tail-pane read may touch at the end of a JSONL
+transcript. Transcripts grow without bound while a session works (18.6 MB measured on this box)
+and the tail pane refreshes every 2s tick, so reading whole files re-parsed megabytes per tick
+to display twelve events. The window is deliberately far wider than the 64 KiB the status
+classifier works over, because a single transcript line can be an `apply_patch` call carrying a
+whole diff: a window that landed inside one such line would find no complete line at all and
+show an empty pane.
+
+### Registry rollover
+
+`find_state_db` is re-globbed on **every** listing tick, not resolved once at startup. It is the
+only thing that notices a Codex upgrade laying down a new `state_N+1.sqlite`: the previously
+opened file stays open, stays readable, and keeps answering with its frozen row set, so a
+registry resolved once showed no new session until the viewer was restarted. The cost is one
+`readdir` of `~/.codex` per tick, against a scan that already reads thousands of rollout tails.
+The open connection is still cached and reused for as long as the winning path is unchanged.
+
+### Detached-child reaping
+
+`setsid` detaches the SESSION, not the parent-child relationship. This process stays the child's
+parent, so dropping the `Child` never collects its exit status and the kernel holds a zombie for
+the whole life of the viewer (two accumulated in 22 minutes of ordinary use). Every detached
+spawn therefore hands its `Child` to a thread that blocks in `wait()`. The thread costs one
+stack and lives exactly as long as the child.
+
+### PR badge fetch
+
+A badge's live color comes from `gh pr view <url> --json state,mergedAt,isDraft,reviewDecision,
+reviewRequests,statusCheckRollup`, run under a 10s deadline (`PR_STATUS_TIMEOUT`); any failure,
+including a missing `gh`, degrades to the flat default color rather than erroring. `pr_status.rs`
+itself is a pure fetch-and-map with no cache. The cache is one layer up in the TUI
+(`PrStatusCache`, modeled on the mutation runner): each resolvable PR key gets a fetch on a
+worker thread, keys already in flight are never re-spawned, results drain non-blocking, the
+render path reads cached colors purely, and an entry re-fetches once past its 30s TTL. Nothing
+here is persisted, so a fresh viewer fills its badges in over its first few seconds.
+
+### Dead-cwd marking
+
+`mark_dead_dirs` flags any session whose cwd is a non-empty path that no longer exists on disk
+as a companion, so the default view hides deleted-directory noise (a `/tmp` scratch dir, a
+removed worktree). It only ever SETS `companion`: an already-flagged session, and one with a
+live or empty cwd, are left untouched, so it can never un-hide something another rule hid.
+`Ctrl+A` still surfaces these rows.
+
+### Claude trust bootstrap
+
+A `claude` launched into a project it has not seen stalls on the trust prompt, which inside an
+embedded PTY reads as an attach that simply hangs. So on the one attach path that starts a fresh
+process in the session's own directory, the Claude fallback (`claude -r`, taken by a row with no
+background job id), the viewer first merges `projects.<cwd>.hasTrustDialogAccepted = true` into
+`~/.claude.json`. This is Claude's own sanctioned field: its error text instructs setting exactly
+that key for non-interactive use. The write is a read-modify-write preserving every other key at
+every level, atomic (temp file in the same directory, then rename), and skipped entirely when the
+cwd or any ancestor is already accepted. A config that is not a JSON object is an error, never an
+overwrite, and the whole call is best-effort: a failure to pre-accept never blocks the attach.
 
 ## Release artifacts
 
 A pushed `v*` tag builds native binaries on GitHub hosted runners and publishes a GitHub Release.
-The release contains these four archives, each with a sibling `.sha256` file:
+`README.md` lists the exact archive names and the verification commands; that list is not
+repeated here.
 
-- `agent-viewer-x86_64-unknown-linux-gnu.tar.gz`
-- `agent-viewer-x86_64-apple-darwin.tar.gz`
-- `agent-viewer-aarch64-apple-darwin.tar.gz`
-- `agent-viewer-x86_64-pc-windows-msvc.zip`
-
-The archive contains `agent-viewer` on Unix and `agent-viewer.exe` on Windows. Build jobs run
-`agent-viewer --version` or `agent-viewer.exe --version` before packaging. `--version` and `-V`
-must print the package version and exit before terminal, filesystem, or backend startup, so they
-remain safe cross platform smoke paths.
+The requirement this spec owns is the smoke path. Every build job runs `agent-viewer --version`
+(`agent-viewer.exe --version` on Windows) before packaging, so `--version` and `-V` must print
+the package version and exit **before** terminal, filesystem, or backend startup. A version flag
+that touched any of those would fail on a runner with no tty and no `~/.codex`, and would take
+the release with it.
 
 ## TUI behavior
 
-- Single list: sessions grouped by project or state, with status glyphs based on
-  opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
+- Single list: sessions grouped by project or state, with status glyphs (spinner=running,
+  green=done, gray=hidden, red=errored).
   Project groups remain alphabetic and their members order by `created_at_ms` ascending.
   State sections remain fixed and their members order by `created_at_ms` ascending.
   After sanitization, the exact whole title `hold` is matched without regard to ASCII letter
@@ -711,8 +847,9 @@ remain safe cross platform smoke paths.
   quickswitcher actions remain. Enumeration, backend data, and mutation behavior do not change.
 - Keys: `Enter` attach/resume when the composer is empty, or spawn a composed task; bare letters
   and numbers type into the composer, including when empty, and `/` composes; `Ctrl+D` hide
-  (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `space` toggles a selected group
-  header; arrows navigate; `Ctrl+F` filters; `Ctrl+C` quit. Keep the set small and obvious.
+  (archive); `Ctrl+U` unhide; `Ctrl+A` toggle show-hidden; `Space` or `Enter` toggles a selected
+  group header; arrows navigate; `Ctrl+F` filters; `Ctrl+C` quit. Keep the set small and obvious.
+  The full shipped set, including the surfaces below, is the in-app `?` help and `README.md`.
 
 ### Mouse capture must be escapable (`Ctrl+T`)
 
@@ -721,10 +858,7 @@ successful Codex or Claude attach or reattach requests capture on, so those tran
 immediately. While attached, `Ctrl+T` requests capture off for host terminal text selection.
 Press it again to restore session scrolling. Codex wheel reports move the viewer's local PTY
 viewport by three rows, using its bounded 2,000 row scrollback. Claude attached terminals receive
-native wheel forwarding. External opencode attaches with capture off for host selection and
-requires `Ctrl+T` to opt into native wheel forwarding. Detaching requests capture on to restore
-list mouse controls. External opencode behavior is described as its supported attach path, not as
-a live verification claim.
+native wheel forwarding. Detaching requests capture on to restore list mouse controls.
 
 The cost is that **capture swallows the terminal's own drag-select**. This spec previously
 waved that away with "the terminal's native text selection still works with Shift held in most
@@ -741,9 +875,8 @@ therefore remains the universal fallback for host terminal selection.
 - Each toggle sets a footer notice naming scrolling or selection and the way back, because the
   state is otherwise invisible.
 - List capture starts **on**. Every successful Codex or Claude attach or reattach requests
-  capture **on**. External opencode attach requests capture **off** until `Ctrl+T` opts into
-  scrolling. Attached `Ctrl+T` toggles between selection and scrolling. Every detach requests
-  capture **on**.
+  capture **on**. Attached `Ctrl+T` toggles between selection and scrolling. Every detach
+  requests capture **on**.
 
 If a mouse mode transition write fails, the viewer writes the complete prior mouse mode as a
 rollback. A successful rollback restores `Ui::mouse_capture` to the prior applied value and
@@ -789,6 +922,95 @@ Only clipboard readback on the client proves mutation.
 
 OSC 52 clipboard reads, terminal multiplexer passthrough wrapping, forwarding OSC 52 emitted by
 the child, and copying content beyond the visible viewport are out of scope.
+
+### Video wall (`Ctrl+W`)
+
+The list is replaced by a grid of live PTY tiles, and the focused tile takes the keyboard. This
+is a real attach, not transcript rendering: the wall connects each session through the same
+attach path a manual attach uses, and closes every one of those connections when it closes. A
+session earns a tile while it is working or awaiting input and keeps it for `RECENT_MS`
+(fifteen minutes) after it stops, because that moment is exactly when the wall is most useful:
+the reply you want to type is the one that follows the result you watched arrive. `MAX_TILES` is
+9, and it is a process budget rather than a rendering one, since each tile is a live child being
+resized and re-parsed; above it the footer carries the overflow count and still-running sessions
+take the slots ahead of recently-stopped ones. `Ctrl+O` zooms the focused tile to the full attach
+view, reusing the connection the wall already holds rather than spawning a second child.
+
+An expired tile has to be pruned explicitly (`prune_wall_tiles`, run each frame before the join
+pass). Without it the expired session's key stays in `wall.requested` and its child stays in
+`attached` until the whole wall closes: invisible, and steadily pushing the live-process count
+past `MAX_TILES` as freed slots are refilled. Dropping the key also invalidates any join still
+in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawns.
+
+### Triage inbox (`Ctrl+N`)
+
+A modal walking every session that is awaiting input, longest wait first, with the session
+itself attached live into the middle panel. Three chords are reserved (`Ctrl+N` next, `Ctrl+P`
+previous, `Ctrl+]` leave) and everything else goes to the session, because typing into the
+agent's own input path is how a prompt gets answered; there is no second reply mechanism. The
+queue is snapshotted when the modal opens so a background refresh cannot reorder it mid-answer.
+
+Sessions are attached one at a time as they are reached, never prefetched, and a visit lasts
+exactly as long as the item is on screen: `release_triage_attachment` closes the child both when
+you move off an item and when you close the queue. Keeping every visited child alive would
+accumulate invisible processes across a walk. The one exception is a key the video wall owns,
+which the wall is responsible for and triage must not tear down underneath it.
+
+### Tail pane (`Ctrl+B`) and command palette (`Ctrl+K`)
+
+The tail pane shows the selected session's last `TAIL_EVENTS` (12) turns beside the list, read
+through the bounded 512 KiB display tail above. It requires `TAIL_MIN_TOTAL_WIDTH` (100)
+columns; below that, opening it is refused with a notice naming the width available, because the
+pane and a usable list cannot both fit. Closing an already-open pane is never refused.
+
+The palette is the discoverability surface for everything without a chord of its own, and the
+only way to reach some actions from the wall. It carries the action list (each with its chord,
+and unavailable actions shown as unavailable rather than hidden), the header sprites, every
+visible session as a jump target, every discovered model per backend, and the slash commands for
+the composer's current backend. Session entries use the same visible-row model as the list, so
+the `hold` rule applies there too.
+
+### Themes, sprites, and the age ramp
+
+Eleven built-in themes, selected through the composer's `/theme` command, which previews a
+candidate against the whole screen on `↑`/`↓`, commits on `Enter`, and reverts on `Esc`. The
+choice persists in the viewer DB. User themes are `*.theme` files under
+`~/.config/agent-viewer/themes`, one `key=#rrggbb` per line with `#` comments; a malformed line
+is skipped with a notice rather than failing the file. The active theme is reloaded whenever its
+file's mtime changes, checked on the ordinary refresh cycle, so editing a theme with the viewer
+running lands on save. Marks and motion belong to the theme: a theme may select glyph marks and
+may switch animation off, and `terminal match` builds itself from the captured host palette
+rather than concrete RGB.
+
+The header sprite is one of six, cycled with `Ctrl+G` and persisted; `AV_SPRITE` overrides the
+startup choice for one run without overwriting what is saved. The age ramp is an optional mode
+that fades a finished row toward the theme's `faint` token over a 24 hour horizon, so today's
+work pops and Tuesday's recedes. Both endpoints come from the theme and there are no literal
+colors in it, which also gives it a free truecolor gate: if either endpoint is not `Color::Rgb`
+(the `terminal` theme builds from named ANSI colors) there is nowhere to interpolate to, so the
+start color comes back untouched instead of degrading to noise.
+
+### Brand logo marks
+
+The row mark is an inline image, not a character, whenever the terminal can render one. The
+backend SVGs are embedded at build time and rasterized once at startup at 64px, oversampled so
+the half-blocks fallback is not chunky. List rows use fixed two-cell protocols; kitty, iTerm2,
+and Sixel composers use separate three-cell protocols whose artwork is offset by half a cell,
+which half-blocks cannot represent, so that fallback reuses the two-cell protocols.
+
+**The probe must run before ratatui takes the alternate screen.** `Picker::from_query_stdio`
+performs real terminal I/O and temporarily toggles raw mode on stdin. On a non-tty or an
+unsupported terminal it errors, and every failure leaves the textual marks in place:
+`[cc]`/`[cx]` by default, or the `✳`/`◆` glyphs under `AGENT_VIEWER_GLYPH_MARKS=1`. Logo mode
+outranks both and blanks the mark slot for the image overlay.
+
+### Terminal title
+
+The tab title is `Agent Viewer · <launch directory basename>`. The basename is sanitized by
+dropping control characters, and a name that is missing, unreadable, or empty after that
+sanitization falls back to a bare `Agent Viewer` rather than emitting a half-formed title. The
+write itself is best-effort: a terminal that does not support `SetTitle` is not an error and is
+never surfaced.
 
 ## Testing
 

@@ -27,8 +27,10 @@ detection, or the mutation path; those facts were verified live on this box and 
 
 ## What this is
 
-A Rust workspace: a terminal viewer for coding-agent sessions (Codex, Claude Code, opencode),
-modeled on `claude agents`. Two crates:
+A Rust workspace: a terminal viewer for coding-agent sessions (Codex, Claude Code),
+modeled on `claude agents`. Two crates, plus `vendor/vt100`, a patched fork of vt100 0.16.2
+wired in through `[patch.crates-io]` (one hunk, and `SPEC.md` "Vendored vt100" is the record of
+what it fixes and when it can be dropped):
 
 - `crates/agent-viewer-core` (lib) - registry readers, rollout parsers, status resolver,
   spawner, PTY attach, PR status, viewer-local SQLite state. No UI. This is the reusable
@@ -43,16 +45,26 @@ cargo build --workspace          # build everything
 cargo run -p agent-viewer-tui    # launch the TUI (binary: agent-viewer)
 cargo test --workspace           # full unit + integration suite
 cargo fmt --all -- --check       # must pass before any commit (CI's first step)
-cargo clippy --workspace         # must be clean before any commit
+cargo clippy --workspace --all-targets -- -D warnings   # exactly what CI runs
+cargo bench --workspace          # criterion benches, not part of the commit gate
 ```
+
+**Match CI's clippy invocation, not a weaker one.** `cargo clippy --workspace` alone skips test
+and bench targets and does not fail on warnings, so it goes green on lints that turn the CI job
+red. Use the line above.
+
+The criterion benches guard the per-tick costs that fleet scale actually exposes: status
+resolution and listing-cache round trips over 5,000 sessions (`-core`), transcript tail parsing
+against 20 MB fixtures, and the TUI row-model rebuild and filter keystroke. Run them when
+touching the refresh tick or the row model; they are not a commit gate.
 
 CI runs `cargo fmt --all -- --check` first and skips clippy, build, and test entirely when it
 fails, so an unformatted file turns the whole workflow red. Run `cargo fmt --all` before the
 check when it reports hunks.
 
 The TUI expects a `~/.codex/state_*.sqlite` on the box (the Codex backend's source of truth).
-The Claude and opencode backends appear automatically when their CLIs and data exist and list
-empty otherwise, so a missing backend is never an error.
+The Claude backend appears automatically when its CLI and data exist and lists empty
+otherwise, so a missing backend is never an error.
 
 ## Cargo is wrapped on this box - bypass it when output is the evidence
 
@@ -81,10 +93,13 @@ capture to a file via the direct binary; the wrapper will otherwise swallow them
 
 ### Known flaky test - re-run standalone before treating as a break
 
-`agent-viewer-core`'s `pty_tests::pty_kill_returns_when_grandchild_holds_slave` has a hard 2s
-deadline and can miss it under the CPU contention of a full parallel `--workspace` run, then
-pass on the next run and pass every time in isolation (~1.35s). It is scheduler jitter, not a
-regression. If it fails in a workspace run, confirm with:
+`agent-viewer-core`'s `pty_tests::pty_kill_returns_when_grandchild_holds_slave` has a 5s
+deadline and can still miss it under the CPU contention of a full parallel `--workspace` run,
+then pass on the next run and pass every time in isolation (~1.35s). It is scheduler jitter, not
+a regression: the invariant is "kill() returns promptly, not never", so the bound is loose on
+purpose and a genuine hang never returns at all. CI runs the whole suite with `--test-threads=2`
+for this class of timing-sensitive test; do the same for a clean workspace-wide tally. If it
+fails in a workspace run, confirm with:
 
 ```bash
 ~/.cargo/bin/cargo test -p agent-viewer-core --test pty_tests
@@ -123,13 +138,15 @@ the blast radius of the change:
 
 - Logic in `-core` (parsers, resolvers, grouping, source parsing): unit tests with fixtures.
 - Status detection / spawner: the live e2e above (real `codex exec`, watch `running` to `done`).
-- TUI rendering, keys, reply, layout: run `cargo run -p agent-viewer-tui` against the real
-  session store, or the pty harness for a scripted headless check.
+- TUI rendering, keys, layout, and the wall/triage/tail surfaces: run
+  `cargo run -p agent-viewer-tui` against the real session store, or the pty harness for a
+  scripted headless check.
 - Mutations (archive/unarchive/rename/stop): drive them in the running TUI and confirm the row
   moves between visible/hidden or updates, since these run on a background worker.
 
-Run `cargo fmt --all -- --check`, `cargo clippy --workspace`, and the relevant tests before
-every commit; every commit must build clean with fmt --check, clippy, and tests passing.
+Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+the relevant tests before every commit; every commit must build clean with fmt --check, clippy,
+and tests passing.
 
 **Always close a change with the command Brian runs to see it.** Anything with a visible
 surface (a sprite, a key, a layout, a row, a popup) ends the report with the literal line to
@@ -156,7 +173,7 @@ run is not a two-minute compile.
 - **Never hardcode the state file version.** Glob `state_*.sqlite` and pick the highest version
   number. Same for any versioned Codex path.
 - **Mutations delegate to CLI subcommands or the app-server, never the DB.**
-  Archive/unarchive/resume go through `codex ...` (and the Claude/opencode equivalents), never a
+  Archive/unarchive/resume go through `codex ...` (and the Claude equivalents), never a
   direct DB write. Two documented exceptions:
   - Codex spawn and stop speak JSON-RPC to the `codex app-server` daemon (`thread/start` plus
     `turn/start`, and `turn/interrupt`), because a `codex exec` spawn hosts its app-server in
@@ -212,7 +229,7 @@ landed afterward. The approval gate above still holds for anything that decides 
 looks or behaves, adds a surface, or changes an invariant in this file. Merging locally is never pushing; pushing still
 needs Brian.
 
-Run `cargo fmt --all -- --check`, `cargo clippy --workspace`, and the tests on `main` after
-every merge, not only on the branch:
-a textually clean merge still hits semantic conflicts (a `Draw` literal gaining a field on one
-branch while another branch adds a new call site) that only the compiler catches.
+Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+the tests on `main` after every merge, not only on the branch: a textually clean merge still
+hits semantic conflicts (a `Draw` literal gaining a field on one branch while another branch
+adds a new call site) that only the compiler catches.

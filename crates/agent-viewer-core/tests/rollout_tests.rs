@@ -2,7 +2,7 @@ mod common;
 
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
-    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript, tail_state,
+    PendingApproval, TailState, pending_approval, read_transcript_tail, tail_state,
 };
 use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status, TailEvent};
 use common::rfc3339_at;
@@ -71,30 +71,9 @@ fn insert_codex_activity_thread(
 // --- Preserved v1 tests (unchanged behavior) ---
 
 #[test]
-fn session_meta_parses_first_line() {
-    let path = common::fixture_path("rollout_complete.jsonl");
-    let meta = read_session_meta(&path).expect("parse session_meta");
-    assert_eq!(meta.id, "019f4dda-fecb-7b71-adba-9fda570e4cdb");
-    assert_eq!(meta.cwd, PathBuf::from("/home/user/project"));
-    assert_eq!(meta.originator, "codex_exec");
-    assert_eq!(meta.cli_version, "0.144.1");
-}
-
-#[test]
-fn session_meta_rejects_empty_and_garbage() {
-    let empty_dir = tempfile::TempDir::new().unwrap();
-    let empty = empty_dir.path().join("empty.jsonl");
-    std::fs::write(&empty, b"").unwrap();
-    assert!(read_session_meta(&empty).is_err());
-
-    let garbage = common::fixture_path("rollout_garbage.jsonl");
-    assert!(read_session_meta(&garbage).is_err());
-}
-
-#[test]
 fn transcript_extracts_text_and_tool_calls_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
-    let items = read_transcript(&path).expect("read transcript");
+    let items = read_transcript_tail(&path).expect("read transcript");
     // The user message, the assistant message, and the function_call the tail pane needs,
     // in transcript order. `arguments` is an embedded JSON string, so the detail comes out
     // of its `cmd` key.
@@ -143,7 +122,7 @@ fn transcript_drops_developer_and_system_scaffolding() {
     drop(f);
 
     assert_eq!(
-        read_transcript(&path).expect("read transcript"),
+        read_transcript_tail(&path).expect("read transcript"),
         vec![
             TailEvent::User("the real task".to_string()),
             TailEvent::Agent("on it".to_string()),
@@ -189,7 +168,7 @@ fn transcript_tool_detail_squashes_multiline_and_survives_unknown_arguments() {
     drop(f);
 
     assert_eq!(
-        read_transcript(&path).expect("read transcript"),
+        read_transcript_tail(&path).expect("read transcript"),
         vec![
             TailEvent::Tool {
                 name: "exec_command".to_string(),
@@ -236,7 +215,7 @@ fn transcript_excludes_empty_text_items() {
     .unwrap();
     drop(f);
 
-    let items = read_transcript(&path).expect("read transcript");
+    let items = read_transcript_tail(&path).expect("read transcript");
     assert_eq!(
         items,
         vec![
@@ -534,6 +513,66 @@ fn codex_turn_activity_includes_only_requested_subtree() {
     );
 }
 
+/// `turn_activity` runs once per visible session on every activity refresh, so the registry's
+/// spawn edges are scanned once and reused across those calls instead of rescanning every row
+/// per session. A subagent spawned AFTER the first call must still join its parent's ribbon on
+/// the next one - a cache that never expired would hide it for the life of the process.
+#[test]
+fn codex_turn_activity_sees_a_subagent_spawned_after_the_first_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let root_path = dir.path().join("root.jsonl");
+    write_codex_activity(&root_path, now - 4);
+
+    let db_path = dir.path().join("state_5.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).expect("open registry");
+    conn.execute_batch(&common::read_fixture("threads_schema.sql"))
+        .expect("create registry schema");
+    insert_codex_activity_thread(&conn, "root", &root_path, "cli", (now - 4) * 1_000);
+    conn.close().expect("close registry");
+
+    let backend = CodexBackend::new(dir.path().to_path_buf());
+    let activity = || {
+        backend
+            .turn_activity(
+                &codex_activity_session("root", root_path.clone()),
+                Duration::from_secs(60),
+            )
+            .expect("root subtree activity")
+    };
+    assert_eq!(activity(), vec![(now - 4) * 1_000]);
+
+    let child_path = dir.path().join("child.jsonl");
+    write_codex_activity(&child_path, now - 2);
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen registry");
+    insert_codex_activity_thread(
+        &conn,
+        "child",
+        &child_path,
+        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}"#,
+        (now - 2) * 1_000,
+    );
+    conn.close().expect("close registry");
+    // The insert already moved the db's mtime; pushing it forward makes the freshness key
+    // differ by seconds, so the assertion below cannot ride on filesystem timestamp
+    // granularity (a one-row insert need not change the file's length at all).
+    std::fs::File::options()
+        .write(true)
+        .open(&db_path)
+        .expect("open db for a timestamp bump")
+        .set_modified(SystemTime::now() + Duration::from_secs(2))
+        .expect("bump the db mtime");
+
+    assert_eq!(
+        activity(),
+        vec![(now - 4) * 1_000, (now - 2) * 1_000],
+        "a subagent inserted after the first call must invalidate the cached spawn edges"
+    );
+}
+
 // --- v2 tail_state contract (tests 1-5) ---
 
 #[test]
@@ -770,7 +809,7 @@ fn the_codex_environment_preamble_is_dropped_from_the_tail() {
     )
     .unwrap();
 
-    let events = read_transcript(&path).unwrap();
+    let events = read_transcript_tail(&path).unwrap();
     assert_eq!(
         events,
         [
@@ -800,7 +839,7 @@ fn a_later_message_carrying_the_environment_tag_is_kept() {
     )
     .unwrap();
 
-    let events = read_transcript(&path).unwrap();
+    let events = read_transcript_tail(&path).unwrap();
     assert_eq!(
         events,
         [
@@ -808,5 +847,69 @@ fn a_later_message_carrying_the_environment_tag_is_kept() {
             TailEvent::User("why does <environment_context> say bash here?".to_string()),
         ],
         "only the LEADING scaffolding item may be dropped"
+    );
+}
+
+/// The tail read must be BOUNDED. A live rollout grows without bound (18.6 MB measured on this
+/// box) and the pane re-reads it on every 2s tick to show twelve events, so the reader looks
+/// only at the end of the file. Written large enough that the early half is provably outside
+/// the window.
+#[test]
+fn read_transcript_tail_touches_only_the_end_of_a_multi_megabyte_rollout() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("rollout-huge.jsonl");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = std::io::BufWriter::new(file);
+    // ~2 KB of text per message; 1,000 of them is ~2 MB before the tail messages.
+    let filler = "x".repeat(2_048);
+    for n in 0..1_000 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("early-{n} {filler}")}]
+                }
+            })
+        )
+        .unwrap();
+    }
+    for n in 0..3 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("late-{n}")}]
+                }
+            })
+        )
+        .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
+
+    let events = read_transcript_tail(&path).expect("read tail");
+    assert_eq!(
+        events.last(),
+        Some(&TailEvent::Agent("late-2".to_string())),
+        "the newest message must survive"
+    );
+    assert!(
+        events.len() < 1_003,
+        "the whole file was parsed: {} events",
+        events.len()
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TailEvent::Agent(text) if text.starts_with("early-0 ")
+        )),
+        "a message megabytes back from the end must never be read"
     );
 }

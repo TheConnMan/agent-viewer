@@ -2,18 +2,21 @@
 
 A terminal viewer for coding-agent sessions, modeled on Claude Code's `claude agents`
 view. These CLIs have no built-in "see all my sessions" console; this fills that gap
-across backends. It reads each agent's own local session store, shows every session in a
+across Codex and Claude Code. It reads each agent's own local session store, shows every session in a
 single live list, and lets you attach to one in an embedded terminal without leaving the
 viewer.
 
 The header identifies the viewer as `[av] Agent Viewer` with its version, the full
 launch workspace, and live totals for sessions awaiting input, working, and completed
-(including errors). The terminal tab title is `Agent Viewer · <launch directory name>`;
-when the launch directory cannot be determined, it falls back safely to `Agent Viewer`.
+(including errors). On a comfortably sized terminal it also names the active theme and
+draws an animated sprite beside all of that; both drop out on a narrow or short terminal
+rather than crowding the totals. The terminal tab title is
+`Agent Viewer · <launch directory name>`; when the launch directory cannot be determined,
+it falls back safely to `Agent Viewer`.
 
 ## Backends
 
-Three backends ship, and each advertises which capabilities it supports; the TUI gates
+Two backends ship, and each advertises which capabilities it supports; the TUI gates
 keys accordingly (an unsupported action is a no-op with a footer notice). Backends with
 no data or whose CLI is not installed simply list empty — they never error the view.
 
@@ -31,15 +34,6 @@ no data or whose CLI is not installed simply list empty — they never error the
   channel it has (there is no `claude rename` subcommand). It applies to background rows only:
   an interactive row has no job dir, so `Ctrl+R` there is a footer notice. No archive/hide
   (Claude has no hide concept).
-- **opencode**: uses a secured local server when one is available, with read only SQLite
-  compatibility enumeration otherwise. The fallback retains its process and recency status
-  heuristic and companion filtering. The viewer discovers loopback servers on ports `4097` and
-  `4098`; only spawn may start one, from the user home directory, and it never stops or restarts
-  one. Exact viewer marked sessions receive live status, pending input, rename, archive, stop,
-  and delete through that server. Managed attach is refused because it would expose credentials.
-  Other server enumerated rows use compatibility idle status
-  unless hydration fails for their shared active managed directory, when every row there is unknown.
-  External sessions attach locally.
 
 ## States
 
@@ -57,9 +51,12 @@ Every session resolves to one of six states, each with its own glyph in the list
 - `✗` error — exited with an error.
 - `?` unknown — the backend cannot say; never shown as a false idle.
 
-Each row is prefixed by its backend's mark in the backend's color — by default the textual
-tag `[cc]` Claude (terracotta), `[cx]` Codex (teal), `[oc]` opencode (green) — followed by
-the title. Titles share a visible column sized to the widest title, capped at 40 terminal
+Each row is prefixed by its backend's mark, followed by
+the title. On a terminal that answers the graphics probe the mark is the backend's own inline
+brand logo; the viewer always attempts this at startup, so it is what you get on kitty, iTerm2,
+Sixel, and half-block terminals alike. When the probe fails (a terminal with no graphics
+support, or no tty at all) the mark falls back to the textual tag in the backend's color,
+`[cc]` Claude (terracotta) and `[cx]` Codex (teal). Titles share a visible column sized to the widest title, capped at 40 terminal
 columns. The state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`,
 `Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
 summary and any pull request badge. Elapsed time alone sits flush right. Sessions with
@@ -77,9 +74,13 @@ from its own recursive subagent subtree, so a parent remains visibly active whil
 work. A child row shows only its own subtree.
 
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
-`✳` Claude, `◆` Codex, `■` opencode (only if your terminal font renders them).
+`✳` Claude, `◆` Codex (only if your terminal font renders them). This applies to the fallback
+only; when the logo probe succeeds the inline images win over both text modes.
 
-The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by creation time. After sanitization, the exact whole title `hold` is matched without regard to ASCII letter case as a TUI presentation convention. Thus `hold`, `Hold`, and `HOLD` session rows are omitted in either grouping, while whitespace and substring variants remain visible. Project headers count rendered non hold sessions, so a project with only matching sessions remains with count zero. State section counts include only rendered rows. `Ctrl+K` quickswitcher session entries use the same visible row model, so matching sessions are omitted while ordinary sessions and independent quickswitcher actions remain. This does not change backend data or mutation behavior.
+The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by creation time. A session whose whole title is
+exactly `hold` (in any letter case) is not drawn as a row, is not counted in its group's
+header, and does not appear in the `Ctrl+K` palette; it is a presentation filter only, and
+touches no backend data. `SPEC.md` carries the exact rule.
 The list is uncapped and scrolls with the selection to fill the terminal height. A blank line
 separates each group/section, and rows sit flush-left under their group header.
 
@@ -92,8 +93,8 @@ A single session can surface from more than one source (e.g. a registry row and 
 rollout file). The secondary copies are marked **companions** and hidden by default so
 the list shows one row per session. One-shot runs started by a script rather than by you
 are companions too, because they are steps inside somebody else's job and not fleet members
-you would ever attach to: Codex `exec` and subagent threads, and `opencode run` sessions
-(the review passes an `/implement` run fires off, for example). Archived sessions are hidden
+you would ever attach to: Codex `exec` and subagent threads (the review passes an
+`/implement` run fires off, for example). Archived sessions are hidden
 too, and so are sessions whose working directory no longer exists on disk (e.g. deleted
 `/tmp` scratch dirs). Press `Ctrl+A` to reveal all of them; the footer shows how many rows are
 currently hidden, and `Ctrl+F` searches the hidden rows too. Sessions you spawn from the
@@ -113,12 +114,11 @@ starting selection;
 detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
 daemon if none is running and never stops one. The models are discovered from each agent's
-CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
-opencode: `opencode models`), default first. Discovery runs in the background and is cached
+CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`),
+default first. Discovery runs in the background and is cached
 for a day, so the picker is populated from the first keystroke rather than waiting on a probe
 that takes seconds; a catalog that has never been discovered shows just the agent's default
-until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists;
-opencode has too many models to cycle, so it stays on its default there (use `/model`). The
+until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists. The
 target directory is the selected row's project root (by-project view) or its exact cwd
 (by-state view). Bare letters, numbers, and slash always type into the composer, including when
 it is empty; once you have typed anything, every printable key (and space) is task text, and
@@ -130,8 +130,8 @@ rows that existed before submission.
 ### Auto (agent-router)
 
 Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
-project when its CLI is on your `PATH`: the composer then STARTS on a fourth `auto` entry
-(one `Tab` reaches the concrete agents, and the entry sits after opencode in the cycle). It
+project when its CLI is on your `PATH`: the composer then STARTS on a third `auto` entry
+(one `Tab` reaches the concrete agents, and the entry sits last in the cycle). It
 has a single `auto` model, because the router chooses the provider, model, and reasoning
 effort itself, scaled to the task's classified complexity: on `Enter` the viewer runs
 `agent-router run --json --dir <target> --provider auto -- "<task>"`, and the router classifies the task, weighs
@@ -141,15 +141,6 @@ and the new session appears and is selected through the winning agent's normal l
 the binary installed the entry never appears at all and the composer starts on Claude, and a
 router that fails (missing, non-zero exit, timeout, unreadable output) is a footer error with
 nothing spawned, never a fallback to a guessed provider.
-
-An opencode spawn may start a secured loopback server when neither verified candidate is usable.
-It starts from the user home directory and the viewer never stops or restarts it. The viewer uses
-an environment password override when present, otherwise a stable generated secret in owner only
-credential files. SQLite stores only viewer presentation state. Task shells receive neither
-`OPENCODE_SERVER_USERNAME` nor `OPENCODE_SERVER_PASSWORD`. An existing listener that allows
-unauthenticated health requests is rejected; it is left untouched and the viewer may use port
-`4098` instead. Process shared ownership uses only `flock`; each viewer process serializes its
-own work locally.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
@@ -167,7 +158,7 @@ shell privileges, because that is what it is.
 
 Typing any other slash command shows a completion popup above the box: the available commands
 for the selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
-opencode commands under `~/.config/opencode/command`; codex prompts under `~/.codex/prompts`),
+codex prompts under `~/.codex/prompts`),
 prefix-filtered live. While it is open, `↑`/`↓` move the highlight, `Tab` inserts the
 highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-is (so
 `/implement RS-123` runs that slash command as the task prompt).
@@ -185,12 +176,23 @@ its SQLite title still shows the prompt.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
 - `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's discovered models
-  (Claude and Codex; opencode has too many, so use `/model` there).
+  (Claude and Codex).
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
-- `Space` — collapse or expand a group when a group header is selected; does nothing on a session row.
-- `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below);
-  pressing it always reports a footer notice that reply is not supported.
+- `Space` / `Enter` — collapse or expand a group when a group header is selected (the collapse
+  is persisted); on a session row `Space` does nothing and `Enter` attaches.
+- `/theme` — open the theme picker: `↑`/`↓` preview a theme against the whole screen, `Enter`
+  commits and persists it, `Esc` reverts to the one you started on.
+- `Ctrl+K` — command palette. It carries every action in this list (each with its chord, and
+  unavailable ones shown as such), plus the header sprites, every visible session to jump to,
+  every discovered model for each backend, and the slash commands for the composer's backend.
+- `Ctrl+B` — toggle the tail pane, the last 12 turns of the selected session beside the list.
+  It needs at least 100 columns; below that opening it is a footer notice naming the width.
+- `Ctrl+W` — video wall (see below). `Ctrl+O` zooms the focused tile to the full attach view.
+- `Ctrl+G` — cycle the header sprite; the choice is announced and persisted.
+- `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below); on a
+  selected session it reports a footer notice that reply is not supported, and with nothing
+  selected it does nothing at all.
 - `Ctrl+N` — open the triage inbox on every session waiting for input, longest wait first
   (see below). Nothing waiting is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
@@ -202,7 +204,9 @@ its SQLite title still shows the prompt.
   retaining it for later attach.
   A Codex session hosted by the app-server daemon is stopped by interrupting its current turn,
   never by signalling a process: the daemon runs every session it hosts, so a signal would take
-  all of them down with it.
+  all of them down with it. A Codex subagent row advertises no stop at all and reports
+  `codex does not support stop`, because the only pid on that row is its parent's and
+  signalling it would take the parent and every sibling down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
@@ -217,37 +221,38 @@ its SQLite title still shows the prompt.
   hover row selection, and wheel scrolling. Every successful Codex or Claude attach or reattach
   starts with capture on, so scrolling works immediately. While attached, press `Ctrl+T` to
   switch capture off for host terminal text selection, then press it again to restore scrolling.
-  External opencode attaches with capture off for selection; press `Ctrl+T` to opt into its native
-  wheel forwarding. Detaching restores list mouse controls. A footer notice names the mode and
+  Detaching restores list mouse controls. A footer notice names the mode and
   the way back.
 - `?` — key help.
 - `Ctrl+C` — quit.
 
 Renames, stops, removes, and archives run on a background worker so a slow backend call
-never freezes the list; a `…` notice shows while the action is in flight.
+never freezes the list; a `…` notice shows while the action is in flight, and pressing the
+same action again on the same row while it is still running reports `still <verb>` rather
+than queueing a second call.
 
 ## Embedded attach
 
 `→` (or `Enter` with an empty composer) opens the selected session inside the viewer as a
 full-screen embedded terminal. Codex joins the `codex app-server` daemon that hosts the session
 (`codex resume --remote unix://<socket>`) when it hosts one, and otherwise runs a plain
-`codex resume`; an exact viewer marked opencode session is refused because attach would expose
-credentials, while an external opencode session runs `opencode -s`;
-Claude runs `claude attach`, which resumes the same thread for both a running background
+`codex resume`; Claude runs `claude attach`, which resumes the same thread for both a running background
 job and a finished one (waking it in place); a row with no background-job id falls back to
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always returns.
 A session is connected exactly while it is on screen: leaving it closes that connection, so
 there is never a session still connected in the background. Opening it again reconnects, which
 takes a second or two. Conversation state lives in each backend's own store, so nothing is lost
-by closing.
+by closing. Resolving an attach can take those seconds, so if you have moved on by the time it
+lands the viewer drops it rather than yanking you into a session you left: the footer reads
+`attach cancelled: <title> is no longer in focus` and nothing was spawned.
 New attached PTYs use the active viewer theme's text and background as their terminal defaults;
 explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
 uses the captured host foreground and background. Because a session reconnects when you open it,
 a theme change applies to the next session you open.
 Codex and Claude attached transcripts scroll immediately: Codex scrolls the viewer's retained
-transcript, while Claude receives the wheel in its attached terminal. Their capture behavior and
-external opencode selection behavior follow the `Ctrl+T` controls above.
+transcript, while Claude receives the wheel in its attached terminal. Their capture behavior
+follows the `Ctrl+T` controls above.
 
 ### Video wall
 
@@ -310,15 +315,6 @@ attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the lis
 is not drawn while the wall is up, since the tiles have the keyboard, except while it is holding
 that keyboard itself as the overlay above.
 
-When a Linux viewer is displayed remotely through Windows Terminal or another terminal with
-OSC 52 support, `Ctrl+Y` sends the exact visible PTY viewport to that client terminal. The
-request includes only `screen.contents()`, so scrolling first sends the visible historical
-viewport rather than text outside it. The chord leaves mouse capture unchanged and is not
-forwarded to the child. A complete output write means only `copy request sent to terminal`,
-because OSC 52 has no acknowledgement; an output failure means the terminal clipboard state is
-unknown. Terminal policy may still reject the request. Use `Ctrl+T` to disable capture and select
-text in the host terminal when OSC 52 is unavailable.
-
 **A Codex session that cannot be joined is refused instead of forked.**
 Attaching to a mid-turn session the daemon does not host would not join it: the new
 `codex resume` process replays the transcript, finds it ends mid-turn, and writes a synthesized
@@ -349,16 +345,20 @@ resumes the same thread; Codex goes through the app-server daemon) and invents n
 to reach a session. Sessions are attached one at a time as you reach them, never prefetched
 for the whole queue, and leaving the modal detaches without stopping anything. The queue is
 snapshotted when the modal opens, so a background refresh cannot reorder it mid-answer, and
-nothing in the modal touches the composer or the list selection.
+nothing in the modal touches the composer or the list selection. A visit lasts exactly as long
+as the item is on screen: moving to the next or previous item closes the one you left, and so
+does closing the queue, so a walk through seven sessions never leaves seven children running
+behind it.
 
 Reply is deliberately out of scope for this rebuild. `Ctrl+E` is reserved in the key list but
-always reports a footer notice that reply is not supported. Revisiting it is a future,
+only reports a footer notice that reply is not supported. Revisiting it is a future,
 separately specified decision. The triage inbox does not depend on it: it delivers an answer
 by typing into the attached session, which is the agent's own input path, not a reply API.
 
 This viewer binds `Space` to group collapse and expand, not to reply, which is a deliberate
-divergence from Fleet View, which binds `space` to reply — noted here so it is not mistaken
-for an oversight; see the constitution's Additional Constraints.
+divergence from Fleet View, which binds `space` to reply. Peek and reply were removed from this
+rebuild because they confused the interaction model, so the rebinding is a considered choice and
+not an oversight; revisiting either is a future, separately specified decision.
 
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
@@ -366,10 +366,68 @@ If a child exits while you are attached, its final screen stays visible. `Ctrl+Y
 available to send that retained visible screen, and `Ctrl+T` remains available for host
 selection. Any other key returns you to the list.
 
-Viewer-local presentation state is kept in a SQLite database at
-`~/.local/state/agent-viewer/viewer.db`, separate from every backend's own store. OpenCode's own
-SQLite database is read only compatibility enumeration, not job authority. OpenCode credentials
-are stored only in owner only credential files.
+## Themes
+
+Eleven themes ship: `analog amber` (the default), `terminal match`, `paper light`, `mono 16`,
+`aubergine`, `hoth`, `catppuccin mocha`, `tokyo night`, `gruvbox dark`, `rose pine`, and `nord`.
+Type `/theme` in the composer to open the picker; `↑`/`↓` preview each one against the whole
+screen, `Enter` commits, `Esc` reverts. The choice is persisted, so the next launch opens on it.
+Marks and motion travel with the theme: `terminal match` builds itself from your terminal's own
+palette, and a theme with animation off holds colors solid instead of blinking or shimmering.
+
+Your own themes go in `~/.config/agent-viewer/themes` as `*.theme` files, one `key=#rrggbb` per
+line, `#` comments allowed. They join the picker alongside the built-ins. The active user theme
+is reloaded whenever its file's timestamp changes, so you can edit one with the viewer running
+and watch each save land. A malformed line is skipped with a footer notice rather than failing
+the file.
+
+## Sprites
+
+The header carries one of six animated sprites: `lighthouse` (the default), `constellation`,
+`turbine`, `sailboat`, `airplane`, and `hot air balloon`. `Ctrl+G` cycles to the next one and
+persists it, and the `Ctrl+K` palette picks one directly. `AV_SPRITE=<name>` opens on that
+sprite for one run without overwriting the saved choice; an unknown name falls back rather than
+erroring.
+
+## Configuration
+
+There is no config file. The viewer reads:
+
+- `AGENT_VIEWER_GLYPH_MARKS=1` uses the brand glyphs `✳`/`◆` instead of the `[cc]`/`[cx]` text
+  tags when the inline logo marks are unavailable.
+- `AV_SPRITE=<name>` opens on that header sprite for one run.
+- `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` spawns Codex sessions with `codex exec` instead of the
+  app-server daemon. Those sessions can never be attached to, which is why it is opt-in.
+- `CODEX_HOME` is where the Codex registry and rollouts live. Defaults to `~/.codex`.
+- `CLAUDE_CONFIG_DIR` is where Claude's `jobs/` and `sessions/` live. Defaults to `~/.claude`.
+- `~/.config/agent-viewer/themes/*.theme` holds your own themes, as described above.
+- `~/.local/state/agent-viewer/viewer.db` is the only database the viewer writes, holding
+  presentation state only: the theme, the sprite, the age ramp, which groups are collapsed, the
+  cached model catalogs, the shared listing cache, and the record of sessions this viewer
+  spawned (which is what keeps your own spawns from being filtered away as companions). Deleting
+  it resets all of that to defaults and costs nothing else: no conversation, session, or backend
+  state lives here.
+
+## Troubleshooting
+
+- **The list is empty.** Each backend fails quietly and independently. A missing
+  `~/.codex/state_*.sqlite` shows `codex: no state_*.sqlite found under <path>` in the footer
+  with an empty Codex list; if no backend can be listed at all, the viewer exits with
+  `agent-viewer: no backend could be listed` rather than showing a blank screen. A CLI that is
+  not on `PATH` simply drops out of the composer's `Tab` cycle.
+- **A Codex session refuses to attach.** `codex exec` sessions (background jobs and plugin
+  dispatches) host their app server inside their own process, so nothing can join them. Joining
+  one mid-turn would write a fake interruption into its transcript, so the viewer refuses and
+  says so in the footer. Sessions started in a terminal, and sessions this viewer spawns, are
+  hosted by the shared daemon and attach normally.
+- **Rows show `[cc]`/`[cx]` instead of logos.** The startup graphics probe needs a real terminal
+  that answers it. On one that does not, the text tags are the fallback; set
+  `AGENT_VIEWER_GLYPH_MARKS=1` for the glyphs instead.
+- **`Ctrl+]` seems to do nothing.** Terminals send it as the raw byte `0x1D`, which some parsers
+  report as `Ctrl+5`. Both encodings are accepted everywhere `Ctrl+]` is documented, so if it
+  still does not detach, the chord is being swallowed before the viewer sees it.
+- **`Ctrl+B` will not open.** The tail pane needs 100 columns; below that it reports the width
+  it has instead of opening.
 
 Built in Rust. See `SPEC.md` for the full architecture and the evidence behind it.
 
@@ -423,12 +481,12 @@ cargo run -p agent-viewer-tui
 ```
 
 The binary is named `agent-viewer`. It expects a `~/.codex/state_*.sqlite` on the box
-(the Codex backend's source of truth); the Claude and opencode backends appear
-automatically when their CLIs and data exist and silently list empty otherwise.
+(the Codex backend's source of truth); the Claude backend appears
+automatically when its CLI and data exist and silently lists empty otherwise.
 
 Linux retains the full measured runtime behavior. macOS and Windows can enumerate and render
-sessions, but do not claim Linux process status, Codex daemon controls, or secure managed
-opencode behavior. On those platforms, a rollout is `Done` only when its transcript proves
+sessions, but do not claim Linux process status or Codex daemon controls. On those
+platforms, a rollout is `Done` only when its transcript proves
 completion; every other process dependent state is `Unknown`. Unsupported actions remain
 no ops with the existing footer notice. `agent-viewer --version` and `agent-viewer -V` print
 the version before terminal, filesystem, or backend startup, making them safe release smoke

@@ -183,28 +183,31 @@ fn parse_pr_json(stdout: &str) -> Option<PrStatusFacts> {
     })
 }
 
+/// How long one `gh pr view` may take. Generous, because it is a real network round trip on a
+/// worker thread and a slow answer is still the right answer - but bounded, because `gh` talks
+/// to GitHub over a socket that can stall indefinitely, and an unbounded wait wedges this
+/// badge's in flight slot upstream for the rest of the session.
+const PR_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shell `gh pr view <url> --json ...` for owner/repo/number, parse, and map to a color.
-/// Returns `PrBadgeColor::Default` on ANY failure. Never errors.
+/// Returns `PrBadgeColor::Default` on ANY failure, a hung `gh` included. Never errors.
 pub fn fetch_pr_status(owner: &str, repo: &str, number: u64) -> PrBadgeColor {
     // Pass the full URL so gh resolves the repo independent of cwd (this repo has no remote).
     let url = format!("https://github.com/{owner}/{repo}/pull/{number}");
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &url,
-            "--json",
-            "state,mergedAt,isDraft,reviewDecision,reviewRequests,statusCheckRollup",
-        ])
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return PrBadgeColor::Default,
+    let mut command = std::process::Command::new("gh");
+    command.args([
+        "pr",
+        "view",
+        &url,
+        "--json",
+        "state,mergedAt,isDraft,reviewDecision,reviewRequests,statusCheckRollup",
+    ]);
+    let Some(stdout) = crate::spawn::run_with_timeout(command, PR_STATUS_TIMEOUT) else {
+        return PrBadgeColor::Default;
     };
-    if output.stdout.is_empty() {
+    if stdout.is_empty() {
         return PrBadgeColor::Default;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     match parse_pr_json(&stdout) {
         Some(facts) => pr_color(&facts),
         None => PrBadgeColor::Default,

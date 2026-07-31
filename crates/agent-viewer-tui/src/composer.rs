@@ -52,7 +52,7 @@ pub fn subdir_names(dir: &Path) -> Vec<String> {
 }
 
 /// File stems (name without the final extension) of the files directly under `dir`
-/// (opencode/codex commands). A missing/unreadable dir yields an empty list.
+/// (codex commands). A missing/unreadable dir yields an empty list.
 pub fn file_stems(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -82,11 +82,7 @@ impl Composer {
         Composer {
             text: String::new(),
             backend: BackendKind::Claude,
-            available_backends: vec![
-                BackendKind::Claude,
-                BackendKind::Codex,
-                BackendKind::Opencode,
-            ],
+            available_backends: vec![BackendKind::Claude, BackendKind::Codex],
             auto: false,
             auto_available: false,
             model: BackendKind::Claude.default_model().to_string(),
@@ -263,9 +259,9 @@ impl Composer {
     }
 
     /// Shift+Tab: advance to the next discovered model after the current one, wrapping. A
-    /// no-op for opencode (its list is huge — use the `/model` picker) or a <2-entry list.
+    /// no-op for a <2-entry list.
     pub fn cycle_model(&mut self) {
-        if self.backend == BackendKind::Opencode || self.models.len() < 2 {
+        if self.models.len() < 2 {
             return;
         }
         let cur = self
@@ -321,7 +317,7 @@ impl Composer {
         }
         // Under Auto the provider is not known until the router answers, so the backend's own
         // commands must not be offered: the task may well land on a different provider, where an
-        // opencode-only command means nothing. The viewer's own `/theme` is provider-independent.
+        // backend-only command means nothing. The viewer's own `/theme` is provider-independent.
         if self.auto {
             return suggestions;
         }
@@ -481,11 +477,7 @@ mod tests {
 
     #[test]
     fn theme_is_suggested_for_matching_prefix_on_every_backend() {
-        for backend in [
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Opencode,
-        ] {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
             let mut composer = Composer::new();
             while composer.backend() != backend {
                 composer.cycle_backend();
@@ -501,7 +493,7 @@ mod tests {
     }
 
     /// The Auto entry is gated: without a discoverable router the Tab cycle is exactly the
-    /// three backends it always was, and no spawn can be aimed at a missing binary.
+    /// backends it always was, and no spawn can be aimed at a missing binary.
     #[test]
     fn auto_is_absent_from_the_cycle_until_the_router_is_available() {
         let mut composer = Composer::new();
@@ -512,11 +504,11 @@ mod tests {
 
         composer.set_auto_available(true);
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             seen.push(composer.provider_name());
             composer.cycle_backend();
         }
-        assert_eq!(seen, vec!["claude", "codex", "opencode", "auto"]);
+        assert_eq!(seen, vec!["claude", "codex", "auto"]);
         assert_eq!(composer.provider_name(), "claude", "the cycle must wrap");
     }
 
@@ -551,19 +543,21 @@ mod tests {
     #[test]
     fn provider_cycle_only_includes_backends_available_on_the_host() {
         let mut composer = Composer::new();
-        composer.set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+        composer.set_available_backends(vec![BackendKind::Codex]);
 
         assert_eq!(composer.provider_name(), "codex");
         composer.cycle_backend();
-        assert_eq!(composer.provider_name(), "opencode");
-        composer.cycle_backend();
-        assert_eq!(composer.provider_name(), "codex");
+        assert_eq!(
+            composer.provider_name(),
+            "codex",
+            "a backend the host cannot spawn must never enter the cycle"
+        );
     }
 
     #[test]
     fn auto_returns_to_the_first_available_backend() {
         let mut composer = Composer::new();
-        composer.set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+        composer.set_available_backends(vec![BackendKind::Codex, BackendKind::Claude]);
         composer.set_auto_available(true);
         composer.default_to_auto();
 
@@ -585,7 +579,7 @@ mod tests {
         composer.set_auto_available(false);
 
         assert!(!composer.is_auto());
-        assert_eq!(composer.provider_name(), "opencode");
+        assert_eq!(composer.provider_name(), "codex");
     }
 
     /// Auto offers one model entry and no picker: the router chooses model and effort, so the
@@ -607,7 +601,7 @@ mod tests {
     }
 
     /// Auto has no provider until the router answers, so the backend's own slash commands must
-    /// not be offered: a task routed to codex has no business carrying an opencode-only command.
+    /// not be offered: a task routed to codex has no business carrying a claude-only command.
     /// The viewer's own commands are provider-independent and stay.
     #[test]
     fn auto_offers_no_backend_slash_commands() {
@@ -616,12 +610,9 @@ mod tests {
         while !composer.is_auto() {
             composer.cycle_backend();
         }
-        composer.set_commands(
-            vec!["opencode-only".to_string()],
-            (BackendKind::Opencode, None),
-        );
+        composer.set_commands(vec!["claude-only".to_string()], (BackendKind::Claude, None));
 
-        composer.push_str("/open");
+        composer.push_str("/clau");
         assert!(
             composer.suggestions().is_empty(),
             "Auto must offer no backend commands, got {:?}",

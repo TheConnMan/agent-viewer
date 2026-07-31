@@ -1,5 +1,7 @@
 mod common;
 
+use agent_viewer_core::Backend;
+use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::registry::{Registry, find_state_db};
 use agent_viewer_core::codex::source::Source;
 use agent_viewer_core::error::Error;
@@ -274,6 +276,42 @@ fn threads_without_a_session_index_keep_the_sqlite_title() {
     assert_eq!(threads[0].title, "SQLite Fallback Name");
 }
 
+/// The overlay is parsed once and held under the index file's (mtime, len), so the whole file
+/// is not re-read on every listing tick. A rename must still land on the very next listing.
+/// Every step here changes the file's LENGTH as well as its mtime, so the test cannot pass by
+/// accident on filesystem timestamp granularity.
+#[test]
+fn threads_overlay_follows_a_rewritten_session_index() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_duplicate", "SQLite Fallback Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+    let reg = Registry::open(&path).expect("open read only");
+    let title = |threads: Vec<agent_viewer_core::codex::registry::Thread>| threads[0].title.clone();
+
+    assert_eq!(
+        title(reg.threads().expect("query without an index")),
+        "SQLite Fallback Name"
+    );
+
+    copy_session_index(&dir);
+    assert_eq!(
+        title(reg.threads().expect("query after the index appeared")),
+        "Latest Index Name",
+        "an index file that appears after the first listing must still be read"
+    );
+
+    std::fs::write(
+        dir.path().join("session_index.jsonl"),
+        b"{\"id\":\"fixture_thread_duplicate\",\"thread_name\":\"Renamed\"}\n",
+    )
+    .expect("rewrite session index");
+    assert_eq!(
+        title(reg.threads().expect("query after the rename")),
+        "Renamed",
+        "a rename rewrites session_index.jsonl, and the cached overlay must not survive it"
+    );
+}
+
 #[test]
 fn distinct_models_orders_by_frequency_and_drops_empty_null() {
     let schema = common::read_fixture("threads_schema.sql");
@@ -319,4 +357,56 @@ fn open_missing_db_errors_and_creates_nothing() {
     assert!(Registry::open(&path).is_err());
     // Read-only open must NOT create the file.
     assert!(!path.exists());
+}
+
+/// Build one `state_N.sqlite` at an exact path (the shared helper picks its own filename, and
+/// the rollover test below needs both versions side by side in one codex home).
+fn write_state_db(path: &std::path::Path, schema: &str, inserts: &[String]) {
+    let conn = rusqlite::Connection::open(path).expect("open state db");
+    conn.execute_batch(schema).expect("run schema DDL");
+    for stmt in inserts {
+        conn.execute(stmt, []).expect("run insert");
+    }
+    conn.close().expect("close writer connection");
+}
+
+/// A Codex upgrade lays down a NEW `state_N+1.sqlite` and leaves the old one in place, readable
+/// and frozen. The listing has to follow the rollover while running: the registry used to be
+/// re-resolved only when a read ERRORED, and the stale file never errors, so every session
+/// created after the upgrade stayed invisible until the viewer was restarted.
+#[test]
+fn list_follows_a_state_db_rollover_without_a_restart() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let dir = tempfile::TempDir::new().unwrap();
+    write_state_db(
+        &dir.path().join("state_1.sqlite"),
+        &schema,
+        &[thread_insert("t_before", "Before", 1000)],
+    );
+
+    let mut backend = CodexBackend::new(dir.path().to_path_buf());
+    let ids = |sessions: Vec<agent_viewer_core::Session>| {
+        sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(backend.list().expect("first listing")),
+        vec!["t_before"]
+    );
+
+    write_state_db(
+        &dir.path().join("state_2.sqlite"),
+        &schema,
+        &[
+            thread_insert("t_before", "Before", 1000),
+            thread_insert("t_after", "After", 2000),
+        ],
+    );
+    let after = ids(backend.list().expect("listing after the rollover"));
+    assert!(
+        after.contains(&"t_after".to_string()),
+        "a session created in state_2 must appear without a restart, got {after:?}"
+    );
 }

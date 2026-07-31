@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS backend_listing_cache (\
   lease_owner TEXT,\
   lease_until_ms INTEGER NOT NULL DEFAULT 0,\
   PRIMARY KEY (backend, scope)\
+);\
+CREATE TABLE IF NOT EXISTS backend_listing_snapshot (\
+  backend TEXT NOT NULL,\
+  scope TEXT NOT NULL,\
+  snapshot_json TEXT NOT NULL,\
+  PRIMARY KEY (backend, scope)\
 );";
 
 /// Legacy shadow-state tables the viewer no longer owns. Dropped once after a successful
@@ -50,6 +56,18 @@ CREATE TABLE IF NOT EXISTS backend_listing_cache (\
 const DROP_LEGACY_TABLES: &str = "\
 DROP TABLE IF EXISTS renames;\
 DROP TABLE IF EXISTS stopped;";
+
+/// The listing payload used to live in `backend_listing_cache` beside the lease columns, and
+/// leaving it there is not free: sqlite rewrites a row's ENTIRE record - overflow pages
+/// included - whenever the record's size changes, so every lease take, renewal, release, and
+/// invalidation dragged the whole snapshot back through the write ahead log. Measured on this
+/// box with a 24 MB snapshot: one metadata-only UPDATE cost 48 MB of WAL, against 4 KB once the
+/// payload sits in its own row. Clearing the legacy column (rather than dropping it) keeps an
+/// older viewer binary running against the same file readable - it sees a cache miss and
+/// refreshes, instead of erroring on a column that vanished. Best effort like the drops above:
+/// a lock loss just leaves it for the next open.
+const RELEASE_LEGACY_LISTING_PAYLOAD: &str =
+    "UPDATE backend_listing_cache SET snapshot_json = NULL WHERE snapshot_json IS NOT NULL;";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GroupingMode {
@@ -223,8 +241,8 @@ fn listing_snapshot(
     scope: &ListingCacheScope,
     row: &ListingCacheRow,
 ) -> rusqlite::Result<Option<ListingCacheSnapshot>> {
-    connection.query_row(
-        "SELECT snapshot_json FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+    let snapshot = connection.query_row(
+        "SELECT snapshot_json FROM backend_listing_snapshot WHERE backend = ?1 AND scope = ?2",
         rusqlite::params![scope.backend().name(), scope.as_str()],
         |sqlite_row| {
             let rusqlite::types::ValueRef::Text(snapshot_json) = sqlite_row.get_ref(0)? else {
@@ -241,11 +259,35 @@ fn listing_snapshot(
                     )
                 }))
         },
-    )
+    );
+    match snapshot {
+        // A metadata row with no payload yet (a cold lease, or a scope whose payload predates
+        // the split) is a miss, not an error.
+        Ok(snapshot) => Ok(snapshot),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn listing_snapshot_is_fresh(refreshed_at_ms: i64, now_ms: i64, freshness_ms: i64) -> bool {
-    refreshed_at_ms > 0 && freshness_ms > 0 && now_ms.saturating_sub(refreshed_at_ms) < freshness_ms
+    if refreshed_at_ms <= 0 || freshness_ms <= 0 {
+        return false;
+    }
+    // Freshness is a wall clock difference, so a backward clock step leaves the stored stamp in
+    // the FUTURE. Checking only the upper bound would then read as fresh until the clock caught
+    // up - hours, potentially - with nobody refreshing and every viewer serving the same stale
+    // rows. A negative age counts as stale, which costs one honest refresh and no more.
+    (0..freshness_ms).contains(&now_ms.saturating_sub(refreshed_at_ms))
+}
+
+/// The furthest out a live viewer's lease deadline can plausibly sit. Every caller leases for
+/// at most a minute, so anything beyond this came from a clock that has since rolled back (or
+/// from a bogus write), and treating it as held would lock the scope for the whole difference.
+const LISTING_LEASE_HORIZON_MS: i64 = 60_000;
+
+fn listing_lease_is_held(row: &ListingCacheRow, now_ms: i64, lease_ms: i64) -> bool {
+    let horizon_ms = now_ms.saturating_add(lease_ms.max(0).max(LISTING_LEASE_HORIZON_MS));
+    row.lease_owner.is_some() && row.lease_until_ms > now_ms && row.lease_until_ms <= horizon_ms
 }
 
 fn listing_lease_owner(now_ms: i64) -> String {
@@ -254,12 +296,11 @@ fn listing_lease_owner(now_ms: i64) -> String {
     format!("{}:{now_ms}:{sequence}", std::process::id())
 }
 
-/// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
+/// "codex" | "claude" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
     match s {
         "codex" => Some(BackendKind::Codex),
         "claude" => Some(BackendKind::Claude),
-        "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
 }
@@ -291,7 +332,27 @@ fn create_state_parent(path: &Path) -> Result<()> {
     let mut current = path;
     while !current.exists() {
         missing.push(current);
-        current = current.parent().unwrap_or(current);
+        // `unwrap_or(current)` here was a fixpoint. An absolute path always terminates on `/`,
+        // but a RELATIVE one walks down to `""`, whose `parent()` is None - so the loop spun
+        // forever while `missing` grew without bound. That is not a hypothetical shape: with
+        // HOME unset or empty `home_dir()` returns an empty path and `open_default` joins onto
+        // it, producing exactly this relative path. Running off the top means there is no
+        // directory to create, so the state path is unusable and the caller (whose call site is
+        // `open_default().ok()`) degrades to running without viewer state.
+        let Some(parent) = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no usable parent directory for state path {}",
+                    path.display()
+                ),
+            )
+            .into());
+        };
+        current = parent;
     }
 
     for directory in missing.into_iter().rev() {
@@ -394,6 +455,7 @@ impl ViewerDb {
         // Best effort: a lock contention failure here leaves the legacy tables in place for
         // the next open rather than discarding a usable DB.
         let _ = db.conn.execute_batch(DROP_LEGACY_TABLES);
+        let _ = db.conn.execute_batch(RELEASE_LEGACY_LISTING_PAYLOAD);
         restrict_database_files(path)?;
         Ok(db)
     }
@@ -457,7 +519,7 @@ impl ViewerDb {
                     return Ok(ListingCacheClaim::Fresh(snapshot));
                 }
             }
-            if row.lease_owner.is_some() && row.lease_until_ms > now_ms {
+            if listing_lease_is_held(row, now_ms, lease_ms) {
                 if known_generation == Some(row.generation) {
                     transaction.commit()?;
                     return Ok(ListingCacheClaim::Unchanged);
@@ -485,8 +547,8 @@ impl ViewerDb {
         } else {
             transaction.execute(
                 "INSERT INTO backend_listing_cache \
-                 (backend, scope, snapshot_json, refreshed_at_ms, generation, lease_owner, lease_until_ms) \
-                 VALUES (?1, ?2, NULL, 0, ?3, ?4, ?5)",
+                 (backend, scope, refreshed_at_ms, generation, lease_owner, lease_until_ms) \
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5)",
                 rusqlite::params![
                     scope.backend().name(),
                     scope.as_str(),
@@ -563,13 +625,15 @@ impl ViewerDb {
                 "decoded listing snapshot cannot be published".to_string(),
             ));
         };
-        let changed = self.conn.execute(
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let published = transaction.execute(
             "UPDATE backend_listing_cache \
-             SET snapshot_json = ?1, refreshed_at_ms = ?2, generation = ?3, \
-                 lease_owner = NULL, lease_until_ms = 0 \
-             WHERE backend = ?4 AND scope = ?5 AND generation = ?6 AND lease_owner = ?7",
+             SET refreshed_at_ms = ?1, generation = ?2, lease_owner = NULL, lease_until_ms = 0 \
+             WHERE backend = ?3 AND scope = ?4 AND generation = ?5 AND lease_owner = ?6",
             rusqlite::params![
-                snapshot_json,
                 now_ms,
                 lease.next_published_generation(),
                 lease.scope.backend().name(),
@@ -578,11 +642,44 @@ impl ViewerDb {
                 lease.owner
             ],
         )?;
-        Ok(if changed == 1 {
-            ListingCacheWrite::Published
-        } else {
-            ListingCacheWrite::Fenced
-        })
+        if published != 1 {
+            transaction.commit()?;
+            return Ok(ListingCacheWrite::Fenced);
+        }
+        // Most refresh ticks find nothing changed, and the payload is tens of megabytes: writing
+        // it back unconditionally put the whole listing through the write ahead log every couple
+        // of seconds. Compare inside sqlite so the stored payload never crosses the FFI, and skip
+        // the write when the bytes match. The generation still advances either way, because the
+        // caller records `next_published_generation()` as its own cursor.
+        let unchanged = transaction
+            .query_row(
+                "SELECT snapshot_json = ?1 FROM backend_listing_snapshot \
+                 WHERE backend = ?2 AND scope = ?3",
+                rusqlite::params![
+                    snapshot_json,
+                    lease.scope.backend().name(),
+                    lease.scope.as_str()
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                error => Err(error),
+            })?;
+        if !unchanged {
+            transaction.execute(
+                "INSERT INTO backend_listing_snapshot (backend, scope, snapshot_json) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (backend, scope) DO UPDATE SET snapshot_json = excluded.snapshot_json",
+                rusqlite::params![
+                    lease.scope.backend().name(),
+                    lease.scope.as_str(),
+                    snapshot_json
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(ListingCacheWrite::Published)
     }
 
     /// Release a failed authoritative refresh without changing the last good snapshot.
@@ -870,60 +967,6 @@ impl ViewerDb {
                 fetched_at_ms,
             })),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub fn opencode_server_url(&self) -> Result<Option<String>> {
-        self.setting("opencode.server_url")
-    }
-
-    pub fn set_opencode_server_url(&self, url: Option<&str>) -> Result<()> {
-        if let Some(url) = url {
-            self.set_setting("opencode.server_url", url)
-        } else {
-            self.conn.execute(
-                "DELETE FROM settings WHERE key = ?1",
-                rusqlite::params!["opencode.server_url"],
-            )?;
-            Ok(())
-        }
-    }
-
-    pub fn opencode_server_secret(&self) -> Result<String> {
-        use base64::Engine;
-        use std::io::Read;
-
-        let transaction = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        let existing = transaction.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            rusqlite::params!["opencode.server_password"],
-            |row| row.get::<_, String>(0),
-        );
-        match existing {
-            Ok(secret) => {
-                transaction.commit()?;
-                Ok(secret)
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let mut random = [0u8; 32];
-                std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-                let candidate = base64::engine::general_purpose::STANDARD.encode(random);
-                transaction.execute(
-                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-                    rusqlite::params!["opencode.server_password", candidate],
-                )?;
-                let secret = transaction.query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    rusqlite::params!["opencode.server_password"],
-                    |row| row.get::<_, String>(0),
-                )?;
-                transaction.commit()?;
-                Ok(secret)
-            }
             Err(error) => Err(error.into()),
         }
     }

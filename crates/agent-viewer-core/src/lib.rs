@@ -3,16 +3,6 @@ pub mod claude;
 pub mod codex;
 pub mod error;
 pub mod group;
-#[cfg(target_os = "linux")]
-#[path = "opencode.rs"]
-mod opencode_impl;
-#[cfg(not(target_os = "linux"))]
-#[path = "opencode_portable.rs"]
-mod opencode_impl;
-pub mod opencode {
-    pub use crate::backend::opencode_capabilities_for_platform as capabilities_for_platform;
-    pub use crate::opencode_impl::*;
-}
 pub mod platform;
 pub mod pr_status;
 pub mod pty;
@@ -22,7 +12,7 @@ pub mod state;
 
 pub use backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session, SessionOrigin,
-    SpawnResult, Status, StatusEvent, StatusSink, Subscription, TailEvent,
+    SpawnResult, Status, TailEvent,
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use pr_status::PrBadgeColor;
@@ -49,7 +39,7 @@ pub fn mark_dead_dirs(sessions: &mut [Session]) {
     }
 }
 
-/// Open a SQLite DB read-only with a 500ms busy timeout (Codex and opencode write
+/// Open a SQLite DB read-only with a 500ms busy timeout (Codex writes
 /// concurrently). Read-only flags mean the file is never created if missing.
 pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
     let conn =
@@ -80,6 +70,30 @@ pub fn default_codex_home() -> std::path::PathBuf {
 /// value[key] as &str — the ubiquitous JSON string-field accessor.
 pub(crate) fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(|v| v.as_str())
+}
+
+/// Bytes a tail-pane read may touch at the end of a JSONL transcript.
+///
+/// Transcripts grow without bound while a session works (18.6 MB measured on this box), and the
+/// tail pane refreshes on every 2s tick, so reading whole files re-parsed megabytes per tick to
+/// display twelve events. This window is deliberately far wider than the 64 KiB the status tail
+/// classifies over: a single transcript line can be an `apply_patch` call carrying a whole diff,
+/// and a window that lands inside one such line would show an empty pane.
+pub(crate) const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Read at most the final `window` bytes of `path` as lossy UTF-8.
+///
+/// The leading line is usually a fragment; every caller feeds the result to `parse_json_line`,
+/// which drops it silently along with any other malformed line.
+pub(crate) fn read_tail_window(path: &std::path::Path, window: u64) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// One JSONL line -> Value: trim, then None for blank or malformed lines (all the

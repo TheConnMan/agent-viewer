@@ -1,6 +1,6 @@
 [package]
 name = "agent-viewer-tui"
-description = "Terminal viewer for coding-agent sessions across Codex, Claude Code, and opencode."
+description = "Terminal viewer for coding-agent sessions across Codex and Claude Code."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -27,11 +27,23 @@ ratatui = "0.30.2"
 # default-features off to drop the chafa (libchafa-dev) system-C dependency; we only need
 # the built-in kitty/iterm2/sixel/half-blocks protocols and the crossterm backend.
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
-resvg = "0.45"
+# default-features off drops resvg's text/font machinery (fontdb, rustybuzz, ttf-parser,
+# unicode-bidi/script/vo, and the system-font scan) plus raster-image decoding. Every SVG in
+# assets/logos is svg/g/path/title only, so none of it is reachable.
+resvg = { version = "0.45", default-features = false }
 termina = "0.3.3"
 tui-term = "0.3.4"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 
 [dev-dependencies]
+# default-features off drops criterion's plotters/rayon trees; `cargo_bench_support` is the
+# only feature `cargo bench` needs to drive these targets.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "row_rebuild"
+harness = false
