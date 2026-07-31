@@ -28,9 +28,9 @@
 //!
 //! `set_filter_one_char_5000` is the per-keystroke budget. It is not cheaper than a full
 //! refresh even though it looks like less work, because a non-empty filter lifts the
-//! hidden/companion exclusion (so the rebuild spans the FULL set, not the visible one) and
-//! because `passes_filter` lowercases the needle, the title, and the cwd once PER SESSION,
-//! allocating three Strings per row per keystroke.
+//! hidden/companion exclusion (so the rebuild spans the FULL set, not the visible one). The
+//! needle is lowercased once per rebuild; the per-session cost is lowercasing each row's
+//! title and cwd for the case-insensitive match.
 //!
 //! Deterministic (fixed LCG seed). Project dirs are created in a temp dir so `project_root`
 //! does real work without touching the user's home.
@@ -142,6 +142,7 @@ fn synthetic_sessions(dirs: &[PathBuf]) -> Vec<Session> {
             updated_at_ms: 1_783_500_000_000 + index as i64 * 997,
             hidden: index % 7 == 0,
             companion: index % 11 == 0,
+            subagent: false,
             summary: paragraph(&mut rng, 6, 40),
             pid: (index % 3 == 0).then_some(10_000 + index as u32),
             rollout_path: None,
