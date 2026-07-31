@@ -436,7 +436,7 @@ impl Backend for CodexBackend {
         else {
             return Ok(Vec::new());
         };
-        let mut events = rollout::read_transcript(path)?;
+        let mut events = rollout::read_transcript_tail(path)?;
         if events.len() > max_events {
             events = events.split_off(events.len() - max_events);
         }

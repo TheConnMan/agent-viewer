@@ -1,6 +1,6 @@
 use crate::backend::TailEvent;
 use crate::error::{Error, Result};
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::BufRead;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,13 +53,7 @@ pub enum TailState {
 /// Read at most the final 64 KiB of `path` as text (lossy UTF-8). Shared by
 /// `tail_state` and `pending_approval` so both classify over the identical window.
 pub(crate) fn tail_window(path: &std::path::Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let window: u64 = 64 * 1024;
-    file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    crate::read_tail_window(path, 64 * 1024)
 }
 
 /// Read at most the final 64 KiB and classify the last turn. Tracks the last line
@@ -249,22 +243,28 @@ pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval
 /// - and only the LEADING item counts. The measurement found the blob at the head of the
 ///   thread and nowhere else, so a later message carrying that tag is a human quoting it, and
 ///   showing a preamble is a far smaller failure than silently swallowing a real prompt.
+///
+/// "Leading" is the first item of the read WINDOW, which for a transcript longer than
+/// `TRANSCRIPT_TAIL_BYTES` is no longer the first item of the thread. That only matters for a
+/// mid-conversation message that both quotes the tag and happens to land at the window head.
 fn is_environment_preamble(text: &str, emitted_so_far: usize) -> bool {
     emitted_so_far == 0 && text.contains("<environment_context>")
 }
 
-/// Full lazy parse for the tail pane, in transcript order. Two kinds of response_item
-/// survive: a message (payload.role + payload.content[], concatenating content[].text where
-/// content[].type is "input_text" or "output_text") and a tool call (payload.type
-/// "function_call" or "custom_tool_call", whose `arguments` is a JSON *string*). Skip
-/// malformed lines silently.
-pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
+/// Parse the END of a rollout for the tail pane, in transcript order. Two kinds of
+/// response_item survive: a message (payload.role + payload.content[], concatenating
+/// content[].text where content[].type is "input_text" or "output_text") and a tool call
+/// (payload.type "function_call" or "custom_tool_call", whose `arguments` is a JSON *string*).
+/// Skip malformed lines silently.
+///
+/// Only the final `TRANSCRIPT_TAIL_BYTES` are read. This used to parse the whole file on every
+/// 2s tick to render twelve events, which on a live 18.6 MB rollout is the single most expensive
+/// thing the viewer did.
+pub fn read_transcript_tail(path: &std::path::Path) -> Result<Vec<TailEvent>> {
+    let window = crate::read_tail_window(path, crate::TRANSCRIPT_TAIL_BYTES)?;
     let mut items = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Some(value) = crate::parse_json_line(&line) else {
+    for line in window.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
             continue;
         };
         if crate::json_str(&value, "type") != Some("response_item") {

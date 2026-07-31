@@ -879,8 +879,7 @@ fn claude_list_finds_project_transcript_without_job_transcript_path() {
             "state": "working"
         }
     ]);
-    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", agents)).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
 
     let config_root = dir.path().join("config");
     let jobs_root = config_root.join("jobs");
@@ -1068,5 +1067,60 @@ fn claude_delete_capability_is_per_row_and_requires_a_short_id() {
         !backend
             .capabilities_for(&session_with_short_id(Some("")))
             .delete
+    );
+}
+
+/// Same bound as the codex rollout reader: a claude transcript grows without bound while the
+/// session works, and the pane re-reads it every tick, so only the end of the file is parsed.
+#[test]
+fn read_claude_transcript_touches_only_the_end_of_a_multi_megabyte_transcript() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("transcript-huge.jsonl");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = std::io::BufWriter::new(file);
+    let filler = "x".repeat(2_048);
+    for n in 0..1_000 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": format!("early-{n} {filler}")}]}
+            })
+        )
+        .unwrap();
+    }
+    for n in 0..3 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": format!("late-{n}")}]}
+            })
+        )
+        .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
+
+    let events = read_claude_transcript(&path, 10_000).expect("read tail");
+    assert_eq!(
+        events.last(),
+        Some(&agent_viewer_core::TailEvent::Agent("late-2".to_string())),
+        "the newest message must survive"
+    );
+    assert!(
+        events.len() < 1_003,
+        "the whole file was parsed: {} events",
+        events.len()
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            agent_viewer_core::TailEvent::Agent(text) if text.starts_with("early-0 ")
+        )),
+        "a message megabytes back from the end must never be read"
     );
 }
