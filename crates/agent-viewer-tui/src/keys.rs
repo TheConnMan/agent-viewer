@@ -528,6 +528,24 @@ fn is_quit_chord(key: KeyEvent, ctrl: bool, forwarding: bool) -> bool {
     ctrl && matches!(key.code, KeyCode::Char('c')) && !forwarding
 }
 
+/// Ctrl+] — the chord that backs out of every full-screen surface the viewer puts up.
+///
+/// It arrives under two encodings: terminals send raw byte 0x1D, which crossterm's legacy unix
+/// parser folds onto Char('5')+CTRL (it folds 0x1C..=0x1F onto Ctrl+'4'..'7'), while the kitty
+/// keyboard protocol delivers the literal Char(']')+CTRL. Matching only the literal leaves the
+/// chord dead in most terminals — which is what a live run found. The caller checks CTRL; this
+/// is the key code half.
+fn is_leave_chord(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char(']') | KeyCode::Char('5'))
+}
+
+/// The wall's ways out, which the compose overlay honors unchanged: Ctrl+] as everywhere else,
+/// plus the Ctrl+W the wall documents as its unconditional exit. A surface that swallowed
+/// either would turn the grid into the trap they exist to prevent.
+fn is_wall_leave_chord(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('w')) || is_leave_chord(code)
+}
+
 /// Whether the spawn composer is floating over the grid with the keyboard.
 ///
 /// `Mode::Compose` is only ever entered from the wall's palette, so the two conditions cannot
@@ -617,10 +635,7 @@ fn handle_wall_key(
     }
     if ctrl {
         match key.code {
-            // Ctrl+] leaves too, matching the attach view. Terminals send it as raw 0x1D,
-            // which crossterm's legacy unix parser folds onto Char('5')+CTRL; the kitty
-            // protocol delivers the literal Char(']')+CTRL. Accept both.
-            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+            code if is_wall_leave_chord(code) => {
                 toggle_wall(ui);
                 return;
             }
@@ -780,10 +795,6 @@ fn handle_compose_key(
     refresher: &Refresher,
     ui: &mut Ui,
 ) {
-    // Same up-front refresh the list does, and for the same reason: nothing may read
-    // `suggestions_active` against commands scanned for a target that has since moved.
-    ensure_completions(ui);
-    ensure_models(ui);
     // Every ctrl chord below `handle_key`'s own globals (Ctrl+C, handled here, and Ctrl+T,
     // which toggles mouse capture before the mode dispatch) is inert here rather than acting:
     // the wall's chords aim at the focused tile, and firing one from behind an input box that
@@ -791,11 +802,9 @@ fn handle_compose_key(
     // are the exits, because every way out of this box has to keep the draft.
     if ctrl {
         match key.code {
-            // The wall documents Ctrl+W and Ctrl+] as the unconditional ways back to the list,
-            // and an overlay that swallows them turns the grid into the trap they exist to
-            // prevent. Leave compose first so `toggle_wall` closes the wall it was floating
-            // over. Crossterm folds raw 0x1D onto Char('5'), same as `handle_wall_key`.
-            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+            // Leave compose first, so `toggle_wall` closes the wall this box was floating over
+            // rather than reopening it a keystroke later.
+            code if is_wall_leave_chord(code) => {
                 ui.mode = Mode::Normal;
                 toggle_wall(ui);
             }
@@ -807,6 +816,12 @@ fn handle_compose_key(
         }
         return;
     }
+    // Same up-front refresh the list does, and for the same reason: nothing may read
+    // `suggestions_active` against commands scanned for a target that has since moved. Below
+    // the ctrl branch because none of those chords reads either, and the rescan costs a
+    // `spawn_target()` and a `PathBuf` every time one is pressed over the grid.
+    ensure_completions(ui);
+    ensure_models(ui);
     if !handle_composer_popup_key(key.code, ui) {
         match key.code {
             // Up/Down deliberately do nothing with no popup open. The wall pins the list
@@ -1437,13 +1452,18 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
         return Ok(());
     }
 
-    // Both of these only write composer state, and the wall does not draw the composer, so on
-    // the grid they used to land somewhere nothing on screen showed — a pick the user only
-    // discovered after leaving the wall. Opening the overlay is what makes them finishable.
+    // The one expression that decides Compose, applied after the `Mode::Normal` below that
+    // every palette pick passes through. Commands and Models only write composer state, and
+    // the wall does not draw the composer, so on the grid they used to land somewhere nothing
+    // on screen showed — a pick the user only discovered after leaving the wall. Spawn is here
+    // because opening that box is the whole action; it is a wall-only entry, so the `wall.on`
+    // gate is what it already implies.
     let opens_composer = ui.wall.on
         && matches!(
             item.target,
-            PaletteTarget::Command(_) | PaletteTarget::Model { .. }
+            PaletteTarget::Command(_)
+                | PaletteTarget::Model { .. }
+                | PaletteTarget::Action(PaletteAction::Spawn)
         );
 
     ui.mode = Mode::Normal;
@@ -1463,8 +1483,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::Filter => open_filter(ui),
             PaletteAction::AgeRamp => toggle_age_ramp(ui),
             PaletteAction::TailPane => toggle_tail(ui),
-            // Set after the `Mode::Normal` above, which every palette action passes through.
-            PaletteAction::Spawn => ui.mode = Mode::Compose,
+            // Nothing to do: `opens_composer` below is what hands over the keyboard.
+            PaletteAction::Spawn => {}
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
@@ -1524,11 +1544,8 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     // attach (do not type our queued reply in behind the user's own input).
     ui.pending_reply = None;
 
-    // Ctrl+] always leaves, closing the connection. Terminals send Ctrl+] as raw byte
-    // 0x1D, which crossterm's legacy unix parser maps to Char('5')+CTRL (it folds 0x1C..=0x1F
-    // onto Ctrl+'4'..'7'); the kitty keyboard protocol delivers the literal Char(']')+CTRL.
-    // Match both so the header/help "ctrl+]" is honored under either encoding.
-    if ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')) {
+    // Ctrl+] always leaves, closing the connection, so the header/help "ctrl+]" is honored here.
+    if ctrl && is_leave_chord(key.code) {
         close_attached(ui);
         return;
     }
@@ -1691,11 +1708,6 @@ enum TriageCommand {
 /// Ctrl+N is the chord that opened the modal, which makes it the obvious "next". Bare Esc,
 /// Enter, arrows and digits are all deliberately NOT reserved: they are how you answer a
 /// prompt, and stealing them would break the thing the panel exists for.
-///
-/// Ctrl+] arrives under two encodings, exactly as the attached path documents: terminals send
-/// raw byte 0x1D, which crossterm's legacy unix parser folds onto Char('5')+CTRL, while the
-/// kitty keyboard protocol delivers the literal Char(']')+CTRL. Matching only the literal
-/// leaves the chord dead in most terminals — which is what a live run found.
 fn triage_command(key: KeyEvent) -> Option<TriageCommand> {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
@@ -1703,7 +1715,7 @@ fn triage_command(key: KeyEvent) -> Option<TriageCommand> {
     match key.code {
         KeyCode::Char('n') => Some(TriageCommand::Next),
         KeyCode::Char('p') => Some(TriageCommand::Previous),
-        KeyCode::Char(']') | KeyCode::Char('5') => Some(TriageCommand::Leave),
+        code if is_leave_chord(code) => Some(TriageCommand::Leave),
         _ => None,
     }
 }
@@ -2359,6 +2371,24 @@ pub(crate) mod tests {
         .expect("wall tile child")
     }
 
+    /// The same tile, but with a child that echoes. `cat` sends every byte it receives back
+    /// through the tty line discipline, so what is on the child's screen is direct evidence of
+    /// what actually reached its pty — which is what lets a test assert routing rather than
+    /// intent, in both directions.
+    fn echoing_wall_tile_pty() -> PtySession {
+        PtySession::spawn(PtySpec {
+            program: "cat".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("echoing tile child")
+    }
+
     fn kill_attached(ui: &mut Ui) {
         for (_, mut pty) in std::mem::take(&mut ui.attached) {
             pty.kill();
@@ -2392,20 +2422,7 @@ pub(crate) mod tests {
         session.status = Status::Working;
         let target = (session.backend, session.id.clone());
         let mut ui = test_ui_with(vec![session]);
-        ui.attached.insert(
-            target.clone(),
-            PtySession::spawn(PtySpec {
-                program: "cat".to_string(),
-                args: Vec::new(),
-                cwd: None,
-                envs: Vec::new(),
-                rows: 6,
-                cols: 40,
-                palette: None,
-                scrollback_rows: 0,
-            })
-            .expect("echoing tile child"),
-        );
+        ui.attached.insert(target.clone(), echoing_wall_tile_pty());
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
         assert!(ui.wall.on);
 
@@ -2543,20 +2560,7 @@ pub(crate) mod tests {
         session.status = Status::Working;
         let target = (session.backend, session.id.clone());
         let mut ui = test_ui_with(vec![session]);
-        ui.attached.insert(
-            target.clone(),
-            PtySession::spawn(PtySpec {
-                program: "cat".to_string(),
-                args: Vec::new(),
-                cwd: None,
-                envs: Vec::new(),
-                rows: 6,
-                cols: 40,
-                palette: None,
-                scrollback_rows: 0,
-            })
-            .expect("echoing tile child"),
-        );
+        ui.attached.insert(target.clone(), echoing_wall_tile_pty());
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
 
         handle_paste("pasted", &mut ui);
@@ -2884,23 +2888,25 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
-    /// A spawn-capable Claude backend, so an Enter in the wall's compose overlay reaches the
-    /// same spawn path the list's composer takes. Everything else panics: nothing but spawn
-    /// belongs on that path.
-    struct WallSpawningBackend;
+    /// A Claude backend whose only variable is whether it advertises spawn: capable puts Enter
+    /// on the same spawn path the list's composer takes, refusing puts it on the refusal path.
+    /// Everything else panics — nothing but spawn belongs on either.
+    pub(crate) struct SpawnBackend {
+        pub(crate) spawn: bool,
+    }
 
-    impl agent_viewer_core::Backend for WallSpawningBackend {
+    impl agent_viewer_core::Backend for SpawnBackend {
         fn kind(&self) -> BackendKind {
             BackendKind::Claude
         }
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
             agent_viewer_core::Capabilities {
-                spawn: true,
+                spawn: self.spawn,
                 ..agent_viewer_core::Capabilities::none()
             }
         }
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("list is not exercised by the wall compose tests")
+            unreachable!("listing is not exercised by composer submission")
         }
         fn spawn(
             &self,
@@ -2909,14 +2915,48 @@ pub(crate) mod tests {
             _model: Option<&str>,
             _effort: Option<&str>,
         ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
-            unreachable!("the mutation executor intercepts spawn in these tests")
+            unreachable!("the external mutation executor must intercept spawn")
         }
         fn attach_command(
             &self,
             _session: &Session,
         ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
-            unreachable!("attach is not exercised by the wall compose tests")
+            unreachable!("attach is not exercised by composer submission")
         }
+    }
+
+    /// One live tile with an echoing child, the wall up, and the compose overlay open over it.
+    /// The shape every "the box has the keyboard, the tile must not see it" test starts from.
+    fn composing_over_an_echoing_tile(id: &str) -> (Ui, (BackendKind, String)) {
+        let mut session = sess(id, "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(target.clone(), echoing_wall_tile_pty());
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        pick_palette_target(
+            &mut ui,
+            "New session",
+            &PaletteTarget::Action(PaletteAction::Spawn),
+        );
+        (ui, target)
+    }
+
+    /// Leave compose, then type a sentinel straight into the tile and wait for it to land.
+    ///
+    /// A pty is ordered, so once the sentinel is on the child's screen anything forwarded
+    /// earlier would already be there too — which turns the absence of `needle` from a race
+    /// into a fact.
+    fn assert_tile_never_saw(ui: &mut Ui, target: &(BackendKind, String), needle: &str) {
+        press_normal_code(ui, &[], KeyCode::Esc, KeyModifiers::NONE);
+        for character in "SENTINEL".chars() {
+            press_normal_key(ui, &[], character, KeyModifiers::NONE);
+        }
+        wait_for_pty_screen(ui, target, "SENTINEL");
+        assert!(
+            ui.attached[target].with_screen(|screen| !screen.contents().contains(needle)),
+            "{needle:?} was typed into the live session"
+        );
     }
 
     /// Starting a new task was the one thing the wall could not do: it hides the composer, so
@@ -2973,48 +3013,14 @@ pub(crate) mod tests {
     /// moment compose opens — otherwise the draft is typed into a live agent mid-turn.
     #[test]
     fn typing_while_composing_fills_the_composer_and_never_reaches_the_tile() {
-        let mut session = sess("compose-tile", "/tmp/agentviewer-wall", 100);
-        session.status = Status::Working;
-        let target = (session.backend, session.id.clone());
-        let mut ui = test_ui_with(vec![session]);
-        ui.attached.insert(
-            target.clone(),
-            PtySession::spawn(PtySpec {
-                program: "cat".to_string(),
-                args: Vec::new(),
-                cwd: None,
-                envs: Vec::new(),
-                rows: 6,
-                cols: 40,
-                palette: None,
-                scrollback_rows: 0,
-            })
-            .expect("echoing tile child"),
-        );
-        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
-        pick_palette_target(
-            &mut ui,
-            "New session",
-            &PaletteTarget::Action(PaletteAction::Spawn),
-        );
+        let (mut ui, target) = composing_over_an_echoing_tile("compose-tile");
 
         for character in "draft".chars() {
             press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
         }
         assert_eq!(ui.composer.text(), "draft");
 
-        // Leave compose and type a sentinel into the tile. A pty is ordered, so once the
-        // sentinel has reached the child's screen anything forwarded earlier would already be
-        // there too — which makes the absence of the draft a fact rather than a race.
-        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
-        for character in "SENTINEL".chars() {
-            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
-        }
-        wait_for_pty_screen(&ui, &target, "SENTINEL");
-        assert!(
-            ui.attached[&target].with_screen(|screen| !screen.contents().contains("draft")),
-            "the composed draft was typed into the live session"
-        );
+        assert_tile_never_saw(&mut ui, &target, "draft");
         kill_attached(&mut ui);
     }
 
@@ -3039,7 +3045,7 @@ pub(crate) mod tests {
             })
         });
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(WallSpawningBackend)];
+            vec![Box::new(SpawnBackend { spawn: true })];
 
         pick_palette_target(
             &mut ui,
@@ -3100,45 +3106,12 @@ pub(crate) mod tests {
     /// vanished" symptom the wall's own paste guard exists to prevent, one mode over.
     #[test]
     fn pasting_while_composing_fills_the_composer_and_never_reaches_the_tile() {
-        let mut session = sess("paste-tile", "/tmp/agentviewer-wall", 100);
-        session.status = Status::Working;
-        let target = (session.backend, session.id.clone());
-        let mut ui = test_ui_with(vec![session]);
-        ui.attached.insert(
-            target.clone(),
-            PtySession::spawn(PtySpec {
-                program: "cat".to_string(),
-                args: Vec::new(),
-                cwd: None,
-                envs: Vec::new(),
-                rows: 6,
-                cols: 40,
-                palette: None,
-                scrollback_rows: 0,
-            })
-            .expect("echoing tile child"),
-        );
-        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
-        pick_palette_target(
-            &mut ui,
-            "New session",
-            &PaletteTarget::Action(PaletteAction::Spawn),
-        );
+        let (mut ui, target) = composing_over_an_echoing_tile("paste-tile");
 
         handle_paste("pasted-draft", &mut ui);
         assert_eq!(ui.composer.text(), "pasted-draft");
 
-        // Same ordered-pty barrier the typing test uses: once the sentinel is on the child's
-        // screen, anything forwarded before it would already be there too.
-        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
-        for character in "SENTINEL".chars() {
-            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
-        }
-        wait_for_pty_screen(&ui, &target, "SENTINEL");
-        assert!(
-            ui.attached[&target].with_screen(|screen| !screen.contents().contains("pasted-draft")),
-            "the pasted draft was typed into the live session"
-        );
+        assert_tile_never_saw(&mut ui, &target, "pasted-draft");
         kill_attached(&mut ui);
     }
 
@@ -3246,30 +3219,7 @@ pub(crate) mod tests {
     /// forwarded to a live agent mid-turn is an answer the user never typed.
     #[test]
     fn tab_and_backspace_while_composing_edit_the_composer_not_the_tile() {
-        let mut session = sess("edit-tile", "/tmp/agentviewer-wall", 100);
-        session.status = Status::Working;
-        let target = (session.backend, session.id.clone());
-        let mut ui = test_ui_with(vec![session]);
-        ui.attached.insert(
-            target.clone(),
-            PtySession::spawn(PtySpec {
-                program: "cat".to_string(),
-                args: Vec::new(),
-                cwd: None,
-                envs: Vec::new(),
-                rows: 6,
-                cols: 40,
-                palette: None,
-                scrollback_rows: 0,
-            })
-            .expect("echoing tile child"),
-        );
-        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
-        pick_palette_target(
-            &mut ui,
-            "New session",
-            &PaletteTarget::Action(PaletteAction::Spawn),
-        );
+        let (mut ui, target) = composing_over_an_echoing_tile("edit-tile");
         for character in "abc".chars() {
             press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
         }
@@ -3290,17 +3240,8 @@ pub(crate) mod tests {
             "Shift+Tab is the model cycle, not text"
         );
 
-        // The ordered-pty barrier again: nothing typed or edited in the box may have reached
-        // the child, and the sentinel proves anything earlier would already have arrived.
-        press_normal_code(&mut ui, &[], KeyCode::Esc, KeyModifiers::NONE);
-        for character in "SENTINEL".chars() {
-            press_normal_key(&mut ui, &[], character, KeyModifiers::NONE);
-        }
-        wait_for_pty_screen(&ui, &target, "SENTINEL");
-        assert!(
-            ui.attached[&target].with_screen(|screen| !screen.contents().contains("ab")),
-            "the composed draft was typed into the live session"
-        );
+        // Nothing typed OR edited in the box may have reached the child, Tab included.
+        assert_tile_never_saw(&mut ui, &target, "ab");
         kill_attached(&mut ui);
     }
 
@@ -3320,7 +3261,7 @@ pub(crate) mod tests {
             })
         });
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(WallSpawningBackend)];
+            vec![Box::new(SpawnBackend { spawn: true })];
 
         pick_palette_target(
             &mut ui,
@@ -3343,36 +3284,6 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
-    /// A Claude backend that advertises no spawn, so Enter takes one of the refusal paths.
-    struct WallRefusingBackend;
-
-    impl agent_viewer_core::Backend for WallRefusingBackend {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Claude
-        }
-        fn capabilities(&self) -> agent_viewer_core::Capabilities {
-            agent_viewer_core::Capabilities::none()
-        }
-        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            unreachable!("list is not exercised by the wall compose tests")
-        }
-        fn spawn(
-            &self,
-            _dir: &std::path::Path,
-            _task: &str,
-            _model: Option<&str>,
-            _effort: Option<&str>,
-        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
-            unreachable!("a backend that cannot spawn is never asked to")
-        }
-        fn attach_command(
-            &self,
-            _session: &Session,
-        ) -> std::result::Result<std::process::Command, agent_viewer_core::AttachRefusal> {
-            unreachable!("attach is not exercised by the wall compose tests")
-        }
-    }
-
     /// The draft is only drawn while composing, so a refusal that closed the box would strand
     /// text the user can neither see nor recover — with the notice explaining it flashing on a
     /// grid they were just sent back to.
@@ -3380,7 +3291,7 @@ pub(crate) mod tests {
     fn a_refused_spawn_keeps_the_composer_open_with_the_draft() {
         let mut ui = wall_ui_focused_on_the_second_tile();
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(WallRefusingBackend)];
+            vec![Box::new(SpawnBackend { spawn: false })];
 
         pick_palette_target(
             &mut ui,

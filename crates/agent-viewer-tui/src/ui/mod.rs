@@ -496,7 +496,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // memory holds. It floats rather than taking layout rows deliberately: real rows would
     // shrink the grid, and resizing a tile SIGWINCHes its child agent into a full repaint —
     // every session on screen redrawn because someone opened an input box.
-    if d.wall.is_some() && matches!(d.mode, Mode::Compose) {
+    if composing_over_wall(d.mode, d.wall.as_ref()) {
         // The box grows with the draft, but never past the footer: on a terminal short enough
         // that a third of it still outruns the grid, `y` saturates at 0 while the height does
         // not, and the row that gets covered is the compose hint telling you how to get out.
@@ -550,14 +550,13 @@ pub fn draw(frame: &mut Frame, d: Draw) {
 /// interlock rather than a lookup — the same one `handle_composer_popup_key` keeps on the key
 /// side. Two copies would drift the first time one of the guards changed.
 fn draw_composer_popups(frame: &mut Frame, d: &Draw, theme: &Theme, anchor: Rect) {
-    let highlight = d.composer.suggestion_highlight();
     if d.themes.picker_open() {
         overlay::draw_theme_picker(frame, d.themes, anchor);
     } else if d.composer.is_model_command() {
         overlay::draw_suggestions(
             frame,
             &d.composer.model_suggestions(),
-            highlight,
+            d.composer.suggestion_highlight(),
             "",
             theme,
             anchor,
@@ -566,12 +565,22 @@ fn draw_composer_popups(frame: &mut Frame, d: &Draw, theme: &Theme, anchor: Rect
         overlay::draw_suggestions(
             frame,
             &d.composer.suggestions(),
-            highlight,
+            d.composer.suggestion_highlight(),
             "/",
             theme,
             anchor,
         );
     }
+}
+
+/// Whether the spawn composer is floating over the grid, holding the keyboard.
+///
+/// The UI layer's copy of the same pair `keys::composing_over_wall` gates the quit chord on:
+/// the overlay draw and the footer both hang off it, and the two must never disagree about
+/// which surface is on screen — the footer would then advertise the grid's chords at a box
+/// that does not honor them.
+fn composing_over_wall(mode: &Mode, wall: Option<&WallView>) -> bool {
+    matches!(mode, Mode::Compose) && wall.is_some()
 }
 
 /// Per-row decorations layered over the list model.
@@ -810,7 +819,7 @@ fn draw_footer(
     // The composer holds the keyboard over the grid, so the grid's chord list is the wrong
     // hint: Shift+arrows and Ctrl+X are the tiles' and do nothing from in here, while the three
     // keys that matter — send, switch agent, back out — are not on it at all.
-    if wall.is_some() && matches!(mode, Mode::Compose) {
+    if composing_over_wall(mode, wall) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "new session · ⏎ start · ⇥ agent · ⇧⇥ model · Esc cancel",
@@ -865,8 +874,10 @@ fn draw_footer(
         Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
-        Mode::Triage(_) => Line::from(""),
-        Mode::Compose => Line::from(""),
+        // Compose only ever renders over the wall, which the branch above already returned
+        // for, so it never reaches here — it rides along with Triage as the exhaustiveness
+        // stub rather than as a second empty line implying the composer has a list footer.
+        Mode::Triage(_) | Mode::Compose => Line::from(""),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -2156,13 +2167,16 @@ mod tests {
         );
     }
 
-    /// Render a one-tile wall frame in `mode` with `composer`, as (whole frame, footer row).
-    fn wall_frame(mode: &Mode, composer: &Composer) -> (String, String) {
+    /// Render a one-tile wall frame for `app`, as (whole frame, footer row).
+    ///
+    /// The single place the wall's `Draw` literal is built for a test: the compose overlay and
+    /// the footer both need one, and a second copy is the field-added-on-one-branch break this
+    /// repo keeps hitting on merge.
+    fn wall_render(app: &App, mode: &Mode, composer: &Composer, now_ms: i64) -> (String, String) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let session = walled_test_session();
-        let app = App::new(vec![session.clone()]);
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -2173,13 +2187,13 @@ mod tests {
             draw(
                 frame,
                 Draw {
-                    app: &app,
+                    app,
                     workspace: Path::new("/tmp"),
                     mode,
                     notice: "",
                     composer,
                     pulses: &pulses,
-                    now_ms: 0,
+                    now_ms,
                     attach: None,
                     pr_status: &pr_status,
                     logos: None,
@@ -2209,10 +2223,17 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
+        // The footer is the last row of the frame.
         let footer = (0..buffer.area.width)
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
             .collect();
         (whole, footer)
+    }
+
+    /// Render a one-tile wall frame in `mode` with `composer`, as (whole frame, footer row).
+    fn wall_frame(mode: &Mode, composer: &Composer) -> (String, String) {
+        let app = App::new(vec![walled_test_session()]);
+        wall_render(&app, mode, composer, 0)
     }
 
     /// The wall hides the composer because the tiles own the keyboard, so this overlay is the
@@ -2299,56 +2320,7 @@ mod tests {
 
     /// Render the wall footer for `app` at `now_ms`, as one string.
     fn wall_footer(app: &App, now_ms: i64) -> String {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let session = walled_test_session();
-        let composer = Composer::new();
-        let pulses = Pulses::new();
-        let pr_status = crate::pr_cache::PrStatusCache::new();
-        let list_hit = RefCell::new(ListHit::default());
-        let themes = ThemeState::default();
-        let rects = RefCell::new(Vec::new());
-        let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        term.draw(|frame| {
-            draw(
-                frame,
-                Draw {
-                    app,
-                    workspace: Path::new("/tmp"),
-                    mode: &Mode::Normal,
-                    notice: "",
-                    composer: &composer,
-                    pulses: &pulses,
-                    now_ms,
-                    attach: None,
-                    pr_status: &pr_status,
-                    logos: None,
-                    list_hit: &list_hit,
-                    themes: &themes,
-                    sprite: Default::default(),
-                    age_ramp: false,
-                    tail: None,
-                    wall: Some(WallView {
-                        tiles: vec![WallTile {
-                            session: &session,
-                            project: String::new(),
-                            pty: None,
-                            error: None,
-                        }],
-                        selected: 0,
-                        overflow: 0,
-                    }),
-                    wall_rects: &rects,
-                },
-            );
-        })
-        .unwrap();
-        let buffer = term.backend().buffer().clone();
-        // The footer is the last row of the frame.
-        (0..buffer.area.width)
-            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
-            .collect()
+        wall_render(app, &Mode::Normal, &Composer::new(), now_ms).1
     }
 
     /// The arm window has to be visible on the wall, not only in the list. Ctrl+X on a tile
