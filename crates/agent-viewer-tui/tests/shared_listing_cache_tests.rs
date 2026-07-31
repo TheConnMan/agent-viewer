@@ -158,6 +158,7 @@ fn session(backend: BackendKind, id: &str, pid: Option<u32>, daemon_hosted: bool
         updated_at_ms: 1_000,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid,
         rollout_path: None,

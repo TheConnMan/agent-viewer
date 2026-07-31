@@ -526,10 +526,13 @@ pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
     let runner_key = format!("attach:{}:{}", key.0.name(), key.1);
     let outcome_key = key;
     if !ui.attaches.submit(runner_key, move || {
-        executor(request).map(|plan| crate::AttachOutcome::Focus {
+        // The failure rides INSIDE the outcome rather than surfacing as a runner-level `Err`,
+        // so it carries the key it was submitted for and the landing guard can drop a failure
+        // whose row the user has already walked off - exactly as the wall's joins do.
+        Ok(crate::AttachOutcome::Focus {
             key: outcome_key,
             triage,
-            plan,
+            plan: executor(request),
         })
     }) {
         return false;
@@ -1553,6 +1556,16 @@ mod async_attach_tests {
         }
     }
 
+    /// The failure a landed focus attach carries, if any. A resolution failure rides inside
+    /// the outcome (keyed, so the landing guard can drop a stale one), not as a runner `Err`.
+    fn focus_error(result: &Result<crate::AttachOutcome, String>) -> Option<&str> {
+        match result {
+            Ok(crate::AttachOutcome::Focus { plan, .. }) => plan.as_ref().err().map(String::as_str),
+            Ok(crate::AttachOutcome::Wall { .. }) => panic!("expected a focus attach"),
+            Err(error) => Some(error.as_str()),
+        }
+    }
+
     /// Drive one landed attach result through the exact path the run loop uses.
     fn land_attach(ui: &mut crate::Ui, result: Result<crate::AttachOutcome, String>) {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
@@ -1621,10 +1634,7 @@ mod async_attach_tests {
             *calls.lock().expect("recorded calls"),
             vec![request.clone()]
         );
-        assert_eq!(
-            result.err().as_deref(),
-            Some("fresh authority refused attach")
-        );
+        assert_eq!(focus_error(&result), Some("fresh authority refused attach"));
         assert!(ui.attached.is_empty());
         assert!(ui.focused.is_none());
 
@@ -1639,7 +1649,7 @@ mod async_attach_tests {
             thread::yield_now();
         };
         assert_eq!(
-            missing.err().as_deref(),
+            focus_error(&missing),
             Some("claude session is no longer available")
         );
         assert!(ui.attached.is_empty());
@@ -1734,6 +1744,80 @@ mod async_attach_tests {
             ui.notice.text, "attach cancelled: left_behind is no longer in focus",
             "a dropped attach says so rather than vanishing"
         );
+    }
+
+    /// The control for the error-path drop test below: a FAILED resolution that lands while
+    /// its row is still the selected one is still the user's answer, so it is shown.
+    #[test]
+    fn a_landed_attach_failure_is_shown_while_its_row_is_still_selected() {
+        let first = sess("failing_selected", "/tmp/agentviewer_failing_selected", 100);
+        let other = sess("elsewhere_ok", "/tmp/agentviewer_elsewhere_ok", 200);
+        let mut ui = test_ui_with(vec![first.clone(), other]);
+        ui.attach_executor = Arc::new(|_| Err("codex session is no longer available".to_string()));
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, first.id.clone()))
+        );
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        land_attach(&mut ui, result);
+
+        assert_eq!(ui.notice.text, "codex session is no longer available");
+        assert!(ui.attached.is_empty());
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    /// THE REGRESSION, the error-path twin of the drop test above. A resolution failure used
+    /// to surface as a bare footer notice with nothing tying it to the row it came from, so a
+    /// stale failure from an attach the user had already walked away from stamped itself over
+    /// whatever they were looking at - reading as if the CURRENT row had just failed.
+    #[test]
+    fn a_landed_attach_failure_is_dropped_when_the_selection_moved_on() {
+        let first = sess("failing_left", "/tmp/agentviewer_failing_left", 100);
+        let second = sess("failing_moved", "/tmp/agentviewer_failing_moved", 200);
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        ui.attach_executor = Arc::new(|_| Err("codex session is no longer available".to_string()));
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, first.id.clone()))
+        );
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, second.id.clone()))
+        );
+        land_attach(&mut ui, result);
+
+        assert_eq!(
+            ui.notice.text, "attach cancelled: failing_left is no longer in focus",
+            "a failure for a row the user left must not read as the current row failing"
+        );
+        assert!(ui.attached.is_empty());
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
+    /// The same guard for a triage failure: the queue closed, so the failure belongs to a view
+    /// the user has already left.
+    #[test]
+    fn a_landed_triage_attach_failure_is_dropped_after_the_queue_closed() {
+        let waiting = blocked("failing_queue", 100);
+        let mut ui = test_ui_with(vec![waiting.clone()]);
+        ui.attach_executor = Arc::new(|_| Err("codex session is no longer available".to_string()));
+
+        open_triage(&mut ui);
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+        let result = poll_attach(&mut ui);
+        close_triage(&mut ui);
+        land_attach(&mut ui, result);
+
+        assert_eq!(
+            ui.notice.text,
+            "attach cancelled: failing_queue is no longer in focus"
+        );
+        assert!(ui.attached.is_empty());
     }
 
     /// A triage attach that lands after the queue closed must not reopen as a full-screen
