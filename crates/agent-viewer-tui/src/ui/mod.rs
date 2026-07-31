@@ -380,7 +380,10 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         Some(_) if vertical[1].width >= TAIL_MIN_TOTAL_WIDTH => {
             let split = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(tail::TAIL_WIDTH)])
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(tail::tail_width(vertical[1].width)),
+                ])
                 .split(vertical[1]);
             (split[0], Some(split[1]))
         }

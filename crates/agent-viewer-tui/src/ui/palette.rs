@@ -45,6 +45,7 @@ pub enum PaletteAction {
     ShowAll,
     Group,
     Filter,
+    TailPane,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
