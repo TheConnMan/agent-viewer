@@ -367,6 +367,27 @@ Verify an archive before unpacking it with `sha256sum --check <archive>.sha256` 
 in PowerShell on Windows. Unpack a `.tar.gz` with
 `tar -xzf <archive>` and the Windows `.zip` with `Expand-Archive <archive>`.
 
+## Install
+
+Download the archive for your platform from the
+[releases page](https://github.com/TheConnMan/agent-viewer/releases), verify it against its
+sibling SHA256 file as described above, unpack it, and put the `agent-viewer` binary on your
+`PATH`. On linux-x86_64:
+
+```
+tar -xzf agent-viewer-x86_64-unknown-linux-gnu.tar.gz
+mv agent-viewer ~/.local/bin/
+```
+
+To build from source instead:
+
+```
+cargo install --git https://github.com/TheConnMan/agent-viewer agent-viewer-tui
+```
+
+A source build uses the repository's vendored vt100 patch, so it pulls the whole repo rather
+than the published crate.
+
 ## Run
 
 ```
