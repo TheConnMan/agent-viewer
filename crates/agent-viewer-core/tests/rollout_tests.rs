@@ -2,8 +2,7 @@ mod common;
 
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
-    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript_tail,
-    tail_state,
+    PendingApproval, TailState, pending_approval, read_transcript_tail, tail_state,
 };
 use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status, TailEvent};
 use common::rfc3339_at;
@@ -70,27 +69,6 @@ fn insert_codex_activity_thread(
 }
 
 // --- Preserved v1 tests (unchanged behavior) ---
-
-#[test]
-fn session_meta_parses_first_line() {
-    let path = common::fixture_path("rollout_complete.jsonl");
-    let meta = read_session_meta(&path).expect("parse session_meta");
-    assert_eq!(meta.id, "019f4dda-fecb-7b71-adba-9fda570e4cdb");
-    assert_eq!(meta.cwd, PathBuf::from("/home/user/project"));
-    assert_eq!(meta.originator, "codex_exec");
-    assert_eq!(meta.cli_version, "0.144.1");
-}
-
-#[test]
-fn session_meta_rejects_empty_and_garbage() {
-    let empty_dir = tempfile::TempDir::new().unwrap();
-    let empty = empty_dir.path().join("empty.jsonl");
-    std::fs::write(&empty, b"").unwrap();
-    assert!(read_session_meta(&empty).is_err());
-
-    let garbage = common::fixture_path("rollout_garbage.jsonl");
-    assert!(read_session_meta(&garbage).is_err());
-}
 
 #[test]
 fn transcript_extracts_text_and_tool_calls_in_order() {

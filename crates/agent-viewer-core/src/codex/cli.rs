@@ -93,16 +93,7 @@ pub fn rename(thread_id: &str, name: &str) -> Result<()> {
         }
     });
 
-    let initialize = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": { "name": "agent-viewer", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": { "experimentalApi": true },
-        },
-    })
-    .to_string();
+    let initialize = crate::codex::app_server::initialize_request(1);
     let name_set = name_set_request(2, thread_id, name);
 
     let outcome = (|| -> Result<()> {

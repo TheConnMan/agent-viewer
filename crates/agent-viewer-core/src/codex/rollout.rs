@@ -1,45 +1,6 @@
 use crate::backend::TailEvent;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use std::io::BufRead;
-use std::path::PathBuf;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionMeta {
-    pub id: String,
-    pub cwd: std::path::PathBuf,
-    pub originator: String,
-    pub cli_version: String,
-}
-
-/// Parse ONLY the first line (type "session_meta"; fields under .payload).
-/// The first line is large (payload.base_instructions) — read_line, do not cap.
-/// Empty file or non-session_meta first line -> Err.
-pub fn read_session_meta(path: &std::path::Path) -> Result<SessionMeta> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(Error::Command("empty rollout file".into()));
-    }
-    let value: serde_json::Value = serde_json::from_str(line.trim())?;
-    if crate::json_str(&value, "type") != Some("session_meta") {
-        return Err(Error::Command("first line is not session_meta".into()));
-    }
-    let payload = value
-        .get("payload")
-        .ok_or_else(|| Error::Command("session_meta missing payload".into()))?;
-    let field = |key: &str| {
-        crate::json_str(payload, key)
-            .unwrap_or_default()
-            .to_string()
-    };
-    Ok(SessionMeta {
-        id: field("id"),
-        cwd: PathBuf::from(field("cwd")),
-        originator: field("originator"),
-        cli_version: field("cli_version"),
-    })
-}
 
 /// The last-turn outcome derived from the rollout tail (replaces v1's
 /// `has_task_complete_tail`). See section 5.2 of the v2 plan for the decision order.
