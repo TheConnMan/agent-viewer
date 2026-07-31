@@ -148,6 +148,35 @@ pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabil
     }
 }
 
+/// How long `claude agents --json --all` may take before the listing gives up on it.
+///
+/// Generous, because it runs on the refresh worker and the CLI does real work (it walks the
+/// jobs tree), and a deadline it loses empties the whole Claude backend for that tick. Its
+/// purpose is only to keep a WEDGED claude from parking that worker forever: the call had no
+/// deadline at all, and `std::process::Command::output` waits without bound.
+const AGENTS_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run `claude agents --json --all` under a deadline, returning its stdout.
+///
+/// A missing binary, a non-zero exit, a hang past `timeout`, or non-utf8 stdout are all the
+/// same answer: None, which the caller renders as a quiet empty backend rather than an error.
+pub fn agents_json(binary: &std::path::Path, timeout: std::time::Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("agents").arg("--json").arg("--all");
+    crate::spawn::run_with_timeout(cmd, timeout)
+}
+
+/// A file's mtime as epoch milliseconds, or None when it cannot be read.
+fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as i64)
+}
+
 pub fn capabilities_for_session_on_platform(
     platform: crate::platform::Platform,
     session: &Session,
@@ -184,18 +213,10 @@ impl Backend for ClaudeBackend {
         capabilities_for_session_on_platform(crate::platform::current_platform(), session)
     }
     fn list(&mut self) -> Result<Vec<Session>> {
-        // A missing/failing binary or non-zero exit is a quiet empty backend, not an error.
-        // `--all` includes completed sessions (required to populate the DONE section).
-        let output = std::process::Command::new(&self.binary)
-            .arg("agents")
-            .arg("--json")
-            .arg("--all")
-            .output();
-        let output = match output {
-            Ok(output) if output.status.success() => output,
-            _ => return Ok(Vec::new()),
+        let Some(stdout) = agents_json(std::path::Path::new(&self.binary), AGENTS_LIST_TIMEOUT)
+        else {
+            return Ok(Vec::new());
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut sessions = parse_agents_json(&stdout)?;
         for session in &mut sessions {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
@@ -220,6 +241,19 @@ impl Backend for ClaudeBackend {
             if session.rollout_path.is_none() {
                 session.rollout_path =
                     canonical_transcript_path(&self.jobs_root, &session.cwd, &session.id);
+            }
+            // A `claude agents` entry can arrive with no `startedAt`, which parses to 0. Left
+            // there the row sorts at the epoch, in front of every real session, and it can
+            // never be matched to a spawn: spawn matching keys on created_at_ms landing inside
+            // a window seconds wide around the spawn instant, so the just-created row is
+            // invisible to the viewer that created it. Fall back to a real timestamp for the
+            // session: its job state.json mtime (already read into updated_at_ms above), else
+            // the transcript's own mtime.
+            if session.created_at_ms == 0 {
+                session.created_at_ms = Some(session.updated_at_ms)
+                    .filter(|updated| *updated > 0)
+                    .or_else(|| session.rollout_path.as_deref().and_then(file_mtime_ms))
+                    .unwrap_or(0);
             }
         }
         // Hide nested `claude -p` children. The entrypoint lives only in the per-process

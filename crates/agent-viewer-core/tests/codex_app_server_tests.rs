@@ -14,10 +14,12 @@
 mod common;
 
 use agent_viewer_core::codex::app_server::{
-    Daemon, daemon_start_command, initialize_request, parse_daemon_version, parse_thread_id,
-    remote_endpoint, stable_daemon_cwd, thread_start_request, turn_interrupt_request,
-    turn_start_request,
+    Daemon, SpawnAttempt, daemon_start_command, initialize_request, parse_daemon_version,
+    parse_thread_id, remote_endpoint, stable_daemon_cwd, thread_start_request,
+    turn_interrupt_request, turn_start_request,
 };
+use agent_viewer_core::codex::spawn_failure_reason;
+use agent_viewer_core::error::Error;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -344,4 +346,33 @@ fn the_daemon_cwd_falls_back_to_root_when_home_is_gone() {
         PathBuf::from("/"),
         "an unset or deleted HOME must not become a cwd the daemon can outlive"
     );
+}
+
+/// A spawn whose `turn/start` response was lost must not be reported as a flat failure. The
+/// turn is accepted before the answer is written, so the work may well be running; a user told
+/// "the turn failed" retries the spawn and runs the task twice.
+#[test]
+fn a_lost_turn_response_reads_as_indeterminate_not_as_a_failure() {
+    let reason = spawn_failure_reason(&SpawnAttempt::TurnFailed {
+        thread_id: "thread-abc".to_string(),
+        error: Error::Command("app-server request timed out".to_string()),
+    });
+    assert!(
+        reason.contains("thread-abc"),
+        "the reason must name the thread that exists: {reason}"
+    );
+    assert!(
+        reason.contains("may have started"),
+        "the reason must say the turn may be running: {reason}"
+    );
+    assert!(
+        reason.contains("app-server request timed out"),
+        "the underlying error must survive: {reason}"
+    );
+
+    // A thread that really was never created keeps carrying its own error verbatim.
+    let reason = spawn_failure_reason(&SpawnAttempt::NotCreated(Error::Command(
+        "no daemon is listening".to_string(),
+    )));
+    assert_eq!(reason, "command failed: no daemon is listening");
 }
