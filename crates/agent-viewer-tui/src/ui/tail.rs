@@ -1,4 +1,4 @@
-//! The Ctrl+B tail pane: a fixed-width side pane showing the selected session's last few
+//! The Ctrl+B tail pane: a half-width side pane showing the selected session's last few
 //! turns.
 //!
 //! It reads the backend's TRANSCRIPT. It never starts a process, because the pane retargets
@@ -22,8 +22,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-/// The pane's fixed width, from the design frame.
-pub const TAIL_WIDTH: u16 = 46;
+/// The pane takes half the width it is given.
+///
+/// The design frame drew a fixed 46 columns, but at that width tool lines truncate to about
+/// two thirds of a path and prose wraps every few words, which is not enough to read from.
+/// Half is wide enough that the pane earns its columns.
+pub fn tail_width(total: u16) -> u16 {
+    total / 2
+}
 
 /// Below this the list would be crushed, so Ctrl+B refuses rather than opening a pane that
 /// makes both halves unreadable. 100 columns is the design's documented narrow width.
@@ -37,8 +43,8 @@ const TOOL_PREFIX: &str = "⎿";
 
 pub struct TailView<'a> {
     /// `None` when the cursor sits on a group header or the list is empty. The pane still
-    /// renders: unmounting it would hand its 46 columns back to the list and re-lay every
-    /// row out mid-arrow, then take them away again on the next session row.
+    /// renders: unmounting it would hand its columns back to the list and re-lay every row
+    /// out mid-arrow, then take them away again on the next session row.
     pub session: Option<&'a agent_viewer_core::Session>,
     /// `None` until the background read for this session lands; `Some(&[])` once it has
     /// landed and there was nothing to show.
@@ -188,6 +194,9 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
+    /// The pane width these render tests use: half of a 170-column terminal.
+    const PANE: u16 = 85;
+
     fn done_session() -> Session {
         Session {
             backend: BackendKind::Codex,
@@ -248,7 +257,7 @@ mod tests {
             // A done session has no live process, and the pane must never make one.
             live: None,
         };
-        let buffer = render(&view, &theme, TAIL_WIDTH, 12);
+        let buffer = render(&view, &theme, PANE, 12);
 
         assert!(row(&buffer, 0).contains("tail · SRE agent scaffold"));
         // The source label says where this came from: the transcript, not a live child.
@@ -286,7 +295,7 @@ mod tests {
             events: Some(&events),
             live: None,
         };
-        let buffer = render(&view, &theme, TAIL_WIDTH, 8);
+        let buffer = render(&view, &theme, PANE, 8);
 
         // Body starts at row 3: agent, tool, user, one line each at this width.
         let color = |y: u16| buffer[(first_ink(&buffer, y).expect("ink"), y)].fg;
@@ -318,7 +327,7 @@ mod tests {
             live: None,
         };
         // 3 header rows + 4 body rows.
-        let buffer = render(&view, &theme, TAIL_WIDTH, 7);
+        let buffer = render(&view, &theme, PANE, 7);
         let body = (3..7).map(|y| row(&buffer, y)).collect::<Vec<_>>();
         assert!(
             body.iter().any(|line| line.contains("line 19")),
@@ -331,17 +340,34 @@ mod tests {
     }
 
     #[test]
+    fn the_pane_takes_half_the_width_and_leaves_the_rest_to_the_list() {
+        assert_eq!(tail_width(170), 85);
+        assert_eq!(tail_width(120), 60);
+        assert_eq!(tail_width(TAIL_MIN_TOTAL_WIDTH), 50);
+        // Whatever the width, the list keeps at least as much as the pane takes: an odd
+        // total gives the extra column to the list, never to the pane.
+        for total in [100u16, 101, 137, 170, 240] {
+            let pane = tail_width(total);
+            assert!(
+                total - pane >= pane,
+                "at {total} the pane took {pane} and left {}",
+                total - pane
+            );
+        }
+    }
+
+    #[test]
     fn a_header_row_keeps_the_pane_mounted_instead_of_collapsing_the_list() {
         let theme = crate::ui::theme::amber(false);
         // No session: the cursor is on a group header. The pane must still paint its rule
-        // and header, because unmounting it would give its 46 columns back to the list and
+        // and header, because unmounting it would give its columns back to the list and
         // re-lay every row out mid-arrow.
         let view = TailView {
             session: None,
             events: None,
             live: None,
         };
-        let buffer = render(&view, &theme, TAIL_WIDTH, 8);
+        let buffer = render(&view, &theme, PANE, 8);
 
         assert_eq!(
             buffer[(0, 3)].symbol(),
@@ -363,13 +389,13 @@ mod tests {
             events: None,
             live: None,
         };
-        assert!(row(&render(&unread, &theme, TAIL_WIDTH, 6), 3).contains("reading transcript"));
+        assert!(row(&render(&unread, &theme, PANE, 6), 3).contains("reading transcript"));
 
         let empty = TailView {
             session: Some(&session),
             events: Some(&[]),
             live: None,
         };
-        assert!(row(&render(&empty, &theme, TAIL_WIDTH, 6), 3).contains("nothing to show yet"));
+        assert!(row(&render(&empty, &theme, PANE, 6), 3).contains("nothing to show yet"));
     }
 }

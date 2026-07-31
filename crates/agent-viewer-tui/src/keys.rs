@@ -362,6 +362,18 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     );
 }
 
+/// Why the tail pane cannot open right now, if it cannot.
+///
+/// Below the minimum the half it takes would leave the list unreadable, so opening is
+/// refused rather than turning a flag on that renders nothing. A width of 0 means the list
+/// has not been drawn yet, which is not evidence of a narrow terminal. Shared by the Ctrl+B
+/// chord and the palette entry so both refuse for the same reason, in the same words.
+pub(crate) fn tail_refusal(ui: &Ui) -> Option<String> {
+    let width = ui.list_hit.borrow().width();
+    (width > 0 && width < TAIL_MIN_TOTAL_WIDTH)
+        .then(|| format!("tail pane needs {TAIL_MIN_TOTAL_WIDTH} columns and this one is {width}"))
+}
+
 /// Ctrl+B opens and closes the tail pane. It is a pure view toggle: the transcript read it
 /// implies happens on a background worker and never starts a process.
 fn toggle_tail(ui: &mut Ui) {
@@ -370,16 +382,9 @@ fn toggle_tail(ui: &mut Ui) {
         ui.set_notice("tail pane off".to_string());
         return;
     }
-    // Refuse rather than open a pane that cannot render: below the minimum the 46 columns it
-    // takes would leave the list unreadable, and an unsupported action is a footer notice,
-    // never a silent no-op. A width of 0 means the list has not been drawn yet, which is not
-    // evidence of a narrow terminal.
-    let width = ui.list_hit.borrow().width();
-    if width > 0 && width < TAIL_MIN_TOTAL_WIDTH {
-        ui.set_notice(format!(
-            "tail pane needs {} columns and this one is {width}",
-            TAIL_MIN_TOTAL_WIDTH
-        ));
+    // An unsupported action is a footer notice, never a silent no-op.
+    if let Some(reason) = tail_refusal(ui) {
+        ui.set_notice(reason);
         return;
     }
     ui.tail_open = true;
@@ -554,7 +559,7 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
             backend_of(backends, session.backend).map(|b| b.capabilities_for(session))
         })
         .unwrap_or_else(Capabilities::none);
-    let mut items = palette_action_items(selected, capabilities);
+    let mut items = palette_action_items(selected, capabilities, ui, ui.tail_open);
     items.extend(SpriteKind::ALL.into_iter().map(|sprite| {
         let active = sprite == ui.sprite;
         PaletteItem::new(
@@ -662,6 +667,8 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
 fn palette_action_items(
     selected: Option<&Session>,
     capabilities: Capabilities,
+    ui: &Ui,
+    tail_open: bool,
 ) -> Vec<PaletteItem> {
     [
         action_item(
@@ -736,6 +743,23 @@ fn palette_action_items(
             "open the list filter",
             Some("⌃F"),
             None,
+        ),
+        action_item(
+            PaletteAction::TailPane,
+            if tail_open {
+                "Hide tail pane"
+            } else {
+                "Show tail pane"
+            },
+            if tail_open {
+                "showing now · give the columns back to the list"
+            } else {
+                "tail the selected session's last turns beside the list"
+            },
+            Some("⌃B"),
+            // Only the open direction can be refused; closing always works, even if the
+            // terminal was resized narrow while the pane was up.
+            if tail_open { None } else { tail_refusal(ui) },
         ),
     ]
     .into_iter()
@@ -979,6 +1003,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::ShowAll => ui.app.toggle_show_all(),
             PaletteAction::Group => ui.app.toggle_group_mode(),
             PaletteAction::Filter => open_filter(ui),
+            PaletteAction::TailPane => toggle_tail(ui),
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
@@ -2254,6 +2279,98 @@ pub(crate) mod tests {
                 );
             })
             .expect("draw list frame");
+    }
+
+    /// The tail-pane entry in an open palette, as the user would find it.
+    fn tail_palette_item(ui: &Ui) -> agent_viewer_tui::ui::PaletteItem {
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("expected the palette to be open");
+        };
+        palette
+            .results()
+            .find(|item| matches!(&item.target, PaletteTarget::Action(PaletteAction::TailPane)))
+            .cloned()
+            .expect("the palette offers the tail pane")
+    }
+
+    /// Open the palette and type `query`, leaving it open on the ranked results. An empty
+    /// query lists only enabled actions, so a disabled one is found by typing for it, which
+    /// is how the user would find it too.
+    fn open_palette_with_query(ui: &mut Ui, query: &str) {
+        let mut terminal = test_terminal();
+        assert!(!press_normal_key(ui, &[], 'k', KeyModifiers::CONTROL));
+        for character in query.chars() {
+            handle_palette_key(
+                key(KeyCode::Char(character), KeyModifiers::NONE),
+                &[],
+                ui,
+                &mut terminal,
+            )
+            .expect("type palette query");
+        }
+    }
+
+    /// Open the palette, type `query`, and press Enter on the top hit.
+    fn pick_from_palette(ui: &mut Ui, query: &str) {
+        open_palette_with_query(ui, query);
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            ui,
+            &mut test_terminal(),
+        )
+        .expect("accept palette selection");
+    }
+
+    #[test]
+    fn the_quick_switcher_toggles_the_tail_pane_both_ways() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-palette", 100)]);
+        render_list_frame(&ui, 170);
+
+        // Closed: typing "tail pane" finds an entry offering to show it.
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert_eq!(item.name, "Show tail pane");
+        assert!(item.enabled);
+        ui.mode = Mode::Normal;
+
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(ui.tail_open, "the palette entry opened the pane");
+        assert!(matches!(ui.mode, Mode::Normal));
+
+        // Open: the same entry now reads as hide, and picking it closes the pane again.
+        render_list_frame(&ui, 170);
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert_eq!(item.name, "Hide tail pane");
+        assert!(item.detail.contains("showing now"));
+        ui.mode = Mode::Normal;
+
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(!ui.tail_open, "the palette entry closed the pane");
+    }
+
+    #[test]
+    fn the_quick_switcher_disables_the_tail_pane_on_a_narrow_terminal() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-narrow-p", 100)]);
+        render_list_frame(&ui, 80);
+
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert!(!item.enabled, "80 columns cannot show the pane");
+        assert!(
+            item.disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("80")),
+            "the reason names the measured width: {:?}",
+            item.disabled_reason
+        );
+        ui.mode = Mode::Normal;
+
+        // Picking it anyway leaves the pane closed and says why.
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(!ui.tail_open);
+        assert!(ui.notice.text().contains("80"), "{:?}", ui.notice.text());
     }
 
     #[test]
