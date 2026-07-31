@@ -50,6 +50,13 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Whether the age ramp has anywhere to fade to under this theme. A theme built from named
+    /// ANSI colors (`terminal`) cannot be interpolated, so the ramp is a no-op there; this only
+    /// drives the footer notice, the hard gate is per-color inside `ui::age::ramp`.
+    pub fn supports_age_ramp(&self) -> bool {
+        matches!(self.faint, Color::Rgb(..))
+    }
+
     pub fn terminal_palette(&self) -> Option<TerminalPalette> {
         let (
             Color::Rgb(foreground_red, foreground_green, foreground_blue),
