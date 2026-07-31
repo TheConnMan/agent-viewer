@@ -37,6 +37,23 @@ pub struct CodexProcessScan {
 }
 
 impl CodexProcessScan {
+    /// Assemble a scan from already-collected evidence.
+    ///
+    /// The platform sweeps below build theirs through it, and it is the only way to drive
+    /// `resolve_scanned` - the resolver entry point `list` actually calls - without a live codex
+    /// process to observe. `fd_evidence_available` is false only where procfs does not exist.
+    pub fn from_evidence(
+        open_rollouts: HashMap<PathBuf, RolloutOwner>,
+        attached_threads: HashSet<String>,
+        fd_evidence_available: bool,
+    ) -> CodexProcessScan {
+        CodexProcessScan {
+            open_rollouts,
+            attached_threads,
+            fd_evidence_available,
+        }
+    }
+
     fn fd_signal(&self, rollout_path: &Path) -> FdSignal {
         if !self.fd_evidence_available {
             return FdSignal::Unavailable;
@@ -67,11 +84,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         true,
         sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
     );
-    let mut scan = CodexProcessScan {
-        open_rollouts: HashMap::new(),
-        attached_threads: HashSet::new(),
-        fd_evidence_available: true,
-    };
+    let mut scan = CodexProcessScan::from_evidence(HashMap::new(), HashSet::new(), true);
     // The two host signals are a UNION, not a fallback chain. Neither is complete on its own:
     // the socket table misses an app-server on the `stdio://` transport (it holds no socket at
     // all), and argv misses a host whose command line this crate cannot parse. Either saying
@@ -130,11 +143,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
 /// process is still live. Return explicit unavailable evidence and make no process claims.
 #[cfg(not(target_os = "linux"))]
 pub fn scan_codex_processes() -> CodexProcessScan {
-    CodexProcessScan {
-        open_rollouts: HashMap::new(),
-        attached_threads: HashSet::new(),
-        fd_evidence_available: false,
-    }
+    CodexProcessScan::from_evidence(HashMap::new(), HashSet::new(), false)
 }
 
 /// PURE: the inode of an fd whose /proc link target is `socket:[N]`, else None.
