@@ -228,6 +228,16 @@ impl Backend for ClaudeBackend {
         sessions.sort_by_key(|session| session.updated_at_ms);
         Ok(sessions)
     }
+    fn tail(&self, session: &Session, max_events: usize) -> Result<Vec<crate::TailEvent>> {
+        let Some(path) = session
+            .rollout_path
+            .as_deref()
+            .filter(|path| path.is_file())
+        else {
+            return Ok(Vec::new());
+        };
+        read_claude_transcript(path, max_events)
+    }
     fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
         let Some(path) = session
             .rollout_path
@@ -871,64 +881,96 @@ pub fn replace_atomic(_path: &std::path::Path, _body: &str) -> Result<()> {
     Err(Error::Unsupported(BackendKind::Claude.name()))
 }
 
-/// Peek parser for the claude session JSONL (verified record shapes 2026-07-11):
-/// keep type=="user" (message.content is a STRING, or a list with
-/// content[].type=="text") and type=="assistant" (content[].type=="text";
-/// "thinking"/tool blocks skipped); skip attachment/system/queue-operation/etc.
-/// Return at most the LAST max_items items. Reuses codex::rollout::TranscriptItem.
+/// Tail parser for the claude session JSONL (verified record shapes 2026-07-11, tool
+/// shapes 2026-07-31): keep type=="user" (message.content is a STRING, or a list with
+/// content[].type=="text") and type=="assistant" (content[].type=="text" as prose,
+/// content[].type=="tool_use" as a tool event; "thinking" skipped); skip
+/// attachment/system/queue-operation/etc. Blocks are emitted in the order they appear, so
+/// prose written before a tool call stays before it. Return at most the LAST max_events
+/// events.
 pub fn read_claude_transcript(
     path: &std::path::Path,
-    max_items: usize,
-) -> Result<Vec<crate::codex::rollout::TranscriptItem>> {
-    use crate::codex::rollout::TranscriptItem;
+    max_events: usize,
+) -> Result<Vec<crate::backend::TailEvent>> {
+    use crate::backend::TailEvent;
     use std::io::BufRead;
 
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let mut items = Vec::new();
+    let mut events = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
         let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
-        let role = match crate::json_str(&value, "type") {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
+        let is_user = match crate::json_str(&value, "type") {
+            Some("user") => true,
+            Some("assistant") => false,
             // attachment/system/queue-operation/etc. are skipped.
             _ => continue,
         };
+        let prose = |text: String| {
+            if is_user {
+                TailEvent::User(text)
+            } else {
+                TailEvent::Agent(text)
+            }
+        };
         let content = value.get("message").and_then(|m| m.get("content"));
-        let text = match content {
+        match content {
             // message.content is either a plain string...
-            Some(serde_json::Value::String(s)) => s.clone(),
-            // ...or a list of blocks; keep only type=="text" (thinking/tool skipped).
+            Some(serde_json::Value::String(text)) => {
+                if !text.is_empty() {
+                    events.push(prose(text.clone()));
+                }
+            }
+            // ...or a list of blocks: type=="text" is prose, type=="tool_use" is a tool
+            // event, thinking and tool_result are skipped.
             Some(serde_json::Value::Array(blocks)) => {
                 let mut text = String::new();
                 for block in blocks {
-                    if crate::json_str(block, "type") == Some("text")
-                        && let Some(t) = crate::json_str(block, "text")
-                    {
-                        text.push_str(t);
+                    match crate::json_str(block, "type") {
+                        Some("text") => {
+                            if let Some(chunk) = crate::json_str(block, "text") {
+                                text.push_str(chunk);
+                            }
+                        }
+                        Some("tool_use") => {
+                            let Some(name) =
+                                crate::json_str(block, "name").filter(|name| !name.is_empty())
+                            else {
+                                continue;
+                            };
+                            // Flush the prose written before this call so the pane reads in
+                            // the order the agent produced it.
+                            if !text.is_empty() {
+                                events.push(prose(std::mem::take(&mut text)));
+                            }
+                            let detail = block
+                                .get("input")
+                                .map(crate::backend::tool_detail)
+                                .unwrap_or_default();
+                            events.push(TailEvent::Tool {
+                                name: name.to_string(),
+                                detail,
+                            });
+                        }
+                        _ => {}
                     }
                 }
-                text
+                // A message whose content is only thinking/tool_result blocks extracts to
+                // "" — skip it so the pane never shows a blank role-only line.
+                if !text.is_empty() {
+                    events.push(prose(text));
+                }
             }
             _ => continue,
-        };
-        // A message whose content is only thinking/tool blocks extracts to "" — skip it
-        // so peek never shows a blank role-only line.
-        if text.is_empty() {
-            continue;
         }
-        items.push(TranscriptItem {
-            role: role.to_string(),
-            text,
-        });
     }
-    if items.len() > max_items {
-        items = items.split_off(items.len() - max_items);
+    if events.len() > max_events {
+        events = events.split_off(events.len() - max_events);
     }
-    Ok(items)
+    Ok(events)
 }
 
 /// Read turn timestamps from the full Claude transcript.
