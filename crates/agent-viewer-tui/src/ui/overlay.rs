@@ -206,7 +206,9 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("← back", "detach (composer empty)"),
         ("Ctrl+]", "detach (always)"),
         ("Enter/Space", "toggle group on a header"),
-        ("Ctrl+K", "command palette"),
+        // Paired onto one line: the popup already fills an 80x24 terminal, and a 23rd entry
+        // pushes Ctrl+C off the bottom.
+        ("Ctrl+K / Ctrl+W", "command palette / video wall"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
