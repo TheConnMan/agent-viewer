@@ -2,7 +2,6 @@
 pub enum BackendKind {
     Codex,
     Claude,
-    Opencode,
 }
 
 /// A nonsecret namespace for one concrete backend listing source.
@@ -108,30 +107,28 @@ pub struct SpawnResult {
 }
 
 impl BackendKind {
-    /// "codex" | "claude" | "opencode"
+    /// "codex" | "claude"
     pub fn name(self) -> &'static str {
         match self {
             BackendKind::Codex => "codex",
             BackendKind::Claude => "claude",
-            BackendKind::Opencode => "opencode",
         }
     }
     /// The model label a spawn uses when the user has picked nothing: the leading entry of
     /// `available_models`, and the composer's placeholder while discovery is still running.
-    /// Codex and opencode take "default" (their CLIs resolve it themselves); claude has no
+    /// Codex takes "default" (its CLI resolves it itself); claude has no
     /// such passthrough, so its label is a real model id.
     pub fn default_model(self) -> &'static str {
         match self {
-            BackendKind::Codex | BackendKind::Opencode => "default",
+            BackendKind::Codex => "default",
             BackendKind::Claude => "opus[1m]",
         }
     }
-    /// "[cx]" | "[cc]" | "[oc]"  (row + composer prefix)
+    /// "[cx]" | "[cc]"  (row + composer prefix)
     pub fn tag(self) -> &'static str {
         match self {
             BackendKind::Codex => "[cx]",
             BackendKind::Claude => "[cc]",
-            BackendKind::Opencode => "[oc]",
         }
     }
 }
@@ -175,39 +172,6 @@ impl Capabilities {
             pr_refs: false,
             live_status: false,
         }
-    }
-}
-
-/// PURE capability ceiling for the OpenCode implementation available on each platform.
-///
-/// The Linux backend may narrow this at runtime when its authenticated server is unavailable.
-/// Portable builds expose only the read only SQLite and CLI compatibility actions.
-pub const fn opencode_capabilities_for_platform(
-    platform: crate::platform::Platform,
-) -> Capabilities {
-    match platform {
-        crate::platform::Platform::Linux => Capabilities {
-            spawn: true,
-            attach: true,
-            rename: true,
-            archive: true,
-            delete: true,
-            stop: true,
-            needs_input: true,
-            pr_refs: false,
-            live_status: true,
-        },
-        crate::platform::Platform::Macos | crate::platform::Platform::Windows => Capabilities {
-            spawn: true,
-            attach: true,
-            rename: false,
-            archive: false,
-            delete: false,
-            stop: false,
-            needs_input: false,
-            pr_refs: false,
-            live_status: false,
-        },
     }
 }
 
@@ -267,23 +231,21 @@ pub struct Session {
     /// show, even if their backend would otherwise mark them a companion.
     pub companion: bool,
     /// One-line dim summary for the row. codex: threads.preview; claude: state.json needs
-    /// (blocked) else detail; opencode: "".
+    /// (blocked) else detail.
     pub summary: String,
     /// Live PID when known — codex: the process holding the rollout fd; claude: agents-json
-    /// "pid" (present on working entries); opencode: filled by the overlay from the viewer
-    /// spawn record.
+    /// "pid" (present on working entries).
     pub pid: Option<u32>,
     /// Some for codex — the rollout JSONL, OR the claude session JSONL (state.json
-    /// linkScanPath) for peek. None for opencode.
+    /// linkScanPath) for peek.
     pub rollout_path: Option<std::path::PathBuf>,
     /// Associated PR references, rendered as a right-aligned badge. Claude: jobs
     /// `state.json` children where kind=="pr". Codex: github PR links scanned out of the
-    /// rollout transcript, since its registry records none. Empty for opencode.
+    /// rollout transcript, since its registry records none.
     pub pr_refs: Vec<PrRef>,
     /// True when this session lives inside a shared backend runtime whose process hosts
     /// multiple sessions. Such a row carries no `pid` because that process belongs to every
-    /// session it hosts. Codex joins and stops these rows through its app server. OpenCode
-    /// joins and stops them through its server API.
+    /// session it hosts. Codex joins and stops these rows through its app server.
     pub daemon_hosted: bool,
 }
 
@@ -298,9 +260,9 @@ pub enum TailEvent {
     Tool { name: String, detail: String },
 }
 
-/// Keys the three backends use for the one argument worth showing on a tool line, tried in
-/// this order. Codex writes `cmd`, Claude writes `command`/`file_path`, opencode writes
-/// `filePath`; the rest are the next-best identifying argument when none of those is present.
+/// Keys the backends use for the one argument worth showing on a tool line, tried in
+/// this order. Codex writes `cmd`, Claude writes `command`/`file_path`; the rest are the
+/// next-best identifying argument when none of those is present.
 const TOOL_DETAIL_KEYS: [&str; 9] = [
     "cmd",
     "command",
@@ -437,7 +399,7 @@ pub trait Backend: Send {
     }
     /// Returns the direct child PID when the viewer forked it and the exact backend session
     /// identity when the spawn protocol provides one.
-    /// `model` is the optional per-spawn model (claude `--model`, codex/opencode `-m`);
+    /// `model` is the optional per-spawn model (claude `--model`, codex `-m`);
     /// None uses the backend's own default.
     /// `effort` is the optional per-spawn reasoning effort; it is advisory and is ignored by
     /// backends without the concept.
@@ -506,21 +468,11 @@ pub(crate) fn dedup_preserve(v: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The fixed v1 roster. OpenCode uses its server first and falls back to its read only
-/// SQLite registry when no managed server is healthy. No config surface.
+/// The fixed v1 roster. No config surface.
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
-    all_backends_with_opencode(crate::opencode::OpencodeRuntime::new())
-}
-
-/// The fixed v1 roster with a caller supplied OpenCode runtime. Callers with multiple
-/// backend sets use this factory so listing and actions observe the same server state.
-pub fn all_backends_with_opencode(
-    runtime: crate::opencode::OpencodeRuntime,
-) -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
         Box::new(crate::claude::ClaudeBackend::new()),
-        Box::new(crate::opencode::OpencodeBackend::with_runtime(runtime)),
     ]
 }
 

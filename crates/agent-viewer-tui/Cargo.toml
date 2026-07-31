@@ -1,6 +1,6 @@
 [package]
 name = "agent-viewer-tui"
-description = "Terminal viewer for coding-agent sessions across Codex, Claude Code, and opencode."
+description = "Terminal viewer for coding-agent sessions across Codex and Claude Code."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

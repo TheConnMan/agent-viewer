@@ -483,15 +483,15 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
     Ok(true)
 }
 
-/// Companion filter for claude - the peer of the codex `Source::is_companion` rule and the
-/// opencode `is_run_mode_permission` rule, which claude previously had no equivalent of.
+/// Companion filter for claude - the peer of the codex `Source::is_companion` rule, which
+/// claude previously had no equivalent of.
 ///
 /// Every live claude process registers itself in `~/.claude/sessions/<pid>.json`, and
 /// `claude agents --json --all` returns all of them. That includes a NESTED `claude -p` (the
 /// Agent SDK's headless entrypoint) that another session shelled out to - a skill, a hook, an
 /// `/implement` planning pass. It is a real process, but not a fleet member anyone started,
 /// and it carries no `jobId`, so claude derives its name from the cwd as `<dir-basename>-<n>`
-/// ("opencode-server-runtime-69"). Those rows read as mystery sessions in the default view and
+/// ("agent-viewer-worker-69"). Those rows read as mystery sessions in the default view and
 /// vanish when the child exits, since the pid file is removed on exit.
 ///
 /// The discriminator is `entrypoint`, matched on the `sdk-` PREFIX so the whole Agent SDK
@@ -501,7 +501,7 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
 /// of `id`/`jobId` is equally true of one. A `--bg` job and an interactive session BOTH report
 /// `entrypoint: "cli"`, which is exactly what makes the `sdk-` prefix the safe cut.
 ///
-/// Same safe direction as the opencode rule: anything unrecognized is treated as a real
+/// Same safe direction as the codex rule: anything unrecognized is treated as a real
 /// session, because a shown row one keypress from hidden beats a hidden row you cannot find.
 /// Companion only HIDES (Ctrl+A reveals); it never drops the row.
 pub fn is_sdk_entrypoint(entrypoint: Option<&str>) -> bool {

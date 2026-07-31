@@ -97,7 +97,7 @@ pub struct RouterOutcome {
     pub provider: BackendKind,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// The backend's own identity (codex thread id, claude short id, opencode session id) when
+    /// The backend's own identity (codex thread id, claude short id) when
     /// the router resolved one. `None` still means dispatched: a `claude --bg` job whose short
     /// id had not surfaced yet is findable by name.
     pub job_id: Option<String>,
@@ -227,7 +227,6 @@ fn provider_kind(name: &str) -> std::result::Result<BackendKind, String> {
     match name {
         "codex" => Ok(BackendKind::Codex),
         "claude" => Ok(BackendKind::Claude),
-        "opencode" => Ok(BackendKind::Opencode),
         other => Err(format!(
             "`{ROUTER_BIN}` routed to unknown provider {other:?}"
         )),

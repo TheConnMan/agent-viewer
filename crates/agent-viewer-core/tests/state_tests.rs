@@ -5,12 +5,10 @@ use agent_viewer_core::state::{
     DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
     apply_viewer_state, match_spawn, match_spawn_between,
 };
-use base64::Engine;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
 
 fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: Status) -> Session {
     Session {
@@ -47,81 +45,6 @@ fn mode(path: &std::path::Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
-}
-
-#[test]
-fn opencode_server_secret_is_stable_random_and_shared_by_concurrent_openers() {
-    let (_dir, path) = temp_db_path();
-    let workers = 12;
-    let barrier = Arc::new(Barrier::new(workers));
-    let handles = (0..workers)
-        .map(|_| {
-            let path = path.clone();
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                ViewerDb::open(&path)
-                    .expect("open viewer db")
-                    .opencode_server_secret()
-                    .expect("read or create server secret")
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let secrets = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("secret worker"))
-        .collect::<Vec<_>>();
-    assert!(
-        secrets.iter().all(|secret| secret == &secrets[0]),
-        "all concurrent transactions must reread the single committed secret"
-    );
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&secrets[0])
-        .expect("secret is standard Base64");
-    assert_eq!(decoded.len(), 32, "the stored secret has 256 bits");
-    assert!(
-        decoded.iter().any(|byte| *byte != 0),
-        "the stored secret is not a zero filled placeholder"
-    );
-
-    let conn = rusqlite::Connection::open(&path).expect("inspect viewer db");
-    let count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM settings WHERE key = 'opencode.server_password'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count stored secrets");
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn opencode_server_secrets_are_distinct_across_independent_databases() {
-    let roots = (0..6)
-        .map(|_| tempfile::TempDir::new().unwrap())
-        .collect::<Vec<_>>();
-    let secrets = roots
-        .iter()
-        .map(|root| {
-            ViewerDb::open(&root.path().join("viewer.db"))
-                .expect("open independent viewer db")
-                .opencode_server_secret()
-                .expect("create independent server secret")
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        secrets.iter().collect::<HashSet<_>>().len(),
-        secrets.len(),
-        "independent databases must not share a server secret"
-    );
-    for secret in secrets {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(secret)
-            .expect("secret is standard Base64");
-        assert_eq!(decoded.len(), 32, "the stored secret has 256 bits");
-    }
 }
 
 #[test]
@@ -507,14 +430,14 @@ fn apply_viewer_state_preserves_backend_titles() {
     pinned.title = "Backend Pinned Title".to_string();
     let mut unpinned = sess(BackendKind::Claude, "unpinned", "/p", 20, Status::Working);
     unpinned.title = "Backend Unpinned Title".to_string();
-    let mut spawned = sess(BackendKind::Opencode, "spawned", "/p", 30, Status::Working);
+    let mut spawned = sess(BackendKind::Claude, "spawned", "/p", 30, Status::Working);
     spawned.title = "Backend Spawn Title".to_string();
     let mut sessions = vec![pinned, unpinned, spawned];
 
     let mut pinned = HashSet::new();
     pinned.insert((BackendKind::Codex, "pinned".to_string()));
     let mut spawn_pids = HashMap::new();
-    spawn_pids.insert((BackendKind::Opencode, "spawned".to_string()), 555);
+    spawn_pids.insert((BackendKind::Claude, "spawned".to_string()), 555);
     let state = ViewerState { pinned, spawn_pids };
 
     apply_viewer_state(&mut sessions, &state);
@@ -613,12 +536,12 @@ fn apply_viewer_state_clears_companion_only_for_pinned_session() {
 
 #[test]
 fn apply_viewer_state_skips_pid_on_terminal_sessions() {
-    let mut has_pid = sess(BackendKind::Opencode, "withpid", "/p", 60, Status::Working);
+    let mut has_pid = sess(BackendKind::Claude, "withpid", "/p", 60, Status::Working);
     has_pid.pid = Some(999);
     let mut sessions = vec![
-        sess(BackendKind::Opencode, "working", "/p", 10, Status::Working),
+        sess(BackendKind::Claude, "working", "/p", 10, Status::Working),
         sess(
-            BackendKind::Opencode,
+            BackendKind::Claude,
             "needs-input",
             "/p",
             20,
@@ -626,10 +549,10 @@ fn apply_viewer_state_skips_pid_on_terminal_sessions() {
                 reason: Some("permission required".to_string()),
             },
         ),
-        sess(BackendKind::Opencode, "idle", "/p", 30, Status::Idle),
-        sess(BackendKind::Opencode, "done", "/p", 40, Status::Done),
-        sess(BackendKind::Opencode, "error", "/p", 50, Status::Error),
-        sess(BackendKind::Opencode, "unknown", "/p", 60, Status::Unknown),
+        sess(BackendKind::Claude, "idle", "/p", 30, Status::Idle),
+        sess(BackendKind::Claude, "done", "/p", 40, Status::Done),
+        sess(BackendKind::Claude, "error", "/p", 50, Status::Error),
+        sess(BackendKind::Claude, "unknown", "/p", 60, Status::Unknown),
         has_pid,
     ];
     let mut spawn_pids = HashMap::new();
@@ -642,7 +565,7 @@ fn apply_viewer_state_skips_pid_on_terminal_sessions() {
         "unknown",
         "withpid",
     ] {
-        spawn_pids.insert((BackendKind::Opencode, id.to_string()), 777);
+        spawn_pids.insert((BackendKind::Claude, id.to_string()), 777);
     }
     let state = ViewerState {
         pinned: HashSet::new(),
@@ -775,7 +698,7 @@ fn match_spawn_window_and_nearest() {
             Status::Working,
         ),
         sess(
-            BackendKind::Opencode,
+            BackendKind::Claude,
             "wrong-backend",
             "/home/user/match-proj",
             1_005_000,
@@ -838,7 +761,7 @@ fn match_spawn_between_spans_the_whole_routing_interval() {
             Status::Working,
         ),
         sess(
-            BackendKind::Opencode,
+            BackendKind::Claude,
             "wrong-backend",
             "/home/user/routed-proj",
             1_005_000,
@@ -1020,38 +943,6 @@ fn viewer_db_retention_window_defaults_and_roundtrips() {
     );
 }
 
-#[test]
-fn viewer_db_opencode_server_url_defaults_roundtrips_and_clears() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    assert_eq!(db.opencode_server_url().expect("default url"), None);
-
-    db.set_opencode_server_url(Some("http://127.0.0.1:4096"))
-        .expect("set url");
-    assert_eq!(
-        db.opencode_server_url().expect("read url"),
-        Some("http://127.0.0.1:4096".to_string())
-    );
-
-    drop(db);
-    let db = ViewerDb::open(&path).expect("reopen viewer db");
-    assert_eq!(
-        db.opencode_server_url().expect("read persisted url"),
-        Some("http://127.0.0.1:4096".to_string())
-    );
-
-    db.set_opencode_server_url(Some("http://localhost:4097"))
-        .expect("overwrite url");
-    assert_eq!(
-        db.opencode_server_url().expect("read overwritten url"),
-        Some("http://localhost:4097".to_string())
-    );
-
-    db.set_opencode_server_url(None).expect("clear url");
-    assert_eq!(db.opencode_server_url().expect("read cleared url"), None);
-}
-
 // Model-catalog cache: a backend's discovered model ids survive a viewer restart, so the
 // composer's picker is populated instantly instead of waiting on a multi-second CLI probe.
 // The DB is dumb storage here - it stamps the fetch time and hands it back; whether that is
@@ -1063,17 +954,17 @@ fn cached_models_round_trip_survives_reopen() {
     let db = ViewerDb::open(&path).expect("open viewer db");
     let models = vec![
         "default".to_string(),
-        "opencode-go/kimi-k3".to_string(),
+        "zai/kimi-k3".to_string(),
         "anthropic/claude-opus-5".to_string(),
     ];
 
-    db.set_cached_models(BackendKind::Opencode, &models, 1_000)
+    db.set_cached_models(BackendKind::Claude, &models, 1_000)
         .expect("write model cache");
 
     drop(db);
     let db = ViewerDb::open(&path).expect("reopen viewer db");
     let hit = db
-        .cached_models(BackendKind::Opencode)
+        .cached_models(BackendKind::Claude)
         .expect("read model cache")
         .expect("row present");
     assert_eq!(hit.models, models);
@@ -1084,7 +975,7 @@ fn cached_models_round_trip_survives_reopen() {
 fn cached_models_absent_backend_is_none() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");
-    db.set_cached_models(BackendKind::Opencode, &["default".to_string()], 1_000)
+    db.set_cached_models(BackendKind::Claude, &["default".to_string()], 1_000)
         .expect("write model cache");
 
     // Another backend's row is not a hit; discovery still has to run for it.
@@ -1099,22 +990,22 @@ fn cached_models_absent_backend_is_none() {
 fn cached_models_overwrite_replaces_previous_list() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");
-    db.set_cached_models(BackendKind::Opencode, &["default".to_string()], 1_000)
+    db.set_cached_models(BackendKind::Claude, &["default".to_string()], 1_000)
         .expect("write first list");
     db.set_cached_models(
-        BackendKind::Opencode,
-        &["default".to_string(), "opencode-go/glm-5.2".to_string()],
+        BackendKind::Claude,
+        &["default".to_string(), "zai/glm-5.2".to_string()],
         2_000,
     )
     .expect("overwrite list");
 
     let hit = db
-        .cached_models(BackendKind::Opencode)
+        .cached_models(BackendKind::Claude)
         .expect("read model cache")
         .expect("row present");
     assert_eq!(
         hit.models,
-        vec!["default".to_string(), "opencode-go/glm-5.2".to_string()]
+        vec!["default".to_string(), "zai/glm-5.2".to_string()]
     );
     assert_eq!(hit.fetched_at_ms, 2_000);
 }
@@ -1128,14 +1019,14 @@ fn cached_models_preserve_order_and_survive_odd_ids() {
     let models = vec![
         "default".to_string(),
         "zzz/last-alphabetically".to_string(),
-        "opencode/big-pickle".to_string(),
+        "vendor/big-pickle".to_string(),
         "anthropic/claude-opus-5[1m]".to_string(),
     ];
-    db.set_cached_models(BackendKind::Opencode, &models, 1_000)
+    db.set_cached_models(BackendKind::Claude, &models, 1_000)
         .expect("write model cache");
 
     let hit = db
-        .cached_models(BackendKind::Opencode)
+        .cached_models(BackendKind::Claude)
         .expect("read model cache")
         .expect("row present");
     assert_eq!(hit.models, models);

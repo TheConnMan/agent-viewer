@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -56,12 +56,4 @@ pub fn home_from(
             .or(native_windows_home)
             .unwrap_or_default(),
     }
-}
-
-pub fn opencode_db_from(xdg_data_home: Option<&OsStr>, home: &Path) -> PathBuf {
-    xdg_data_home
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"))
-        .join("opencode/opencode.db")
 }
