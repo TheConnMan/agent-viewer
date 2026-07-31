@@ -2,7 +2,8 @@ mod common;
 
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
-    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript, tail_state,
+    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript_tail,
+    tail_state,
 };
 use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status, TailEvent};
 use common::rfc3339_at;
@@ -94,7 +95,7 @@ fn session_meta_rejects_empty_and_garbage() {
 #[test]
 fn transcript_extracts_text_and_tool_calls_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
-    let items = read_transcript(&path).expect("read transcript");
+    let items = read_transcript_tail(&path).expect("read transcript");
     // The user message, the assistant message, and the function_call the tail pane needs,
     // in transcript order. `arguments` is an embedded JSON string, so the detail comes out
     // of its `cmd` key.
@@ -143,7 +144,7 @@ fn transcript_drops_developer_and_system_scaffolding() {
     drop(f);
 
     assert_eq!(
-        read_transcript(&path).expect("read transcript"),
+        read_transcript_tail(&path).expect("read transcript"),
         vec![
             TailEvent::User("the real task".to_string()),
             TailEvent::Agent("on it".to_string()),
@@ -189,7 +190,7 @@ fn transcript_tool_detail_squashes_multiline_and_survives_unknown_arguments() {
     drop(f);
 
     assert_eq!(
-        read_transcript(&path).expect("read transcript"),
+        read_transcript_tail(&path).expect("read transcript"),
         vec![
             TailEvent::Tool {
                 name: "exec_command".to_string(),
@@ -236,7 +237,7 @@ fn transcript_excludes_empty_text_items() {
     .unwrap();
     drop(f);
 
-    let items = read_transcript(&path).expect("read transcript");
+    let items = read_transcript_tail(&path).expect("read transcript");
     assert_eq!(
         items,
         vec![
@@ -770,7 +771,7 @@ fn the_codex_environment_preamble_is_dropped_from_the_tail() {
     )
     .unwrap();
 
-    let events = read_transcript(&path).unwrap();
+    let events = read_transcript_tail(&path).unwrap();
     assert_eq!(
         events,
         [
@@ -800,7 +801,7 @@ fn a_later_message_carrying_the_environment_tag_is_kept() {
     )
     .unwrap();
 
-    let events = read_transcript(&path).unwrap();
+    let events = read_transcript_tail(&path).unwrap();
     assert_eq!(
         events,
         [
@@ -808,5 +809,69 @@ fn a_later_message_carrying_the_environment_tag_is_kept() {
             TailEvent::User("why does <environment_context> say bash here?".to_string()),
         ],
         "only the LEADING scaffolding item may be dropped"
+    );
+}
+
+/// The tail read must be BOUNDED. A live rollout grows without bound (18.6 MB measured on this
+/// box) and the pane re-reads it on every 2s tick to show twelve events, so the reader looks
+/// only at the end of the file. Written large enough that the early half is provably outside
+/// the window.
+#[test]
+fn read_transcript_tail_touches_only_the_end_of_a_multi_megabyte_rollout() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("rollout-huge.jsonl");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = std::io::BufWriter::new(file);
+    // ~2 KB of text per message; 1,000 of them is ~2 MB before the tail messages.
+    let filler = "x".repeat(2_048);
+    for n in 0..1_000 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("early-{n} {filler}")}]
+                }
+            })
+        )
+        .unwrap();
+    }
+    for n in 0..3 {
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": format!("late-{n}")}]
+                }
+            })
+        )
+        .unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
+
+    let events = read_transcript_tail(&path).expect("read tail");
+    assert_eq!(
+        events.last(),
+        Some(&TailEvent::Agent("late-2".to_string())),
+        "the newest message must survive"
+    );
+    assert!(
+        events.len() < 1_003,
+        "the whole file was parsed: {} events",
+        events.len()
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TailEvent::Agent(text) if text.starts_with("early-0 ")
+        )),
+        "a message megabytes back from the end must never be read"
     );
 }

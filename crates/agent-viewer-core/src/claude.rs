@@ -917,19 +917,20 @@ pub fn replace_atomic(_path: &std::path::Path, _body: &str) -> Result<()> {
 /// attachment/system/queue-operation/etc. Blocks are emitted in the order they appear, so
 /// prose written before a tool call stays before it. Return at most the LAST max_events
 /// events.
+///
+/// Only the final `TRANSCRIPT_TAIL_BYTES` of the file are read. A transcript grows without
+/// bound while a session works, and this runs on every refresh tick to render a handful of
+/// events, so parsing the whole file re-read megabytes per tick.
 pub fn read_claude_transcript(
     path: &std::path::Path,
     max_events: usize,
 ) -> Result<Vec<crate::backend::TailEvent>> {
     use crate::backend::TailEvent;
-    use std::io::BufRead;
 
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
+    let window = crate::read_tail_window(path, crate::TRANSCRIPT_TAIL_BYTES)?;
     let mut events = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Some(value) = crate::parse_json_line(&line) else {
+    for line in window.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
             continue;
         };
         let is_user = match crate::json_str(&value, "type") {
