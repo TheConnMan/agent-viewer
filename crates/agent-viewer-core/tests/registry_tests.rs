@@ -276,6 +276,42 @@ fn threads_without_a_session_index_keep_the_sqlite_title() {
     assert_eq!(threads[0].title, "SQLite Fallback Name");
 }
 
+/// The overlay is parsed once and held under the index file's (mtime, len), so the whole file
+/// is not re-read on every listing tick. A rename must still land on the very next listing.
+/// Every step here changes the file's LENGTH as well as its mtime, so the test cannot pass by
+/// accident on filesystem timestamp granularity.
+#[test]
+fn threads_overlay_follows_a_rewritten_session_index() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_duplicate", "SQLite Fallback Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+    let reg = Registry::open(&path).expect("open read only");
+    let title = |threads: Vec<agent_viewer_core::codex::registry::Thread>| threads[0].title.clone();
+
+    assert_eq!(
+        title(reg.threads().expect("query without an index")),
+        "SQLite Fallback Name"
+    );
+
+    copy_session_index(&dir);
+    assert_eq!(
+        title(reg.threads().expect("query after the index appeared")),
+        "Latest Index Name",
+        "an index file that appears after the first listing must still be read"
+    );
+
+    std::fs::write(
+        dir.path().join("session_index.jsonl"),
+        b"{\"id\":\"fixture_thread_duplicate\",\"thread_name\":\"Renamed\"}\n",
+    )
+    .expect("rewrite session index");
+    assert_eq!(
+        title(reg.threads().expect("query after the rename")),
+        "Renamed",
+        "a rename rewrites session_index.jsonl, and the cached overlay must not survive it"
+    );
+}
+
 #[test]
 fn distinct_models_orders_by_frequency_and_drops_empty_null() {
     let schema = common::read_fixture("threads_schema.sql");
