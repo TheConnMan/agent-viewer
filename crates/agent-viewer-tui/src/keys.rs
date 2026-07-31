@@ -11,8 +11,8 @@ use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
-    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
-    TAIL_MIN_TOTAL_WIDTH,
+    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState,
+    PaletteTarget, SpriteKind, TAIL_MIN_TOTAL_WIDTH,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -64,7 +64,16 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
     // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
     // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some();
+    // The triage panel is a live child exactly like the attach view is, so Ctrl+C there is an
+    // interrupt for the session being answered, not a request to tear the viewer down (and
+    // with it every other PTY it owns). Without a child in the panel there is nothing to
+    // interrupt, so the chord keeps its global meaning.
+    let triage_target = matches!(ui.mode, Mode::Triage(_))
+        && ui
+            .focused
+            .as_ref()
+            .is_some_and(|key| ui.attached.contains_key(key));
+    let forwarding = matches!(ui.mode, Mode::Attached) || wall_target.is_some() || triage_target;
     if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
@@ -780,7 +789,15 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
 
 fn open_palette(backends: &[Box<dyn Backend>], ui: &mut Ui) {
     let items = palette_items(backends, ui);
-    ui.mode = Mode::Palette(PaletteState::new(items));
+    // Every ACTION row is built for the row selected right now, so that identity is captured
+    // with them: a refresh landing while the palette is up can clamp the selection onto a
+    // different session, and Archive/Stop/Delete must never follow it there.
+    let action_target = ui.app.selected().map(|session| PaletteSessionTarget {
+        backend: session.backend,
+        id: session.id.clone(),
+        title: session.title.clone(),
+    });
+    ui.mode = Mode::Palette(PaletteState::new(items).with_action_target(action_target));
 }
 
 fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
@@ -1152,22 +1169,55 @@ fn handle_palette_key<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn cached_palette_target(
-    ui: &Ui,
-    target: &PaletteTarget,
-) -> Option<(TargetRequest, String, PaletteAction)> {
+/// What Enter on a palette row resolves to, once the row's session identity is re-checked
+/// against the listing as it stands now.
+enum PaletteExecution {
+    /// Not a row that acts on a session.
+    Other,
+    /// Run `action` against this session.
+    Session {
+        request: TargetRequest,
+        title: String,
+        action: PaletteAction,
+    },
+    /// The session the row was built for has left the listing since the palette opened.
+    Gone { title: String },
+}
+
+fn cached_palette_target(ui: &Ui, target: &PaletteTarget) -> PaletteExecution {
     match target {
         PaletteTarget::Action(action) => {
-            let session = ui.app.selected()?;
             let action = match action {
                 PaletteAction::Attach
                 | PaletteAction::Archive
                 | PaletteAction::Unarchive
                 | PaletteAction::Rename
                 | PaletteAction::StopOrRemove => *action,
-                _ => return None,
+                _ => return PaletteExecution::Other,
             };
-            Some((TargetRequest::from(session), session.title.clone(), action))
+            // The row the palette was OPENED on, never `selected()` as it stands now: a
+            // background refresh can drop that row and clamp the selection onto another
+            // session, and archiving or stopping that one is destructive and unasked for.
+            let Mode::Palette(state) = &ui.mode else {
+                return PaletteExecution::Other;
+            };
+            let Some(captured) = state.action_target() else {
+                return PaletteExecution::Other;
+            };
+            if ui
+                .app
+                .session_for(&(captured.backend, captured.id.clone()))
+                .is_none()
+            {
+                return PaletteExecution::Gone {
+                    title: captured.title.clone(),
+                };
+            }
+            PaletteExecution::Session {
+                request: TargetRequest::new(captured.backend, captured.id.clone()),
+                title: captured.title.clone(),
+                action,
+            }
         }
         PaletteTarget::Session { backend, id } => {
             let title = ui
@@ -1175,13 +1225,13 @@ fn cached_palette_target(
                 .session_for(&(*backend, id.clone()))
                 .map(|session| session.title.clone())
                 .unwrap_or_else(|| id.clone());
-            Some((
-                TargetRequest::new(*backend, id.clone()),
+            PaletteExecution::Session {
+                request: TargetRequest::new(*backend, id.clone()),
                 title,
-                PaletteAction::Attach,
-            ))
+                action: PaletteAction::Attach,
+            }
         }
-        _ => None,
+        _ => PaletteExecution::Other,
     }
 }
 
@@ -1223,13 +1273,28 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
     }) else {
         return Ok(());
     };
-    if let Some((request, title, action)) = cached_palette_target(ui, &item.target) {
-        if let PaletteTarget::Session { backend, id } = &item.target {
-            let _ = ui.app.select_by_key(&(*backend, id.clone()));
+    match cached_palette_target(ui, &item.target) {
+        PaletteExecution::Session {
+            request,
+            title,
+            action,
+        } => {
+            // Put the cursor back on the row the palette acted on, whichever group it came
+            // from: it is where the user's attention is, and the attach path only lands a
+            // resolved plan onto the session that is still selected.
+            let _ = ui
+                .app
+                .select_by_key(&(request.backend(), request.id().to_string()));
+            ui.mode = Mode::Normal;
+            execute_cached_palette_action(ui, request, title, action);
+            return Ok(());
         }
-        ui.mode = Mode::Normal;
-        execute_cached_palette_action(ui, request, title, action);
-        return Ok(());
+        PaletteExecution::Gone { title } => {
+            ui.mode = Mode::Normal;
+            ui.set_notice(format!("{title} is no longer listed"));
+            return Ok(());
+        }
+        PaletteExecution::Other => {}
     }
     if !item.enabled {
         if let Some(reason) = item.disabled_reason {
@@ -1937,7 +2002,7 @@ pub(crate) mod tests {
     /// through `submit_attach`, so a `Wall` outcome here would mean the runner crossed wires.
     fn focus_plan(outcome: crate::AttachOutcome) -> crate::ops::AttachPlan {
         match outcome {
-            crate::AttachOutcome::Focus(plan) => plan,
+            crate::AttachOutcome::Focus { plan, .. } => plan,
             crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
         }
     }
@@ -5414,6 +5479,106 @@ pub(crate) mod tests {
         );
     }
 
+    // --- palette actions target the row the palette was opened on --------------------
+
+    /// Move the palette highlight onto a specific row, so the assertion is about what Enter
+    /// does to that row rather than about how the fuzzy ranker orders a query.
+    fn highlight_palette_target(ui: &mut Ui, wanted: &PaletteTarget) {
+        let Mode::Palette(palette) = &mut ui.mode else {
+            panic!("expected the palette to be open");
+        };
+        for _ in 0..palette.result_count() {
+            if palette.highlighted().map(|item| &item.target) == Some(wanted) {
+                return;
+            }
+            palette.move_highlight(1);
+        }
+        panic!("the palette does not offer {wanted:?}");
+    }
+
+    /// Report which session each archive mutation actually ran against.
+    fn recording_archive_executor(ui: &mut Ui) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let crate::ops::Mutation::Hide(request) = mutation else {
+                panic!("the palette archive row must only ever hide");
+            };
+            tx.lock()
+                .expect("mutation recorder")
+                .send(request.id().to_string())
+                .expect("record the archived session");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+        rx
+    }
+
+    /// The palette's ACTION rows read "the selected session", and the 1s refresh keeps running
+    /// while the palette is up. Enter must archive the row the palette was opened on, not
+    /// whichever row the selection was clamped onto in the meantime.
+    #[test]
+    fn a_palette_action_archives_the_row_it_was_opened_on_not_a_moved_selection() {
+        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
+        let archived = recording_archive_executor(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+        );
+
+        open_palette(&backends, &mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, bravo.id.clone()))
+        );
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::Archive));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert_eq!(
+            archived
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .as_deref(),
+            Ok("alpha"),
+            "the palette must archive the row it was opened on"
+        );
+    }
+
+    /// And when that row has left the listing entirely, the action is refused rather than
+    /// following the selection onto a session the user never chose.
+    #[test]
+    fn a_palette_action_whose_row_left_the_listing_notices_instead_of_acting() {
+        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
+        let archived = recording_archive_executor(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+        );
+
+        open_palette(&backends, &mut ui);
+        // The refresh drops the row the palette was opened on; the selection clamps onto the
+        // only row left.
+        ui.app.set_sessions(vec![bravo.clone()]);
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::Archive));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert!(
+            archived
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "no session may be archived once the palette's row is gone"
+        );
+        assert_eq!(ui.notice.text(), "alpha is no longer listed");
+        assert!(matches!(ui.mode, Mode::Normal));
+    }
+
     // --- Ctrl+N triage inbox --------------------------------------------------------
 
     fn blocked_session(id: &str, updated_at_ms: i64) -> Session {
@@ -5695,6 +5860,109 @@ pub(crate) mod tests {
             "typing into the session must never reach the composer"
         );
         assert_eq!(ui.app.selected_index(), selection_before);
+    }
+
+    /// Ctrl+C in the triage panel is an interrupt for the session being answered. Quitting
+    /// there tears down every PTY the viewer owns while a child is live, which is the opposite
+    /// of what a user stopping a runaway answer is asking for.
+    #[test]
+    fn ctrl_c_in_triage_interrupts_the_session_rather_than_quitting_the_viewer() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        let quit = press_normal_key(&mut ui, &backends, 'c', KeyModifiers::CONTROL);
+
+        assert!(!quit, "Ctrl+C must not tear the viewer down from triage");
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+        // `cat` runs with ISIG on, so 0x03 reaching it is observable as the child dying.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ui.attached.get_mut(&item).expect("panel child").is_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ctrl+C must reach the session in the panel as an interrupt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// With nothing live in the panel there is no child to interrupt, so the chord keeps its
+    /// global meaning rather than becoming a dead key.
+    #[test]
+    fn ctrl_c_in_triage_without_a_live_child_still_quits() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert!(ui.attached.is_empty());
+
+        assert!(press_normal_key(
+            &mut ui,
+            &backends,
+            'c',
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    /// A triage visit lasts exactly as long as the item is in the panel: walking on closes the
+    /// child it left, so a long queue does not accumulate invisible processes.
+    #[test]
+    fn walking_to_the_next_item_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let first = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, first.clone());
+
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        assert!(
+            !ui.attached.contains_key(&first),
+            "the item the queue walked off must not stay connected off screen"
+        );
+        assert!(
+            !ui.detach_trackers.contains_key(&first),
+            "its per-PTY state goes with it"
+        );
+    }
+
+    /// Same on the way back: Ctrl+P is a move like any other.
+    #[test]
+    fn walking_back_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let second = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, second.clone());
+
+        press_triage(&mut ui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(!ui.attached.contains_key(&second));
+    }
+
+    #[test]
+    fn leaving_the_queue_closes_the_child_it_was_showing() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        press_triage(&mut ui, KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&item),
+            "nothing stays connected once the queue is closed"
+        );
     }
 
     #[test]

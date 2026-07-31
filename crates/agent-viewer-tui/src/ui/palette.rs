@@ -59,6 +59,20 @@ pub enum PaletteTarget {
     Command(String),
 }
 
+/// The session the ACTION rows were built for, captured when the palette opened.
+///
+/// Action rows read "the selected session", and every one of them is built from
+/// `App::selected()` at open time. The 1s background refresh keeps running while the palette
+/// is up, so by the time Enter lands the selection can have been clamped onto a DIFFERENT
+/// session (its own row having left the listing). Archive/Stop/Delete against that row is
+/// destructive, so the identity is captured here and the action executes against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaletteSessionTarget {
+    pub backend: BackendKind,
+    pub id: String,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaletteItem {
     pub group: PaletteGroup,
@@ -109,6 +123,7 @@ pub struct PaletteState {
     items: Vec<PaletteItem>,
     results: Vec<usize>,
     highlight: usize,
+    action_target: Option<PaletteSessionTarget>,
 }
 
 impl PaletteState {
@@ -119,9 +134,20 @@ impl PaletteState {
             items,
             results: Vec::new(),
             highlight: 0,
+            action_target: None,
         };
         state.rank();
         state
+    }
+
+    /// Record the session the ACTION rows were built for. See [`PaletteSessionTarget`].
+    pub fn with_action_target(mut self, target: Option<PaletteSessionTarget>) -> Self {
+        self.action_target = target;
+        self
+    }
+
+    pub fn action_target(&self) -> Option<&PaletteSessionTarget> {
+        self.action_target.as_ref()
     }
 
     pub fn query(&self) -> &str {
