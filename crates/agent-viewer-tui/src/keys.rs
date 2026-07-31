@@ -101,7 +101,9 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         Mode::Rename(_) => handle_rename_key(key.code, ui),
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
         Mode::Triage(_) => handle_triage_key(key, ui)?,
-        Mode::Compose => {}
+        // Reached from the palette while the wall is on: the composer floats over the grid and
+        // takes the keyboard back off the focused tile for as long as it is up.
+        Mode::Compose => handle_compose_key(key, ctrl, backends, refresher, ui),
     }
     Ok(false)
 }
@@ -682,102 +684,175 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
         return Ok(false);
     }
 
-    // While either popup (slash-command or /model picker) is open, Up/Down/Tab/Esc drive it
-    // instead of the list. For /model the guard is `is_model_command()` (not `model_picking`):
-    // an active `/model <no-match>` command must still capture these keys, otherwise Tab would
-    // cycle the backend and Up/Down would move the session selection mid-command. The
-    // underlying composer ops (`move_suggestion`, `accept_model`) are safe no-ops when the
-    // active list is empty.
+    // An open composer popup takes Up/Down/Tab/Enter/Esc before the list ever sees them.
+    if !handle_composer_popup_key(key, ui) {
+        match key.code {
+            // Arrows navigate or act at all times.
+            KeyCode::Down => ui.app.move_selection(1),
+            KeyCode::Up => ui.app.move_selection(-1),
+            KeyCode::Right => {
+                attach_selected(ui);
+            }
+            // Tab cycles the target backend once no popup wants it; Shift+Tab cycles that
+            // backend's model.
+            KeyCode::Tab => ui.composer.cycle_backend(),
+            KeyCode::BackTab => ui.composer.cycle_model(),
+            KeyCode::Backspace => ui.composer.backspace(),
+            // The popup pass already dismissed anything that was open, so this Esc is the
+            // second one: it clears the composer.
+            KeyCode::Esc => ui.composer.clear(),
+            KeyCode::Enter => {
+                if ui.composer.is_empty() {
+                    // On a group header, Enter collapses/expands the group (and persists)
+                    // instead of attaching; on a session it attaches as before.
+                    activate_selected(ui);
+                } else {
+                    spawn_from_composer(backends, refresher, ui);
+                }
+            }
+            KeyCode::Char(c) => {
+                if ui.composer.is_empty() {
+                    // Empty composer: punctuation hotkeys still fire; every bare letter and
+                    // number starts a task.
+                    match c {
+                        '?' => ui.mode = Mode::Help,
+                        // On a header, Space toggles the group and persists it. On a session it
+                        // does nothing. With no selected session or header it is composer text.
+                        ' ' => {
+                            if !toggle_group_if_header(ui) && ui.app.selected().is_none() {
+                                ui.composer.push_char(' ');
+                            }
+                        }
+                        // '/' is no longer a filter hotkey — it types into the composer so a
+                        // slash command like `/implement RS-123` spawns as the task prompt.
+                        _ => ui.composer.push_char(c),
+                    }
+                } else {
+                    // Non-empty composer: every printable (and space) is task text.
+                    ui.composer.push_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    sync_composer_popups(ui);
+    Ok(false)
+}
+
+/// Keys while the spawn composer floats over the wall. The list's composer with the list taken
+/// away: same popups, same Tab/⇧Tab cycling, but no row to move onto and none to activate.
+///
+/// Reached from the palette rather than from a chord, and it reserves none of its own: every
+/// chord the wall does not take belongs to the focused child permanently, and this overlay is
+/// not worth another one.
+fn handle_compose_key(
+    key: KeyEvent,
+    ctrl: bool,
+    backends: &[Box<dyn Backend>],
+    refresher: &Refresher,
+    ui: &mut Ui,
+) {
+    // Same up-front refresh the list does, and for the same reason: nothing may read
+    // `suggestions_active` against commands scanned for a target that has since moved.
+    ensure_completions(ui);
+    ensure_models(ui);
+    // Ctrl chords are inert here rather than acting: the wall's own chords aim at the focused
+    // tile, and firing one from behind an input box that has the keyboard would act on a
+    // session the user is no longer typing at. Esc is the way out.
+    if ctrl {
+        return;
+    }
+    if !handle_composer_popup_key(key, ui) {
+        match key.code {
+            // Up/Down deliberately do nothing with no popup open. The wall pins the list
+            // selection to the focused tile and `spawn_target()` reads it, so moving it here
+            // would silently repoint the directory this new session lands in.
+            KeyCode::Tab => ui.composer.cycle_backend(),
+            KeyCode::BackTab => ui.composer.cycle_model(),
+            KeyCode::Backspace => ui.composer.backspace(),
+            // Nothing left to dismiss, so Esc hands the keyboard back to the grid — and keeps
+            // the draft. Losing a long task description to a glance at a tile is the failure
+            // this avoids; the text is still there the next time the overlay opens.
+            KeyCode::Esc => ui.mode = Mode::Normal,
+            // An empty composer has nothing to send and no list row underneath to activate, so
+            // Enter simply stays put.
+            KeyCode::Enter if !ui.composer.is_empty() => {
+                spawn_from_composer(backends, refresher, ui);
+                ui.mode = Mode::Normal;
+            }
+            // Every printable is task text. The list's empty-composer hotkeys ('?' for help,
+            // Space on a header) do not apply: there is no list under this box.
+            KeyCode::Char(c) => ui.composer.push_char(c),
+            _ => {}
+        }
+    }
+    sync_composer_popups(ui);
+}
+
+/// Give an open composer popup — the slash-command list, the `/model` picker, the theme picker
+/// — first refusal on this key. Returns `true` when it took it.
+///
+/// Shared by the list and the wall's compose overlay because these guards are an interlock, not
+/// a lookup table: the `/model` arms key off `is_model_command()` rather than `model_picking()`
+/// so a `/model <no-match>` still swallows Tab and the arrows instead of cycling the backend or
+/// moving the session selection mid-command, and the theme arms have to beat both. A second
+/// copy would drift the first time one of them changed.
+fn handle_composer_popup_key(key: KeyEvent, ui: &mut Ui) -> bool {
     let suggesting = ui.composer.suggestions_active();
     let model_cmd = ui.composer.is_model_command();
     let theme_cmd = ui.composer.is_theme_command();
     match key.code {
         KeyCode::Down if theme_cmd => ui.themes.move_preview(1),
         KeyCode::Up if theme_cmd => ui.themes.move_preview(-1),
+        // Safe no-ops when the active list is empty, which is why they can capture the key
+        // outright.
         KeyCode::Down if suggesting || model_cmd => ui.composer.move_suggestion(1),
         KeyCode::Up if suggesting || model_cmd => ui.composer.move_suggestion(-1),
-        // Arrows navigate or act at all times.
-        KeyCode::Down => ui.app.move_selection(1),
-        KeyCode::Up => ui.app.move_selection(-1),
-        KeyCode::Right => {
-            attach_selected(ui);
-        }
-        // Tab accepts the highlighted suggestion/model while a popup is open, else cycles the
-        // target backend; Shift+Tab cycles that backend's model.
+        // Tab accepts the highlighted suggestion or model while a popup is open.
         KeyCode::Tab if suggesting => {
             ui.composer.accept_suggestion();
         }
         KeyCode::Tab if model_cmd => {
-            // No-op when there is nothing to pick (a `/model <no-match>` command), but still
-            // captures Tab so it does not fall through to `cycle_backend`.
             ui.composer.accept_model();
         }
         KeyCode::Tab if theme_cmd => {}
-        KeyCode::Tab => ui.composer.cycle_backend(),
-        KeyCode::BackTab => ui.composer.cycle_model(),
-        KeyCode::Backspace => ui.composer.backspace(),
-        // Esc dismisses an open popup first; a second Esc clears the composer as before.
+        // Esc dismisses the popup; what a second Esc means is the caller's business.
         KeyCode::Esc if theme_cmd => {
             ui.themes.cancel_picker();
             ui.composer.clear();
         }
         KeyCode::Esc if suggesting => ui.composer.dismiss_suggestions(),
-        KeyCode::Esc => ui.composer.clear(),
-        KeyCode::Enter => {
-            if theme_cmd {
-                let theme_id = ui.themes.commit_picker().to_string();
-                if let Some(db) = &ui.db
-                    && let Err(error) = agent_viewer_tui::ui::theme::persist_theme(db, &theme_id)
-                {
-                    ui.set_notice(format!("could not persist theme: {error}"));
-                }
-                ui.composer.clear();
-            } else if ui.composer.model_picking() {
-                // A /model picker is up: Enter picks the highlighted model.
-                ui.composer.accept_model();
-            } else if ui.composer.is_model_command() {
-                // A /model command with no matches: a meta-command, nothing to spawn.
-            } else if ui.composer.is_empty() {
-                // On a group header, Enter collapses/expands the group (and persists) instead
-                // of attaching; on a session it attaches as before.
-                activate_selected(ui);
-            } else {
-                spawn_from_composer(backends, refresher, ui);
+        KeyCode::Enter if theme_cmd => {
+            let theme_id = ui.themes.commit_picker().to_string();
+            if let Some(db) = &ui.db
+                && let Err(error) = agent_viewer_tui::ui::theme::persist_theme(db, &theme_id)
+            {
+                ui.set_notice(format!("could not persist theme: {error}"));
             }
+            ui.composer.clear();
         }
-        KeyCode::Char(c) => {
-            if ui.composer.is_empty() {
-                // Empty composer: punctuation hotkeys still fire; every bare letter and
-                // number starts a task.
-                match c {
-                    '?' => ui.mode = Mode::Help,
-                    // On a header, Space toggles the group and persists it. On a session it
-                    // does nothing. With no selected session or header it is composer text.
-                    ' ' => {
-                        if !toggle_group_if_header(ui) && ui.app.selected().is_none() {
-                            ui.composer.push_char(' ');
-                        }
-                    }
-                    // '/' is no longer a filter hotkey — it types into the composer so a
-                    // slash command like `/implement RS-123` spawns as the task prompt.
-                    _ => ui.composer.push_char(c),
-                }
-            } else {
-                // Non-empty composer: every printable (and space) is task text.
-                ui.composer.push_char(c);
-            }
+        // A /model picker is up: Enter picks the highlighted model.
+        KeyCode::Enter if ui.composer.model_picking() => {
+            ui.composer.accept_model();
         }
-        _ => {}
+        // A /model command with no matches: a meta-command, nothing to spawn.
+        KeyCode::Enter if model_cmd => {}
+        _ => return false,
     }
+    true
+}
+
+/// Open or cancel the theme picker to match what the composer now holds, then re-scan the
+/// completion lists for the (possibly new) backend, target, and text. The tail every composer
+/// keystroke ends with, wherever it was typed.
+fn sync_composer_popups(ui: &mut Ui) {
     if ui.composer.is_theme_command() {
         ui.themes.open_picker();
     } else if ui.themes.picker_open() {
         ui.themes.cancel_picker();
     }
-    // Refresh the slash-command list for the (possibly new) backend/target and text.
     ensure_completions(ui);
     ensure_models(ui);
-    Ok(false)
 }
 
 fn open_palette(backends: &[Box<dyn Backend>], ui: &mut Ui) {
@@ -903,7 +978,7 @@ fn palette_action_items(
     ui: &Ui,
     tail_open: bool,
 ) -> Vec<PaletteItem> {
-    [
+    let mut items: Vec<PaletteItem> = [
         action_item(
             PaletteAction::Attach,
             "Attach session",
@@ -1014,7 +1089,25 @@ fn palette_action_items(
         ),
     ]
     .into_iter()
-    .collect()
+    .collect();
+    // Wall only, and first, because starting a task is the one thing the grid otherwise cannot
+    // do: the composer is not drawn there, so every spawn used to mean leaving the wall and
+    // coming back. Off the wall the composer is already on screen with the keyboard, so the
+    // entry would be a row that does nothing. No chord: the palette is its only entry point,
+    // which is what keeps it from costing the tiles' children another one.
+    if ui.wall.on {
+        items.insert(
+            0,
+            action_item(
+                PaletteAction::Spawn,
+                "New session",
+                "compose a task and start it on this wall",
+                None,
+                None,
+            ),
+        );
+    }
+    items
 }
 
 fn action_item(
@@ -1240,6 +1333,15 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
         return Ok(());
     }
 
+    // Both of these only write composer state, and the wall does not draw the composer, so on
+    // the grid they used to land somewhere nothing on screen showed — a pick the user only
+    // discovered after leaving the wall. Opening the overlay is what makes them finishable.
+    let opens_composer = ui.wall.on
+        && matches!(
+            item.target,
+            PaletteTarget::Command(_) | PaletteTarget::Model { .. }
+        );
+
     ui.mode = Mode::Normal;
     match item.target {
         PaletteTarget::Action(action) => match action {
@@ -1257,7 +1359,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::Filter => open_filter(ui),
             PaletteAction::AgeRamp => toggle_age_ramp(ui),
             PaletteAction::TailPane => toggle_tail(ui),
-            PaletteAction::Spawn => {}
+            // Set after the `Mode::Normal` above, which every palette action passes through.
+            PaletteAction::Spawn => ui.mode = Mode::Compose,
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
@@ -1278,6 +1381,9 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             }
             ensure_completions(ui);
         }
+    }
+    if opens_composer {
+        ui.mode = Mode::Compose;
     }
     Ok(())
 }
