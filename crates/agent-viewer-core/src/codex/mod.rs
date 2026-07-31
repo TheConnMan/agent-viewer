@@ -268,11 +268,45 @@ fn codex_models_via_registry(home: &Path) -> Vec<String> {
     reg.distinct_models().unwrap_or_default()
 }
 
+/// One thread's spawn edge: the three fields `turn_activity` needs to walk a subtree. Kept
+/// instead of the whole `Thread` so the cache below does not pin every title and preview in a
+/// five-thousand-row registry in memory.
+struct ThreadEdge {
+    id: String,
+    parent_thread_id: Option<String>,
+    rollout_path: std::path::PathBuf,
+}
+
+/// Freshness key for the cached spawn edges: the resolved db path plus the (mtime, len) of the
+/// db AND of its `-wal` sidecar. Codex runs the state db in WAL mode, so a write that has not
+/// been checkpointed moves only the sidecar and the db file alone would key as unchanged for
+/// hours - a new subagent thread would then never join its parent's activity ribbon.
+type RegistryKey = (std::path::PathBuf, registry::FileKey, registry::FileKey);
+
+fn registry_key(db: &Path) -> RegistryKey {
+    let mut wal = db.as_os_str().to_os_string();
+    wal.push("-wal");
+    (
+        db.to_path_buf(),
+        registry::file_key(db),
+        registry::file_key(Path::new(&wal)),
+    )
+}
+
+/// The open registry and which `state_N.sqlite` it is open on.
+#[derive(Default)]
+struct OpenRegistry {
+    registry: Option<Registry>,
+    path: Option<std::path::PathBuf>,
+}
+
 pub struct CodexBackend {
     codex_home: std::path::PathBuf,
-    registry: Option<Registry>,
-    /// Which `state_N.sqlite` `registry` is open on, so a rollover to state_N+1 is noticed.
-    registry_path: Option<std::path::PathBuf>,
+    /// The open registry, behind a `RefCell` because `turn_activity` runs on `&self` and has
+    /// to reuse this connection rather than open its own once per visible session.
+    registry: std::cell::RefCell<OpenRegistry>,
+    /// Every thread's spawn edge, cached across `turn_activity` calls under `RegistryKey`.
+    spawn_edges: std::cell::RefCell<Option<(RegistryKey, Vec<ThreadEdge>)>>,
     resolver: StatusResolver,
     /// Discovered model catalog, computed once and reused (best-effort; degrades to the
     /// default when both the CLI probe and the registry fallback come up empty).
@@ -286,46 +320,109 @@ impl CodexBackend {
     pub fn new(codex_home: std::path::PathBuf) -> CodexBackend {
         CodexBackend {
             codex_home,
-            registry: None,
-            registry_path: None,
+            registry: std::cell::RefCell::new(OpenRegistry::default()),
+            spawn_edges: std::cell::RefCell::new(None),
             resolver: StatusResolver::new(),
             models_cache: std::sync::OnceLock::new(),
             pr_scan: pr_scan::PrScanner::new(),
         }
     }
 
-    /// Query threads, re-resolving the state DB every listing and reopening it once on failure.
+    /// Run `query` against the open registry, re-resolving the state DB first and reopening the
+    /// connection once if the query fails.
     ///
     /// The re-glob is the only thing that notices a Codex upgrade laying down a NEW
     /// `state_N+1.sqlite`: the previous file stays open, stays readable, and keeps answering
     /// with its frozen row set, so a registry resolved once at startup showed no new session
     /// until the viewer was restarted. `find_state_db` is one readdir of `~/.codex`, run once
     /// per listing tick against a scan that already reads thousands of rollout tails.
-    fn query_threads(&mut self) -> Result<Vec<registry::Thread>> {
+    fn with_registry<T>(&self, query: impl Fn(&Registry) -> Result<T>) -> Result<T> {
         let db = registry::find_state_db(&self.codex_home)?;
-        if self.registry_path.as_deref() != Some(db.as_path()) {
-            self.registry = None;
+        let mut open = self.registry.borrow_mut();
+        if open.path.as_deref() != Some(db.as_path()) {
+            *open = OpenRegistry::default();
         }
-        if self.registry.is_none() {
-            self.registry = Some(Registry::open(&db)?);
-            self.registry_path = Some(db.clone());
+        if open.registry.is_none() {
+            open.registry = Some(Registry::open(&db)?);
+            open.path = Some(db.clone());
         }
-        let opened = self
-            .registry
-            .as_ref()
-            .expect("registry opened immediately above");
-        match opened.threads() {
-            Ok(threads) => Ok(threads),
+        let first = query(
+            open.registry
+                .as_ref()
+                .expect("registry opened immediately above"),
+        );
+        match first {
+            Ok(value) => Ok(value),
             Err(_) => {
-                self.registry = None;
-                self.registry_path = None;
+                *open = OpenRegistry::default();
                 let reg = Registry::open(&db)?;
-                let threads = reg.threads()?;
-                self.registry = Some(reg);
-                self.registry_path = Some(db);
-                Ok(threads)
+                let value = query(&reg)?;
+                *open = OpenRegistry {
+                    registry: Some(reg),
+                    path: Some(db),
+                };
+                Ok(value)
             }
         }
+    }
+
+    fn query_threads(&self) -> Result<Vec<registry::Thread>> {
+        self.with_registry(Registry::threads)
+    }
+
+    /// Rollout paths of every thread spawned beneath `root_id`, transitively (the root's own
+    /// rollout is not among them). Best-effort: an unreadable registry yields none.
+    ///
+    /// The edge scan is cached because this runs once per VISIBLE SESSION on every activity
+    /// refresh. It used to reopen the state DB and re-materialize all ~5k rows on each of those
+    /// calls, so a refresh cost O(visible x rows); now a refresh scans the registry once and
+    /// every later call walks the cached edges.
+    fn descendant_rollouts(&self, root_id: &str) -> Vec<std::path::PathBuf> {
+        let Ok(db) = registry::find_state_db(&self.codex_home) else {
+            return Vec::new();
+        };
+        let key = registry_key(&db);
+        let mut cached = self.spawn_edges.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|(cached_key, _)| *cached_key != key)
+        {
+            let Ok(threads) = self.query_threads() else {
+                return Vec::new();
+            };
+            let edges = threads
+                .into_iter()
+                .map(|thread| ThreadEdge {
+                    id: thread.id,
+                    parent_thread_id: thread.parent_thread_id,
+                    rollout_path: thread.rollout_path,
+                })
+                .collect();
+            *cached = Some((key, edges));
+        }
+        let (_, edges) = cached.as_ref().expect("edges cached immediately above");
+        let mut reachable: HashSet<&str> = HashSet::from([root_id]);
+        let mut rollouts = Vec::new();
+        loop {
+            let mut found_descendant = false;
+            for edge in edges {
+                if reachable.contains(edge.id.as_str())
+                    || !edge
+                        .parent_thread_id
+                        .as_deref()
+                        .is_some_and(|parent| reachable.contains(parent))
+                {
+                    continue;
+                }
+                reachable.insert(&edge.id);
+                rollouts.push(edge.rollout_path.clone());
+                found_descendant = true;
+            }
+            if !found_descendant {
+                break;
+            }
+        }
+        rollouts
     }
 }
 
@@ -457,38 +554,9 @@ impl Backend for CodexBackend {
             return Ok(Vec::new());
         };
         let mut timestamps = rollout::read_turn_activity(path, window)?;
-        let Ok(db_path) = registry::find_state_db(&self.codex_home) else {
-            return Ok(timestamps);
-        };
-        let Ok(registry) = Registry::open(&db_path) else {
-            return Ok(timestamps);
-        };
-        let Ok(threads) = registry.threads() else {
-            return Ok(timestamps);
-        };
-
-        let mut reachable = HashSet::from([session.id.clone()]);
-        loop {
-            let mut found_descendant = false;
-            for thread in &threads {
-                if reachable.contains(&thread.id)
-                    || !thread
-                        .parent_thread_id
-                        .as_ref()
-                        .is_some_and(|parent| reachable.contains(parent))
-                {
-                    continue;
-                }
-                reachable.insert(thread.id.clone());
-                found_descendant = true;
-                if let Ok(child_activity) =
-                    rollout::read_turn_activity(&thread.rollout_path, window)
-                {
-                    timestamps.extend(child_activity);
-                }
-            }
-            if !found_descendant {
-                break;
+        for rollout_path in self.descendant_rollouts(&session.id) {
+            if let Ok(child_activity) = rollout::read_turn_activity(&rollout_path, window) {
+                timestamps.extend(child_activity);
             }
         }
         timestamps.sort_unstable();
