@@ -936,6 +936,27 @@ fn viewer_db_sort_order_defaults_and_roundtrips() {
 }
 
 #[test]
+fn viewer_db_age_ramp_defaults_off_and_roundtrips() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+
+    assert!(
+        !db.age_ramp().expect("default age ramp"),
+        "the age ramp is opt-in, so an untouched viewer db must read off"
+    );
+
+    db.set_age_ramp(true).expect("enable age ramp");
+    assert!(db.age_ramp().expect("read age ramp"));
+
+    drop(db);
+    let db = ViewerDb::open(&path).expect("reopen viewer db");
+    assert!(db.age_ramp().expect("read persisted age ramp"));
+
+    db.set_age_ramp(false).expect("disable age ramp");
+    assert!(!db.age_ramp().expect("read disabled age ramp"));
+}
+
+#[test]
 fn viewer_db_retention_window_defaults_and_roundtrips() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");

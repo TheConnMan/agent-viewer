@@ -378,6 +378,28 @@ fn set_sprite(ui: &mut Ui, sprite: SpriteKind) {
     ui.set_notice(format!("sprite: {} · ⌃G for the next", sprite.name()));
 }
 
+/// Flip the age ramp, persist it, and say what happened. Under a theme with no truecolor
+/// endpoint to fade toward the flag still flips (so it takes effect on the next theme change),
+/// but the notice says plainly that nothing will look different here.
+pub(crate) fn toggle_age_ramp(ui: &mut Ui) {
+    ui.age_ramp = !ui.age_ramp;
+    let state = if ui.age_ramp { "on" } else { "off" };
+    if let Some(db) = &ui.db
+        && let Err(error) = db.set_age_ramp(ui.age_ramp)
+    {
+        ui.set_notice(format!("age ramp: {state} (not saved: {error})"));
+        return;
+    }
+    if ui.age_ramp && !ui.themes.active().supports_age_ramp() {
+        ui.set_notice(format!(
+            "age ramp: on · no effect under the {} theme",
+            ui.themes.active().name
+        ));
+        return;
+    }
+    ui.set_notice(format!("age ramp: {state}"));
+}
+
 /// Ctrl+C is the app-wide "kill the viewer" chord, except while attached — there it is
 /// forwarded to the child as a raw interrupt instead. Kept as a pure predicate so the quit
 /// decision is unit-testable without a live terminal.
@@ -711,6 +733,14 @@ fn palette_action_items(
             Some("⌃F"),
             None,
         ),
+        // No chord: the palette is the only entry point for this one, by design.
+        action_item(
+            PaletteAction::AgeRamp,
+            "Age ramp",
+            "fade finished sessions as they age",
+            None,
+            None,
+        ),
     ]
     .into_iter()
     .collect()
@@ -953,6 +983,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::ShowAll => ui.app.toggle_show_all(),
             PaletteAction::Group => ui.app.toggle_group_mode(),
             PaletteAction::Filter => open_filter(ui),
+            PaletteAction::AgeRamp => toggle_age_ramp(ui),
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
@@ -1245,6 +1276,7 @@ pub(crate) mod tests {
             mouse_capture: true,
             mouse_press: None,
             sprite: Default::default(),
+            age_ramp: false,
         }
     }
 
@@ -1294,6 +1326,7 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        age_ramp: ui.age_ramp,
                     },
                 );
             })
@@ -1330,6 +1363,7 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        age_ramp: ui.age_ramp,
                     },
                 );
             })
@@ -2228,6 +2262,48 @@ pub(crate) mod tests {
             item.name == "Show all sessions"
                 && matches!(&item.target, PaletteTarget::Action(PaletteAction::ShowAll))
         }));
+    }
+
+    #[test]
+    fn age_ramp_is_off_by_default_and_toggles_from_the_palette() {
+        let mut ui = test_ui_with(Vec::new());
+        assert!(!ui.age_ramp, "the age ramp must start off");
+
+        assert!(
+            palette_items(&[], &ui).iter().any(|item| {
+                item.name == "Age ramp"
+                    && matches!(&item.target, PaletteTarget::Action(PaletteAction::AgeRamp))
+                    && item.enabled
+            }),
+            "the palette is the only entry point, so the item has to be there and enabled"
+        );
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(ui.age_ramp);
+        assert_eq!(ui.notice.text(), "age ramp: on");
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(!ui.age_ramp);
+        assert_eq!(ui.notice.text(), "age ramp: off");
+    }
+
+    #[test]
+    fn switching_the_age_ramp_on_under_a_non_truecolor_theme_says_it_will_do_nothing() {
+        let mut ui = test_ui_with(Vec::new());
+        // Walk the picker to `terminal`, the builtin with no truecolor endpoint to fade toward.
+        while ui.themes.active().id != "terminal" {
+            ui.themes.move_preview(1);
+        }
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(
+            ui.age_ramp,
+            "the flag still flips, so a theme change picks it up"
+        );
+        assert_eq!(
+            ui.notice.text(),
+            "age ramp: on · no effect under the terminal match theme"
+        );
     }
 
     #[test]

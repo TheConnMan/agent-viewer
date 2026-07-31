@@ -59,6 +59,7 @@ pub(super) fn row_to_item(
     title_width: usize,
     elapsed_width: usize,
     theme: &Theme,
+    age_ramp: bool,
 ) -> ListItem<'static> {
     match row {
         Row::Spacer => ListItem::new(Line::from("")),
@@ -110,6 +111,9 @@ pub(super) fn row_to_item(
             };
             let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
             let pr_color = pr_badge_theme_color(pr_status.badge_color(pr_refs), theme);
+            // Age runs from the last thing the session did, not from when it started: a
+            // three-day job that finished an hour ago is fresh work and must stay bright.
+            let fade = row_fade(status, now_ms - *updated_at_ms, age_ramp);
             let line = session_line(
                 SessionRow {
                     glyph,
@@ -129,6 +133,7 @@ pub(super) fn row_to_item(
                     width,
                     title_width,
                     elapsed_width,
+                    fade,
                 },
                 theme,
             );
@@ -199,9 +204,27 @@ struct SessionRow<'a> {
     width: usize,
     title_width: usize,
     elapsed_width: usize,
+    /// How far this row has receded toward `faint` under the age ramp: 0.0 is untouched.
+    fade: f32,
+}
+
+/// How far along the age ramp this row sits, given the mode flag and the row's age.
+///
+/// Only a **finished** session recedes. `Working` and `NeedsInput` are live states, and a live
+/// session that has been running a long time is the opposite of receding, so they are pinned at
+/// zero at every age. `Idle` and `Unknown` already resolve to `muted`/`faint`, so a fade toward
+/// `faint` would buy nothing and `Unknown` is not a finished session either way.
+fn row_fade(status: &Status, age_ms: i64, age_ramp: bool) -> f32 {
+    if !age_ramp || !matches!(status, Status::Done | Status::Error) {
+        return 0.0;
+    }
+    crate::ui::age::age_progress(age_ms)
 }
 
 fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
+    // The theme owns both endpoints: whatever token the span would normally use is the start,
+    // and `faint` is the end. `ramp` is a no-op at fade 0.0 and under a non-truecolor theme.
+    let faded = |color: ratatui::style::Color| crate::ui::age::ramp(color, theme.faint, row.fade);
     let word = status_display_word(row.status);
     let status_field = if row.show_activity {
         format!("{word:<width$}", width = "Needs input".len())
@@ -220,11 +243,12 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
         row.elapsed_width,
     );
     let mut spans = vec![
-        Span::styled(row.glyph.to_string(), fg(row.glyph_color)),
+        Span::styled(row.glyph.to_string(), fg(faded(row.glyph_color))),
+        // The backend mark keeps full strength: it is brand identity, not chrome.
         Span::styled(row.mark.to_string(), fg(row.mark_color)),
-        Span::styled(title, fg(theme.text)),
+        Span::styled(title, fg(faded(theme.text))),
         Span::raw(" "),
-        Span::styled(status, fg(status_color(row.status, theme))),
+        Span::styled(status, fg(faded(status_color(row.status, theme)))),
     ];
     if row.project_width > 0
         && let Some(project) = row.project
@@ -251,7 +275,7 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     if has_pr || has_summary {
         spans.push(Span::raw("  "));
         if has_summary {
-            spans.push(Span::styled(summary, fg(theme.muted)));
+            spans.push(Span::styled(summary, fg(faded(theme.muted))));
         }
         if has_pr && has_summary {
             spans.push(Span::raw(" "));
@@ -259,13 +283,18 @@ fn session_line(row: SessionRow, theme: &Theme) -> Line<'static> {
     }
     spans.push(Span::raw(" ".repeat(pad)));
     if has_pr {
+        // The PR badge keeps full strength too: it is a live external signal, and it must not
+        // read as stale just because the session that opened it finished days ago.
         spans.push(Span::styled(pr, fg(row.pr_color)));
     }
     spans.push(Span::raw(" "));
     spans.push(Span::raw(" ".repeat(
         row.elapsed_width.saturating_sub(display_width(row.elapsed)),
     )));
-    spans.push(Span::styled(row.elapsed.to_string(), fg(theme.muted)));
+    spans.push(Span::styled(
+        row.elapsed.to_string(),
+        fg(faded(theme.muted)),
+    ));
     Line::from(spans)
 }
 
@@ -317,6 +346,171 @@ fn header_label(label: impl std::fmt::Display, count: usize, collapsed: bool) ->
         format!("▼ {label}  ({count})")
     }
 }
+#[cfg(test)]
+mod age_ramp_tests {
+    use super::{Pulses, row_to_item};
+    use crate::app::Row;
+    use crate::ui::theme::{Theme, amber, terminal};
+    use agent_viewer_core::{BackendKind, Status};
+    use ratatui::style::Color;
+
+    const HORIZON_MS: i64 = 24 * 60 * 60 * 1_000;
+    const NOW_MS: i64 = HORIZON_MS * 100;
+    const TITLE: &str = "Age ramp session";
+    const WORD: &str = "Done";
+
+    fn row(status: Status, updated_at_ms: i64) -> Row {
+        Row::Session {
+            backend: BackendKind::Codex,
+            id: "session".into(),
+            title: "Age ramp session".into(),
+            summary: "did the thing".into(),
+            project: None,
+            activity: None,
+            status,
+            hidden: false,
+            created_at_ms: updated_at_ms,
+            updated_at_ms,
+            pr_refs: Vec::new(),
+        }
+    }
+
+    const WIDTH: u16 = 140;
+
+    /// Render one row through the real widget and return each cell as (symbol, foreground).
+    /// Going through the buffer rather than the spans keeps this honest about what is painted.
+    fn render(row: &Row, theme: &Theme, age_ramp: bool) -> Vec<(String, Color)> {
+        let item = row_to_item(
+            row,
+            &Pulses::new(),
+            NOW_MS,
+            &crate::pr_cache::PrStatusCache::default(),
+            false,
+            0,
+            WIDTH as usize,
+            32,
+            2,
+            theme,
+            age_ramp,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(WIDTH, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::List::new(vec![item]),
+                    ratatui::layout::Rect::new(0, 0, WIDTH, 1),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..WIDTH)
+            .map(|x| {
+                let cell = &buffer[(x, 0)];
+                (cell.symbol().to_string(), cell.fg)
+            })
+            .collect()
+    }
+
+    /// The foreground of the first cell of `needle` in the rendered row. Wide glyphs leave an
+    /// empty continuation cell, so the byte offset is mapped back through a cell index table
+    /// rather than assumed to be one char per cell.
+    fn color_of(cells: &[(String, Color)], needle: &str) -> Color {
+        let mut text = String::new();
+        let mut owners = Vec::new();
+        for (index, (symbol, _)) in cells.iter().enumerate() {
+            for _ in 0..symbol.len() {
+                owners.push(index);
+            }
+            text.push_str(symbol);
+        }
+        let byte = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("row is missing {needle:?}"));
+        cells[owners[byte]].1
+    }
+
+    #[test]
+    fn finished_row_recedes_toward_faint_as_it_ages() {
+        let theme = amber(false);
+        let fresh = render(&row(Status::Done, NOW_MS), &theme, true);
+        let half = render(&row(Status::Done, NOW_MS - HORIZON_MS / 2), &theme, true);
+        let old = render(&row(Status::Done, NOW_MS - HORIZON_MS), &theme, true);
+
+        assert_eq!(color_of(&fresh, TITLE), theme.text);
+        assert_eq!(color_of(&fresh, WORD), theme.ok);
+
+        // Half a horizon in: moved off both start tokens but not yet all the way to faint.
+        assert_ne!(color_of(&half, TITLE), theme.text);
+        assert_ne!(color_of(&half, TITLE), theme.faint);
+        assert_ne!(color_of(&half, WORD), theme.ok);
+        assert_ne!(color_of(&half, WORD), theme.faint);
+
+        // Past the horizon everything that ramps has landed exactly on faint.
+        assert_eq!(color_of(&old, TITLE), theme.faint);
+        assert_eq!(color_of(&old, WORD), theme.faint);
+    }
+
+    #[test]
+    fn live_states_never_ramp_at_any_age() {
+        let theme = amber(false);
+        for status in [Status::Working, Status::NeedsInput { reason: None }] {
+            let word = super::status_display_word(&status);
+            let live = super::status_color(&status, &theme);
+            let ancient = render(&row(status.clone(), NOW_MS - HORIZON_MS * 30), &theme, true);
+            assert_eq!(
+                color_of(&ancient, TITLE),
+                theme.text,
+                "{status:?} title receded, but a live session must never ramp"
+            );
+            assert_eq!(
+                color_of(&ancient, word),
+                live,
+                "{status:?} state word receded, but a live session must never ramp"
+            );
+            assert_eq!(color_of(&ancient, "did the thing"), theme.muted);
+        }
+    }
+
+    #[test]
+    fn the_mode_is_a_no_op_when_off() {
+        let theme = amber(false);
+        let cells = render(&row(Status::Done, NOW_MS - HORIZON_MS * 7), &theme, false);
+        assert_eq!(color_of(&cells, TITLE), theme.text);
+        assert_eq!(color_of(&cells, WORD), theme.ok);
+        assert_eq!(color_of(&cells, "did the thing"), theme.muted);
+    }
+
+    #[test]
+    fn non_truecolor_theme_renders_identically_with_the_mode_on() {
+        let theme = terminal(false);
+        // The gate, at the row level: under a theme with no truecolor endpoint, a fully aged
+        // finished row must be byte-identical to the mode being off.
+        let old = row(Status::Done, NOW_MS - HORIZON_MS * 7);
+        assert_eq!(render(&old, &theme, true), render(&old, &theme, false));
+        assert_eq!(color_of(&render(&old, &theme, true), TITLE), theme.text);
+    }
+
+    #[test]
+    fn the_backend_mark_and_pr_badge_keep_full_strength() {
+        let theme = amber(false);
+        let mut old = row(Status::Done, NOW_MS - HORIZON_MS * 7);
+        if let Row::Session { pr_refs, .. } = &mut old {
+            pr_refs.push(agent_viewer_core::PrRef {
+                id: "42".into(),
+                href: None,
+            });
+        }
+        let cells = render(&old, &theme, true);
+        // The mark carries the backend's brand token, untouched.
+        assert_eq!(color_of(&cells, "[cx]"), theme.cx);
+        // The PR badge is a live external signal, so it must not read as stale.
+        assert_eq!(color_of(&cells, "#42"), theme.accent);
+        // ... while the row around it has receded.
+        assert_eq!(color_of(&cells, TITLE), theme.faint);
+    }
+}
+
 #[cfg(test)]
 mod activity_ribbon_tests {
     use super::{SessionRow, activity_ribbon, session_line};
@@ -389,6 +583,7 @@ mod activity_ribbon_tests {
                 project_width: 0,
                 width,
                 title_width: 32,
+                fade: 0.0,
             },
             theme,
         );
@@ -434,6 +629,7 @@ mod activity_ribbon_tests {
                 project_width: 0,
                 width: 140,
                 title_width: 32,
+                fade: 0.0,
             },
             theme,
         );
@@ -468,6 +664,7 @@ mod activity_ribbon_tests {
                 project_width: 0,
                 width: 140,
                 title_width: 32,
+                fade: 0.0,
             },
             theme,
         );
