@@ -305,13 +305,16 @@ spawn composer over the grid. It is the list's composer unchanged — `Tab` swit
 `⇧Tab` cycles its model, and slash commands complete as they do below the list — so describe
 the task and press `Enter` to start it, and the keyboard goes straight back to the tiles. `Esc`
 backs out and keeps what you had typed, so glancing at a tile mid-sentence never costs the
-draft. Picking a slash command or a model from the palette opens the same box, since both write
-into the composer and the grid has nowhere else to show it.
+draft. `Ctrl+C` backs out the same way rather than quitting the viewer, and `Ctrl+W` and
+`Ctrl+]` still leave for the list — every way out of the box keeps the draft. Picking a slash
+command or a model from the palette opens the same box, since both write into the composer and
+the grid has nowhere else to show it.
 
 Everything else you type —
 plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:
 `Esc` interrupts it and `Ctrl+C` clears its input line, exactly as they would if you had
-attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
+attached to it. That holds while the grid has the keyboard; the compose overlay above takes it
+back for as long as it is up. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
 is not drawn while the wall is up, since the tiles have the keyboard, except while it is holding
 that keyboard itself as the overlay above.
 
