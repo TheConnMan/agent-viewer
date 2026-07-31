@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui_image::Image;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -194,6 +194,9 @@ pub struct ReplyModal {
 /// composer and inline rename both live on the Normal list view.
 pub enum Mode {
     Normal,
+    /// The spawn composer holding the keyboard as a floating overlay over the video wall, so a
+    /// new task can be started without leaving the grid.
+    Compose,
     Palette(PaletteState),
     Filter,
     Rename(RenameModal),
@@ -349,7 +352,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // reply buffer.
     let inner_w = input_inner_width(frame.area().width);
     // The wall owns the keyboard, so the composer is not drawn while it is on: an input box
-    // that cannot receive your input is a lie, and those rows are better spent on tiles.
+    // that cannot receive your input is a lie, and those rows are better spent on tiles. The
+    // one exception, `Mode::Compose`, floats over the grid after the footer instead of taking
+    // rows here — see below.
     let composer_h = if d.wall.is_some() {
         0
     } else {
@@ -456,7 +461,8 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
     // the persistent spawn composer.
     if d.wall.is_some() {
-        // No composer on the wall: `composer_h` is zero, so there is nothing to draw into.
+        // No composer in the layout on the wall: `composer_h` is zero, so there is nothing to
+        // draw into. `Mode::Compose` paints its own floating box after the footer.
     } else if let Mode::Reply(m) = d.mode {
         let title = d
             .app
@@ -486,32 +492,44 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         vertical[4],
     );
 
+    // The spawn composer over the wall, in the rows the list's composer occupies so the muscle
+    // memory holds. It floats rather than taking layout rows deliberately: real rows would
+    // shrink the grid, and resizing a tile SIGWINCHes its child agent into a full repaint —
+    // every session on screen redrawn because someone opened an input box.
+    if composing_over_wall(d.mode, d.wall.as_ref()) {
+        // The box grows with the draft, but never past the footer: on a terminal short enough
+        // that a third of it still outruns the grid, `y` saturates at 0 while the height does
+        // not, and the row that gets covered is the compose hint telling you how to get out.
+        let height = composer_box_height(d.composer.text(), inner_w, frame.area().height)
+            .min(vertical[4].y.max(1));
+        let overlay_area = Rect {
+            x: frame.area().x,
+            y: vertical[4].y.saturating_sub(height),
+            width: frame.area().width,
+            height,
+        };
+        // Clear plus the composer block's own surface background is what keeps tile text from
+        // bleeding through the box.
+        frame.render_widget(Clear, overlay_area);
+        composer::draw(
+            frame,
+            d.app,
+            d.composer,
+            d.logos,
+            theme,
+            overlay_area,
+            caret_visible(d.now_ms, theme.animation),
+        );
+        // The same popups the list gets, anchored to the floating box: `vertical[3]` is a
+        // zero-height slice while the wall is on, so it cannot anchor anything.
+        draw_composer_popups(frame, &d, theme, overlay_area);
+    }
+
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup. Never on the wall — the composer
     // it belongs to is not on screen.
     if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
-        let highlight = d.composer.suggestion_highlight();
-        if d.themes.picker_open() {
-            overlay::draw_theme_picker(frame, d.themes, vertical[3]);
-        } else if d.composer.is_model_command() {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.model_suggestions(),
-                highlight,
-                "",
-                theme,
-                vertical[3],
-            );
-        } else {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.suggestions(),
-                highlight,
-                "/",
-                theme,
-                vertical[3],
-            );
-        }
+        draw_composer_popups(frame, &d, theme, vertical[3]);
     }
 
     if matches!(d.mode, Mode::Help) {
@@ -523,6 +541,46 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     if let Mode::Triage(state) = d.mode {
         triage::draw(frame, state, d.attach.as_ref(), d.now_ms, theme);
     }
+}
+
+/// Draw whichever completion popup the composer currently wants, floating just above `anchor`:
+/// the theme picker, the `/model` picker, or the slash-command list.
+///
+/// One body for the list's composer and the wall's overlay, because which popup wins is an
+/// interlock rather than a lookup — the same one `handle_composer_popup_key` keeps on the key
+/// side. Two copies would drift the first time one of the guards changed.
+fn draw_composer_popups(frame: &mut Frame, d: &Draw, theme: &Theme, anchor: Rect) {
+    if d.themes.picker_open() {
+        overlay::draw_theme_picker(frame, d.themes, anchor);
+    } else if d.composer.is_model_command() {
+        overlay::draw_suggestions(
+            frame,
+            &d.composer.model_suggestions(),
+            d.composer.suggestion_highlight(),
+            "",
+            theme,
+            anchor,
+        );
+    } else {
+        overlay::draw_suggestions(
+            frame,
+            &d.composer.suggestions(),
+            d.composer.suggestion_highlight(),
+            "/",
+            theme,
+            anchor,
+        );
+    }
+}
+
+/// Whether the spawn composer is floating over the grid, holding the keyboard.
+///
+/// The UI layer's copy of the same pair `keys::composing_over_wall` gates the quit chord on:
+/// the overlay draw and the footer both hang off it, and the two must never disagree about
+/// which surface is on screen — the footer would then advertise the grid's chords at a box
+/// that does not honor them.
+fn composing_over_wall(mode: &Mode, wall: Option<&WallView>) -> bool {
+    matches!(mode, Mode::Compose) && wall.is_some()
 }
 
 /// Per-row decorations layered over the list model.
@@ -758,6 +816,19 @@ fn draw_footer(
     wall: Option<&WallView>,
     area: Rect,
 ) {
+    // The composer holds the keyboard over the grid, so the grid's chord list is the wrong
+    // hint: Shift+arrows and Ctrl+X are the tiles' and do nothing from in here, while the three
+    // keys that matter — send, switch agent, back out — are not on it at all.
+    if composing_over_wall(mode, wall) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "new session · ⏎ start · ⇥ agent · ⇧⇥ model · Esc cancel",
+                fg(theme.muted),
+            ))),
+            area,
+        );
+        return;
+    }
     // The wall owns the footer while it is on (except for a live notice), because its keys
     // differ from the list's and the overflow count has nowhere else to go.
     if let Some(view) = wall
@@ -803,7 +874,10 @@ fn draw_footer(
         Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
-        Mode::Triage(_) => Line::from(""),
+        // Compose only ever renders over the wall, which the branch above already returned
+        // for, so it never reaches here — it rides along with Triage as the exhaustiveness
+        // stub rather than as a second empty line implying the composer has a list footer.
+        Mode::Triage(_) | Mode::Compose => Line::from(""),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -2101,13 +2175,16 @@ mod tests {
         );
     }
 
-    /// Render the wall footer for `app` at `now_ms`, as one string.
-    fn wall_footer(app: &App, now_ms: i64) -> String {
+    /// Render a one-tile wall frame for `app`, as (whole frame, footer row).
+    ///
+    /// The single place the wall's `Draw` literal is built for a test: the compose overlay and
+    /// the footer both need one, and a second copy is the field-added-on-one-branch break this
+    /// repo keeps hitting on merge.
+    fn wall_render(app: &App, mode: &Mode, composer: &Composer, now_ms: i64) -> (String, String) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let session = walled_test_session();
-        let composer = Composer::new();
         let pulses = Pulses::new();
         let pr_status = crate::pr_cache::PrStatusCache::new();
         let list_hit = RefCell::new(ListHit::default());
@@ -2120,9 +2197,9 @@ mod tests {
                 Draw {
                     app,
                     workspace: Path::new("/tmp"),
-                    mode: &Mode::Normal,
+                    mode,
                     notice: "",
-                    composer: &composer,
+                    composer,
                     pulses: &pulses,
                     now_ms,
                     attach: None,
@@ -2149,10 +2226,109 @@ mod tests {
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
+        let whole = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         // The footer is the last row of the frame.
-        (0..buffer.area.width)
+        let footer = (0..buffer.area.width)
             .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
-            .collect()
+            .collect();
+        (whole, footer)
+    }
+
+    /// Render a one-tile wall frame in `mode` with `composer`, as (whole frame, footer row).
+    fn wall_frame(mode: &Mode, composer: &Composer) -> (String, String) {
+        let app = App::new(vec![walled_test_session()]);
+        wall_render(&app, mode, composer, 0)
+    }
+
+    /// The wall hides the composer because the tiles own the keyboard, so this overlay is the
+    /// only thing that can show a draft while the grid is up. If it does not paint, the user is
+    /// typing into a box that is not there — which is exactly what the palette's Commands and
+    /// Models groups used to do on the wall.
+    #[test]
+    fn the_spawn_composer_floats_over_the_wall_only_while_composing() {
+        let mut composer = Composer::new();
+        for character in "start something new".chars() {
+            composer.push_char(character);
+        }
+
+        let (composing, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(
+            composing.contains('❯'),
+            "the composer prompt is not on screen while composing over the wall"
+        );
+        assert!(
+            composing.contains("start something new"),
+            "the draft is not on screen while composing over the wall"
+        );
+
+        let (grid, _) = wall_frame(&Mode::Normal, &composer);
+        assert!(
+            !grid.contains('❯'),
+            "the composer must stay hidden while the tiles own the keyboard"
+        );
+        assert!(
+            !grid.contains("start something new"),
+            "the draft must stay hidden while the tiles own the keyboard"
+        );
+    }
+
+    /// A slash command typed over the wall has to complete like it does in the list. The
+    /// popup anchors to the floating box rather than the composer's usual rows, which are a
+    /// zero-height slice while the grid is up — so without this the suggestions would render
+    /// off the top of the screen and the overlay would look like it had none.
+    #[test]
+    fn the_completion_popup_renders_over_the_wall_while_composing() {
+        let mut composer = Composer::new();
+        composer.set_commands(
+            vec!["implement".to_string()],
+            (composer.backend(), Some(std::path::PathBuf::from("/tmp"))),
+        );
+        for character in "/imp".chars() {
+            composer.push_char(character);
+        }
+        assert_eq!(composer.suggestions(), vec!["implement"]);
+
+        let (composing, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(
+            composing.contains("implement"),
+            "the completion popup is not on screen while composing over the wall"
+        );
+
+        let (grid, _) = wall_frame(&Mode::Normal, &composer);
+        assert!(
+            !grid.contains("implement"),
+            "the popup must stay hidden while the tiles own the keyboard"
+        );
+    }
+
+    /// The grid's chord list is wrong while the composer holds the keyboard: Shift+arrows and
+    /// Ctrl+X are the tiles', and the three keys that matter here — send, switch agent, back
+    /// out — are not on it at all.
+    #[test]
+    fn the_wall_footer_shows_the_compose_hint_while_composing() {
+        let composer = Composer::new();
+
+        let (_, footer) = wall_frame(&Mode::Compose, &composer);
+
+        for hint in ["⏎ start", "⇥ agent", "Esc cancel"] {
+            assert!(
+                footer.contains(hint),
+                "the compose footer is missing {hint:?}: {footer}"
+            );
+        }
+        assert!(
+            !footer.contains("Ctrl+W exit"),
+            "the grid's chord list must give way to the compose hint: {footer}"
+        );
+    }
+
+    /// Render the wall footer for `app` at `now_ms`, as one string.
+    fn wall_footer(app: &App, now_ms: i64) -> String {
+        wall_render(app, &Mode::Normal, &Composer::new(), now_ms).1
     }
 
     /// The arm window has to be visible on the wall, not only in the list. Ctrl+X on a tile
