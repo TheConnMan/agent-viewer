@@ -367,11 +367,15 @@ fn parse_job_state_flags_working_state_with_idle_tempo() {
     // `state` is a self-reported label that sticks after the last turn ends: a session that
     // said "awaiting PRs" stays "working" forever. `tempo` is the field that tracks whether
     // turns are actually running, so working+idle is the stale combination.
-    let stale = parse_job_state(&common::read_fixture("claude_state_working_idle_tempo.json"));
+    let stale = parse_job_state(&common::read_fixture(
+        "claude_state_working_idle_tempo.json",
+    ));
     assert!(stale.idle_despite_working);
 
     // A genuinely live job carries the same `state` and must NOT be flagged.
-    let live = parse_job_state(&common::read_fixture("claude_state_working_active_tempo.json"));
+    let live = parse_job_state(&common::read_fixture(
+        "claude_state_working_active_tempo.json",
+    ));
     assert!(!live.idle_despite_working);
 
     // `tempo: idle` under any other state is ordinary and carries no flag: every finished job
@@ -381,7 +385,9 @@ fn parse_job_state_flags_working_state_with_idle_tempo() {
     assert!(!parse_job_state(r#"{"state": "blocked", "tempo": "idle"}"#).idle_despite_working);
 
     // Absent `tempo` is absent evidence, never an inferred demotion.
-    assert!(!parse_job_state(&common::read_fixture("claude_state_working.json")).idle_despite_working);
+    assert!(
+        !parse_job_state(&common::read_fixture("claude_state_working.json")).idle_despite_working
+    );
     assert!(!parse_job_state("{}").idle_despite_working);
 }
 
@@ -430,7 +436,10 @@ fn claude_list_demotes_working_row_whose_tempo_is_idle() {
         dir.path().join("sessions"),
     );
     let sessions = backend.list().expect("list claude sessions");
-    assert_eq!(by_title(&sessions, "Overnight Campaign").status, Status::Idle);
+    assert_eq!(
+        by_title(&sessions, "Overnight Campaign").status,
+        Status::Idle
+    );
     assert_eq!(by_title(&sessions, "Live Fix").status, Status::Working);
 }
 
