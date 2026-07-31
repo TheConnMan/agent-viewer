@@ -300,6 +300,25 @@ impl<W: io::Write> Drop for BracketedPasteGuard<W> {
     }
 }
 
+/// The same guard for mouse reporting. `ratatui`'s panic hook restores raw mode and the
+/// alternate screen and nothing else, so a panic with any-motion tracking still on leaves the
+/// shell printing escape sequences for every mouse move until the user runs `reset`.
+struct MouseCaptureGuard<W: io::Write> {
+    writer: W,
+}
+
+impl<W: io::Write> MouseCaptureGuard<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: io::Write> Drop for MouseCaptureGuard<W> {
+    fn drop(&mut self) {
+        let _ = execute!(&mut self.writer, DisableMouseCapture);
+    }
+}
+
 /// Apply a changed mouse capture request once. UI state changes never write terminal control
 /// bytes themselves, so the live loop calls this after events and completed attach plans.
 fn sync_mouse_capture<W: io::Write>(
@@ -877,6 +896,8 @@ fn main() -> io::Result<()> {
     let mut applied_mouse_capture = true;
     let result = {
         let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
+        // Both modes come off on the way out of this scope, whether `run` returns or unwinds.
+        let _mouse_capture = MouseCaptureGuard::new(io::stdout());
         run(
             &mut terminal,
             &action_backends,
@@ -887,7 +908,6 @@ fn main() -> io::Result<()> {
             &mut applied_mouse_capture,
         )
     };
-    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -3491,6 +3511,36 @@ mod tests {
                 .any(|bytes| bytes == b"\x1b[?2004l"),
             "panic cleanup must disable bracketed paste"
         );
+    }
+
+    /// The symmetric proof for mouse reporting: `ratatui`'s panic hook restores raw mode and
+    /// the alternate screen only, so without this guard a panic leaves any-motion tracking on
+    /// and the shell fills with escape sequences on every mouse move.
+    #[test]
+    fn mouse_capture_is_disabled_during_panic_unwinding() {
+        let bytes = TestArc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(TestArc::clone(&bytes));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = MouseCaptureGuard::new(writer);
+            panic!("simulate tui panic");
+        }));
+
+        assert!(result.is_err());
+        let written = bytes.lock().unwrap().clone();
+        for sequence in [
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+        ] {
+            assert!(
+                written
+                    .windows(sequence.len())
+                    .any(|bytes| bytes == sequence),
+                "panic cleanup must disable mouse reporting ({})",
+                String::from_utf8_lossy(sequence)
+            );
+        }
     }
 
     #[test]
