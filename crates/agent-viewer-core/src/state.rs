@@ -813,6 +813,16 @@ impl ViewerDb {
         self.set_setting("header_sprite", name)
     }
 
+    /// Whether finished rows fade toward the theme's faint token as they age. Unset reads as
+    /// off: the mode is opt-in, so a viewer that has never been told otherwise never ramps.
+    pub fn age_ramp(&self) -> Result<bool> {
+        Ok(self.setting("age_ramp")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_age_ramp(&self, enabled: bool) -> Result<()> {
+        self.set_setting("age_ramp", if enabled { "1" } else { "0" })
+    }
+
     pub fn retention_window_ms(&self) -> Result<i64> {
         Ok(self
             .setting("retention_window_ms")?

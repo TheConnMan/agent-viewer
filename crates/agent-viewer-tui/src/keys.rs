@@ -12,6 +12,7 @@ use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
+    TAIL_MIN_TOTAL_WIDTH,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -417,6 +418,35 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
     );
 }
 
+/// Why the tail pane cannot open right now, if it cannot.
+///
+/// Below the minimum the half it takes would leave the list unreadable, so opening is
+/// refused rather than turning a flag on that renders nothing. A width of 0 means the list
+/// has not been drawn yet, which is not evidence of a narrow terminal. Shared by the Ctrl+B
+/// chord and the palette entry so both refuse for the same reason, in the same words.
+pub(crate) fn tail_refusal(ui: &Ui) -> Option<String> {
+    let width = ui.list_hit.borrow().width();
+    (width > 0 && width < TAIL_MIN_TOTAL_WIDTH)
+        .then(|| format!("tail pane needs {TAIL_MIN_TOTAL_WIDTH} columns and this one is {width}"))
+}
+
+/// Ctrl+B opens and closes the tail pane. It is a pure view toggle: the transcript read it
+/// implies happens on a background worker and never starts a process.
+fn toggle_tail(ui: &mut Ui) {
+    if ui.tail_open {
+        ui.tail_open = false;
+        ui.set_notice("tail pane off".to_string());
+        return;
+    }
+    // An unsupported action is a footer notice, never a silent no-op.
+    if let Some(reason) = tail_refusal(ui) {
+        ui.set_notice(reason);
+        return;
+    }
+    ui.tail_open = true;
+    ui.set_notice("tail pane on · ⌃B to close".to_string());
+}
+
 /// Ctrl+G advances the header mascot; the palette picks one directly. Both land here so the
 /// choice is announced and persisted the same way.
 fn cycle_sprite(ui: &mut Ui) {
@@ -432,6 +462,28 @@ fn set_sprite(ui: &mut Ui, sprite: SpriteKind) {
         return;
     }
     ui.set_notice(format!("sprite: {} · ⌃G for the next", sprite.name()));
+}
+
+/// Flip the age ramp, persist it, and say what happened. Under a theme with no truecolor
+/// endpoint to fade toward the flag still flips (so it takes effect on the next theme change),
+/// but the notice says plainly that nothing will look different here.
+pub(crate) fn toggle_age_ramp(ui: &mut Ui) {
+    ui.age_ramp = !ui.age_ramp;
+    let state = if ui.age_ramp { "on" } else { "off" };
+    if let Some(db) = &ui.db
+        && let Err(error) = db.set_age_ramp(ui.age_ramp)
+    {
+        ui.set_notice(format!("age ramp: {state} (not saved: {error})"));
+        return;
+    }
+    if ui.age_ramp && !ui.themes.active().supports_age_ramp() {
+        ui.set_notice(format!(
+            "age ramp: on · no effect under the {} theme",
+            ui.themes.active().name
+        ));
+        return;
+    }
+    ui.set_notice(format!("age ramp: {state}"));
 }
 
 /// Ctrl+C is the app-wide "kill the viewer" chord, except when a child is taking our keys
@@ -561,6 +613,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('x') => kill_selected(backends, ui),
             KeyCode::Char('f') => open_filter(ui),
             KeyCode::Char('k') => open_palette(backends, ui),
+            KeyCode::Char('b') => toggle_tail(ui),
             KeyCode::Char('w') => toggle_wall(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
@@ -678,7 +731,7 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
             backend_of(backends, session.backend).map(|b| b.capabilities_for(session))
         })
         .unwrap_or_else(Capabilities::none);
-    let mut items = palette_action_items(selected, capabilities);
+    let mut items = palette_action_items(selected, capabilities, ui, ui.tail_open);
     items.extend(SpriteKind::ALL.into_iter().map(|sprite| {
         let active = sprite == ui.sprite;
         PaletteItem::new(
@@ -786,6 +839,8 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
 fn palette_action_items(
     selected: Option<&Session>,
     capabilities: Capabilities,
+    ui: &Ui,
+    tail_open: bool,
 ) -> Vec<PaletteItem> {
     [
         action_item(
@@ -860,6 +915,31 @@ fn palette_action_items(
             "open the list filter",
             Some("⌃F"),
             None,
+        ),
+        // No chord: the palette is the only entry point for this one, by design.
+        action_item(
+            PaletteAction::AgeRamp,
+            "Age ramp",
+            "fade finished sessions as they age",
+            None,
+            None,
+        ),
+        action_item(
+            PaletteAction::TailPane,
+            if tail_open {
+                "Hide tail pane"
+            } else {
+                "Show tail pane"
+            },
+            if tail_open {
+                "showing now · give the columns back to the list"
+            } else {
+                "tail the selected session's last turns beside the list"
+            },
+            Some("⌃B"),
+            // Only the open direction can be refused; closing always works, even if the
+            // terminal was resized narrow while the pane was up.
+            if tail_open { None } else { tail_refusal(ui) },
         ),
     ]
     .into_iter()
@@ -1103,6 +1183,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::ShowAll => ui.app.toggle_show_all(),
             PaletteAction::Group => ui.app.toggle_group_mode(),
             PaletteAction::Filter => open_filter(ui),
+            PaletteAction::AgeRamp => toggle_age_ramp(ui),
+            PaletteAction::TailPane => toggle_tail(ui),
         },
         PaletteTarget::Session { backend, id } => {
             if ui.app.select_by_key(&(backend, id)) {
@@ -1410,6 +1492,10 @@ pub(crate) mod tests {
             mouse_capture: true,
             mouse_press: None,
             sprite: Default::default(),
+            age_ramp: false,
+            tail_open: false,
+            tail: None,
+            tail_pending: None,
             wall: agent_viewer_tui::ui::WallState::default(),
             wall_rects: std::cell::RefCell::new(Vec::new()),
         }
@@ -1461,6 +1547,8 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        age_ramp: ui.age_ramp,
+                        tail: None,
                         wall: None,
                         wall_rects: &ui.wall_rects,
                     },
@@ -1499,6 +1587,8 @@ pub(crate) mod tests {
                         list_hit: &ui.list_hit,
                         themes: &ui.themes,
                         sprite: ui.sprite,
+                        age_ramp: ui.age_ramp,
+                        tail: None,
                         wall: None,
                         wall_rects: &ui.wall_rects,
                     },
@@ -2861,6 +2951,175 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ctrl_b_toggles_the_tail_pane_and_disturbs_nothing_else() {
+        let mut ui = test_ui_with(vec![
+            sess("first", "/tmp/agentviewer-tail-first", 100),
+            sess("second", "/tmp/agentviewer-tail-second", 200),
+        ]);
+        select_session_row(&mut ui, "first");
+        ui.composer.push_str("draft stays");
+        let selected = ui.app.selected_index();
+
+        assert!(!ui.tail_open);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(ui.tail_open, "ctrl+b opens the pane");
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(!ui.tail_open, "ctrl+b closes it again");
+
+        // The chord belongs to the pane alone: it never reaches the composer (where every
+        // bare letter starts a task), never changes mode, and never moves the selection.
+        assert_eq!(ui.composer.text(), "draft stays");
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(ui.app.selected_index(), selected);
+    }
+
+    /// Draw one list frame at `width`, which is what populates `list_hit` with the real
+    /// measured list geometry the tail pane's width gate reads.
+    fn render_list_frame(ui: &Ui, width: u16) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                agent_viewer_tui::ui::draw(
+                    frame,
+                    Draw {
+                        app: &ui.app,
+                        workspace: &ui.workspace,
+                        mode: &ui.mode,
+                        notice: ui.notice.text(),
+                        composer: &ui.composer,
+                        pulses: &ui.pulses,
+                        now_ms: 0,
+                        attach: None,
+                        pr_status: &ui.pr_status,
+                        logos: None,
+                        list_hit: &ui.list_hit,
+                        themes: &ui.themes,
+                        sprite: ui.sprite,
+                        age_ramp: ui.age_ramp,
+                        tail: None,
+                        wall: None,
+                        wall_rects: &ui.wall_rects,
+                    },
+                );
+            })
+            .expect("draw list frame");
+    }
+
+    /// The tail-pane entry in an open palette, as the user would find it.
+    fn tail_palette_item(ui: &Ui) -> agent_viewer_tui::ui::PaletteItem {
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("expected the palette to be open");
+        };
+        palette
+            .results()
+            .find(|item| matches!(&item.target, PaletteTarget::Action(PaletteAction::TailPane)))
+            .cloned()
+            .expect("the palette offers the tail pane")
+    }
+
+    /// Open the palette and type `query`, leaving it open on the ranked results. An empty
+    /// query lists only enabled actions, so a disabled one is found by typing for it, which
+    /// is how the user would find it too.
+    fn open_palette_with_query(ui: &mut Ui, query: &str) {
+        let mut terminal = test_terminal();
+        assert!(!press_normal_key(ui, &[], 'k', KeyModifiers::CONTROL));
+        for character in query.chars() {
+            handle_palette_key(
+                key(KeyCode::Char(character), KeyModifiers::NONE),
+                &[],
+                ui,
+                &mut terminal,
+            )
+            .expect("type palette query");
+        }
+    }
+
+    /// Open the palette, type `query`, and press Enter on the top hit.
+    fn pick_from_palette(ui: &mut Ui, query: &str) {
+        open_palette_with_query(ui, query);
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            ui,
+            &mut test_terminal(),
+        )
+        .expect("accept palette selection");
+    }
+
+    #[test]
+    fn the_quick_switcher_toggles_the_tail_pane_both_ways() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-palette", 100)]);
+        render_list_frame(&ui, 170);
+
+        // Closed: typing "tail pane" finds an entry offering to show it.
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert_eq!(item.name, "Show tail pane");
+        assert!(item.enabled);
+        ui.mode = Mode::Normal;
+
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(ui.tail_open, "the palette entry opened the pane");
+        assert!(matches!(ui.mode, Mode::Normal));
+
+        // Open: the same entry now reads as hide, and picking it closes the pane again.
+        render_list_frame(&ui, 170);
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert_eq!(item.name, "Hide tail pane");
+        assert!(item.detail.contains("showing now"));
+        ui.mode = Mode::Normal;
+
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(!ui.tail_open, "the palette entry closed the pane");
+    }
+
+    #[test]
+    fn the_quick_switcher_disables_the_tail_pane_on_a_narrow_terminal() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-narrow-p", 100)]);
+        render_list_frame(&ui, 80);
+
+        open_palette_with_query(&mut ui, "tail pane");
+        let item = tail_palette_item(&ui);
+        assert!(!item.enabled, "80 columns cannot show the pane");
+        assert!(
+            item.disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("80")),
+            "the reason names the measured width: {:?}",
+            item.disabled_reason
+        );
+        ui.mode = Mode::Normal;
+
+        // Picking it anyway leaves the pane closed and says why.
+        pick_from_palette(&mut ui, "tail pane");
+        assert!(!ui.tail_open);
+        assert!(ui.notice.text().contains("80"), "{:?}", ui.notice.text());
+    }
+
+    #[test]
+    fn ctrl_b_refuses_to_open_a_pane_a_narrow_terminal_cannot_render() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-narrow", 100)]);
+
+        // At 80 columns the pane's 46 would leave the list unreadable, so the chord refuses
+        // and says why instead of turning a flag on that renders nothing.
+        render_list_frame(&ui, 80);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(!ui.tail_open, "the pane must not open at 80 columns");
+        assert!(
+            ui.notice.text().contains("80"),
+            "the refusal names the measured width: {:?}",
+            ui.notice.text()
+        );
+
+        // Wide enough, and the same chord opens it.
+        render_list_frame(&ui, agent_viewer_tui::ui::TAIL_MIN_TOTAL_WIDTH + 20);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(ui.tail_open);
+    }
+
+    #[test]
     fn ctrl_k_escape_restores_selection_and_preserves_the_composer() {
         let mut ui = test_ui_with(vec![
             sess("first", "/tmp/agentviewer-palette-first", 100),
@@ -2916,6 +3175,48 @@ pub(crate) mod tests {
             item.name == "Show all sessions"
                 && matches!(&item.target, PaletteTarget::Action(PaletteAction::ShowAll))
         }));
+    }
+
+    #[test]
+    fn age_ramp_is_off_by_default_and_toggles_from_the_palette() {
+        let mut ui = test_ui_with(Vec::new());
+        assert!(!ui.age_ramp, "the age ramp must start off");
+
+        assert!(
+            palette_items(&[], &ui).iter().any(|item| {
+                item.name == "Age ramp"
+                    && matches!(&item.target, PaletteTarget::Action(PaletteAction::AgeRamp))
+                    && item.enabled
+            }),
+            "the palette is the only entry point, so the item has to be there and enabled"
+        );
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(ui.age_ramp);
+        assert_eq!(ui.notice.text(), "age ramp: on");
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(!ui.age_ramp);
+        assert_eq!(ui.notice.text(), "age ramp: off");
+    }
+
+    #[test]
+    fn switching_the_age_ramp_on_under_a_non_truecolor_theme_says_it_will_do_nothing() {
+        let mut ui = test_ui_with(Vec::new());
+        // Walk the picker to `terminal`, the builtin with no truecolor endpoint to fade toward.
+        while ui.themes.active().id != "terminal" {
+            ui.themes.move_preview(1);
+        }
+
+        super::toggle_age_ramp(&mut ui);
+        assert!(
+            ui.age_ramp,
+            "the flag still flips, so a theme change picks it up"
+        );
+        assert_eq!(
+            ui.notice.text(),
+            "age ramp: on · no effect under the terminal match theme"
+        );
     }
 
     #[test]

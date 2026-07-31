@@ -1,3 +1,4 @@
+use crate::backend::TailEvent;
 use crate::error::{Error, Result};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -232,16 +233,32 @@ pub fn pending_approval(path: &std::path::Path) -> Result<Option<PendingApproval
     Ok(None)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranscriptItem {
-    pub role: String,
-    pub text: String,
+/// Codex opens every thread with a `role: "user"` item that is not the user's: the plugin
+/// catalogue, the whole of AGENTS.md, and an `<environment_context>` block naming the cwd,
+/// shell and date. It is scaffolding wearing the user's role, so the `developer`/`system`
+/// filter below does not catch it.
+///
+/// Measured on this box 2026-07-31: the blob was ~11 KB and was the FIRST tail item of a fresh
+/// thread, so the pane opened on a plugin list instead of the task.
+///
+/// Narrow on BOTH axes, because this filter deletes conversation and a false positive eats the
+/// user's own words:
+///
+/// - the signature is the `<environment_context>` tag codex composes itself, not "looks long"
+///   or "mentions AGENTS.md";
+/// - and only the LEADING item counts. The measurement found the blob at the head of the
+///   thread and nowhere else, so a later message carrying that tag is a human quoting it, and
+///   showing a preamble is a far smaller failure than silently swallowing a real prompt.
+fn is_environment_preamble(text: &str, emitted_so_far: usize) -> bool {
+    emitted_so_far == 0 && text.contains("<environment_context>")
 }
 
-/// Full lazy parse for the detail pane. Keep only response_item lines with
-/// payload.role + payload.content[]; concatenate content[].text where
-/// content[].type is "input_text" or "output_text". Skip malformed lines silently.
-pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
+/// Full lazy parse for the tail pane, in transcript order. Two kinds of response_item
+/// survive: a message (payload.role + payload.content[], concatenating content[].text where
+/// content[].type is "input_text" or "output_text") and a tool call (payload.type
+/// "function_call" or "custom_tool_call", whose `arguments` is a JSON *string*). Skip
+/// malformed lines silently.
+pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     let mut items = Vec::new();
@@ -256,8 +273,35 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        let Some(role) = crate::json_str(payload, "role") else {
+        if matches!(
+            crate::json_str(payload, "type"),
+            Some("function_call") | Some("custom_tool_call")
+        ) {
+            let Some(name) = crate::json_str(payload, "name").filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            // `arguments` holds the input as an embedded JSON string; a custom tool call
+            // carries its raw `input` string instead.
+            let detail = crate::json_str(payload, "arguments")
+                .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
+                .map(|arguments| crate::backend::tool_detail(&arguments))
+                .or_else(|| crate::json_str(payload, "input").map(crate::backend::squash))
+                .unwrap_or_default();
+            items.push(TailEvent::Tool {
+                name: name.to_string(),
+                detail,
+            });
             continue;
+        }
+        // `developer` and `system` messages are harness scaffolding, not conversation: the
+        // memory preamble, the multi-agent prompt, the plugin list. Measured on this box
+        // 2026-07-31, a real 6-item rollout was half developer blobs, so a tail that kept
+        // them would open on "## Memory You have access to a memory folder ..." instead of
+        // the task. The claude parser drops its equivalents the same way.
+        let role = match crate::json_str(payload, "role") {
+            Some(role @ ("user" | "assistant")) => role,
+            _ => continue,
         };
         let Some(content) = payload.get("content").and_then(|c| c.as_array()) else {
             continue;
@@ -272,12 +316,13 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TranscriptItem>> {
                 text.push_str(t);
             }
         }
-        // Tool-only response_items extract to "" — skip them so peek never shows a
+        // Tool-only response_items extract to "" — skip them so the pane never shows a
         // blank role-only line.
-        if !text.is_empty() {
-            items.push(TranscriptItem {
-                role: role.to_string(),
-                text,
+        if !text.is_empty() && !is_environment_preamble(&text, items.len()) {
+            items.push(if role == "user" {
+                TailEvent::User(text)
+            } else {
+                TailEvent::Agent(text)
             });
         }
     }

@@ -1,13 +1,12 @@
 mod common;
 
-use agent_viewer_core::Session;
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
     ClaudeBackend, SessionRegistryEntry, is_sdk_entrypoint, mark_sdk_companions, parse_agents_json,
     parse_claude_json_models, parse_job_state, parse_session_registry, read_claude_transcript,
     sessions_root_from,
 };
-use agent_viewer_core::codex::rollout::TranscriptItem;
+use agent_viewer_core::{Session, TailEvent};
 use common::rfc3339_at;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -339,46 +338,66 @@ fn parse_job_state_working_uses_detail_and_empty_default() {
 }
 
 #[test]
-fn read_claude_transcript_extracts_text_tail() {
+fn read_claude_transcript_extracts_text_and_tool_use_tail() {
     let path = common::fixture_path("claude_transcript.jsonl");
 
-    // Full read: string-content user, list-content user, assistant text; thinking,
-    // tool_use, and system/attachment/queue noise all skipped.
+    // Full read: string-content user, list-content user, assistant text, and the tool_use
+    // block the tail pane needs; thinking and system/attachment/queue noise still skipped.
+    // The last assistant message puts its tool_use BEFORE its text, and that order holds.
     let all = read_claude_transcript(&path, 100).expect("read transcript");
     assert_eq!(
         all,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "first user line as a plain string".to_string(),
+            TailEvent::User("first user line as a plain string".to_string()),
+            TailEvent::Agent("assistant reply one".to_string()),
+            TailEvent::User("second user line from a block list".to_string()),
+            TailEvent::Tool {
+                name: "Bash".to_string(),
+                detail: "cargo test limiter".to_string(),
             },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "assistant reply one".to_string(),
-            },
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "second user line from a block list".to_string(),
-            },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "assistant reply two".to_string(),
-            },
+            TailEvent::Agent("assistant reply two".to_string()),
         ]
     );
 
-    // max_items caps to the LAST two.
+    // max_events caps to the LAST two.
     let tail = read_claude_transcript(&path, 2).expect("read transcript");
     assert_eq!(
         tail,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "second user line from a block list".to_string(),
+            TailEvent::Tool {
+                name: "Bash".to_string(),
+                detail: "cargo test limiter".to_string(),
             },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "assistant reply two".to_string(),
+            TailEvent::Agent("assistant reply two".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn read_claude_transcript_keeps_prose_written_before_a_tool_call_ahead_of_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("interleaved.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // One assistant message: prose, a call, more prose, another call.
+    writeln!(
+        f,
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"looking at the limiter"}},{{"type":"tool_use","name":"Read","input":{{"file_path":"src/limiter/bucket.rs"}}}},{{"type":"text","text":"the clock drifts"}},{{"type":"tool_use","name":"Grep","input":{{"pattern":"refill"}}}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    assert_eq!(
+        read_claude_transcript(&path, 100).expect("read transcript"),
+        vec![
+            TailEvent::Agent("looking at the limiter".to_string()),
+            TailEvent::Tool {
+                name: "Read".to_string(),
+                detail: "src/limiter/bucket.rs".to_string(),
+            },
+            TailEvent::Agent("the clock drifts".to_string()),
+            TailEvent::Tool {
+                name: "Grep".to_string(),
+                detail: "refill".to_string(),
             },
         ]
     );
@@ -396,7 +415,8 @@ fn read_claude_transcript_skips_text_empty_message() {
         r#"{{"type":"user","message":{{"content":"a real user line"}}}}"#
     )
     .unwrap();
-    // Only thinking + tool_use blocks -> text == "" -> skipped.
+    // Only thinking + tool_use blocks: the tool call is an event, the thinking is not, and
+    // the message contributes NO prose event (that would render as a blank line).
     writeln!(
         f,
         r#"{{"type":"assistant","message":{{"content":[{{"type":"thinking","thinking":"hmm"}},{{"type":"tool_use","name":"bash"}}]}}}}"#
@@ -413,15 +433,19 @@ fn read_claude_transcript_skips_text_empty_message() {
     assert_eq!(
         items,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "a real user line".to_string(),
+            TailEvent::User("a real user line".to_string()),
+            TailEvent::Tool {
+                name: "bash".to_string(),
+                detail: String::new(),
             },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "a real reply".to_string(),
-            },
+            TailEvent::Agent("a real reply".to_string()),
         ]
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|event| matches!(event, TailEvent::Agent(text) | TailEvent::User(text) if text.trim().is_empty())),
+        "no empty prose event may reach the pane: {items:?}"
     );
 }
 

@@ -203,14 +203,12 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/model", "pick from all available models"),
         ("/theme", "preview and select a theme"),
         ("Enter", "spawn composed task"),
-        ("← back", "back to the list (input line empty)"),
-        ("Ctrl+]", "back to the list (always)"),
+        // Entries are paired onto single lines where they are related: the list already
+        // fills an 80x24 popup, and a 23rd line pushes Ctrl+C off the bottom.
+        ("← / Ctrl+]", "back to the list (input line empty / always)"),
         ("Enter/Space", "toggle group on a header"),
-        // Paired onto one line: the popup already fills an 80x24 terminal, and a 23rd entry
-        // pushes Ctrl+C off the bottom.
-        // The wall's own keys are in the footer while it is up; a longer line here wraps and
-        // pushes Ctrl+C off the bottom of an 80x24 popup.
-        ("Ctrl+K / Ctrl+W", "command palette / video wall"),
+        ("Ctrl+K", "command palette"),
+        ("Ctrl+B / Ctrl+W", "tail pane / video wall"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),
