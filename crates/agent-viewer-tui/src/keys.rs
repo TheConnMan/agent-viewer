@@ -12,6 +12,7 @@ use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
+    TAIL_MIN_TOTAL_WIDTH,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -364,15 +365,25 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
 /// Ctrl+B opens and closes the tail pane. It is a pure view toggle: the transcript read it
 /// implies happens on a background worker and never starts a process.
 fn toggle_tail(ui: &mut Ui) {
-    ui.tail_open = !ui.tail_open;
-    ui.set_notice(
-        if ui.tail_open {
-            "tail pane on · ⌃B to close"
-        } else {
-            "tail pane off"
-        }
-        .to_string(),
-    );
+    if ui.tail_open {
+        ui.tail_open = false;
+        ui.set_notice("tail pane off".to_string());
+        return;
+    }
+    // Refuse rather than open a pane that cannot render: below the minimum the 46 columns it
+    // takes would leave the list unreadable, and an unsupported action is a footer notice,
+    // never a silent no-op. A width of 0 means the list has not been drawn yet, which is not
+    // evidence of a narrow terminal.
+    let width = ui.list_hit.borrow().width();
+    if width > 0 && width < TAIL_MIN_TOTAL_WIDTH {
+        ui.set_notice(format!(
+            "tail pane needs {} columns and this one is {width}",
+            TAIL_MIN_TOTAL_WIDTH
+        ));
+        return;
+    }
+    ui.tail_open = true;
+    ui.set_notice("tail pane on · ⌃B to close".to_string());
 }
 
 /// Ctrl+G advances the header mascot; the palette picks one directly. Both land here so the
@@ -2213,6 +2224,57 @@ pub(crate) mod tests {
         assert_eq!(ui.composer.text(), "draft stays");
         assert!(matches!(ui.mode, Mode::Normal));
         assert_eq!(ui.app.selected_index(), selected);
+    }
+
+    /// Draw one list frame at `width`, which is what populates `list_hit` with the real
+    /// measured list geometry the tail pane's width gate reads.
+    fn render_list_frame(ui: &Ui, width: u16) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                agent_viewer_tui::ui::draw(
+                    frame,
+                    Draw {
+                        app: &ui.app,
+                        workspace: &ui.workspace,
+                        mode: &ui.mode,
+                        notice: ui.notice.text(),
+                        composer: &ui.composer,
+                        pulses: &ui.pulses,
+                        now_ms: 0,
+                        attach: None,
+                        pr_status: &ui.pr_status,
+                        logos: None,
+                        list_hit: &ui.list_hit,
+                        themes: &ui.themes,
+                        sprite: ui.sprite,
+                        tail: None,
+                    },
+                );
+            })
+            .expect("draw list frame");
+    }
+
+    #[test]
+    fn ctrl_b_refuses_to_open_a_pane_a_narrow_terminal_cannot_render() {
+        let mut ui = test_ui_with(vec![sess("only", "/tmp/agentviewer-tail-narrow", 100)]);
+
+        // At 80 columns the pane's 46 would leave the list unreadable, so the chord refuses
+        // and says why instead of turning a flag on that renders nothing.
+        render_list_frame(&ui, 80);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(!ui.tail_open, "the pane must not open at 80 columns");
+        assert!(
+            ui.notice.text().contains("80"),
+            "the refusal names the measured width: {:?}",
+            ui.notice.text()
+        );
+
+        // Wide enough, and the same chord opens it.
+        render_list_frame(&ui, agent_viewer_tui::ui::TAIL_MIN_TOTAL_WIDTH + 20);
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+        assert!(ui.tail_open);
     }
 
     #[test]
