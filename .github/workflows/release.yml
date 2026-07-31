@@ -4,12 +4,26 @@ on:
   push:
     tags:
       - "v*"
+  # Rehearsal path: run against a tag that already exists. Dispatch this workflow
+  # FROM the tag ref itself - the remote-tag-vs-commit guard in the publish job
+  # fails the run when the input tag does not point at the dispatched commit.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (dispatch this run from that same tag ref)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+env:
+  # Single source of truth for the tag under release, for both triggers. On a push
+  # event the `inputs` context is empty, so this falls back to the pushed tag name.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -33,7 +47,7 @@ jobs:
             archive: agent-viewer-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -44,6 +58,13 @@ jobs:
       - name: Build
         run: cargo build --workspace --release --locked --target ${{ matrix.target }}
 
+      # Native host leg only: the other targets are cross-compiled, so their test
+      # binaries cannot run here. Live e2e tests are #[ignore] by default and the
+      # suite has timing-sensitive tests that flake under full parallelism.
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --workspace --locked -- --test-threads=2
+
       - name: Smoke test
         if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/agent-viewer --version
@@ -52,6 +73,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: '& "target/${{ matrix.target }}/release/agent-viewer.exe" --version'
+
+      # The tag is the release contract. A Cargo.toml version left behind must fail
+      # the build, not ship as a release whose name lies about its contents.
+      - name: Assert binary version matches tag
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          version_output=$(./target/${{ matrix.target }}/release/agent-viewer --version)
+          actual="${version_output##* }"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Binary reports version %s but tag %s expects %s\n' \
+              "$actual" "$RELEASE_TAG" "$expected" >&2
+            exit 1
+          fi
 
       - name: Package
         if: runner.os != 'Windows'
@@ -95,7 +132,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out release source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Download packaged binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -132,6 +169,25 @@ jobs:
           cd dist
           sha256sum --check ./*.sha256
 
+      # Checks the artifact that actually ships, not the build tree binary the build
+      # job already checked - a mispackaged tarball fails here, before publication.
+      - name: Assert packaged binary version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          # Under RUNNER_TEMP, not /tmp: the extracted binary has to be executable.
+          unpacked=$(mktemp -d -p "${RUNNER_TEMP:-/tmp}")
+          trap 'rm -rf "$unpacked"' EXIT
+          tar -C "$unpacked" -xzf dist/agent-viewer-x86_64-unknown-linux-gnu.tar.gz
+          version_output=$("$unpacked/agent-viewer" --version)
+          actual="${version_output##* }"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Packaged binary reports version %s but tag %s expects %s\n' \
+              "$actual" "$RELEASE_TAG" "$expected" >&2
+            exit 1
+          fi
+
       - name: Publish verified GitHub Release
         shell: bash
         run: |
@@ -148,105 +204,19 @@ jobs:
             agent-viewer-x86_64-unknown-linux-gnu.tar.gz.sha256
           )
 
-          tag_ref="refs/tags/$GITHUB_REF_NAME"
-          peeled_ref="$tag_ref^{}"
-          remote_refs=$(git ls-remote --exit-code origin "$tag_ref" "$peeled_ref")
-          direct_object=
-          peeled_commit=
-          while IFS=$'\t' read -r object_id ref_name; do
-            case "$ref_name" in
-              "$tag_ref") direct_object="$object_id" ;;
-              "$peeled_ref") peeled_commit="$object_id" ;;
-              *)
-                printf 'Unexpected remote ref: %s\n' "$ref_name" >&2
-                exit 1
-                ;;
-            esac
-          done <<< "$remote_refs"
-          if [[ -z "$direct_object" ]]; then
-            printf 'Remote tag %s did not resolve.\n' "$tag_ref" >&2
-            exit 1
-          fi
-          remote_commit="${peeled_commit:-$direct_object}"
-          if [[ "$remote_commit" != "$GITHUB_SHA" ]]; then
-            printf 'Remote tag commit %s does not match workflow commit %s.\n' \
-              "$remote_commit" "$GITHUB_SHA" >&2
-            exit 1
-          fi
-
-          release_json=$(mktemp)
-          api_error=$(mktemp)
-          remote_dir=$(mktemp -d)
-          trap 'rm -f "$release_json" "$api_error"; rm -rf "$remote_dir"' EXIT
-
-          release_state=new
-          if gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" > "$release_json" 2> "$api_error"; then
-            if [[ $(jq -r '.draft' "$release_json") == true ]]; then
-              release_state=draft
-            else
-              release_state=public
-            fi
-          elif ! grep -q 'HTTP 404' "$api_error"; then
-            cat "$api_error" >&2
-            exit 1
-          fi
-
-          if [[ "$release_state" == new ]]; then
-            gh release create "$GITHUB_REF_NAME" \
-              --draft \
-              --verify-tag \
-              --generate-notes \
-              --title "$GITHUB_REF_NAME"
-          elif [[ "$release_state" == draft ]]; then
-            mapfile -t asset_ids < <(jq -r '.assets[].id' "$release_json")
-            for asset_id in "${asset_ids[@]}"; do
-              gh api --method DELETE "repos/$GH_REPO/releases/assets/$asset_id"
-            done
-          fi
-
-          if [[ "$release_state" != public ]]; then
-            upload_paths=()
-            for asset in "${expected[@]}"; do
-              upload_paths+=("dist/$asset")
-            done
-            gh release upload "$GITHUB_REF_NAME" "${upload_paths[@]}"
-          fi
-
-          gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" > "$release_json"
-          mapfile -t remote_names < <(jq -r '.assets[].name' "$release_json" | sort)
-          if [[ ${#remote_names[@]} -ne ${#expected[@]} ]]; then
-            printf 'Unexpected remote asset count: %s\n' "${#remote_names[@]}" >&2
-            printf 'Found: %s\n' "${remote_names[@]}" >&2
-            exit 1
-          fi
-          for index in "${!expected[@]}"; do
-            if [[ "${remote_names[$index]}" != "${expected[$index]}" ]]; then
-              printf 'Expected remote asset %s but found %s\n' \
-                "${expected[$index]}" "${remote_names[$index]}" >&2
-              exit 1
-            fi
-          done
-
-          for asset in "${expected[@]}"; do
-            asset_id=$(jq -r --arg name "$asset" \
-              '.assets[] | select(.name == $name) | .id' "$release_json")
-            gh api \
-              -H "Accept: application/octet-stream" \
-              "repos/$GH_REPO/releases/assets/$asset_id" > "$remote_dir/$asset"
-            local_digest=$(sha256sum "dist/$asset" | awk '{print $1}')
-            remote_digest=$(sha256sum "$remote_dir/$asset" | awk '{print $1}')
-            if [[ "$local_digest" != "$remote_digest" ]]; then
-              printf 'Digest mismatch for remote asset %s\n' "$asset" >&2
-              exit 1
-            fi
-          done
-
-          if [[ "$release_state" != public ]]; then
-            tag_ref="refs/tags/$GITHUB_REF_NAME"
-            peeled_ref="$tag_ref^{}"
+          # Asserts the remote tag still points at the commit this run built. Called
+          # once up front and again immediately before the draft is made public, so a
+          # tag force-moved mid-run cannot slip past.
+          verify_remote_tag() {
+            local tag_ref="refs/tags/$RELEASE_TAG"
+            local peeled_ref="$tag_ref^{}"
+            local remote_refs object_id ref_name remote_commit
+            local direct_object=
+            local peeled_commit=
+            # Reads the remote over `origin`, which relies on the credentials
+            # actions/checkout persists by default; `persist-credentials: false`
+            # on the checkout step above would break this line.
             remote_refs=$(git ls-remote --exit-code origin "$tag_ref" "$peeled_ref")
-            direct_object=
-            peeled_commit=
             while IFS=$'\t' read -r object_id ref_name; do
               case "$ref_name" in
                 "$tag_ref") direct_object="$object_id" ;;
@@ -267,7 +237,100 @@ jobs:
                 "$remote_commit" "$GITHUB_SHA" >&2
               exit 1
             fi
-            gh release edit "$GITHUB_REF_NAME" --draft=false
+          }
+
+          verify_remote_tag
+
+          release_json=$(mktemp)
+          api_error=$(mktemp)
+          trap 'rm -f "$release_json" "$api_error"' EXIT
+
+          release_state=new
+          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$release_json" 2> "$api_error"; then
+            if [[ $(jq -r '.draft' "$release_json") == true ]]; then
+              release_state=draft
+            else
+              release_state=public
+            fi
+          elif ! grep -q 'HTTP 404' "$api_error"; then
+            cat "$api_error" >&2
+            exit 1
+          fi
+
+          if [[ "$release_state" == new ]]; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          elif [[ "$release_state" == draft ]]; then
+            mapfile -t asset_ids < <(jq -r '.assets[].id' "$release_json")
+            for asset_id in "${asset_ids[@]}"; do
+              gh api --method DELETE "repos/$GH_REPO/releases/assets/$asset_id"
+            done
+          fi
+
+          if [[ "$release_state" != public ]]; then
+            upload_paths=()
+            for asset in "${expected[@]}"; do
+              upload_paths+=("dist/$asset")
+            done
+            gh release upload "$RELEASE_TAG" "${upload_paths[@]}"
+          fi
+
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$release_json"
+          mapfile -t remote_names < <(jq -r '.assets[].name' "$release_json" | sort)
+          if [[ ${#remote_names[@]} -ne ${#expected[@]} ]]; then
+            printf 'Unexpected remote asset count: %s\n' "${#remote_names[@]}" >&2
+            printf 'Found: %s\n' "${remote_names[@]}" >&2
+            exit 1
+          fi
+          for index in "${!expected[@]}"; do
+            if [[ "${remote_names[$index]}" != "${expected[$index]}" ]]; then
+              printf 'Expected remote asset %s but found %s\n' \
+                "${expected[$index]}" "${remote_names[$index]}" >&2
+              exit 1
+            fi
+          done
+
+          # Verifies remote content out of the release JSON already in hand: the assets
+          # API reports each asset's sha256, so nothing has to be downloaded back. It
+          # omits the digest for an asset GitHub has not hashed yet, and the state and
+          # size gates are what stand in that case.
+          for asset in "${expected[@]}"; do
+            remote_state=$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .state' "$release_json")
+            if [[ "$remote_state" != uploaded ]]; then
+              printf 'Remote asset %s is in state %s, expected uploaded\n' \
+                "$asset" "$remote_state" >&2
+              exit 1
+            fi
+            remote_size=$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .size' "$release_json")
+            local_size=$(stat -c %s "dist/$asset")
+            if [[ "$remote_size" != "$local_size" ]]; then
+              printf 'Size mismatch for remote asset %s: remote %s bytes, local %s bytes\n' \
+                "$asset" "$remote_size" "$local_size" >&2
+              exit 1
+            fi
+            remote_digest=$(jq -r --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .digest // ""' "$release_json")
+            if [[ -z "$remote_digest" ]]; then
+              printf 'Remote asset %s reports no digest; verified by state and size only.\n' \
+                "$asset"
+              continue
+            fi
+            local_digest="sha256:$(sha256sum "dist/$asset" | awk '{print $1}')"
+            if [[ "$remote_digest" != "$local_digest" ]]; then
+              printf 'Digest mismatch for remote asset %s: remote %s, local %s\n' \
+                "$asset" "$remote_digest" "$local_digest" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "$release_state" != public ]]; then
+            verify_remote_tag
+            gh release edit "$RELEASE_TAG" --draft=false
           else
             printf 'Existing public release matches all local assets.\n'
           fi
