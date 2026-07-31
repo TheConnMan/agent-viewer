@@ -431,6 +431,13 @@ it, which is not a lie — the resume process really does exist — and it canno
 forever, because the recency window is measured against `updated_at_ms`, which the connection
 does not touch. At minute fifteen the tile drops and the connection closes with it.
 
+That last clause is load-bearing and was not free: a tile leaving the wall has to be pruned
+explicitly (`prune_wall_tiles`, run each frame before the join pass). Without it the expired
+session's key stays in `wall.requested` and its child stays in `attached` until the whole wall
+closes — invisible, and steadily pushing the live-process count past `MAX_TILES` as expired
+slots are refilled. Dropping the key from `requested` also invalidates any join still in
+flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawns.
+
 **Known gap, narrowed but not closed: stale-daemon attach targeting.** `attach_route` points a
 daemon-hosted row at whatever daemon `daemon version` currently answers, without checking that
 it is the same process that holds the row's fd. If a daemon were restarted (the viewer never

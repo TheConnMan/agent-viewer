@@ -44,8 +44,14 @@ const CARET_COLS: usize = 2;
 #[derive(Default)]
 pub struct WallState {
     pub on: bool,
-    /// Index into the capped tile list.
-    pub selected: usize,
+    /// The session whose tile has the keyboard, held by key rather than by position. A
+    /// refresh can reorder tiles (a status flip under state grouping, a new project sorting
+    /// in earlier), and an index would silently slide the focus — and the next thing typed —
+    /// onto a different agent.
+    pub focus: Option<(BackendKind, String)>,
+    /// Where the focus last resolved to, so a focused session leaving the wall lands on a
+    /// neighbouring tile instead of snapping back to the first.
+    pub last_index: usize,
     /// Last size each tile's PTY was resized to, so the run loop does not SIGWINCH every
     /// child on every frame.
     pub sized: HashMap<(BackendKind, String), (u16, u16)>,
@@ -59,6 +65,26 @@ pub struct WallState {
 }
 
 impl WallState {
+    /// Index of the focused tile within `keys`. Falls back to the last resolved position,
+    /// clamped, when the focused session is no longer tiled.
+    pub fn focus_index(&self, keys: &[(BackendKind, String)]) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+        self.focus
+            .as_ref()
+            .and_then(|focus| keys.iter().position(|key| key == focus))
+            .unwrap_or_else(|| self.last_index.min(keys.len() - 1))
+    }
+
+    /// Move the focus to `index` within `keys`, recording both the key and the position.
+    pub fn set_focus(&mut self, keys: &[(BackendKind, String)], index: usize) {
+        if let Some(key) = keys.get(index) {
+            self.focus = Some(key.clone());
+            self.last_index = index;
+        }
+    }
+
     /// Whether the wall owns this session's connection. Zooming into a tile must not close
     /// it on the way back out, and closing the wall must close every one of these.
     pub fn owns(&self, key: &(BackendKind, String)) -> bool {
@@ -68,7 +94,8 @@ impl WallState {
     /// Forget everything about a visit. The caller closes the PTYs; this only drops the
     /// bookkeeping, so it must run alongside that, never instead of it.
     pub fn clear(&mut self) {
-        self.selected = 0;
+        self.focus = None;
+        self.last_index = 0;
         self.sized.clear();
         self.requested.clear();
         self.failed.clear();
@@ -96,29 +123,52 @@ pub struct WallView<'a> {
 
 // --- Membership -----------------------------------------------------------------
 
-/// Every session the wall should tile, in `visible()` order so the wall reads in the same
-/// sequence as the list it replaced.
+/// Every session the wall should tile: still-live ones first, then recently-stopped ones,
+/// each group in `visible()` order so the wall reads in the same sequence as the list it
+/// replaced.
 ///
 /// Membership is state plus recency. The wall connects whatever is not connected yet rather
 /// than showing only what happened to be connected already — the whole point is that one
 /// keypress shows you everything that is running.
 ///
+/// The two-band ordering exists because of the cap: in plain list order, nine sessions that
+/// stopped in the last fifteen minutes could fill every slot and push a working session into
+/// the overflow count, which is precisely the thing the wall exists to show. Ranking is stable
+/// within each band, so the grid still tracks the list.
+///
 /// Never iterate `attached` here — `HashMap` order is unspecified and the grid would shuffle
 /// between frames.
 pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
-    app.visible()
-        .iter()
-        .filter_map(|row| match row {
-            Row::Session {
-                backend,
-                id,
-                status,
-                updated_at_ms,
-                ..
-            } if tiled(status, *updated_at_ms, now_ms) => Some((*backend, id.clone())),
-            _ => None,
-        })
-        .collect()
+    let mut live = Vec::new();
+    let mut recent = Vec::new();
+    for row in app.visible() {
+        let Row::Session {
+            backend,
+            id,
+            status,
+            updated_at_ms,
+            ..
+        } = row
+        else {
+            continue;
+        };
+        if !tiled(status, *updated_at_ms, now_ms) {
+            continue;
+        }
+        if is_live(status) {
+            &mut live
+        } else {
+            &mut recent
+        }
+        .push((*backend, id.clone()));
+    }
+    live.append(&mut recent);
+    live
+}
+
+/// Whether a session is still going, as opposed to being held by the recency window.
+fn is_live(status: &Status) -> bool {
+    matches!(status, Status::Working | Status::NeedsInput { .. })
 }
 
 /// Whether one session earns a tile.
@@ -130,9 +180,9 @@ pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
 /// `NeedsInput` is — a run that just failed is the most useful thing a wall can show.
 fn tiled(status: &Status, updated_at_ms: i64, now_ms: i64) -> bool {
     match status {
-        Status::Working | Status::NeedsInput { .. } => true,
+        _ if is_live(status) => true,
         Status::Idle | Status::Done | Status::Error => now_ms - updated_at_ms <= RECENT_MS,
-        Status::Unknown => false,
+        _ => false,
     }
 }
 
@@ -498,6 +548,74 @@ mod tests {
             scrollback_rows: 0,
         })
         .expect("wall tile child")
+    }
+
+    /// The cap is a process budget, so it must not be spent on sessions that have stopped
+    /// while something still running waits in the overflow count. That is the wall's whole
+    /// job.
+    #[test]
+    fn live_sessions_take_the_capped_slots_ahead_of_recently_stopped_ones() {
+        // Nine stopped sessions ahead of one working session in list order.
+        let mut sessions: Vec<Session> = (0..9)
+            .map(|i| session(&format!("stopped-{i}"), Status::Idle))
+            .collect();
+        sessions.push(session("still-working", Status::Working));
+        let app = App::new(sessions);
+
+        let keys = tile_keys(&app, NOW);
+
+        assert_eq!(keys.len(), MAX_TILES);
+        assert_eq!(
+            keys[0].1, "still-working",
+            "a working session must not be pushed into the overflow by stopped ones"
+        );
+        // And the stopped ones keep their list order behind it.
+        assert_eq!(keys[1].1, "stopped-0");
+        assert_eq!(overflow(wall_sessions(&app, NOW).len()), 1);
+    }
+
+    /// Focus is stored by key so a reorder cannot slide it onto a different agent.
+    #[test]
+    fn the_focus_follows_its_session_when_the_tiles_reorder() {
+        let first = App::new(vec![
+            session("alpha", Status::Working),
+            session("beta", Status::Working),
+        ]);
+        let mut wall = WallState::default();
+        let keys = tile_keys(&first, NOW);
+        wall.set_focus(&keys, 1);
+        assert_eq!(wall.focus_index(&keys), 1);
+
+        // A refresh puts beta first; the focus must stay on beta, not on whatever is at 1.
+        let reordered = App::new(vec![
+            session("beta", Status::Working),
+            session("alpha", Status::Working),
+        ]);
+        let keys = tile_keys(&reordered, NOW);
+        assert_eq!(keys[0].1, "beta");
+        assert_eq!(
+            wall.focus_index(&keys),
+            0,
+            "the focus slid onto another session when the tiles reordered"
+        );
+    }
+
+    /// When the focused session leaves the wall entirely there is no key to follow, so the
+    /// focus lands next to where it was rather than snapping back to the first tile.
+    #[test]
+    fn a_focus_whose_session_left_falls_back_to_its_last_position() {
+        let app = App::new(vec![
+            session("a", Status::Working),
+            session("b", Status::Working),
+            session("c", Status::Working),
+        ]);
+        let mut wall = WallState::default();
+        let keys = tile_keys(&app, NOW);
+        wall.set_focus(&keys, 2);
+
+        let survivors = vec![keys[0].clone(), keys[1].clone()];
+        assert_eq!(wall.focus_index(&survivors), 1);
+        assert_eq!(wall.focus_index(&[]), 0, "an empty wall must not panic");
     }
 
     #[test]

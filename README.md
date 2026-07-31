@@ -262,7 +262,9 @@ instead of vanishing at that moment.
 
 The grid is 1x1 for one session, 2x1 for two, 2x2 for three or four, 3x2 for five or six, and
 3x3 up to nine. Nine is the cap, because every tile is a live child process; beyond that the
-footer reads `showing 9 of N` rather than dropping the rest silently. Each tile carries its
+footer reads `showing 9 of N` rather than dropping the rest silently, and still-running
+sessions take the slots ahead of recently-stopped ones so a busy agent is never the one pushed
+into the overflow. Each tile carries its
 state glyph, backend mark, title, project, and elapsed time, dropping the project then the
 elapsed as tiles get narrower. The focused tile is marked with a caret and an accent border; a
 tile awaiting input turns its own border and header amber without disturbing the rest of the
