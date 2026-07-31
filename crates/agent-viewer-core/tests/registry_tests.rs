@@ -1,5 +1,7 @@
 mod common;
 
+use agent_viewer_core::Backend;
+use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::registry::{Registry, find_state_db};
 use agent_viewer_core::codex::source::Source;
 use agent_viewer_core::error::Error;
@@ -319,4 +321,56 @@ fn open_missing_db_errors_and_creates_nothing() {
     assert!(Registry::open(&path).is_err());
     // Read-only open must NOT create the file.
     assert!(!path.exists());
+}
+
+/// Build one `state_N.sqlite` at an exact path (the shared helper picks its own filename, and
+/// the rollover test below needs both versions side by side in one codex home).
+fn write_state_db(path: &std::path::Path, schema: &str, inserts: &[String]) {
+    let conn = rusqlite::Connection::open(path).expect("open state db");
+    conn.execute_batch(schema).expect("run schema DDL");
+    for stmt in inserts {
+        conn.execute(stmt, []).expect("run insert");
+    }
+    conn.close().expect("close writer connection");
+}
+
+/// A Codex upgrade lays down a NEW `state_N+1.sqlite` and leaves the old one in place, readable
+/// and frozen. The listing has to follow the rollover while running: the registry used to be
+/// re-resolved only when a read ERRORED, and the stale file never errors, so every session
+/// created after the upgrade stayed invisible until the viewer was restarted.
+#[test]
+fn list_follows_a_state_db_rollover_without_a_restart() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let dir = tempfile::TempDir::new().unwrap();
+    write_state_db(
+        &dir.path().join("state_1.sqlite"),
+        &schema,
+        &[thread_insert("t_before", "Before", 1000)],
+    );
+
+    let mut backend = CodexBackend::new(dir.path().to_path_buf());
+    let ids = |sessions: Vec<agent_viewer_core::Session>| {
+        sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(backend.list().expect("first listing")),
+        vec!["t_before"]
+    );
+
+    write_state_db(
+        &dir.path().join("state_2.sqlite"),
+        &schema,
+        &[
+            thread_insert("t_before", "Before", 1000),
+            thread_insert("t_after", "After", 2000),
+        ],
+    );
+    let after = ids(backend.list().expect("listing after the rollover"));
+    assert!(
+        after.contains(&"t_after".to_string()),
+        "a session created in state_2 must appear without a restart, got {after:?}"
+    );
 }
