@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn header_degrades_project_then_elapsed_then_the_title() {
-        let title = "Opencode daemon probe";
+        let title = "Codex session probing";
         let project = "example-user/agent-viewer";
         let elapsed = "6h";
         let mark = 4;
@@ -896,7 +896,7 @@ mod tests {
         theme.animation = false;
         let mut pty = live_pty();
         let tile = WallTile {
-            session: &session("Opencode daemon probe", Status::Working),
+            session: &session("Codex session probing", Status::Working),
             project: "example-user/agent-viewer".to_string(),
             pty: Some(&pty),
             error: None,

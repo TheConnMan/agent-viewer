@@ -20,8 +20,7 @@ config surfaces, or features not requested.
   primary deliverable because the killer feature (one keystroke attach/resume into a session)
   is inherently terminal. Linux is the fully measured runtime platform. Native release archives
   also target macOS Intel, macOS Apple Silicon, and Windows x64; those platforms enumerate and
-  render sessions but do not claim Linux process status, Codex daemon controls, or secure
-  managed OpenCode behavior.
+  render sessions but do not claim Linux process status or Codex daemon controls.
 - **Out of scope for v1:** a web/Tailscale surface. It is a natural v2 (an `axum` binary
   sharing `-core`, deployed like the `bonus-drain`/`bg-schedule` viewers with token-guarded
   write routes) but do NOT build it now. Leave `-core` cleanly separable so v2 can reuse it.
@@ -62,56 +61,15 @@ check is the fast path for readers. Successful empty listings are snapshots too.
 wait for the lease holder and then read its snapshot rather than independently listing.
 
 This cache is display only. Attach, mutations, and session derived spawn directories always
-relist their authoritative source. Default viewer managed OpenCode credentials use one shared
-noncredential scope. Explicit configured or environment OpenCode passwords bypass sharing.
+relist their authoritative source.
 
-## Enumeration and runtime: opencode
+## Removed backends
 
-The primary OpenCode authority is a secured loopback server. The viewer probes fixed candidates
-`127.0.0.1:4097`, then `127.0.0.1:4098`. It never stops or restarts a server. Spawn alone may
-start `opencode serve --hostname 127.0.0.1 --port <port>`, always from the user home directory.
-The child inherits the normal environment and overrides only `OPENCODE_SERVER_USERNAME` and
-`OPENCODE_SERVER_PASSWORD`. Task shells receive neither credential.
-
-Credentials use nonempty environment overrides when supplied, otherwise a generated stable
-secret in owner only credential files. SQLite stores only viewer presentation state. `~/.local/share/opencode/opencode.db`
-is opened read only as compatibility enumeration when no secure server is available.
-That fallback retains parent and run mode companion classification through the stored `permission`
-field.
-
-Before any credential bearing request, a fresh stream is connected without writing. The viewer
-verifies the listener owner is the pinned process, sends unauthenticated `GET /global/health`
-with keep alive, and requires `401` on a reusable connection. It finds the accepted connection
-inode for that exact local ephemeral tuple and verifies pid, start time, effective uid, exact
-argv, listener inode, and runtime generation. It revalidates after the test hook, then writes
-the authorized request with close on that same `TcpStream`; it never reconnects for auth. This
-same stream requirement is load bearing because Linux `TCP_DEFER_ACCEPT` delayed acceptance
-until the initial health write.
-
-The pin contains pid, start time, listener inode, effective uid, and exact argv. Runtime state
-contains a generation, pin, healthy state, and managed ids. Process shared ownership uses only
-`flock`; each viewer process serializes its own work locally. An occupied listener that returns `200` to unauthenticated
-health is insecure and rejected, never stopped or restarted. Spawn may use `4098` if it is free.
-
-The HTTP client is bounded HTTP/1.1 over `TcpStream`, with strict content framing, bodyless
-`204` handling, no redirects, and bounded headers, body, and timeouts.
-
-Global listing is `GET /experimental/session?limit=10000&archived=true`, following
-`X-Next-Cursor`. Repeated or malformed cursors, or a full page without a cursor, are errors.
-The only managed marker is the exact permission rule
-`{"permission":"agent-viewer.background","pattern":"*","action":"allow"}`. Metadata is
-not a valid marker.
-
-Only exact marked rows are managed. Only they receive `daemon_hosted`, live status, pending input,
-managed capabilities, and server mutations. The managed id cache includes archived marked rows
-so archive and unarchive work, but archived marked rows are not status polled. Status, permission,
-and question are fetched once per unique active managed directory. A failure affects only that
-directory's rows, including external rows, which become `Unknown`. Otherwise external server
-enumerated rows use compatibility `Idle` status.
-
-Server mutations apply only to exact managed rows. Managed attach is refused because it would
-expose credentials. External rows use `opencode -s <session_id>`. External deletion remains local
-`opencode session delete <id>`.
+opencode support was removed before 1.0 by owner decision: the viewer ships as Codex plus
+Claude Code, and a cleaner integration can be built later. The managed-server design
+(credential pinning, the same-stream authorization rule, and the measured Linux
+`TCP_DEFER_ACCEPT` evidence behind it) lives in git history at commit `30ed871`, the last one
+carrying the "Enumeration and runtime: opencode" section.
 
 ## Enumeration — claude, and the nested `claude -p` companion rule
 
@@ -185,7 +143,7 @@ $ cat ~/.claude/sessions/2054075.json
 Rows with no `pid` are skipped without touching the disk: a pid is absent exactly for finished
 background jobs, which are real fleet members. The sessions root follows the same
 `$CLAUDE_CONFIG_DIR` precedence as the jobs root. A missing or unreadable registry file parses
-to "real session", the same safe direction as the opencode rule, and the same two escapes keep
+to "real session", the same safe direction as the codex rule, and the same two escapes keep
 this from swallowing anything: the viewer-state overlay clears `companion` for sessions the
 viewer itself spawned, and `Ctrl+A` and `Ctrl+F` both surface companion rows.
 
@@ -200,8 +158,8 @@ ribbon, which renders complete streamed Codex history including named tool activ
 Activity ribbons cover one hour and aggregate a row with its recursive descendant subtree. Codex
 reads `parent_thread_id` from a subagent `thread_spawn` source. Claude treats the root's flat
 transcripts under its transcript stem `subagents` directory as descendants, then isolates child
-subtrees through sibling `.meta.json` `parentAgentId` links. OpenCode follows `session.parent_id`
-with a recursive read only SQLite query. A child row remains isolated to its own subtree. Missing
+subtrees through sibling `.meta.json` `parentAgentId` links. A child row remains isolated to
+its own subtree. Missing
 or malformed child data is best effort and never removes readable root activity. The hierarchy
 cache rereads every thirty seconds.
 
@@ -569,17 +527,16 @@ that process. Only spawn may start; attach and stop probe. See "Codex attach/res
 ## Model discovery: probe off-thread, cache on disk
 
 Every backend advertises its spawnable models through `available_models()` (default first).
-Two of the three discover them by shelling out, and those shell-outs are slow enough to shape
-the design. Measured on this box, three consecutive runs: `opencode models` takes 3.72s /
-3.81s / 3.82s and prints 378 ids (12,991 bytes); `codex debug models` is comparable; Claude's
-list is a `~/.claude.json` read and effectively free.
+Codex discovers them by shelling out, and that shell-out is slow enough to shape the design.
+Measured on this box, `codex debug models` takes seconds on a cold run; Claude's list is a
+`~/.claude.json` read and effectively free.
 
 - **The probe never runs on the render thread.** The composer's key path reads memory only.
   `ModelCache` (TUI) spawns discovery on a worker thread, results drain non-blocking via
   `poll()`, and a backend is probed at most once per viewer session, including when that probe
   found nothing. A probe deadline lost to a slow CLI is silent: the picker degrades to the
   single built-in default with no error, which is exactly the bug this replaced (the old
-  3s deadline was under `opencode models`' real 3.8s, so opencode never had a picker).
+  3s deadline was under a real cold probe's 3.8s, so that backend never had a picker).
 - **`MODEL_PROBE_TIMEOUT` is 15s.** Generous on purpose: it only bounds a worker thread, and
   losing the race costs a whole catalog.
 - **Catalogs persist in the viewer DB** (`model_cache` table: backend, newline-joined ids,
@@ -697,8 +654,8 @@ remain safe cross platform smoke paths.
 
 ## TUI behavior
 
-- Single list: sessions grouped by project or state, with status glyphs based on
-  opencode-monitor's vocabulary (spinner=running, green=done, gray=hidden, red=errored).
+- Single list: sessions grouped by project or state, with status glyphs (spinner=running,
+  green=done, gray=hidden, red=errored).
   Project groups remain alphabetic and their members order by `created_at_ms` ascending.
   State sections remain fixed and their members order by `created_at_ms` ascending.
   After sanitization, the exact whole title `hold` is matched without regard to ASCII letter
@@ -721,10 +678,7 @@ successful Codex or Claude attach or reattach requests capture on, so those tran
 immediately. While attached, `Ctrl+T` requests capture off for host terminal text selection.
 Press it again to restore session scrolling. Codex wheel reports move the viewer's local PTY
 viewport by three rows, using its bounded 2,000 row scrollback. Claude attached terminals receive
-native wheel forwarding. External opencode attaches with capture off for host selection and
-requires `Ctrl+T` to opt into native wheel forwarding. Detaching requests capture on to restore
-list mouse controls. External opencode behavior is described as its supported attach path, not as
-a live verification claim.
+native wheel forwarding. Detaching requests capture on to restore list mouse controls.
 
 The cost is that **capture swallows the terminal's own drag-select**. This spec previously
 waved that away with "the terminal's native text selection still works with Shift held in most
@@ -741,9 +695,8 @@ therefore remains the universal fallback for host terminal selection.
 - Each toggle sets a footer notice naming scrolling or selection and the way back, because the
   state is otherwise invisible.
 - List capture starts **on**. Every successful Codex or Claude attach or reattach requests
-  capture **on**. External opencode attach requests capture **off** until `Ctrl+T` opts into
-  scrolling. Attached `Ctrl+T` toggles between selection and scrolling. Every detach requests
-  capture **on**.
+  capture **on**. Attached `Ctrl+T` toggles between selection and scrolling. Every detach
+  requests capture **on**.
 
 If a mouse mode transition write fails, the viewer writes the complete prior mouse mode as a
 rollback. A successful rollback restores `Ui::mouse_capture` to the prior applied value and

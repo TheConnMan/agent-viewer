@@ -25,10 +25,10 @@ fn poll_until_landed(cache: &mut ModelCache, timeout: Duration) -> Vec<(BackendK
 #[test]
 fn seeded_entries_are_served_without_a_probe() {
     let mut cache = ModelCache::default();
-    let models = vec!["default".to_string(), "opencode-go/glm-5.2".to_string()];
-    cache.seed(BackendKind::Opencode, models.clone(), true);
+    let models = vec!["default".to_string(), "zai/glm-5.2".to_string()];
+    cache.seed(BackendKind::Claude, models.clone(), true);
 
-    assert_eq!(cache.models(BackendKind::Opencode), Some(models.as_slice()));
+    assert_eq!(cache.models(BackendKind::Claude), Some(models.as_slice()));
     assert_eq!(cache.models(BackendKind::Codex), None);
 }
 
@@ -37,14 +37,14 @@ fn a_fresh_seed_suppresses_the_probe_entirely() {
     // Startup seeds a fresh disk row, so tabbing to that backend must not shell out at all.
     let mut cache = ModelCache::default();
     cache.seed(
-        BackendKind::Opencode,
-        vec!["default".to_string(), "opencode-go/glm-5.2".to_string()],
+        BackendKind::Claude,
+        vec!["default".to_string(), "zai/glm-5.2".to_string()],
         true,
     );
 
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);
-    cache.request_with(BackendKind::Opencode, move || {
+    cache.request_with(BackendKind::Claude, move || {
         seen.fetch_add(1, Ordering::SeqCst);
         vec!["default".to_string()]
     });
@@ -59,16 +59,16 @@ fn a_stale_seed_still_serves_its_list_while_it_refreshes() {
     // refresh and is replaced only once the new one lands.
     let mut cache = ModelCache::default();
     cache.seed(
-        BackendKind::Opencode,
+        BackendKind::Claude,
         vec!["default".to_string(), "stale/model".to_string()],
         false,
     );
     assert_eq!(
-        cache.models(BackendKind::Opencode),
+        cache.models(BackendKind::Claude),
         Some(["default".to_string(), "stale/model".to_string()].as_slice())
     );
 
-    cache.request_with(BackendKind::Opencode, || {
+    cache.request_with(BackendKind::Claude, || {
         vec!["default".to_string(), "fresh/model".to_string()]
     });
     let landed = poll_until_landed(&mut cache, Duration::from_secs(5));
@@ -76,12 +76,12 @@ fn a_stale_seed_still_serves_its_list_while_it_refreshes() {
     assert_eq!(
         landed,
         vec![(
-            BackendKind::Opencode,
+            BackendKind::Claude,
             vec!["default".to_string(), "fresh/model".to_string()]
         )]
     );
     assert_eq!(
-        cache.models(BackendKind::Opencode),
+        cache.models(BackendKind::Claude),
         Some(["default".to_string(), "fresh/model".to_string()].as_slice())
     );
 }
@@ -113,15 +113,15 @@ fn a_backend_is_probed_at_most_once_per_session() {
 
     for _ in 0..5 {
         let seen = Arc::clone(&calls);
-        cache.request_with(BackendKind::Opencode, move || {
+        cache.request_with(BackendKind::Claude, move || {
             seen.fetch_add(1, Ordering::SeqCst);
-            vec!["default".to_string(), "opencode-go/glm-5.2".to_string()]
+            vec!["default".to_string(), "zai/glm-5.2".to_string()]
         });
     }
     poll_until_landed(&mut cache, Duration::from_secs(5));
     // Requests after the result has landed must not re-probe either.
     let seen = Arc::clone(&calls);
-    cache.request_with(BackendKind::Opencode, move || {
+    cache.request_with(BackendKind::Claude, move || {
         seen.fetch_add(1, Ordering::SeqCst);
         vec!["default".to_string()]
     });
@@ -134,10 +134,10 @@ fn a_probe_that_discovered_nothing_is_not_cached() {
     // A failed CLI probe degrades to just the default. Storing that would persist the
     // failure to disk and pin an empty picker for the whole TTL.
     let mut cache = ModelCache::default();
-    cache.request_with(BackendKind::Opencode, || vec!["default".to_string()]);
+    cache.request_with(BackendKind::Claude, || vec!["default".to_string()]);
 
     assert!(poll_until_landed(&mut cache, Duration::from_millis(500)).is_empty());
-    assert_eq!(cache.models(BackendKind::Opencode), None);
+    assert_eq!(cache.models(BackendKind::Claude), None);
 }
 
 #[test]

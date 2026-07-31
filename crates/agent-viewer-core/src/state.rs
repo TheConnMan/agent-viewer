@@ -296,12 +296,11 @@ fn listing_lease_owner(now_ms: i64) -> String {
     format!("{}:{now_ms}:{sequence}", std::process::id())
 }
 
-/// "codex" | "claude" | "opencode" back into a BackendKind (None for unknown text).
+/// "codex" | "claude" back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
     match s {
         "codex" => Some(BackendKind::Codex),
         "claude" => Some(BackendKind::Claude),
-        "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
 }
@@ -968,60 +967,6 @@ impl ViewerDb {
                 fetched_at_ms,
             })),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub fn opencode_server_url(&self) -> Result<Option<String>> {
-        self.setting("opencode.server_url")
-    }
-
-    pub fn set_opencode_server_url(&self, url: Option<&str>) -> Result<()> {
-        if let Some(url) = url {
-            self.set_setting("opencode.server_url", url)
-        } else {
-            self.conn.execute(
-                "DELETE FROM settings WHERE key = ?1",
-                rusqlite::params!["opencode.server_url"],
-            )?;
-            Ok(())
-        }
-    }
-
-    pub fn opencode_server_secret(&self) -> Result<String> {
-        use base64::Engine;
-        use std::io::Read;
-
-        let transaction = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        let existing = transaction.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            rusqlite::params!["opencode.server_password"],
-            |row| row.get::<_, String>(0),
-        );
-        match existing {
-            Ok(secret) => {
-                transaction.commit()?;
-                Ok(secret)
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let mut random = [0u8; 32];
-                std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-                let candidate = base64::engine::general_purpose::STANDARD.encode(random);
-                transaction.execute(
-                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-                    rusqlite::params!["opencode.server_password", candidate],
-                )?;
-                let secret = transaction.query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    rusqlite::params!["opencode.server_password"],
-                    |row| row.get::<_, String>(0),
-                )?;
-                transaction.commit()?;
-                Ok(secret)
-            }
             Err(error) => Err(error.into()),
         }
     }
