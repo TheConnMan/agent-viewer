@@ -274,8 +274,14 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
             });
             continue;
         }
-        let Some(role) = crate::json_str(payload, "role") else {
-            continue;
+        // `developer` and `system` messages are harness scaffolding, not conversation: the
+        // memory preamble, the multi-agent prompt, the plugin list. Measured on this box
+        // 2026-07-31, a real 6-item rollout was half developer blobs, so a tail that kept
+        // them would open on "## Memory You have access to a memory folder ..." instead of
+        // the task. The claude parser drops its equivalents the same way.
+        let role = match crate::json_str(payload, "role") {
+            Some(role @ ("user" | "assistant")) => role,
+            _ => continue,
         };
         let Some(content) = payload.get("content").and_then(|c| c.as_array()) else {
             continue;
@@ -293,9 +299,10 @@ pub fn read_transcript(path: &std::path::Path) -> Result<Vec<TailEvent>> {
         // Tool-only response_items extract to "" — skip them so the pane never shows a
         // blank role-only line.
         if !text.is_empty() {
-            items.push(match role {
-                "user" => TailEvent::User(text),
-                _ => TailEvent::Agent(text),
+            items.push(if role == "user" {
+                TailEvent::User(text)
+            } else {
+                TailEvent::Agent(text)
             });
         }
     }

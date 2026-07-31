@@ -112,6 +112,46 @@ fn transcript_extracts_text_and_tool_calls_in_order() {
 }
 
 #[test]
+fn transcript_drops_developer_and_system_scaffolding() {
+    // Measured on this box 2026-07-31: a real 6-item rollout was half `developer` prompt
+    // blobs (the memory preamble, the multi-agent prompt), which sit at the START of a
+    // session and would therefore BE the tail of a freshly spawned one. They are harness
+    // scaffolding, not conversation, and must never reach the pane.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("scaffolding.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"developer","content":[{{"type":"input_text","text":"Memory preamble: you have access to a memory folder"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"system","content":[{{"type":"input_text","text":"you are a coding agent"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"the real task"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"on it"}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    assert_eq!(
+        read_transcript(&path).expect("read transcript"),
+        vec![
+            TailEvent::User("the real task".to_string()),
+            TailEvent::Agent("on it".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn transcript_tool_detail_squashes_multiline_and_survives_unknown_arguments() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("tools.jsonl");

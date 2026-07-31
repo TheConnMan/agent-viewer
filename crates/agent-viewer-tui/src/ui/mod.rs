@@ -223,6 +223,12 @@ pub struct ListHit {
 }
 
 impl ListHit {
+    /// The width the list occupied last frame, which is what the tail pane's width gate
+    /// asks about. Zero before the first draw, i.e. "not measured yet", never "too narrow".
+    pub fn width(&self) -> u16 {
+        self.area.width
+    }
+
     pub fn rendered_range(
         &self,
         row_count: usize,
