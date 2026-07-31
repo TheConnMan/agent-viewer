@@ -160,7 +160,9 @@ fn status_glyph(
             },
             theme.accent,
         ),
-        Status::NeedsInput { .. } => ("◐", theme.warn),
+        // `attn`, not `warn`: one hue means "waiting on you" everywhere the viewer says it,
+        // and the wall's flashing border is the same colour as this glyph.
+        Status::NeedsInput { .. } => ("◐", theme.attn),
         Status::Idle => ("∙", theme.muted),
         Status::Done => ("●", theme.ok),
         Status::Error => ("✗", theme.err),
@@ -1537,7 +1539,7 @@ mod tests {
         let status = Status::needs_input();
 
         for now_ms in [0, 300, 600, 900] {
-            assert_eq!(status_glyph(&status, now_ms, &theme), ("◐", theme.warn));
+            assert_eq!(status_glyph(&status, now_ms, &theme), ("◐", theme.attn));
         }
     }
 
