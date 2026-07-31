@@ -194,6 +194,9 @@ pub struct ReplyModal {
 /// composer and inline rename both live on the Normal list view.
 pub enum Mode {
     Normal,
+    /// The spawn composer holding the keyboard as a floating overlay over the video wall, so a
+    /// new task can be started without leaving the grid.
+    Compose,
     Palette(PaletteState),
     Filter,
     Rename(RenameModal),
@@ -804,6 +807,7 @@ fn draw_footer(
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
         Mode::Triage(_) => Line::from(""),
+        Mode::Compose => Line::from(""),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -2096,6 +2100,118 @@ mod tests {
             tile.bottom() >= 22,
             "the tile stopped at row {}, so the composer rows were not reclaimed",
             tile.bottom()
+        );
+    }
+
+    /// Render a one-tile wall frame in `mode` with `composer`, as (whole frame, footer row).
+    fn wall_frame(mode: &Mode, composer: &Composer) -> (String, String) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let session = walled_test_session();
+        let app = App::new(vec![session.clone()]);
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode,
+                    notice: "",
+                    composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let whole = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        let footer = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect();
+        (whole, footer)
+    }
+
+    /// The wall hides the composer because the tiles own the keyboard, so this overlay is the
+    /// only thing that can show a draft while the grid is up. If it does not paint, the user is
+    /// typing into a box that is not there — which is exactly what the palette's Commands and
+    /// Models groups used to do on the wall.
+    #[test]
+    fn the_spawn_composer_floats_over_the_wall_only_while_composing() {
+        let mut composer = Composer::new();
+        for character in "start something new".chars() {
+            composer.push_char(character);
+        }
+
+        let (composing, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(
+            composing.contains('❯'),
+            "the composer prompt is not on screen while composing over the wall"
+        );
+        assert!(
+            composing.contains("start something new"),
+            "the draft is not on screen while composing over the wall"
+        );
+
+        let (grid, _) = wall_frame(&Mode::Normal, &composer);
+        assert!(
+            !grid.contains('❯'),
+            "the composer must stay hidden while the tiles own the keyboard"
+        );
+        assert!(
+            !grid.contains("start something new"),
+            "the draft must stay hidden while the tiles own the keyboard"
+        );
+    }
+
+    /// The grid's chord list is wrong while the composer holds the keyboard: Shift+arrows and
+    /// Ctrl+X are the tiles', and the three keys that matter here — send, switch agent, back
+    /// out — are not on it at all.
+    #[test]
+    fn the_wall_footer_shows_the_compose_hint_while_composing() {
+        let composer = Composer::new();
+
+        let (_, footer) = wall_frame(&Mode::Compose, &composer);
+
+        for hint in ["⏎ start", "⇥ agent", "Esc cancel"] {
+            assert!(
+                footer.contains(hint),
+                "the compose footer is missing {hint:?}: {footer}"
+            );
+        }
+        assert!(
+            !footer.contains("Ctrl+W exit"),
+            "the grid's chord list must give way to the compose hint: {footer}"
         );
     }
 

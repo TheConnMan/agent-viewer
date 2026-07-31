@@ -36,6 +36,9 @@ impl PaletteGroup {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaletteAction {
+    /// Open the spawn composer over the wall. Offered only while the wall is on, because off
+    /// the wall the composer is already on screen and always has the keyboard.
+    Spawn,
     Attach,
     Archive,
     Unarchive,
