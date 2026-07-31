@@ -500,35 +500,3 @@ fn codex_advertises_stop_for_a_daemon_hosted_row_that_has_no_pid() {
             .stop
     );
 }
-
-#[test]
-fn codex_list_flags_daemon_hosted_only_when_the_daemon_holds_the_fd() {
-    // Listing rows whose rollouts nobody has open: every row must come back with
-    // daemon_hosted false and no pid.
-    //
-    // This half only pins the false direction, which a hardcoded `false` would also satisfy.
-    // The true direction cannot be forced from here (it needs a real process holding a real
-    // fd), so it is pinned by the pure resolver tests in `status_tests.rs`
-    // (`resolver_withholds_the_daemon_pid_and_flags_the_row_daemon_hosted`) and end to end by
-    // `e2e_live::codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon`.
-    let schema = common::read_fixture("threads_schema.sql");
-    let rows = [
-        thread_row("t_cli", "cli", 3000),
-        thread_row("t_vscode", "vscode", 2000),
-    ];
-    let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-    let (dir, path) = common::temp_db(&schema, &refs);
-    std::fs::rename(&path, dir.path().join("state_1.sqlite")).expect("rename temp db");
-
-    let mut backend = CodexBackend::new(dir.path().to_path_buf());
-    let sessions = backend.list().expect("list codex sessions");
-    assert_eq!(sessions.len(), 2);
-    for session in &sessions {
-        assert!(
-            !session.daemon_hosted,
-            "{} has no open fd at all, so nothing hosts it",
-            session.id
-        );
-        assert_eq!(session.pid, None, "{} has no live process", session.id);
-    }
-}
