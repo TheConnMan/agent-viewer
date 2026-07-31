@@ -8,6 +8,7 @@ mod list;
 mod overlay;
 mod palette;
 mod sprite;
+mod tail;
 pub mod theme;
 
 use crate::app::{App, Composer, Row};
@@ -35,6 +36,7 @@ pub use list::activity_ribbon;
 use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use sprite::SpriteKind;
+pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -222,6 +224,12 @@ pub struct ListHit {
 }
 
 impl ListHit {
+    /// The width the list occupied last frame, which is what the tail pane's width gate
+    /// asks about. Zero before the first draw, i.e. "not measured yet", never "too narrow".
+    pub fn width(&self) -> u16 {
+        self.area.width
+    }
+
     pub fn rendered_range(
         &self,
         row_count: usize,
@@ -296,6 +304,9 @@ pub struct Draw<'a> {
     /// Whether finished rows fade toward the theme's `faint` token as they age. Off by default,
     /// toggled from the command palette, and a no-op under a non-truecolor theme.
     pub age_ramp: bool,
+    /// The Ctrl+B tail pane, present only while it is open and a session is selected. It
+    /// takes its columns off the right of the list.
+    pub tail: Option<TailView<'a>>,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -367,6 +378,21 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
     // below, floating over the list's bottom) shadows part of it, so record that hole too.
+    // The tail pane takes a fixed slice off the right of the list area; the list keeps the
+    // rest and re-lays itself out at the narrower width.
+    let (list_area, tail_area) = match &d.tail {
+        Some(_) if vertical[1].width >= TAIL_MIN_TOTAL_WIDTH => {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(tail::tail_width(vertical[1].width)),
+                ])
+                .split(vertical[1]);
+            (split[0], Some(split[1]))
+        }
+        _ => (vertical[1], None),
+    };
     let mut hit = draw_list(
         frame,
         d.app,
@@ -377,8 +403,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         d.logos,
         theme,
         d.age_ramp,
-        vertical[1],
+        list_area,
     );
+    if let (Some(view), Some(area)) = (&d.tail, tail_area) {
+        tail::draw(frame, view, theme, area);
+    }
     if matches!(d.mode, Mode::Normal) {
         hit.blocked = overlay::popup_area(d.composer, d.themes, vertical[3]);
     }
@@ -817,6 +846,7 @@ mod tests {
                         themes,
                         sprite: Default::default(),
                         age_ramp: false,
+                        tail: None,
                     },
                 );
             })
@@ -1776,6 +1806,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     age_ramp: false,
+                    tail: None,
                 },
             );
         })
@@ -1807,7 +1838,9 @@ mod tests {
         let (rows, _) = render_viewer(80, 24, "", Mode::Help);
         let rendered = rows.concat();
 
-        for shortcut in ["Ctrl+A", "Ctrl+D", "Ctrl+U", "Ctrl+C"] {
+        // Ctrl+C is last in the list and Ctrl+B is the newest entry, so between them these
+        // catch a list that has outgrown the popup.
+        for shortcut in ["Ctrl+A", "Ctrl+B", "Ctrl+D", "Ctrl+U", "Ctrl+]", "Ctrl+C"] {
             assert!(rendered.contains(shortcut), "missing {shortcut}");
         }
     }
@@ -1883,6 +1916,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     age_ramp: false,
+                    tail: None,
                 },
             );
         })
@@ -1992,6 +2026,7 @@ mod tests {
                     themes: &themes,
                     sprite: Default::default(),
                     age_ramp: false,
+                    tail: None,
                 },
             );
         })

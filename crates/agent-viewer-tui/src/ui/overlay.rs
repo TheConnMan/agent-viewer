@@ -203,10 +203,11 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/model", "pick from all available models"),
         ("/theme", "preview and select a theme"),
         ("Enter", "spawn composed task"),
-        ("← back", "detach (composer empty)"),
-        ("Ctrl+]", "detach (always)"),
+        // Paired onto one line so the whole list still fits an 80x24 popup.
+        ("← / Ctrl+]", "detach (composer empty / always)"),
         ("Enter/Space", "toggle group on a header"),
         ("Ctrl+K", "command palette"),
+        ("Ctrl+B", "tail pane for the selected session"),
         ("Ctrl+R", "rename in row"),
         ("Ctrl+X", "stop, then press again to remove"),
         ("Ctrl+S", "group by state / by project"),

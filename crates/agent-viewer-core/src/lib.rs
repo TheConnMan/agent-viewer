@@ -22,7 +22,7 @@ pub mod state;
 
 pub use backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session, SessionOrigin,
-    SpawnResult, Status, StatusEvent, StatusSink, Subscription,
+    SpawnResult, Status, StatusEvent, StatusSink, Subscription, TailEvent,
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use pr_status::PrBadgeColor;
