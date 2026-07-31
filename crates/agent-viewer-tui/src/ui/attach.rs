@@ -14,7 +14,13 @@ use tui_term::{
 
 pub const ATTACHED_CHROME_ROWS: u16 = 2;
 
-pub(super) fn draw(frame: &mut Frame, av: AttachView, notice: &str, now_ms: i64, theme: &Theme) {
+pub(super) fn draw(
+    frame: &mut Frame,
+    av: &AttachView<'_>,
+    notice: &str,
+    now_ms: i64,
+    theme: &Theme,
+) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,19 +32,26 @@ pub(super) fn draw(frame: &mut Frame, av: AttachView, notice: &str, now_ms: i64,
         .split(area);
 
     draw_header(frame, av.session, av.exited, now_ms, theme, chunks[0]);
+    render_screen(frame, chunks[1], av);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(notice.to_string(), fg(theme.warn)))),
+        chunks[2],
+    );
+}
+
+/// Render a live child's vt100 screen into `area`. Full-screen attach passes the whole
+/// content rect; the triage inbox passes its panel. The child must have been resized to
+/// exactly `area` or it wraps its own output at the wrong column.
+pub(super) fn render_screen(frame: &mut Frame, area: Rect, av: &AttachView<'_>) {
     av.pty.with_screen(|screen| {
         frame.render_widget(
             ThemedPseudoTerminal {
                 screen,
                 palette: av.pty.palette(),
             },
-            chunks[1],
+            area,
         );
     });
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(notice.to_string(), fg(theme.warn)))),
-        chunks[2],
-    );
 }
 
 struct ThemedPseudoTerminal<'a> {
@@ -184,7 +197,7 @@ mod tests {
             .draw(|frame| {
                 draw(
                     frame,
-                    AttachView {
+                    &AttachView {
                         session: &session,
                         pty: &pty,
                         exited: false,

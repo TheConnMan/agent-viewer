@@ -1,45 +1,48 @@
-//! The Ctrl+N triage inbox: a plain modal over the list that walks the needs-input sessions
-//! oldest first, one at a time.
+//! The Ctrl+N triage inbox: a modal over the list that walks the needs-input sessions oldest
+//! first, one at a time, with the session itself live inside it.
 //!
-//! Deliberately the cheap shape. It is a reader over the session snapshot the list already
-//! holds — it never attaches, spawns, joins, or mutates anything — plus one submit that hands
-//! its payload to the existing reply path (`actions::send_reply`). The expensive version of
-//! this feature, an overlay inside an attached full-screen child UI, is not what this is.
+//! The modal owns the queue (order, position, up-next) and nothing else. The panel in the
+//! middle is the real attached session — the same `PtySession` the list's Enter attaches to,
+//! rendered into a bounded rect instead of the whole screen — and every key that is not one of
+//! the three reserved chords is written straight to that child. So the "question" shown is
+//! whatever the agent actually drew, and an answer is delivered by the agent's own input
+//! handling rather than by anything this module invents.
+//!
+//! This replaced a hand-rolled viewer that parsed the transcript, re-rendered the question,
+//! enumerated the options itself, and submitted through `send_reply`. It read one truncated
+//! line of a summary and could not deliver at all (`send_reply` is a stub). Delegating to
+//! attach is both smaller and strictly more faithful.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::overlay::centered_rect;
-use super::{Theme, backend_mark, backend_mark_color, fg, mark_width};
+use super::{Theme, backend_mark, backend_mark_color, fg};
 use agent_viewer_core::{BackendKind, Session, Status};
 
-/// How many "up next" rows the modal lists under the current item.
-const UP_NEXT_ROWS: usize = 4;
-/// How many transcript turns the context panel shows.
-pub(crate) const CONTEXT_TURNS: usize = 3;
-/// Rows one turn may occupy. Three unbounded turns would push the question and the answer box
-/// off the screen, and the question outranks the history.
-const CONTEXT_ROWS_PER_TURN: usize = 4;
-/// The digit keys are the affordance, so there is no tenth quick option.
-const MAX_OPTIONS: usize = 9;
+/// Columns of margin between the modal and the screen edge, and rows above/below it. The modal
+/// is deliberately near-full-screen: the panel hosts a real agent UI, and a genuinely small box
+/// makes the child wrap its own layout into uselessness. The margin is what keeps the list
+/// visible around it, so it still reads as a modal over the list rather than a takeover.
+const MARGIN_X: u16 = 2;
+const MARGIN_Y: u16 = 1;
+/// Chrome rows inside the modal border: the item header above the panel, and the up-next and
+/// hint rows below it.
+const HEADER_ROWS: u16 = 1;
+const FOOTER_ROWS: u16 = 2;
+/// How many "up next" titles the one-line queue preview names.
+const UP_NEXT_SHOWN: usize = 3;
+/// Below this the panel cannot host a child at all and the modal declines to draw.
+const MIN_PANEL_ROWS: u16 = 3;
+const MIN_PANEL_COLS: u16 = 20;
 
-/// One quick option the agent itself enumerated in its question. `label` is what gets
-/// submitted; `detail` is the trailing gloss, shown but never sent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TriageOption {
-    pub label: String,
-    pub detail: String,
-}
-
-/// One blocked session in the queue, flattened to exactly what the modal renders.
+/// One blocked session in the queue, flattened to what the modal chrome renders. The body no
+/// longer needs the question or the transcript: the attached child draws both itself.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriageItem {
     pub backend: BackendKind,
@@ -47,14 +50,6 @@ pub struct TriageItem {
     pub title: String,
     pub project: String,
     pub updated_at_ms: i64,
-    /// The question, with any enumerated option lines lifted out into `options`.
-    pub question: String,
-    pub options: Vec<TriageOption>,
-    /// The session's transcript: the codex rollout JSONL, or the claude session JSONL. Both
-    /// have a reader in `-core`; opencode carries none here and renders its summary instead.
-    pub rollout_path: Option<PathBuf>,
-    /// The row summary, the fallback context line when no transcript can be read.
-    pub summary: String,
 }
 
 impl TriageItem {
@@ -73,34 +68,13 @@ impl TriageItem {
 pub fn triage_queue(sessions: &[Session]) -> Vec<TriageItem> {
     let mut items = sessions
         .iter()
-        .filter_map(|session| {
-            let reason = match &session.status {
-                Status::NeedsInput { reason } => reason.clone(),
-                Status::Working | Status::Idle | Status::Done | Status::Error | Status::Unknown => {
-                    return None;
-                }
-            };
-            // The backend's stated reason wins; a blocked claude job puts its question in
-            // `summary` instead (state.json `needs`); failing both, say so plainly.
-            let raw = reason
-                .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or_else(|| session.summary.clone());
-            let raw = if raw.trim().is_empty() {
-                "waiting for input".to_string()
-            } else {
-                raw
-            };
-            Some(TriageItem {
-                backend: session.backend,
-                id: session.id.clone(),
-                title: session.title.clone(),
-                project: project_label(&session.cwd),
-                updated_at_ms: session.updated_at_ms,
-                question: question_prompt(&raw),
-                options: parse_options(&raw),
-                rollout_path: session.rollout_path.clone(),
-                summary: session.summary.clone(),
-            })
+        .filter(|session| matches!(session.status, Status::NeedsInput { .. }))
+        .map(|session| TriageItem {
+            backend: session.backend,
+            id: session.id.clone(),
+            title: session.title.clone(),
+            project: project_label(&session.cwd),
+            updated_at_ms: session.updated_at_ms,
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
@@ -126,103 +100,17 @@ fn project_label(cwd: &Path) -> String {
     parts[tail..].join("/")
 }
 
-/// PURE: the enumerated quick options an agent wrote into its question.
-///
-/// Recognizes a line whose first token is `N.`, `N)`, `-`, or `*`, and splits the rest into a
-/// submitted `label` and a shown-only `detail` on the first ` — `, ` - `, or `: `. Capped at
-/// nine because the digit keys are the affordance.
-///
-/// Options are never synthesized. A fabricated "approve" that types the wrong word into a live
-/// session is worse than showing no option at all, so prose with no enumerated lines yields an
-/// empty vec and the modal offers only the free-text box.
-pub fn parse_options(question: &str) -> Vec<TriageOption> {
-    question
-        .lines()
-        .filter_map(|line| option_body(line.trim()))
-        .filter_map(|body| {
-            let (label, detail) = split_detail(body);
-            let label = label.trim();
-            (!label.is_empty()).then(|| TriageOption {
-                label: label.to_string(),
-                detail: detail.trim().to_string(),
-            })
-        })
-        .take(MAX_OPTIONS)
-        .collect()
-}
-
-/// PURE: the question with its enumerated option lines removed.
-///
-/// The agent's own line breaks are kept, because they are how it paragraphed its question;
-/// the renderer wraps from here. Nothing is dropped but the option lines, which are shown
-/// separately as the numbered picks.
-pub fn question_prompt(question: &str) -> String {
-    let prompt = question
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && option_body(line).is_none())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if prompt.is_empty() {
-        "pick an option".to_string()
-    } else {
-        prompt
-    }
-}
-
-/// The text after a list marker (`1.`, `2)`, `-`, `*`), or None when the line is not one.
-fn option_body(line: &str) -> Option<&str> {
-    if let Some(rest) = line.strip_prefix(['-', '*'])
-        && rest.starts_with(' ')
-    {
-        return Some(rest.trim_start());
-    }
-    let mut chars = line.chars();
-    let digit = chars.next()?;
-    if !digit.is_ascii_digit() || digit == '0' {
-        return None;
-    }
-    let marker = chars.next()?;
-    if marker != '.' && marker != ')' {
-        return None;
-    }
-    let rest = chars.as_str();
-    rest.starts_with(' ').then(|| rest.trim_start())
-}
-
-/// Split an option body into the submitted label and the shown-only detail.
-fn split_detail(body: &str) -> (&str, &str) {
-    for separator in [" — ", " – ", " - ", ": "] {
-        if let Some(index) = body.find(separator) {
-            return (&body[..index], &body[index + separator.len()..]);
-        }
-    }
-    (body, "")
-}
-
 /// The modal's live state. The queue is snapshotted at open: a background refresh must not
 /// reorder or resize it under the user's fingers mid-answer.
 #[derive(Debug)]
 pub struct TriageState {
     items: Vec<TriageItem>,
     index: usize,
-    buffer: String,
-    highlight: usize,
-    answered: usize,
-    /// Transcript context, filled in off-thread and keyed by session.
-    turns: HashMap<(BackendKind, String), Vec<String>>,
 }
 
 impl TriageState {
     pub fn new(items: Vec<TriageItem>) -> TriageState {
-        TriageState {
-            items,
-            index: 0,
-            buffer: String::new(),
-            highlight: 0,
-            answered: 0,
-            turns: HashMap::new(),
-        }
+        TriageState { items, index: 0 }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -248,69 +136,14 @@ impl TriageState {
 
     pub fn upcoming(&self) -> &[TriageItem] {
         let start = (self.index + 1).min(self.items.len());
-        let end = (start + UP_NEXT_ROWS).min(self.items.len());
+        let end = (start + UP_NEXT_SHOWN).min(self.items.len());
         &self.items[start..end]
-    }
-
-    pub fn buffer(&self) -> &str {
-        &self.buffer
-    }
-
-    pub fn push_char(&mut self, character: char) {
-        self.buffer.push(character);
-    }
-
-    pub fn push_str(&mut self, text: &str) {
-        self.buffer.push_str(text);
-    }
-
-    pub fn backspace(&mut self) {
-        self.buffer.pop();
-    }
-
-    pub fn highlight(&self) -> usize {
-        self.highlight
-    }
-
-    pub fn move_highlight(&mut self, delta: i32) {
-        let count = self.current().map(|item| item.options.len()).unwrap_or(0);
-        if count == 0 {
-            return;
-        }
-        self.highlight = (self.highlight as i32 + delta).rem_euclid(count as i32) as usize;
-    }
-
-    pub fn answered(&self) -> usize {
-        self.answered
-    }
-
-    pub fn record_answer(&mut self) {
-        self.answered += 1;
-    }
-
-    /// The payload the 1-based digit key `n` submits: that option's label, verbatim.
-    pub fn option_payload(&self, n: usize) -> Option<String> {
-        let index = n.checked_sub(1)?;
-        Some(self.current()?.options.get(index)?.label.clone())
-    }
-
-    /// The payload a bare Enter submits: the typed answer, else the highlighted option's
-    /// label. Identical by construction to `option_payload` for the same option — picking a
-    /// number is a shortcut for typing that label, never a second delivery shape.
-    pub fn enter_payload(&self) -> Option<String> {
-        let typed = self.buffer.trim();
-        if !typed.is_empty() {
-            return Some(typed.to_string());
-        }
-        self.option_payload(self.highlight + 1)
     }
 
     /// Step to the next item. Returns false when the queue is finished — it never wraps,
     /// because a wrap would make the `3 of 7` counter a lie.
     pub fn advance(&mut self) -> bool {
         self.index += 1;
-        self.buffer.clear();
-        self.highlight = 0;
         self.index < self.items.len()
     }
 
@@ -320,467 +153,215 @@ impl TriageState {
             return false;
         }
         self.index -= 1;
-        self.buffer.clear();
-        self.highlight = 0;
         true
     }
-
-    /// The current item's transcript context, once it has landed.
-    pub fn context(&self) -> Option<&[String]> {
-        let item = self.current()?;
-        self.turns.get(&item.key()).map(Vec::as_slice)
-    }
-
-    /// The current item when its context has not been read yet — the read to submit.
-    pub fn context_pending(&self) -> Option<&TriageItem> {
-        let item = self.current()?;
-        (!self.turns.contains_key(&item.key())).then_some(item)
-    }
-
-    pub fn set_context(&mut self, backend: BackendKind, id: String, lines: Vec<String>) {
-        self.turns.insert((backend, id), lines);
-    }
 }
 
-/// Read the last few conversational turns of a session — the exchange that led to the
-/// question, so the answer can be given from the actual dialogue rather than a one-line
-/// summary of it.
+/// The modal rect for a given frame, and the panel rect inside it that the child renders into.
 ///
-/// Runs on a background worker, never on the render or key path: a transcript is unbounded.
-/// Both readers already live in `-core` and are tested there; nothing is parsed here.
-/// Tool calls, tool results, and thinking blocks are dropped by both readers, so what is left
-/// is the human's messages and the agent's prose.
-pub fn read_context(backend: BackendKind, path: &Path) -> Vec<String> {
-    let items = match backend {
-        BackendKind::Codex => agent_viewer_core::codex::rollout::read_transcript(path)
-            .map(|items| {
-                let start = items.len().saturating_sub(CONTEXT_TURNS);
-                items[start..].to_vec()
-            })
-            .unwrap_or_default(),
-        BackendKind::Claude => {
-            agent_viewer_core::claude::read_claude_transcript(path, CONTEXT_TURNS)
-                .unwrap_or_default()
-        }
-        // opencode's reader is keyed by (db path, session id) rather than a transcript file,
-        // which this item does not carry; it falls back to the summary line.
-        BackendKind::Opencode => Vec::new(),
+/// One function so the three places that need panel geometry cannot drift: the draw, the pty
+/// size chosen when the child is spawned, and the resize handler. A child sized to anything
+/// other than what it is drawn into wraps its own output at the wrong column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriageLayout {
+    pub modal: Rect,
+    pub panel: Rect,
+}
+
+/// `None` when the frame is too small to host a child at all.
+pub fn layout(frame_area: Rect) -> Option<TriageLayout> {
+    let width = frame_area.width.checked_sub(MARGIN_X * 2)?;
+    let height = frame_area.height.checked_sub(MARGIN_Y * 2)?;
+    let modal = Rect {
+        x: frame_area.x + MARGIN_X,
+        y: frame_area.y + MARGIN_Y,
+        width,
+        height,
     };
-    items
-        .iter()
-        .map(|item| format!("{} · {}", item.role, collapse_whitespace(&item.text)))
-        .collect()
+    // Inside the modal border, then inside the panel's own border.
+    let inner_w = width.checked_sub(2)?;
+    let inner_h = height.checked_sub(2)?;
+    let panel_h = inner_h
+        .checked_sub(HEADER_ROWS + FOOTER_ROWS)?
+        .checked_sub(2)?;
+    let panel_w = inner_w.checked_sub(2)?;
+    if panel_h < MIN_PANEL_ROWS || panel_w < MIN_PANEL_COLS {
+        return None;
+    }
+    let panel = Rect {
+        x: modal.x + 2,
+        y: modal.y + 1 + HEADER_ROWS + 1,
+        width: panel_w,
+        height: panel_h,
+    };
+    Some(TriageLayout { modal, panel })
 }
 
-/// Flatten a turn to a single logical string; the renderer wraps it. Keeps the words, drops
-/// the blank lines and indentation that would otherwise waste modal rows.
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// The pty size for the current frame: exactly the panel's interior.
+pub fn panel_pty_size(frame_area: Rect) -> Option<(u16, u16)> {
+    layout(frame_area).map(|l| (l.panel.height.max(1), l.panel.width.max(1)))
 }
 
-pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &Theme) {
+/// Draw the modal. `screen` renders the live child into the panel; absent (still attaching, or
+/// the attach failed) the panel says so rather than rendering a hole.
+pub(super) fn draw(
+    frame: &mut Frame,
+    state: &TriageState,
+    screen: Option<&super::AttachView<'_>>,
+    now_ms: i64,
+    theme: &Theme,
+) {
     let Some(item) = state.current() else {
         return;
     };
-    let frame_area = frame.area();
-    let available_width = frame_area.width.saturating_sub(4);
-    let width = 92.min(available_width);
-    let context = state.context().unwrap_or(&[]);
-    let full = (width as usize).saturating_sub(2); // inside the modal border
-
-    // The question is the whole reason the modal exists, so it wraps to as many lines as it
-    // needs instead of being truncated to one. Everything else is fixed height, so the modal
-    // grows with the question rather than hiding it.
-    let question = wrap_to_width(&item.question, full);
-    // Each turn of the exchange wraps too, but is capped: three unbounded turns would push the
-    // question and the answer box off the screen, and the question outranks the history.
-    // Each row carries whether it STARTS a turn, so only that row's leading `role · ` is
-    // treated as a role label. Sniffing every row for a separator would mangle a turn whose
-    // own text happens to contain one.
-    let context_lines: Vec<(bool, String)> = if context.is_empty() {
-        // No transcript could be read; the row summary is the honest fallback, and an absent
-        // one says so rather than rendering a blank. A blocked claude job's summary IS its
-        // question, so echoing it here would print the same sentence twice.
-        if item.summary.trim().is_empty() || item.summary == item.question {
-            vec![(
-                false,
-                "no transcript available for this session".to_string(),
-            )]
-        } else {
-            clamp_lines(wrap_to_width(&item.summary, full), CONTEXT_ROWS_PER_TURN)
-                .into_iter()
-                .map(|line| (false, line))
-                .collect()
-        }
-    } else {
-        context
-            .iter()
-            .flat_map(|turn| {
-                clamp_lines(wrap_to_width(turn, full), CONTEXT_ROWS_PER_TURN)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, line)| (index == 0, line))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
-    let fixed_rows = 2                                       // header + rule
-        + 1                                                  // item header
-        + 1 + context_lines.len()                            // LAST N TURNS + lines
-        + item.options.len()
-        + 3                                                  // answer box
-        + 1 + state.upcoming().len()                         // UP NEXT + rows
-        + 1; // hints
-    let desired_height = (fixed_rows + question.len() + 2) as u16; // + borders
-    let height = desired_height.min(frame_area.height.saturating_sub(2));
-    if width < 24 || height < 8 {
+    let Some(TriageLayout { modal, panel }) = layout(frame.area()) else {
         return;
-    }
-    // A question longer than the screen can hold gets the rows left over after the fixed
-    // regions, so a tall question can never push the answer box off the bottom.
-    let question_budget = (height as usize)
-        .saturating_sub(2)
-        .saturating_sub(fixed_rows)
-        .max(1);
-    let question = clamp_lines(question, question_budget);
+    };
 
-    let mut area = centered_rect(50, 50, frame_area);
-    area.width = width;
-    area.height = height;
-    area.x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
-    area.y = frame_area.y + 2.min(frame_area.height.saturating_sub(height));
-
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, modal);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(fg(theme.accent))
         .style(Style::default().bg(theme.surface).fg(theme.text));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
 
-    let mut rows = Rows::new(inner);
+    let full = inner.width as usize;
 
     // Header: the progress affordance carries the meaning without color, so it survives mono16.
     let (position, total) = state.progress();
-    let right = if state.answered() > 0 {
-        format!("oldest first · {} answered", state.answered())
-    } else {
-        "oldest first".to_string()
-    };
-    let left = format!("⟳ triage queue · {position} of {total}");
-    rows.line(
-        frame,
-        Line::from(vec![
-            Span::styled(left.clone(), fg(theme.accent)),
-            Span::raw(" ".repeat(full.saturating_sub(display(&left) + display(&right)))),
-            Span::styled(right, fg(theme.faint)),
-        ]),
-    );
-    rows.line(
-        frame,
-        Line::from(Span::styled("─".repeat(full), fg(theme.border))),
-    );
-
-    // The item itself.
+    let progress = format!("{position} of {total}");
+    let age = crate::app::format_elapsed(now_ms - item.updated_at_ms);
+    let right = format!("waiting {age} · oldest first");
     let mark = backend_mark(item.backend, theme);
-    let waiting = format!(
-        "waiting {}",
-        crate::app::format_elapsed(now_ms - item.updated_at_ms)
-    );
-    let head_left = format!("◐ {mark} {} {}", item.title, item.project);
-    let head_pad = full.saturating_sub(display(&head_left) + display(&waiting));
-    rows.line(
-        frame,
-        Line::from(vec![
-            Span::styled("◐ ", fg(theme.warn)),
+    let left_width = display(&progress) + 1 + display(mark) + 1 + display(&item.title) + 1;
+    let pad = full.saturating_sub(left_width + display(&right) + 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{progress} "), fg(theme.accent)),
             Span::styled(
-                mark.to_string(),
+                format!("{mark} "),
                 fg(backend_mark_color(item.backend, theme)),
             ),
-            Span::raw(" ".repeat(mark_width(mark).saturating_sub(display(mark)))),
-            Span::styled(format!(" {} ", item.title), fg(theme.text)),
+            Span::styled(format!("{} ", item.title), fg(theme.text)),
             Span::styled(item.project.clone(), fg(theme.muted)),
-            Span::raw(" ".repeat(head_pad)),
-            Span::styled(waiting, fg(theme.warn)),
-        ]),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, fg(theme.faint)),
+        ])),
+        Rect {
+            height: HEADER_ROWS,
+            ..inner
+        },
     );
 
-    rows.line(
-        frame,
-        Line::from(Span::styled(
-            format!("LAST {CONTEXT_TURNS} TURNS"),
-            fg(theme.faint),
-        )),
-    );
-    for (starts_turn, line) in &context_lines {
-        // The `role ·` head of each turn is dimmed so the eye lands on what was said, and a
-        // fallback line stays faint so it never reads as something the agent actually said.
-        let (head, said) = match line.split_once(" · ") {
-            Some((role, said)) if *starts_turn => (format!("  {role} · "), said),
-            _ => ("  ".to_string(), line.as_str()),
-        };
-        let body_color = if context.is_empty() {
-            theme.faint
-        } else {
-            theme.text
-        };
-        rows.line(
-            frame,
-            Line::from(vec![
-                Span::styled(head.clone(), fg(theme.faint)),
-                Span::styled(
-                    field(said, full.saturating_sub(display(&head))),
-                    fg(body_color),
-                ),
-            ]),
-        );
-    }
-
-    // `? ` marks the first line; continuations indent under it so a wrapped question still
-    // reads as one question rather than as several.
-    for (index, line) in question.iter().enumerate() {
-        rows.line(
-            frame,
-            Line::from(vec![
-                Span::styled(if index == 0 { "? " } else { "  " }, fg(theme.accent)),
-                Span::styled(field(line, full.saturating_sub(2)), fg(theme.text)),
-            ]),
-        );
-    }
-
-    for (index, option) in item.options.iter().enumerate() {
-        let selected = index == state.highlight();
-        let label_color = if selected { theme.selfg } else { theme.text };
-        let detail_color = if selected { theme.selfg } else { theme.muted };
-        let label_width = 24.min(full.saturating_sub(4));
-        rows.styled_line(
-            frame,
-            Line::from(vec![
-                Span::styled(format!("  {} ", index + 1), fg(theme.faint)),
-                Span::styled(field(&option.label, label_width), fg(label_color)),
-                Span::styled(
-                    field(&option.detail, full.saturating_sub(4 + label_width)),
-                    fg(detail_color),
-                ),
-            ]),
-            if selected {
-                Style::default().bg(theme.selbg)
-            } else {
-                Style::default()
-            },
-        );
-    }
-
-    // The free-text answer box.
-    let caret = if super::caret_visible(now_ms, theme.animation) {
-        "▏"
-    } else {
-        " "
+    // The panel: a bordered box whose interior is the live child.
+    let panel_box = Rect {
+        x: inner.x,
+        y: inner.y + HEADER_ROWS,
+        width: inner.width,
+        height: panel.height + 2,
     };
-    let (answer, answer_color) = if state.buffer().is_empty() {
-        ("or type an answer".to_string(), theme.faint)
-    } else {
-        (state.buffer().to_string(), theme.text)
-    };
-    // The caret sits immediately after the text being typed, NOT at the far right of a padded
-    // field — pad after it. An answer wider than the box shows its tail, which is where the
-    // caret is, exactly like any other single-line input.
-    let answer_width = full.saturating_sub(4); // box borders + the "❯ " prompt
-    let shown = tail_fit(&answer, answer_width.saturating_sub(1));
-    let answer_pad = answer_width.saturating_sub(display(&shown) + 1);
-    rows.boxed(
-        frame,
-        theme,
-        Line::from(vec![
-            Span::styled("❯ ", fg(theme.accent)),
-            Span::styled(shown, fg(answer_color)),
-            Span::styled(caret, fg(theme.accent)),
-            Span::raw(" ".repeat(answer_pad)),
-        ]),
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(theme.border)),
+        panel_box,
     );
+    match screen {
+        Some(av) => super::attach::render_screen(frame, panel, av),
+        None => frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  attaching…".to_string(),
+                fg(theme.faint),
+            ))),
+            panel,
+        ),
+    }
 
+    let mut y = panel_box.y + panel_box.height;
     let upcoming = state.upcoming();
     if !upcoming.is_empty() {
-        rows.line(frame, Line::from(Span::styled("UP NEXT", fg(theme.faint))));
-        for next in upcoming {
-            let age = crate::app::format_elapsed(now_ms - next.updated_at_ms);
-            let left = format!("  ◐ {} {}", next.title, next.project);
-            let pad = full.saturating_sub(display(&left) + display(&age));
-            rows.line(
-                frame,
-                Line::from(vec![
-                    Span::styled("  ◐ ", fg(theme.warn)),
-                    Span::styled(format!("{} ", next.title), fg(theme.text)),
-                    Span::styled(next.project.clone(), fg(theme.muted)),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(age, fg(theme.faint)),
-                ]),
-            );
-        }
+        let names = upcoming
+            .iter()
+            .map(|next| next.title.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let remaining = total.saturating_sub(position + upcoming.len());
+        let tail = if remaining > 0 {
+            format!(" · +{remaining} more")
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("up next  ", fg(theme.faint)),
+                Span::styled(
+                    ellipsize(&format!("{names}{tail}"), full.saturating_sub(9)),
+                    fg(theme.muted),
+                ),
+            ])),
+            Rect {
+                y,
+                height: 1,
+                ..inner
+            },
+        );
+        y += 1;
     }
 
-    rows.line(
-        frame,
-        Line::from(Span::styled(
-            "⏎ send · 1-9 pick · → skip · ← back · esc leave queue",
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "⌃N next · ⌃P previous · ⌃] leave · every other key goes to the session",
             fg(theme.faint),
-        )),
+        ))),
+        Rect {
+            y,
+            height: 1,
+            ..inner
+        },
     );
 }
 
-/// A top-down row writer over the modal's inner rect: every region renders where the previous
-/// one stopped and silently drops off the bottom when the modal is short.
-struct Rows {
-    area: Rect,
-    y: u16,
+fn display(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
 }
 
-impl Rows {
-    fn new(area: Rect) -> Rows {
-        Rows { area, y: area.y }
+/// PURE: `text` cut to `width` columns with a trailing ellipsis when it does not fit.
+fn ellipsize(text: &str, width: usize) -> String {
+    if display(text) <= width || width == 0 {
+        return text.to_string();
     }
-
-    fn take(&mut self, height: u16) -> Option<Rect> {
-        let end = self.area.y.saturating_add(self.area.height);
-        if self.y.saturating_add(height) > end {
-            return None;
-        }
-        let rect = Rect {
-            y: self.y,
-            height,
-            ..self.area
-        };
-        self.y += height;
-        Some(rect)
-    }
-
-    fn line(&mut self, frame: &mut Frame, line: Line<'static>) {
-        self.styled_line(frame, line, Style::default());
-    }
-
-    fn styled_line(&mut self, frame: &mut Frame, line: Line<'static>, style: Style) {
-        if let Some(rect) = self.take(1) {
-            frame.render_widget(Paragraph::new(line).style(style), rect);
-        }
-    }
-
-    fn boxed(&mut self, frame: &mut Frame, theme: &Theme, line: Line<'static>) {
-        let Some(rect) = self.take(3) else {
-            // Too short for the bordered box: the input still has to be reachable, so fall
-            // back to a bare line rather than hiding where the user types.
-            self.line(frame, line);
-            return;
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(fg(theme.border));
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        frame.render_widget(Paragraph::new(line), inner);
-    }
-}
-
-/// PURE: text wrapped to the modal's inner width, allowing for the `? ` marker on the
-/// first line and the matching indent on continuations. Reuses the composer's wrapper rather
-/// than growing a second one; the agent's own line breaks are paragraph breaks.
-fn wrap_to_width(question: &str, full: usize) -> Vec<String> {
-    let budget = full.saturating_sub(2).max(1);
-    let lines = super::composer::wrap_by_width(question, budget, budget);
-    if lines.is_empty() {
-        vec![String::new()]
-    } else {
-        lines
-    }
-}
-
-/// PURE: cut `lines` to at most `budget`, marking the last kept line so a question clipped by
-/// a short terminal is visibly clipped rather than silently ending mid-sentence.
-fn clamp_lines(mut lines: Vec<String>, budget: usize) -> Vec<String> {
-    if lines.len() <= budget {
-        return lines;
-    }
-    lines.truncate(budget);
-    if let Some(last) = lines.last_mut() {
-        last.push('…');
-    }
-    lines
-}
-
-/// PURE: the trailing `width` columns of `value` — what a single-line input shows when the
-/// text outruns the box, because the caret lives at the end.
-fn tail_fit(value: &str, width: usize) -> String {
-    if value.width() <= width {
-        return value.to_string();
-    }
-    let mut kept: Vec<&str> = Vec::new();
-    let mut used = 0usize;
-    for grapheme in value.graphemes(true).rev() {
-        let w = grapheme.width();
-        if used + w > width {
+    let mut out = String::new();
+    for character in text.chars() {
+        if display(&out) + display(&character.to_string()) > width.saturating_sub(1) {
             break;
         }
-        used += w;
-        kept.push(grapheme);
+        out.push(character);
     }
-    kept.into_iter().rev().collect()
-}
-
-fn display(value: &str) -> usize {
-    value.width()
-}
-
-fn field(value: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let text = ellipsize(value, width);
-    let padding = width.saturating_sub(text.width());
-    format!("{text}{}", " ".repeat(padding))
-}
-
-fn ellipsize(value: &str, width: usize) -> String {
-    if value.width() <= width {
-        return value.to_string();
-    }
-    if width <= 1 {
-        return "…".to_string();
-    }
-    let mut result = String::new();
-    let available = width - 1;
-    for grapheme in value.graphemes(true) {
-        if result.width() + grapheme.width() > available {
-            break;
-        }
-        result.push_str(grapheme);
-    }
-    result.push('…');
-    result
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_viewer_core::{SessionOrigin, Status};
 
-    fn blocked(id: &str, updated_at_ms: i64, reason: Option<&str>, summary: &str) -> Session {
+    fn session(id: &str, updated_at_ms: i64, status: Status) -> Session {
         Session {
             backend: BackendKind::Claude,
-            id: id.into(),
-            short_id: None,
-            origin: agent_viewer_core::SessionOrigin::Background,
-            title: id.into(),
-            cwd: "/home/me/git/acme/widget".into(),
+            id: id.to_string(),
+            short_id: Some(id.to_string()),
+            origin: SessionOrigin::Interactive,
+            title: id.to_string(),
+            cwd: "/home/b/git/example-user/agent-viewer".into(),
             git_branch: None,
-            status: Status::NeedsInput {
-                reason: reason.map(str::to_string),
-            },
-            created_at_ms: updated_at_ms,
+            status,
+            created_at_ms: 0,
             updated_at_ms,
             hidden: false,
             companion: false,
-            summary: summary.into(),
+            summary: String::new(),
             pid: None,
             rollout_path: None,
             pr_refs: Vec::new(),
@@ -788,245 +369,106 @@ mod tests {
         }
     }
 
-    fn with_status(mut session: Session, status: Status) -> Session {
-        session.status = status;
-        session
-    }
-
-    #[test]
-    fn queue_is_oldest_first_and_holds_only_needs_input() {
-        let sessions = vec![
-            blocked("newest", 900, Some("q"), ""),
-            with_status(blocked("working", 100, None, ""), Status::Working),
-            blocked("oldest", 100, Some("q"), ""),
-            with_status(blocked("done", 200, None, ""), Status::Done),
-            blocked("middle", 500, Some("q"), ""),
-            with_status(blocked("idle", 300, None, ""), Status::Idle),
-            with_status(blocked("error", 400, None, ""), Status::Error),
-            with_status(blocked("unknown", 600, None, ""), Status::Unknown),
-        ];
-        let queue = triage_queue(&sessions);
-        assert_eq!(
-            queue
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["oldest", "middle", "newest"],
-            "only needs-input sessions, ordered by longest wait first"
-        );
-    }
-
-    #[test]
-    fn same_millisecond_rows_get_a_total_order() {
-        let sessions = vec![
-            blocked("b", 100, Some("q"), ""),
-            blocked("a", 100, Some("q"), ""),
-        ];
-        assert_eq!(
-            triage_queue(&sessions)
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "b"]
-        );
-    }
-
-    #[test]
-    fn question_falls_back_from_reason_to_summary_to_a_literal() {
-        let reasoned = triage_queue(&[blocked("a", 1, Some("why not"), "ignored")]);
-        assert_eq!(reasoned[0].question, "why not");
-        let summarized = triage_queue(&[blocked("b", 1, None, "state.json needs")]);
-        assert_eq!(summarized[0].question, "state.json needs");
-        let bare = triage_queue(&[blocked("c", 1, None, "")]);
-        assert_eq!(bare[0].question, "waiting for input");
-    }
-
-    #[test]
-    fn progress_counter_tracks_the_queue_length() {
-        let sessions = (0..5)
-            .map(|index| blocked(&format!("s{index}"), index, Some("q"), ""))
-            .collect::<Vec<_>>();
-        let queue = triage_queue(&sessions);
-        let total = queue.len();
-        let mut state = TriageState::new(queue);
-        for position in 1..=total {
-            assert_eq!(state.progress(), (position, total));
-            state.advance();
-        }
-    }
-
-    #[test]
-    fn advancing_past_the_last_item_reports_finished_and_never_wraps() {
-        let queue = triage_queue(&[
-            blocked("a", 1, Some("q"), ""),
-            blocked("b", 2, Some("q"), ""),
-        ]);
-        let mut state = TriageState::new(queue);
-        assert!(state.advance(), "one item left");
-        assert!(!state.advance(), "past the end");
-        assert!(state.current().is_none(), "must not wrap to the first item");
-        assert_eq!(state.index(), 2);
-    }
-
-    #[test]
-    fn back_stops_at_the_first_item() {
-        let queue = triage_queue(&[
-            blocked("a", 1, Some("q"), ""),
-            blocked("b", 2, Some("q"), ""),
-        ]);
-        let mut state = TriageState::new(queue);
-        assert!(!state.back(), "already first");
-        assert_eq!(state.index(), 0);
-        state.advance();
-        assert!(state.back());
-        assert_eq!(state.index(), 0);
-    }
-
-    #[test]
-    fn a_numbered_pick_and_the_typed_label_produce_one_payload() {
-        let question =
-            "Pick a direction.\n1. artifact-first — ship now\n2) prove-the-thing: one case study";
-        let queue = triage_queue(&[blocked("a", 1, Some(question), "")]);
-        let picked = TriageState::new(queue.clone());
-        let mut typed = TriageState::new(queue);
-
-        let by_number = picked.option_payload(2).expect("second option exists");
-        for character in by_number.chars() {
-            typed.push_char(character);
-        }
-        let by_text = typed.enter_payload().expect("typed answer");
-
-        assert_eq!(by_number, "prove-the-thing");
-        assert_eq!(by_number, by_text, "one payload, two ways to enter it");
-    }
-
-    #[test]
-    fn enter_falls_through_to_the_highlighted_option_only_when_nothing_is_typed() {
-        let question = "Choose.\n1. first\n2. second";
-        let queue = triage_queue(&[blocked("a", 1, Some(question), "")]);
-        let mut state = TriageState::new(queue);
-        assert_eq!(state.enter_payload().as_deref(), Some("first"));
-        state.move_highlight(1);
-        assert_eq!(state.enter_payload().as_deref(), Some("second"));
-        state.push_str("  something else  ");
-        assert_eq!(state.enter_payload().as_deref(), Some("something else"));
-    }
-
-    #[test]
-    fn enter_on_an_optionless_item_with_an_empty_buffer_submits_nothing() {
-        let queue = triage_queue(&[blocked("a", 1, Some("just prose"), "")]);
-        let state = TriageState::new(queue);
-        assert!(state.enter_payload().is_none());
-        assert!(state.option_payload(1).is_none());
-    }
-
-    #[test]
-    fn options_parse_every_recognized_marker_and_split_label_from_detail() {
-        let question = concat!(
-            "Confirm the plan, then pick a direction.\n",
-            "1. artifact-first — ship the pieces now\n",
-            "2) prove-the-thing: one flagship case study\n",
-            "- snooze 24h - re-queue tomorrow\n",
-            "* keep the session warm\n",
-        );
-        assert_eq!(
-            parse_options(question),
-            vec![
-                TriageOption {
-                    label: "artifact-first".into(),
-                    detail: "ship the pieces now".into()
-                },
-                TriageOption {
-                    label: "prove-the-thing".into(),
-                    detail: "one flagship case study".into()
-                },
-                TriageOption {
-                    label: "snooze 24h".into(),
-                    detail: "re-queue tomorrow".into()
-                },
-                TriageOption {
-                    label: "keep the session warm".into(),
-                    detail: String::new()
-                },
-            ]
-        );
-        assert_eq!(
-            question_prompt(question),
-            "Confirm the plan, then pick a direction."
-        );
-    }
-
-    #[test]
-    fn prose_yields_no_options_so_none_are_ever_synthesized() {
-        let prose = "I need approval before I run 1. the migration and 2. the backfill.";
-        assert!(parse_options(prose).is_empty());
-        assert_eq!(question_prompt(prose), prose);
-    }
-
-    #[test]
-    fn options_cap_at_nine_because_the_digits_are_the_affordance() {
-        let question = (1..=12)
-            .map(|index| format!("{}. option{index}", index % 10))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // "0." is not a marker, so the twelve lines offer ten real options; nine survive.
-        assert_eq!(parse_options(&question).len(), 9);
-    }
-
-    #[test]
-    fn project_label_is_the_trailing_two_components() {
-        assert_eq!(
-            project_label(Path::new("/home/me/git/acme/widget")),
-            "acme/widget"
-        );
-        assert_eq!(project_label(Path::new("/solo")), "solo");
-        assert_eq!(project_label(Path::new("/")), "");
-    }
-
-    #[test]
-    fn claude_sessions_get_their_real_turns_not_an_empty_context() {
-        // The exchange that led to the question is what makes the question answerable, and
-        // claude is the backend most of these sessions are. Its reader lives in `-core`; this
-        // pins that triage actually dispatches to it.
-        let dir = tempfile::tempdir().expect("transcript dir");
-        let path = dir.path().join("session.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","message":{"content":"I'm not sure this is what I expected."}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
-                "\n",
-                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Should I drop\n\n  the detach?"}]}}"#,
-                "\n",
-            ),
+    fn blocked(id: &str, updated_at_ms: i64) -> Session {
+        session(
+            id,
+            updated_at_ms,
+            Status::NeedsInput {
+                reason: Some("pick one".to_string()),
+            },
         )
-        .expect("write transcript");
+    }
 
+    #[test]
+    fn the_queue_is_the_blocked_sessions_oldest_first() {
+        let items = triage_queue(&[
+            blocked("newer", 3_000),
+            session("busy", 1_000, Status::Working),
+            blocked("older", 2_000),
+        ]);
         assert_eq!(
-            read_context(BackendKind::Claude, &path),
-            vec![
-                "user · I'm not sure this is what I expected.".to_string(),
-                "assistant · Should I drop the detach?".to_string(),
-            ],
-            "thinking, tool_use and tool_result carry no dialogue and must be dropped"
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["older", "newer"],
+            "only blocked sessions, longest wait first"
         );
     }
 
     #[test]
-    fn context_is_pending_until_it_is_set() {
-        let queue = triage_queue(&[blocked("a", 1, Some("q"), "")]);
-        let mut state = TriageState::new(queue);
-        assert_eq!(
-            state.context_pending().map(|item| item.id.clone()),
-            Some("a".to_string())
+    fn the_project_label_is_the_last_two_path_components() {
+        let items = triage_queue(&[blocked("one", 1)]);
+        assert_eq!(items[0].project, "example-user/agent-viewer");
+    }
+
+    #[test]
+    fn walking_the_queue_never_wraps() {
+        let mut state = TriageState::new(triage_queue(&[blocked("a", 1), blocked("b", 2)]));
+        assert_eq!(state.progress(), (1, 2));
+        assert!(!state.back(), "already on the first item");
+        assert!(state.advance(), "second item exists");
+        assert_eq!(state.progress(), (2, 2));
+        assert!(
+            !state.advance(),
+            "running off the end reports finished rather than wrapping to the top"
         );
-        state.set_context(BackendKind::Claude, "a".into(), vec!["you · hi".into()]);
-        assert!(state.context_pending().is_none());
-        assert_eq!(state.context(), Some(["you · hi".to_string()].as_slice()));
+    }
+
+    /// The child wraps its own output at the column it was told about, so a pty sized to
+    /// anything other than the rect it is drawn into renders mis-wrapped text.
+    #[test]
+    fn the_pty_size_is_exactly_the_rect_the_child_is_drawn_into() {
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = layout(frame).expect("a 120x40 frame hosts a panel");
+        assert_eq!(
+            panel_pty_size(frame),
+            Some((layout.panel.height, layout.panel.width))
+        );
+        assert!(
+            layout.panel.height >= 30,
+            "the panel gets most of the screen so the child UI is usable, got {}",
+            layout.panel.height
+        );
+    }
+
+    #[test]
+    fn a_frame_too_small_to_host_a_child_reports_no_layout() {
+        assert_eq!(
+            layout(Rect {
+                x: 0,
+                y: 0,
+                width: 18,
+                height: 6
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_panel_stays_inside_the_modal_border() {
+        for width in [24u16, 60, 200] {
+            for height in [10u16, 24, 60] {
+                let frame = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                let Some(l) = layout(frame) else { continue };
+                assert!(l.panel.x > l.modal.x, "{width}x{height}");
+                assert!(l.panel.y > l.modal.y, "{width}x{height}");
+                assert!(
+                    l.panel.x + l.panel.width < l.modal.x + l.modal.width,
+                    "{width}x{height} panel overruns the right border"
+                );
+                assert!(
+                    l.panel.y + l.panel.height < l.modal.y + l.modal.height,
+                    "{width}x{height} panel overruns the bottom chrome"
+                );
+            }
+        }
     }
 }
