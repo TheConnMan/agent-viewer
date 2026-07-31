@@ -15,7 +15,8 @@ Test first development is required for new behavior and reproducible bug fixes w
 behavioral regression test provides protection. It is not required for documentation, copy,
 formatting, straightforward configuration, mechanical refactors covered by existing tests, or
 visual tuning better verified interactively. Verification remains proportional: run relevant
-tests and clippy where applicable, and never weaken or remove tests to make a change pass.
+tests, `cargo fmt --all -- --check`, and clippy where applicable, and never weaken or remove
+tests to make a change pass.
 
 Any project invariant or specialized live verification rule in this file overrides this small
 change path.
@@ -41,8 +42,13 @@ modeled on `claude agents`. Two crates:
 cargo build --workspace          # build everything
 cargo run -p agent-viewer-tui    # launch the TUI (binary: agent-viewer)
 cargo test --workspace           # full unit + integration suite
+cargo fmt --all -- --check       # must pass before any commit (CI's first step)
 cargo clippy --workspace         # must be clean before any commit
 ```
+
+CI runs `cargo fmt --all -- --check` first and skips clippy, build, and test entirely when it
+fails, so an unformatted file turns the whole workflow red. Run `cargo fmt --all` before the
+check when it reports hunks.
 
 The TUI expects a `~/.codex/state_*.sqlite` on the box (the Codex backend's source of truth).
 The Claude and opencode backends appear automatically when their CLIs and data exist and list
@@ -122,8 +128,8 @@ the blast radius of the change:
 - Mutations (archive/unarchive/rename/stop): drive them in the running TUI and confirm the row
   moves between visible/hidden or updates, since these run on a background worker.
 
-Run `cargo clippy --workspace` and the relevant tests before every commit; every commit must
-build clean with clippy and tests passing.
+Run `cargo fmt --all -- --check`, `cargo clippy --workspace`, and the relevant tests before
+every commit; every commit must build clean with fmt --check, clippy, and tests passing.
 
 **Always close a change with the command Brian runs to see it.** Anything with a visible
 surface (a sprite, a key, a layout, a row, a popup) ends the report with the literal line to
@@ -193,12 +199,13 @@ ID, no AI mentions, no Co-Authored-By AI lines). Docs-only or internal changes m
 locally; feature work destined for review opens a PR only after the diff is shown and approved.
 
 **A mechanical bugfix merges itself.** When the work is a bug with one obviously correct fix and
-no design or UX decision in it, do the whole loop without asking: worktree, fix, clippy and tests
-green, commit, `git merge --no-ff` to `main`, remove the worktree. Say what landed afterward. The
-approval gate above still holds for anything that decides how something looks or behaves, adds a
-surface, or changes an invariant in this file. Merging locally is never pushing; pushing still
+no design or UX decision in it, do the whole loop without asking: worktree, fix, fmt --check,
+clippy and tests green, commit, `git merge --no-ff` to `main`, remove the worktree. Say what
+landed afterward. The approval gate above still holds for anything that decides how something
+looks or behaves, adds a surface, or changes an invariant in this file. Merging locally is never pushing; pushing still
 needs Brian.
 
-Run `cargo clippy --workspace` and the tests on `main` after every merge, not only on the branch:
+Run `cargo fmt --all -- --check`, `cargo clippy --workspace`, and the tests on `main` after
+every merge, not only on the branch:
 a textually clean merge still hits semantic conflicts (a `Draw` literal gaining a field on one
 branch while another branch adds a new call site) that only the compiler catches.
