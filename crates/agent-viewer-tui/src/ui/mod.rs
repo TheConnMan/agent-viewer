@@ -49,7 +49,7 @@ pub use wall::{WallState, WallTile, WallView};
 pub type Pulses = HashMap<(BackendKind, String), i64>;
 
 /// Startup-read (once, never per-frame): when true, list rows + composer use the brand
-/// glyphs (✳/◆/■) instead of the DEFAULT textual `[cc]`/`[cx]`/`[oc]` tags — an opt-in for
+/// glyphs (✳/◆) instead of the DEFAULT textual `[cc]`/`[cx]` tags — an opt-in for
 /// terminals whose font renders them. Set from `AGENT_VIEWER_GLYPH_MARKS=1`.
 static GLYPH_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -78,7 +78,7 @@ pub fn logo_marks() -> bool {
 }
 
 /// The mark for a backend on list rows + the composer (single source of truth for every
-/// mark call site): by DEFAULT the textual `[cc]`/`[cx]`/`[oc]` tag, or the brand glyph when
+/// mark call site): by DEFAULT the textual `[cc]`/`[cx]` tag, or the brand glyph when
 /// `AGENT_VIEWER_GLYPH_MARKS=1`. `BackendKind::tag()` is also used directly for help/notices.
 fn backend_mark(backend: BackendKind, theme: &Theme) -> &'static str {
     // Logo mode blanks the slot for the image overlay; it wins over glyph mode.
