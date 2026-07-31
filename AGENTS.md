@@ -130,11 +130,18 @@ surface (a sprite, a key, a layout, a row, a popup) ends the report with the lit
 paste, plus the keys to press:
 
 ```bash
-cd <repo-or-worktree> && cargo run -p agent-viewer-tui
+cd <repo-or-worktree> && cargo run --release -p agent-viewer-tui
 ```
 
 He judges this tool by running it, not by reading a diff, so a report that omits the line only
 costs a round trip. Name the worktree path when the work has not merged to `main` yet.
+
+**`--release` is not optional in that line.** The binary on his PATH is a release build, so
+handing him a debug one makes the build profile the only thing that actually changed, and it
+reads as "your commit made everything slow". Measured 2026-07-31 on an idle list view: debug
+burns 52% of a core against 9% for release, and the gap widens on the wall, where every tile
+is its own vt100 parser. Build the release binary before handing over the line, so his first
+run is not a two-minute compile.
 
 ## Project invariants - do not violate
 
