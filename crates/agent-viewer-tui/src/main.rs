@@ -530,10 +530,15 @@ enum AttachOutcome {
     /// A user attach: take over the screen with this session. `key` and `triage` record what
     /// the user was looking at when it was submitted, so a plan that lands after they moved
     /// on can be dropped instead of stealing the keyboard for the wrong session.
+    ///
+    /// A FAILED resolution rides here too (an `Err` inside the `Ok`), for the same reason the
+    /// wall's does: a failure that arrives after the user walked away belongs to a session
+    /// they are no longer looking at, and posting it as a bare footer notice reads as if the
+    /// row they are on just failed. Carrying the key lets the same ownership guard cover it.
     Focus {
         key: Key,
         triage: bool,
-        plan: ops::AttachPlan,
+        plan: Result<ops::AttachPlan, String>,
     },
     /// A wall tile joining. Carries its own key so a failure can be reported against the
     /// right tile, which is why the failure is an `Ok` here rather than a runner-level `Err`.
@@ -1114,12 +1119,24 @@ fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
         Ok(AttachOutcome::Focus { key, triage, plan }) => {
             if !focus_attach_still_current(ui, &key, triage) {
                 // The plan is only a resolved command: nothing has been spawned for it yet, so
-                // dropping it here is the whole teardown.
+                // dropping it here is the whole teardown. A failure is dropped on the same
+                // terms - it describes a session the user has already left.
                 drop(plan);
                 ui.set_notice(format!("attach cancelled: {} is no longer in focus", key.1));
                 return Ok(());
             }
-            install_completed_attach_plan(ui, terminal, plan, writer, applied_mouse_capture)?;
+            match plan {
+                Ok(plan) => {
+                    install_completed_attach_plan(
+                        ui,
+                        terminal,
+                        plan,
+                        writer,
+                        applied_mouse_capture,
+                    )?;
+                }
+                Err(notice) => ui.set_notice(notice),
+            }
         }
         Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
         Err(notice) => ui.set_notice(notice),
@@ -1673,6 +1690,7 @@ mod tests {
             updated_at_ms: created_at_ms,
             hidden,
             companion: false,
+            subagent: false,
             summary: String::new(),
             pid: None,
             rollout_path: None,
@@ -2845,7 +2863,9 @@ mod tests {
                 // A user attach always resolves to Focus; a Wall join here would mean the
                 // runner crossed wires, so fail loudly rather than skip.
                 match result.expect("resolve event bridge attach") {
-                    AttachOutcome::Focus { plan, .. } => break plan,
+                    AttachOutcome::Focus { plan, .. } => {
+                        break plan.expect("event bridge attach resolved a plan");
+                    }
                     AttachOutcome::Wall { .. } => panic!("expected a focus attach"),
                 }
             }

@@ -45,6 +45,7 @@ fn complete_session(backend: BackendKind) -> Session {
         updated_at_ms: 1_725_000_000_123,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: "waiting for a second viewer".to_string(),
         pid: Some(42_424),
         rollout_path: Some(PathBuf::from("/var/tmp/cache-lease.jsonl")),

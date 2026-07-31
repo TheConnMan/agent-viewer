@@ -24,6 +24,7 @@ fn session(id: &str, status: Status) -> Session {
         updated_at_ms: 0,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path: None,
