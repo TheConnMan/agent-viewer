@@ -60,6 +60,7 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     themes: &themes,
                     sprite: Default::default(),
                     age_ramp: false,
+                    tail: None,
                 },
             );
         })

@@ -2360,6 +2360,10 @@ impl Backend for OpencodeBackend {
         }
     }
 
+    fn tail(&self, session: &Session, max_events: usize) -> Result<Vec<crate::TailEvent>> {
+        read_opencode_tail(&self.db_path, &session.id, max_events)
+    }
+
     fn turn_activity(&self, session: &Session, window: Duration) -> Result<Vec<i64>> {
         if !self.db_path.exists() {
             return Ok(Vec::new());
@@ -2783,22 +2787,27 @@ pub fn parse_opencode_models(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// The most recent opencode message that has text, as a TranscriptItem (role + concatenated
-/// text parts). Reads the `message`/`part` tables read-only. Ok(None) when the DB is missing
-/// or the session has no text message. Never creates/writes the DB.
-pub fn read_opencode_last_message(
+/// The session's recent transcript as tail events, oldest first, at most `max_events`.
+/// Reads the `message`/`part` tables read-only. Empty when the DB is missing or the session
+/// has nothing to show. Never creates/writes the DB.
+///
+/// A text part is prose (whitespace-only text is dropped, since newline-only parts sit
+/// around tool transitions and would otherwise render as blank lines); a part whose
+/// `type` is "tool" is a tool event named by its `tool` field, detailed from `state.input`.
+pub fn read_opencode_tail(
     db_path: &std::path::Path,
     session_id: &str,
-) -> Result<Option<crate::codex::rollout::TranscriptItem>> {
-    use crate::codex::rollout::TranscriptItem;
+    max_events: usize,
+) -> Result<Vec<crate::backend::TailEvent>> {
+    use crate::backend::TailEvent;
     if !db_path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let conn = crate::open_readonly(db_path)?;
-    // Rows arrive grouped by message (most-recent message first), parts in creation order.
+    // Rows arrive grouped by message (oldest message first), parts in creation order.
     let mut stmt = conn.prepare(
         "SELECT m.id, m.data, p.data FROM message m JOIN part p ON p.message_id = m.id \
-         WHERE m.session_id = ?1 ORDER BY m.time_created DESC, m.id DESC, p.time_created ASC",
+         WHERE m.session_id = ?1 ORDER BY m.time_created ASC, m.id ASC, p.time_created ASC",
     )?;
     let rows = stmt.query_map([session_id], |row| {
         let mid: String = row.get(0)?;
@@ -2807,40 +2816,48 @@ pub fn read_opencode_last_message(
         Ok((mid, mdata, pdata))
     })?;
 
-    // Walk the grouped rows, accumulating each message's text parts. Return the first
-    // (most-recent) message whose accumulated text is non-empty.
+    let mut events = Vec::new();
     let mut cur_id: Option<String> = None;
     let mut cur_role = String::from("assistant");
     let mut cur_text = String::new();
+    // Emit the accumulated prose, keeping the original untrimmed text so the message's own
+    // internal formatting survives.
+    fn flush(events: &mut Vec<TailEvent>, role: &str, text: &mut String) {
+        if text.trim().is_empty() {
+            text.clear();
+            return;
+        }
+        let text = std::mem::take(text);
+        events.push(if role == "user" {
+            TailEvent::User(text)
+        } else {
+            TailEvent::Agent(text)
+        });
+    }
+
     for row in rows {
         let (mid, mdata, pdata) = row?;
         if cur_id.as_deref() != Some(mid.as_str()) {
-            // Boundary: the previous message is complete — return it if it had non-blank text
-            // (a whitespace-only message, e.g. newline-only parts around tool transitions,
-            // would otherwise hide the real prior message behind blank lines). Return the
-            // original untrimmed text so the real message's internal formatting is preserved.
-            if cur_id.is_some() && !cur_text.trim().is_empty() {
-                return Ok(Some(TranscriptItem {
-                    role: cur_role,
-                    text: cur_text,
-                }));
-            }
+            flush(&mut events, &cur_role, &mut cur_text);
             cur_id = Some(mid);
             cur_role = parsed_role(&mdata);
-            cur_text = String::new();
         }
         if let Some(text) = parsed_text_part(&pdata) {
             cur_text.push_str(&text);
+            continue;
+        }
+        if let Some(tool) = parsed_tool_part(&pdata) {
+            // Prose written before the call stays before it.
+            flush(&mut events, &cur_role, &mut cur_text);
+            events.push(tool);
         }
     }
-    // The final message (no boundary follows it).
-    if cur_id.is_some() && !cur_text.trim().is_empty() {
-        return Ok(Some(TranscriptItem {
-            role: cur_role,
-            text: cur_text,
-        }));
+    flush(&mut events, &cur_role, &mut cur_text);
+
+    if events.len() > max_events {
+        events = events.split_off(events.len() - max_events);
     }
-    Ok(None)
+    Ok(events)
 }
 
 /// message.data JSON "role" (defaulting to "assistant" when absent/unparseable).
@@ -2860,6 +2877,26 @@ fn parsed_text_part(pdata: &str) -> Option<String> {
         return None;
     }
     crate::json_str(&value, "text").map(String::from)
+}
+
+/// A `part.data` row of type "tool" as a tail event (verified shape 2026-07-31:
+/// `{"type":"tool","tool":"bash","state":{"input":{"command":"..."}}}`). A tool part with no
+/// name is not an event.
+fn parsed_tool_part(pdata: &str) -> Option<crate::backend::TailEvent> {
+    let value: serde_json::Value = serde_json::from_str(pdata).ok()?;
+    if crate::json_str(&value, "type") != Some("tool") {
+        return None;
+    }
+    let name = crate::json_str(&value, "tool").filter(|name| !name.is_empty())?;
+    let detail = value
+        .get("state")
+        .and_then(|state| state.get("input"))
+        .map(crate::backend::tool_detail)
+        .unwrap_or_default();
+    Some(crate::backend::TailEvent::Tool {
+        name: name.to_string(),
+        detail,
+    })
 }
 
 /// IMPURE process check (live-verified only): does any process named `opencode*` exist.

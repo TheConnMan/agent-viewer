@@ -2,10 +2,9 @@ mod common;
 
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::rollout::{
-    PendingApproval, TailState, TranscriptItem, pending_approval, read_session_meta,
-    read_transcript, tail_state,
+    PendingApproval, TailState, pending_approval, read_session_meta, read_transcript, tail_state,
 };
-use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status};
+use agent_viewer_core::{Backend, BackendKind, Session, SessionOrigin, Status, TailEvent};
 use common::rfc3339_at;
 use std::io::Write;
 use std::path::PathBuf;
@@ -93,20 +92,120 @@ fn session_meta_rejects_empty_and_garbage() {
 }
 
 #[test]
-fn transcript_extracts_text_in_order() {
+fn transcript_extracts_text_and_tool_calls_in_order() {
     let path = common::fixture_path("rollout_complete.jsonl");
     let items = read_transcript(&path).expect("read transcript");
-    // Exactly the user then assistant message; the function_call item is skipped.
+    // The user message, the assistant message, and the function_call the tail pane needs,
+    // in transcript order. `arguments` is an embedded JSON string, so the detail comes out
+    // of its `cmd` key.
     assert_eq!(
         items,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "Reply with exactly the word DONE.".to_string(),
+            TailEvent::User("Reply with exactly the word DONE.".to_string()),
+            TailEvent::Agent("DONE".to_string()),
+            TailEvent::Tool {
+                name: "exec_command".to_string(),
+                detail: "ls -la".to_string(),
             },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "DONE".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn transcript_drops_developer_and_system_scaffolding() {
+    // Measured on this box 2026-07-31: a real 6-item rollout was half `developer` prompt
+    // blobs (the memory preamble, the multi-agent prompt), which sit at the START of a
+    // session and would therefore BE the tail of a freshly spawned one. They are harness
+    // scaffolding, not conversation, and must never reach the pane.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("scaffolding.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"developer","content":[{{"type":"input_text","text":"Memory preamble: you have access to a memory folder"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"system","content":[{{"type":"input_text","text":"you are a coding agent"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"the real task"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"on it"}}]}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    assert_eq!(
+        read_transcript(&path).expect("read transcript"),
+        vec![
+            TailEvent::User("the real task".to_string()),
+            TailEvent::Agent("on it".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn transcript_tool_detail_squashes_multiline_and_survives_unknown_arguments() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tools.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // A multi-line shell script must not eat the pane: it squashes to one line.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{{\"cmd\":\"pwd\\n  wc -l state.md\"}}"}}}}"#
+    )
+    .unwrap();
+    // An argv array joins with spaces.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{{\"command\":[\"bash\",\"-lc\",\"ls\"]}}"}}}}"#
+    )
+    .unwrap();
+    // Arguments with no recognized key still produce a named tool line, not a dropped event.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"update_plan","arguments":"{{\"plan\":[]}}"}}}}"#
+    )
+    .unwrap();
+    // A custom tool call carries its input raw rather than as embedded JSON.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}}}}"#
+    )
+    .unwrap();
+    // A nameless call is not an event.
+    writeln!(
+        f,
+        r#"{{"type":"response_item","payload":{{"type":"function_call","name":"","arguments":"{{}}"}}}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    assert_eq!(
+        read_transcript(&path).expect("read transcript"),
+        vec![
+            TailEvent::Tool {
+                name: "exec_command".to_string(),
+                detail: "pwd wc -l state.md".to_string(),
+            },
+            TailEvent::Tool {
+                name: "shell".to_string(),
+                detail: "bash -lc ls".to_string(),
+            },
+            TailEvent::Tool {
+                name: "update_plan".to_string(),
+                detail: String::new(),
+            },
+            TailEvent::Tool {
+                name: "apply_patch".to_string(),
+                detail: "*** Begin Patch *** End Patch".to_string(),
             },
         ]
     );
@@ -141,14 +240,8 @@ fn transcript_excludes_empty_text_items() {
     assert_eq!(
         items,
         vec![
-            TranscriptItem {
-                role: "user".to_string(),
-                text: "hello".to_string(),
-            },
-            TranscriptItem {
-                role: "assistant".to_string(),
-                text: "world".to_string(),
-            },
+            TailEvent::User("hello".to_string()),
+            TailEvent::Agent("world".to_string()),
         ]
     );
 }
@@ -647,4 +740,73 @@ fn pending_approval_none_when_resolved() {
     .unwrap();
     drop(f);
     assert_eq!(pending_approval(&path).expect("pending_approval"), None);
+}
+
+/// Codex opens every thread with a `role: "user"` item that is not the user's: the plugin
+/// catalogue, the whole of AGENTS.md, and an `<environment_context>` block. It wears the user's
+/// role, so the developer/system filter does not catch it, and on a fresh thread it IS the
+/// tail — measured live 2026-07-31, the pane opened on a plugin list instead of the task.
+#[test]
+fn the_codex_environment_preamble_is_dropped_from_the_tail() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("preamble.jsonl");
+    let preamble = "<recommended_plugins>\\n- Slack (slack@openai-curated-remote)\\n\
+</recommended_plugins># AGENTS.md instructions\\n<INSTRUCTIONS>be concise</INSTRUCTIONS>\
+<environment_context>\\n  <cwd>/tmp/x</cwd>\\n  <shell>bash</shell>\\n</environment_context>";
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{preamble}"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"fix the drift"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"on it"}}]}}}}"#
+    )
+    .unwrap();
+
+    let events = read_transcript(&path).unwrap();
+    assert_eq!(
+        events,
+        [
+            TailEvent::User("fix the drift".to_string()),
+            TailEvent::Agent("on it".to_string()),
+        ],
+        "the scaffolding blob must not reach the pane"
+    );
+}
+
+/// The filter deletes conversation, so a false positive eats the user's own words. It is narrow
+/// on BOTH axes: the tag codex composes, and only at the head of the thread. A human quoting
+/// that tag mid-conversation keeps their message; showing a preamble is the smaller failure.
+#[test]
+fn a_later_message_carrying_the_environment_tag_is_kept() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoting.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"first, a real prompt"}}]}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"why does <environment_context> say bash here?"}}]}}}}"#
+    )
+    .unwrap();
+
+    let events = read_transcript(&path).unwrap();
+    assert_eq!(
+        events,
+        [
+            TailEvent::User("first, a real prompt".to_string()),
+            TailEvent::User("why does <environment_context> say bash here?".to_string()),
+        ],
+        "only the LEADING scaffolding item may be dropped"
+    );
 }

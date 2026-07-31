@@ -58,6 +58,8 @@ const PALETTE_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
 const ACTIVITY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const ACTIVITY_REFRESH_MS: i64 = 30_000;
 const ACTIVITY_LOOKAHEAD: usize = 8;
+/// How long a cached tail stays fresh before the pane re-reads a still-selected session.
+const TAIL_REFRESH_MS: i64 = 2_000;
 
 fn available_spawn_backends(platform: Platform, path: Option<&OsStr>) -> Vec<BackendKind> {
     [
@@ -176,6 +178,109 @@ fn activity_results(
         results.push((session.backend, session.id, ribbon));
     }
     results
+}
+
+/// One completed tail read: the session it was read for, the `updated_at_ms` it was read at,
+/// and its events.
+type TailResult = (Key, i64, Vec<agent_viewer_core::TailEvent>);
+
+/// The tail pane's cached read. One entry, because only the selected row has a pane.
+struct TailEntry {
+    key: Key,
+    version: i64,
+    fetched_at_ms: i64,
+    events: Vec<agent_viewer_core::TailEvent>,
+}
+
+/// Reads transcripts for the tail pane off the UI thread. It only ever calls
+/// `Backend::tail`, which reads the backend's store and never starts a process.
+struct TailWorker {
+    requests: Sender<Session>,
+    results: Receiver<TailResult>,
+}
+
+impl TailWorker {
+    fn new(backends: Vec<Box<dyn Backend>>) -> TailWorker {
+        let (request_tx, request_rx) = channel::<Session>();
+        let (result_tx, result_rx) = channel::<TailResult>();
+        thread::spawn(move || {
+            while let Ok(session) = request_rx.recv() {
+                let key = (session.backend, session.id.clone());
+                let events = backends
+                    .iter()
+                    .find(|backend| backend.kind() == session.backend)
+                    .and_then(|backend| backend.tail(&session, ui::TAIL_EVENTS).ok())
+                    .unwrap_or_default();
+                if result_tx
+                    .send((key, session.updated_at_ms, events))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        TailWorker {
+            requests: request_tx,
+            results: result_rx,
+        }
+    }
+
+    fn request(&self, session: Session) {
+        let _ = self.requests.send(session);
+    }
+
+    fn poll(&self) -> Option<TailResult> {
+        self.results.try_recv().ok()
+    }
+}
+
+/// Queue a tail read for the selected session when the pane is open and its cached copy is
+/// missing, stale, or for another row. At most ONE read is ever in flight, which is what
+/// keeps arrowing through thousands of rows from queueing thousands of reads.
+fn request_tail(tail: &TailWorker, ui: &mut Ui, now_ms: i64) {
+    if !ui.tail_open || matches!(ui.mode, Mode::Attached) || ui.tail_pending.is_some() {
+        return;
+    }
+    let Some(session) = ui.app.selected() else {
+        return;
+    };
+    let key = (session.backend, session.id.clone());
+    let fresh = ui.tail.as_ref().is_some_and(|entry| {
+        entry.key == key
+            && entry.version == session.updated_at_ms
+            && now_ms - entry.fetched_at_ms < TAIL_REFRESH_MS
+    });
+    if fresh {
+        return;
+    }
+    let session = session.clone();
+    ui.tail_pending = Some(key);
+    tail.request(session);
+}
+
+/// Assemble the tail pane's view for the selected session, if the pane is open.
+///
+/// `live` is looked up in the EXISTING attach map and nothing else: the pane opportunistically
+/// renders a PTY that already happens to be running, and never creates one.
+fn build_tail_view(ui: &Ui) -> Option<ui::TailView<'_>> {
+    if !ui.tail_open || matches!(ui.mode, Mode::Attached) {
+        return None;
+    }
+    // A group header (or an empty list) has no session, but the pane still mounts: taking
+    // its columns away mid-arrow would re-lay the whole list out and then undo that on the
+    // next session row.
+    let session = ui.app.selected();
+    let key = session.map(|session| (session.backend, session.id.clone()));
+    Some(ui::TailView {
+        session,
+        events: key.as_ref().and_then(|key| {
+            ui.tail
+                .as_ref()
+                .filter(|entry| &entry.key == key)
+                .map(|entry| entry.events.as_slice())
+        }),
+        live: key.as_ref().and_then(|key| ui.attached.get(key)),
+    })
 }
 
 struct BracketedPasteGuard<W: io::Write> {
@@ -463,6 +568,12 @@ struct Ui {
     /// Whether finished rows fade toward `faint` as they age. Off unless the viewer db says
     /// otherwise; toggled from the command palette.
     age_ramp: bool,
+    /// Whether the Ctrl+B tail pane is open.
+    tail_open: bool,
+    /// The tail pane's cached transcript read for the selected session.
+    tail: Option<TailEntry>,
+    /// The session a tail read is currently in flight for. One at a time.
+    tail_pending: Option<Key>,
 }
 
 impl Ui {
@@ -697,6 +808,9 @@ fn main() -> io::Result<()> {
         mouse_press: None,
         sprite: startup_sprite,
         age_ramp: startup_age_ramp,
+        tail_open: false,
+        tail: None,
+        tail_pending: None,
     };
 
     // The composer's Auto entry is capability-gated on the router binary, resolved once here:
@@ -711,6 +825,7 @@ fn main() -> io::Result<()> {
     // a mutation because either operation can dial the backend runtime.
     let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
     let activity = ActivityWorker::new(activity_backends);
+    let tail = TailWorker::new(all_backends_with_opencode(opencode_runtime.clone()));
     let refresher = spawn_refresh_worker(list_backends, last, cursors);
     let action_backends = all_backends_with_opencode(opencode_runtime);
 
@@ -728,6 +843,7 @@ fn main() -> io::Result<()> {
             &action_backends,
             &refresher,
             &activity,
+            &tail,
             &mut ui,
             &mut applied_mouse_capture,
         )
@@ -742,6 +858,7 @@ fn run(
     backends: &[Box<dyn Backend>],
     refresher: &Refresher,
     activity: &ActivityWorker,
+    tail: &TailWorker,
     ui: &mut Ui,
     applied_mouse_capture: &mut bool,
 ) -> io::Result<()> {
@@ -751,6 +868,17 @@ fn run(
         while let Some((backend, id, ribbon)) = activity.poll() {
             ui.app.set_activity_ribbon(backend, &id, ribbon);
         }
+        // Fold in any finished tail read, then queue the next one the open pane needs.
+        while let Some((key, version, events)) = tail.poll() {
+            ui.tail_pending = None;
+            ui.tail = Some(TailEntry {
+                key,
+                version,
+                fetched_at_ms: now,
+                events,
+            });
+        }
+        request_tail(tail, ui, now);
         if ui
             .pending_spawn
             .as_ref()
@@ -823,8 +951,9 @@ fn run(
         // Drive any armed one-shot reply injection once we are safely in the attached run.
         pending_reply::drive_pending_reply(ui);
 
-        // Build the attach view (if focused) before borrowing the frame.
+        // Build the attach and tail views before borrowing the frame.
         let attach = build_attach_view(ui);
+        let tail_view = build_tail_view(ui);
         terminal.draw(|frame| {
             ui::draw(
                 frame,
@@ -843,6 +972,7 @@ fn run(
                     themes: &ui.themes,
                     sprite: ui.sprite,
                     age_ramp: ui.age_ramp,
+                    tail: tail_view,
                 },
             );
         })?;
@@ -1271,6 +1401,104 @@ mod tests {
         }
     }
 
+    /// The children forked by the CALLING thread, read straight from `/proc`. The tail
+    /// pane's whole premise is that filling it costs no process, so this is the assertion
+    /// that holds it to that.
+    ///
+    /// Thread-scoped rather than process-scoped on purpose: other tests in this binary
+    /// spawn and reap PTY children in parallel, and the kernel files each child under the
+    /// tid that forked it, so a process-wide snapshot measures their noise instead of our
+    /// claim.
+    fn thread_child_pids() -> Vec<String> {
+        let children =
+            std::fs::read_to_string("/proc/thread-self/children").expect("read thread children");
+        let mut pids: Vec<String> = children.split_whitespace().map(str::to_string).collect();
+        pids.sort();
+        pids
+    }
+
+    /// A done Codex session backed by a real rollout transcript on disk.
+    fn transcript_session(dir: &std::path::Path, id: &str, body: &str) -> Session {
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&path, body).expect("write rollout");
+        Session {
+            status: Status::Done,
+            rollout_path: Some(path),
+            ..session(BackendKind::Codex, id, 1_000, false)
+        }
+    }
+
+    #[test]
+    fn retargeting_the_tail_pane_reads_transcripts_and_starts_no_process() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions = (0..3)
+            .map(|n| {
+                transcript_session(
+                    dir.path(),
+                    &format!("row-{n}"),
+                    &format!(
+                        "{}\n{}\n",
+                        format_args!(
+                            r#"{{"type":"response_item","payload":{{"role":"assistant","content":[{{"type":"output_text","text":"reply {n}"}}]}}}}"#
+                        ),
+                        r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls -la\"}"}}"#
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut ui = test_ui(sessions.clone());
+        ui.tail_open = true;
+        let backend = agent_viewer_core::codex::CodexBackend::new(PathBuf::from("/unused"));
+
+        // The read itself, on this thread, so the child-process claim is measured where the
+        // fork would land. The worker below runs this exact call on its own thread.
+        let before = thread_child_pids();
+        for session in &sessions {
+            assert!(!backend.tail(session, ui::TAIL_EVENTS).unwrap().is_empty());
+        }
+        assert_eq!(
+            thread_child_pids(),
+            before,
+            "reading a transcript for the tail pane must never fork a process"
+        );
+
+        let worker = TailWorker::new(vec![Box::new(agent_viewer_core::codex::CodexBackend::new(
+            PathBuf::from("/unused"),
+        ))]);
+        for expected in 0..sessions.len() {
+            request_tail(&worker, &mut ui, 1_000 + expected as i64);
+            let (key, version, events) = worker
+                .results
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a tail read completes");
+            ui.tail_pending = None;
+            ui.tail = Some(TailEntry {
+                key,
+                version,
+                fetched_at_ms: 1_000 + expected as i64,
+                events,
+            });
+
+            // A done session with no live process still fills the pane, out of its
+            // transcript, tool call and all.
+            let view = build_tail_view(&ui).expect("the open pane has a view");
+            assert!(view.live.is_none(), "no PTY exists for a done session");
+            let events = view.events.expect("the read landed");
+            assert_eq!(
+                events,
+                [
+                    agent_viewer_core::TailEvent::Agent(format!("reply {expected}")),
+                    agent_viewer_core::TailEvent::Tool {
+                        name: "exec_command".to_string(),
+                        detail: "ls -la".to_string(),
+                    },
+                ],
+                "the pane shows the selected row's own transcript"
+            );
+            ui.app.move_selection(1);
+        }
+    }
+
     fn pending(
         backend: BackendKind,
         session_id: Option<&str>,
@@ -1501,6 +1729,9 @@ mod tests {
             terminal_palette: None,
             sprite: ui::SpriteKind::default(),
             age_ramp: false,
+            tail_open: false,
+            tail: None,
+            tail_pending: None,
         }
     }
 
@@ -2368,6 +2599,7 @@ mod tests {
                             themes: &ui.themes,
                             sprite: ui.sprite,
                             age_ramp: ui.age_ramp,
+                            tail: None,
                         },
                     );
                 })
