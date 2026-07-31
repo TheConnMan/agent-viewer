@@ -263,6 +263,19 @@ pub fn tile_inner(rect: Rect) -> (u16, u16) {
     (rect.height.saturating_sub(3), rect.width.saturating_sub(2))
 }
 
+/// Where the child's own screen sits inside a tile: past the border and the header row. One
+/// definition, because the render path and the mouse path have to agree on it exactly — a
+/// disagreement would send the child a click at the wrong cell.
+pub fn tile_content(rect: Rect) -> Rect {
+    let (rows, cols) = tile_inner(rect);
+    Rect {
+        x: rect.x + 1,
+        y: rect.y + 2,
+        width: cols,
+        height: rows,
+    }
+}
+
 // --- Tile chrome ----------------------------------------------------------------
 
 /// What survives in a tile header at a given width. An empty `project` or `elapsed` means
@@ -409,11 +422,7 @@ fn draw_tile(
         return;
     }
 
-    let content = Rect {
-        y: inner.y + 1,
-        height: inner.height - 1,
-        ..inner
-    };
+    let content = tile_content(rect);
     let Some(pty) = tile.pty else {
         // No connection yet. A joining tile says so rather than sitting blank, and a failed
         // one says why — the wall connects on its own, so a silent empty box would read as

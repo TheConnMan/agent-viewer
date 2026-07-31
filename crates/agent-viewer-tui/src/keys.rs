@@ -18,8 +18,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use crate::actions::{
     activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
     focus_wall_tile, hide_request, hide_selected, kill_request, kill_selected, move_wall_selection,
-    open_filter, open_rename, open_rename_request, open_reply, send_reply, spawn_from_composer,
-    submit_attach, toggle_group_if_header, toggle_wall,
+    open_filter, open_rename, open_rename_request, open_reply, scroll_wall_tile, send_reply,
+    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -117,19 +117,31 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     if !matches!(ui.mode, Mode::Normal) {
         ui.mouse_press = None;
     }
-    // On the wall the pointer picks the tile that has the keyboard: point at a session and
-    // type into it. Events are not forwarded into tile children — clicking around inside an
-    // embedded TUI belongs in the zoomed view.
+    // On the wall the pointer drives the tile under it: hover or click gives it the keyboard,
+    // and the wheel scrolls back through what it has already printed. Pointer events are not
+    // forwarded into tile children — clicking around inside an embedded TUI belongs in the
+    // zoomed view — so the wheel moves OUR viewport onto the child's retained output, which
+    // works the same for every backend regardless of what the child does with mouse reports.
     if matches!(ui.mode, Mode::Normal) && ui.wall.on {
         ui.mouse_press = None;
-        let hit = matches!(
-            me.kind,
-            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
-        )
-        .then(|| agent_viewer_tui::ui::wall::tile_at(&ui.wall_rects.borrow(), me.column, me.row))
-        .flatten();
-        if let Some(index) = hit {
-            focus_wall_tile(ui, index);
+        let hit = {
+            let rects = ui.wall_rects.borrow();
+            agent_viewer_tui::ui::wall::tile_at(&rects, me.column, me.row)
+                .map(|index| (index, rects[index]))
+        };
+        let Some((index, rect)) = hit else {
+            return MouseAction::None;
+        };
+        match me.kind {
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                focus_wall_tile(ui, index)
+            }
+            // Scrolling does not steal the focus: the wheel reads, it does not select.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let content = agent_viewer_tui::ui::wall::tile_content(rect);
+                scroll_wall_tile(ui, index, me, content);
+            }
+            _ => {}
         }
         return MouseAction::None;
     }
@@ -454,15 +466,11 @@ fn wall_input_target(ui: &mut Ui) -> Option<(BackendKind, String)> {
 /// Ctrl+C abandons a half-typed line, and a wall you cannot interrupt from is worse than no
 /// wall. `Ctrl+W` and `Ctrl+]` are the unconditional exits that keep this from being a trap.
 fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, String)>, ui: &mut Ui) {
-    if ctrl {
+    // Shift+arrows walk the grid. Ctrl+arrows were tried first and never arrived — the host
+    // terminal keeps them — so the modifier that actually reaches us is the one that wins.
+    // Bare arrows stay the child's; the wall would be useless if it took them.
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
-            // Ctrl+] leaves too, matching the attach view. Terminals send it as raw 0x1D,
-            // which crossterm's legacy unix parser folds onto Char('5')+CTRL; the kitty
-            // protocol delivers the literal Char(']')+CTRL. Accept both.
-            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
-                toggle_wall(ui);
-                return;
-            }
             KeyCode::Up => {
                 move_wall_selection(ui, 0, -1);
                 return;
@@ -477,6 +485,18 @@ fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, Strin
             }
             KeyCode::Right => {
                 move_wall_selection(ui, 1, 0);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if ctrl {
+        match key.code {
+            // Ctrl+] leaves too, matching the attach view. Terminals send it as raw 0x1D,
+            // which crossterm's legacy unix parser folds onto Char('5')+CTRL; the kitty
+            // protocol delivers the literal Char(']')+CTRL. Accept both.
+            KeyCode::Char('w') | KeyCode::Char(']') | KeyCode::Char('5') => {
+                toggle_wall(ui);
                 return;
             }
             // Zoom the focused tile to the full attach view. It reuses the wall's live PTY
@@ -1532,6 +1552,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// A child that turns on SGR mouse tracking and then echoes every byte it receives,
+    /// with escapes visible (`cat -v` renders ESC as `^[`). Unlike `mouse_recording_pty`
+    /// there is no capture window to race, so an assertion here is about routing rather
+    /// than timing.
+    fn mouse_echoing_pty() -> agent_viewer_core::pty::PtySession {
+        agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; cat -v".to_string(),
+            ],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 24,
+            cols: 80,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("mouse echoing child")
+    }
+
     fn mouse_recording_pty() -> agent_viewer_core::pty::PtySession {
         agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
             program: "sh".to_string(),
@@ -2104,6 +2145,130 @@ pub(crate) mod tests {
         kill_attached(&mut ui);
     }
 
+    /// The wheel scrolls the tile under the pointer back over its retained output, and does
+    /// not steal the focus while doing it — reading a tile is not selecting it.
+    #[test]
+    fn the_wheel_scrolls_the_tile_under_the_pointer_without_focusing_it() {
+        let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
+        first.status = Status::Working;
+        let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
+        second.status = Status::Working;
+        let second_key = (second.backend, second.id.clone());
+        let mut ui = test_ui_with(vec![first, second]);
+        // A child that prints far more than the tile is tall, so there is history to scroll.
+        for key in [
+            (BackendKind::Claude, "tile-a".to_string()),
+            second_key.clone(),
+        ] {
+            ui.attached.insert(
+                key,
+                PtySession::spawn(PtySpec {
+                    program: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done; sleep 30"
+                            .to_string(),
+                    ],
+                    cwd: None,
+                    envs: Vec::new(),
+                    rows: 6,
+                    cols: 40,
+                    palette: None,
+                    scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+                })
+                .expect("scrollable tile child"),
+            );
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        wait_for_pty_screen(&ui, &second_key, "line-59");
+        *ui.wall_rects.borrow_mut() = vec![
+            ratatui::layout::Rect::new(0, 0, 40, 10),
+            ratatui::layout::Rect::new(40, 0, 40, 10),
+        ];
+
+        // Wheel up over the SECOND tile while the FIRST has the focus. This child does not
+        // track the mouse, so the fallback path moves the viewer's own viewport.
+        assert_eq!(wall_focus(&ui), 0);
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 55,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+
+        assert_eq!(
+            wall_focus(&ui),
+            0,
+            "the wheel must not move the keyboard focus"
+        );
+        let scrolled = ui.attached[&second_key].with_screen(|screen| screen.contents());
+        assert!(
+            !scrolled.contains("line-59"),
+            "the tile did not scroll back off the live tail: {scrolled:?}"
+        );
+
+        // Wheel back down returns it to the live tail.
+        for _ in 0..3 {
+            handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 55,
+                    row: 4,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut ui,
+            );
+        }
+        let live = ui.attached[&second_key].with_screen(|screen| screen.contents());
+        assert!(live.contains("line-59"), "the tile did not return to live");
+        kill_attached(&mut ui);
+    }
+
+    /// The case that matters in practice: `claude attach` runs in the alternate screen and
+    /// tracks the mouse, so it owns its scrollback and only a forwarded wheel report scrolls
+    /// it. The report must arrive in the CHILD's coordinates, not the wall's — a tile is
+    /// offset into the grid, and the child thinks it is alone on a terminal its own size.
+    #[test]
+    fn a_mouse_tracking_tile_gets_a_wheel_report_in_its_own_coordinates() {
+        let mut session = sess("tracks-mouse", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        // Turn on SGR mouse tracking, then echo whatever reports arrive back onto the screen.
+        ui.attached.insert(target.clone(), mouse_echoing_pty());
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        let rect = ratatui::layout::Rect::new(40, 6, 40, 12);
+        *ui.wall_rects.borrow_mut() = vec![rect];
+        let content = agent_viewer_tui::ui::wall::tile_content(rect);
+        assert_eq!((content.x, content.y), (41, 8));
+        // The fixture only records once it has enabled tracking and started reading.
+        wait_for_pty_screen(&ui, &target, "READY");
+
+        // Wheel up three cells right and two cells down inside the child's own area.
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: content.x + 3,
+                row: content.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut ui,
+        );
+
+        // The fixture echoes the raw bytes as hex. SGR wheel-up is button 64 and the child's
+        // own 1-based cell is (4, 3), so it must receive ESC [ < 6 4 ; 4 ; 3 — proof the
+        // report was both forwarded and translated out of the wall's coordinates.
+        // `cat -v` shows ESC as `^[`. SGR wheel-up is button 64 and the child's own 1-based
+        // cell is (4, 3) — proof the report was forwarded AND translated out of the wall's
+        // coordinates into the child's.
+        wait_for_pty_screen(&ui, &target, "^[[<64;4;3M");
+        kill_attached(&mut ui);
+        kill_attached(&mut ui);
+    }
+
     #[test]
     fn ctrl_w_toggles_the_video_wall() {
         let mut ui = wall_ui_with_one_live_tile();
@@ -2166,7 +2331,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_arrows_walk_the_grid_and_pin_the_list_selection() {
+    fn shift_arrows_walk_the_grid_and_pin_the_list_selection() {
         let mut first = sess("tile-a", "/tmp/agentviewer-wall", 100);
         first.status = Status::Working;
         let mut second = sess("tile-b", "/tmp/agentviewer-wall", 200);
@@ -2194,8 +2359,13 @@ pub(crate) mod tests {
             "a bare arrow must go to the tile, not move the focus"
         );
 
-        // Two tiles are a 2x1 row, so Ctrl+Right moves and Ctrl+Down does not.
+        // Nor is Ctrl+arrow the wall's: the host terminal keeps it and it never reaches the
+        // viewer, so binding it would be a key that silently does nothing.
         press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(wall_focus(&ui), 0);
+
+        // Two tiles are a 2x1 row, so Shift+Right moves and Shift+Down does not.
+        press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::SHIFT);
         assert_eq!(wall_focus(&ui), 1);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),
@@ -2203,10 +2373,10 @@ pub(crate) mod tests {
             "the tile selection must pin the list selection"
         );
 
-        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::CONTROL);
+        press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::SHIFT);
         assert_eq!(wall_focus(&ui), 1, "a 2x1 grid has no second row");
 
-        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::CONTROL);
+        press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::SHIFT);
         assert_eq!(wall_focus(&ui), 0);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),

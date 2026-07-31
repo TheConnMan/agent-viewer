@@ -270,8 +270,11 @@ elapsed as tiles get narrower. The focused tile is marked with a caret and an ac
 tile awaiting input turns its own border and header amber without disturbing the rest of the
 wall, and the grid never reorders itself, so you keep your place in whatever you were reading.
 
-Hover or click a tile to focus it, or move with `Ctrl+↑↓←→`. `Ctrl+O` zooms the focused tile to
-the full attach view, reusing the connection the wall already holds. Everything else you type —
+Hover or click a tile to focus it, or move with `Shift+↑↓←→`. The mouse wheel scrolls the tile
+under the pointer back through what it has already printed, without moving the focus — that is
+the viewer's own viewport over the session's retained output, so it works the same whatever the
+backend does with mouse reports. `Ctrl+O` zooms the focused tile to the full attach view,
+reusing the connection the wall already holds. Everything else you type —
 plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:
 `Esc` interrupts it and `Ctrl+C` clears its input line, exactly as they would if you had
 attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
