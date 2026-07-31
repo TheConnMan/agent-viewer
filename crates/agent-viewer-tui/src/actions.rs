@@ -10,6 +10,8 @@ use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal};
+use crossterm::event::{MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::keys::set_mouse_capture;
 use crate::ops::{AttachPlan, Mutation};
@@ -72,7 +74,52 @@ pub(crate) fn focus_wall_tile(ui: &mut Ui, index: usize) {
     ui.app.select_by_key(&key);
 }
 
-/// Ctrl+arrow movement inside the wall grid. Clamps at the edges like the list does, and pins
+/// Rows one wheel tick moves a tile's viewport, matching the attached view's feel.
+const WALL_WHEEL_ROWS: usize = 3;
+
+/// Scroll one tile, by whichever mechanism its child actually honours.
+///
+/// Measured on this box: `claude attach` runs in the alternate screen and requests SGR mouse
+/// tracking, so it owns its own scrollback and the only way to scroll it is to hand it a
+/// wheel report — a local viewport scroll finds an empty normal grid and does nothing. Codex
+/// is the mirror image: it discards native wheel reports, which is why the attach view scrolls
+/// it locally. So the wheel is forwarded when the child is tracking the mouse, and falls back
+/// to moving the viewer's own viewport when it is not.
+///
+/// The report has to be translated into the child's coordinate space first; it thinks it is
+/// alone on a terminal the size of the tile's content area, not offset into a grid.
+pub(crate) fn scroll_wall_tile(ui: &mut Ui, index: usize, event: MouseEvent, content: Rect) {
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
+    let Some(key) = keys.get(index).cloned() else {
+        return;
+    };
+    let Some(pty) = ui.attached.get_mut(&key) else {
+        return;
+    };
+    let (mode, encoding) = pty.with_screen(|screen| {
+        (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
+    });
+    let local = MouseEvent {
+        column: event.column.saturating_sub(content.x),
+        row: event.row.saturating_sub(content.y),
+        ..event
+    };
+    if let Some(bytes) = agent_viewer_tui::mouse::encode_mouse_report(local, mode, encoding, 0) {
+        let _ = pty.write_input(&bytes);
+        return;
+    }
+    // The child is not tracking the mouse, so scroll our own viewport over its retained rows.
+    if matches!(event.kind, MouseEventKind::ScrollDown) {
+        pty.scroll_viewport_down(WALL_WHEEL_ROWS);
+    } else {
+        pty.scroll_viewport_up(WALL_WHEEL_ROWS);
+    }
+}
+
+/// Shift+arrow movement inside the wall grid. Clamps at the edges like the list does, and pins
 /// the list selection onto the tile so Ctrl+O zooms the tile that has the keyboard.
 pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
     let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());

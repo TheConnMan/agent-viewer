@@ -11,7 +11,7 @@ use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencod
 use agent_viewer_core::opencode::OpencodeRuntime;
 use agent_viewer_core::platform::{Platform, current_platform};
 use agent_viewer_core::pty::{
-    PtySession, TerminalPalette, VIEWPORT_SCROLLBACK_ROWS, spec_from_command,
+    PtySession, PtySpec, TerminalPalette, VIEWPORT_SCROLLBACK_ROWS, spec_from_command,
 };
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn, match_spawn_between};
@@ -967,11 +967,7 @@ fn install_wall_join(ui: &mut Ui, key: Key, plan: Result<ops::AttachPlan, String
         .or(ui.terminal_palette);
     // Size does not matter yet: `resize_wall_tiles` sets the real one from the region the
     // next frame publishes, before the child has drawn anything worth keeping.
-    let mut spec = spec_from_command(&plan.command, 24, 80);
-    spec.palette = palette;
-    if plan.session.backend == BackendKind::Codex {
-        spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
-    }
+    let spec = wall_tile_spec(&plan.command, palette);
     match PtySession::spawn(spec) {
         Ok(pty) => {
             ui.attached.insert(key, pty);
@@ -1011,6 +1007,20 @@ fn prune_wall_tiles(ui: &mut Ui, now_ms: i64) {
             ui.remove_pty(&key);
         }
     }
+}
+
+/// The PTY spec for one wall tile. Size does not matter yet: `resize_wall_tiles` sets the
+/// real one from the rects the next frame publishes, before the child has drawn anything
+/// worth keeping.
+///
+/// Every tile keeps history, not just Codex: the wheel scrolls a tile by moving the viewer's
+/// own viewport back over retained rows, and a tile with no retained rows cannot scroll at
+/// all.
+fn wall_tile_spec(command: &std::process::Command, palette: Option<TerminalPalette>) -> PtySpec {
+    let mut spec = spec_from_command(command, 24, 80);
+    spec.palette = palette;
+    spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
+    spec
 }
 
 /// Ask the backend to resolve an attach for every wall tile that is not connected yet.
@@ -1676,6 +1686,14 @@ mod tests {
     /// The wall joins each live session once per visit. A per-frame re-request would hammer
     /// the backend (and, for Codex, the app-server) many times a second, and a join that
     /// failed would be retried forever.
+    /// A tile with no retained history cannot be scrolled, so the wheel would be dead on
+    /// every tile. This is the setting that makes wall scrolling possible at all.
+    #[test]
+    fn every_wall_tile_gets_retained_history_to_scroll() {
+        let spec = wall_tile_spec(&std::process::Command::new("true"), None);
+        assert_eq!(spec.scrollback_rows, VIEWPORT_SCROLLBACK_ROWS);
+    }
+
     #[test]
     fn the_wall_requests_each_join_once_not_once_per_frame() {
         let calls = TestArc::new(AtomicUsize::new(0));

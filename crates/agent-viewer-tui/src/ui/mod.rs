@@ -723,7 +723,7 @@ fn draw_footer(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "{overflow}wall · keys go to the focused tile · Ctrl+↑↓←→ move · Ctrl+O zoom · Ctrl+W exit"
+                    "{overflow}wall · Shift+↑↓←→ move · wheel scrolls · Ctrl+O zoom · Ctrl+W exit"
                 ),
                 fg(theme.muted),
             ))),
