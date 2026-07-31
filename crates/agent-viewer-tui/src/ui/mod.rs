@@ -1,5 +1,6 @@
 //! Rendering surface for the session list, composer, overlays, and attached terminal.
 
+pub mod age;
 mod attach;
 mod composer;
 mod header;
@@ -292,6 +293,9 @@ pub struct Draw<'a> {
     /// Which header mascot to draw. Cycled live with Ctrl+G while the candidates are being
     /// compared.
     pub sprite: SpriteKind,
+    /// Whether finished rows fade toward the theme's `faint` token as they age. Off by default,
+    /// toggled from the command palette, and a no-op under a non-truecolor theme.
+    pub age_ramp: bool,
 }
 
 pub fn draw(frame: &mut Frame, d: Draw) {
@@ -372,6 +376,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         deco,
         d.logos,
         theme,
+        d.age_ramp,
         vertical[1],
     );
     if matches!(d.mode, Mode::Normal) {
@@ -452,6 +457,7 @@ fn draw_list(
     deco: ListDeco,
     logos: Option<&LogoMarks>,
     theme: &Theme,
+    age_ramp: bool,
     area: Rect,
 ) -> ListHit {
     let width = area.width as usize;
@@ -562,6 +568,7 @@ fn draw_list(
                         title_width,
                         elapsed_width,
                         theme,
+                        age_ramp,
                     ));
                     item_backends.push(Some(*backend));
                 }
@@ -579,6 +586,7 @@ fn draw_list(
                     title_width,
                     elapsed_width,
                     theme,
+                    age_ramp,
                 ));
                 item_backends.push(None);
                 item_to_row.push(target);
@@ -808,6 +816,7 @@ mod tests {
                         list_hit: &list_hit,
                         themes,
                         sprite: Default::default(),
+                        age_ramp: false,
                     },
                 );
             })
@@ -1045,6 +1054,7 @@ mod tests {
                     },
                     logos,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, 1),
                 );
             })
@@ -1163,6 +1173,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     area,
                 );
             })
@@ -1232,6 +1243,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1289,6 +1301,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1387,6 +1400,7 @@ mod tests {
                         ListDeco { rename: None },
                         None,
                         &theme,
+                        false,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -1464,6 +1478,7 @@ mod tests {
                         ListDeco { rename: None },
                         None,
                         &theme,
+                        false,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -1760,6 +1775,7 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
                 },
             );
         })
@@ -1866,6 +1882,7 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
                 },
             );
         })
@@ -1974,6 +1991,7 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
                 },
             );
         })
