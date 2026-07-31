@@ -10,27 +10,27 @@
 //! | --- | --- |
 //! | `codex_tail_state_20mb` (final 64 KiB only) | **142 us** |
 //! | `codex_pending_approval_20mb` (final 64 KiB only) | **117 us** |
-//! | `codex_read_transcript_20mb` (whole file) | **42 ms** (472 MiB/s) |
-//! | `claude_read_transcript_20mb` (whole file) | **29 ms** (683 MiB/s) |
+//! | `codex_read_transcript_20mb` (512 KiB display tail) | pre-fix full parse: **42 ms** |
+//! | `claude_read_transcript_20mb` (512 KiB display tail) | pre-fix full parse: **29 ms** |
 //!
-//! Absolute times move ~2x run to run when this box is under agent load; the **~300x** gap
-//! between the two groups is what to actually guard, and it is stable.
+//! Absolute times move ~2x run to run when this box is under agent load; the gaps between
+//! groups are what to actually guard, and they are stable.
 //!
 //! The tail-window reads are flat in file size by construction. If either ever starts
 //! scaling with the fixture, the 64 KiB window has been lost and the status resolver is
 //! reading whole rollouts on every tick.
 //!
-//! The full parses are linear in file size and must stay OFF the tick path - they are
-//! peek-pane reads. A regression here is either a slower JSON path or, far worse, a caller
-//! that started invoking them per tick: the reviewed defect was an 18.6 MB transcript fully
-//! re-parsed every 2 s while a session worked, which at this baseline is ~30-40 ms of the
-//! 2 s budget burned per working session, per tick.
+//! The display-tail reads are bounded to `TRANSCRIPT_TAIL_BYTES` (512 KiB) and must also
+//! stay flat in file size. The reviewed defect was an 18.6 MB transcript fully re-parsed
+//! every 2 s while a session worked (~30-40 ms of the 2 s budget per working session per
+//! tick); the bound fixed that. If either bench ever scales with the fixture again, an
+//! unbounded read has been reintroduced on the tick path.
 //!
 //! All fixtures are generated into a temp dir from a fixed LCG seed. No network, no real
 //! `~/.codex` or `~/.claude` access.
 
 use agent_viewer_core::claude::read_claude_transcript;
-use agent_viewer_core::codex::rollout::{pending_approval, read_transcript, tail_state};
+use agent_viewer_core::codex::rollout::{pending_approval, read_transcript_tail, tail_state};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::fs::File;
 use std::hint::black_box;
@@ -317,13 +317,15 @@ fn bench_transcripts(criterion: &mut Criterion) {
     });
     tail.finish();
 
-    // Full-file parses: linear in file size, so minimum samples keep the wall clock sane.
-    let mut full = criterion.benchmark_group("transcript_full_parse");
+    // Display-tail parses: bounded to TRANSCRIPT_TAIL_BYTES, so these must stay flat in
+    // file size just like the 64 KiB group. Scaling with the fixture again means an
+    // unbounded read came back.
+    let mut full = criterion.benchmark_group("transcript_display_tail");
     full.sample_size(10);
     full.measurement_time(std::time::Duration::from_secs(12));
     full.throughput(Throughput::Bytes(fixtures.codex_bytes as u64));
     full.bench_function("codex_read_transcript_20mb", |bencher| {
-        bencher.iter(|| black_box(read_transcript(black_box(&fixtures.codex)).unwrap()));
+        bencher.iter(|| black_box(read_transcript_tail(black_box(&fixtures.codex)).unwrap()));
     });
     full.throughput(Throughput::Bytes(fixtures.claude_bytes as u64));
     full.bench_function("claude_read_transcript_20mb", |bencher| {
