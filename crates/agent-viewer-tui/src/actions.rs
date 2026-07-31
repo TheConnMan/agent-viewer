@@ -9,7 +9,9 @@ use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_com
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
-use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal};
+use agent_viewer_tui::ui::{
+    ATTACHED_CHROME_ROWS, Mode, RenameModal, ReplyModal, TriageState, read_context, triage_queue,
+};
 
 use crate::keys::set_mouse_capture;
 use crate::ops::{AttachPlan, Mutation};
@@ -159,6 +161,130 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     }
     ui.set_notice("reply is not supported".to_string());
     Ok(())
+}
+
+/// `Ctrl+N` — open the triage inbox on the needs-input queue, oldest first.
+///
+/// The queue is snapshotted here and not rebuilt while the modal is up: the 1s background
+/// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
+/// opens nothing — a footer notice, and the list is untouched.
+pub(crate) fn open_triage(ui: &mut Ui) {
+    let items = triage_queue(ui.app.sessions());
+    if items.is_empty() {
+        ui.set_notice("nothing waiting for input".to_string());
+        return;
+    }
+    ui.mode = Mode::Triage(TriageState::new(items));
+}
+
+/// Deliver a triage answer through the EXISTING reply path — `Mode::Reply` + `send_reply` —
+/// never a second delivery mechanism of triage's own.
+///
+/// `send_reply` is currently a stub that reports "reply is not supported" (reply was taken out
+/// of scope in the fleet-view reshape; see README). Triage deliberately does not revive it:
+/// what triage owns is the payload and the queue walk, and the day reply delivery is restored
+/// it lights up here with no change. On success the item is counted and the queue advances;
+/// running off the end closes the modal.
+pub(crate) fn submit_triage_answer<B: ratatui::backend::Backend>(
+    backends: &[Box<dyn Backend>],
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    payload: String,
+) -> io::Result<()> {
+    let Mode::Triage(state) = &ui.mode else {
+        return Ok(());
+    };
+    let Some((backend, id)) = state.current().map(|item| (item.backend, item.id.clone())) else {
+        return Ok(());
+    };
+    let Mode::Triage(mut state) = std::mem::replace(&mut ui.mode, Mode::Normal) else {
+        return Ok(());
+    };
+
+    ui.mode = Mode::Reply(ReplyModal {
+        backend,
+        id,
+        buffer: payload,
+    });
+    let notice_before = ui.notice.text().to_string();
+    send_reply(backends, ui, terminal)?;
+    // A restored reply path attaches, which owns the whole screen; there is no queue to walk
+    // back to in that case. A stubbed one leaves us in Reply mode, so triage resumes.
+    let took_over_the_screen = !matches!(ui.mode, Mode::Reply(_));
+    // Whatever the reply path had to say about this answer outranks the queue tally. Today it
+    // says "reply is not supported", and burying that under "triage: 1 answered" would tell
+    // the user their answer went somewhere.
+    let reply_spoke = ui.notice.text() != notice_before;
+
+    state.record_answer();
+    let answered = state.answered();
+    if took_over_the_screen {
+        return Ok(());
+    }
+    if state.advance() {
+        ui.mode = Mode::Triage(state);
+        return Ok(());
+    }
+    ui.mode = Mode::Normal;
+    if !reply_spoke {
+        ui.set_notice(format!("triage: {answered} answered"));
+    }
+    Ok(())
+}
+
+/// Queue an off-thread transcript read for the triage item under the cursor, once.
+///
+/// Only Codex sessions have a transcript reader in `-core` (`codex::rollout::read_transcript`),
+/// and writing a second parser for the other backends is out of scope here — they record an
+/// empty context immediately so the modal renders its summary fallback and stops asking.
+/// Nothing is prefetched: a queue of forty blocked sessions costs one read, not forty.
+pub(crate) fn ensure_triage_context(ui: &mut Ui) {
+    let Mode::Triage(state) = &ui.mode else {
+        return;
+    };
+    let Some(item) = state.context_pending() else {
+        return;
+    };
+    let key: Key = (item.backend, item.id.clone());
+    let path = match item.backend {
+        BackendKind::Codex => item.rollout_path.clone(),
+        BackendKind::Claude | BackendKind::Opencode => None,
+    };
+    let Some(path) = path else {
+        if let Mode::Triage(state) = &mut ui.mode {
+            state.set_context(key.0, key.1, Vec::new());
+        }
+        return;
+    };
+    let job = format!("{}:{}:triage-context", key.0.name(), key.1);
+    ui.triage_context
+        .submit(job, move || Ok((key, read_context(&path))));
+}
+
+/// Fold landed transcript reads into the open modal. A read that lands after the user has
+/// moved on is simply cached against its own session, never applied to the wrong item.
+pub(crate) fn install_triage_context(ui: &mut Ui) {
+    while let Some(result) = ui.triage_context.poll() {
+        let Ok(((backend, id), lines)) = result else {
+            continue;
+        };
+        if let Mode::Triage(state) = &mut ui.mode {
+            state.set_context(backend, id, lines);
+        }
+    }
+}
+
+/// `→` — skip to the next item without answering; running off the end closes the modal.
+pub(crate) fn skip_triage_item(ui: &mut Ui) {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return;
+    };
+    if state.advance() {
+        return;
+    }
+    let answered = state.answered();
+    ui.mode = Mode::Normal;
+    ui.set_notice(format!("triage: {answered} answered"));
 }
 
 /// Submit the rename to the background runner (the app-server/UDS rename can take 1-2s).

@@ -8,6 +8,7 @@ mod overlay;
 mod palette;
 mod sprite;
 pub mod theme;
+mod triage;
 
 use crate::app::{App, Composer, Row};
 use crate::logos::LogoMarks;
@@ -35,6 +36,10 @@ use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use sprite::SpriteKind;
 pub use theme::{Theme, ThemeState};
+pub use triage::{
+    TriageItem, TriageOption, TriageState, parse_options, question_prompt, read_context,
+    triage_queue,
+};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
 pub type Pulses = HashMap<(BackendKind, String), i64>;
@@ -189,6 +194,8 @@ pub enum Mode {
     Filter,
     Rename(RenameModal),
     Reply(ReplyModal),
+    /// The Ctrl+N triage inbox: a modal walk over the needs-input queue, drawn over the list.
+    Triage(TriageState),
     Help,
     Attached,
 }
@@ -433,6 +440,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     if let Mode::Palette(state) = d.mode {
         palette::draw(frame, state, d.now_ms, theme);
     }
+    if let Mode::Triage(state) = d.mode {
+        triage::draw(frame, state, d.now_ms, theme);
+    }
 }
 
 /// Per-row decorations layered over the list model.
@@ -668,6 +678,7 @@ fn draw_footer(
         Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
+        Mode::Triage(_) => Line::from("triage — Enter send · 1-9 pick · →/← skip/back · Esc leave"),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -688,7 +699,7 @@ fn draw_footer(
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+N triage · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme.muted),
                 ))
