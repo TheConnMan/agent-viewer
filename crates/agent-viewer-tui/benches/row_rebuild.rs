@@ -121,10 +121,9 @@ fn synthetic_sessions(dirs: &[PathBuf]) -> Vec<Session> {
     let mut rng = Lcg::new(0x701_5EED);
     (0..SESSIONS)
         .map(|index| Session {
-            backend: match index % 3 {
+            backend: match index % 2 {
                 0 => BackendKind::Codex,
-                1 => BackendKind::Claude,
-                _ => BackendKind::Opencode,
+                _ => BackendKind::Claude,
             },
             id: format!("019f4dda-fecb-7b71-adba-{index:012}"),
             short_id: None,
