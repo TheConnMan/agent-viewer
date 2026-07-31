@@ -36,39 +36,39 @@ pub(crate) fn activate_selected(ui: &mut Ui) {
 /// Ctrl+W — toggle the video wall. The wall is a flag on the list view, not a mode, so key
 /// routing never leaves `Mode::Normal` and every already-bound chord keeps its meaning.
 pub(crate) fn toggle_wall(ui: &mut Ui) {
-    ui.wall.on = !ui.wall.on;
-    // Tile sizes are meaningless once the grid is gone; a re-entry re-measures from scratch.
-    ui.wall.sized.clear();
-    if !ui.wall.on {
+    if ui.wall.on {
+        // Closing the wall closes every connection it opened: nothing stays connected to a
+        // session that is not on screen.
+        ui.wall.on = false;
+        crate::close_wall(ui);
         ui.set_notice("video wall off".to_string());
         return;
     }
-    ui.wall.selected = 0;
-    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, &ui.attached);
+    ui.wall.on = true;
+    ui.wall.clear();
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
     match keys.first() {
         Some(key) => {
             ui.app.select_by_key(key);
-            let tiles = agent_viewer_tui::ui::wall::tile_count(keys.len());
-            let plural = if tiles == 1 { "" } else { "s" };
+            let plural = if keys.len() == 1 { "" } else { "s" };
             ui.set_notice(format!(
-                "video wall: {tiles} live tile{plural} · Ctrl+W or Esc to exit"
+                "video wall: connecting {} live session{plural} · Ctrl+W or Esc to exit",
+                keys.len()
             ));
         }
-        None => ui.set_notice(
-            "video wall: nothing live to tile · attach a working session with → first".to_string(),
-        ),
+        None => ui.set_notice("video wall: nothing is running right now".to_string()),
     }
 }
 
 /// Arrow movement inside the wall grid. Clamps at the edges like the list does, and pins the
 /// list selection onto the tile so Ctrl+R/Ctrl+X/Ctrl+E/Enter all act on the tile in view.
 pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
-    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, &ui.attached);
-    let count = agent_viewer_tui::ui::wall::tile_count(keys.len());
+    let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app);
+    let count = keys.len();
     if count == 0 {
         return;
     }
-    let (cols, rows) = agent_viewer_tui::ui::wall::grid_dims(keys.len());
+    let (cols, rows) = agent_viewer_tui::ui::wall::grid_dims(count);
     let (cols, rows) = (i32::from(cols), i32::from(rows));
     let current = ui.wall.selected.min(count - 1) as i32;
     let column = (current % cols + dx).clamp(0, cols - 1);
@@ -346,10 +346,11 @@ pub(crate) fn attach_selected(ui: &mut Ui) -> bool {
 pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
     let id = request.id().to_string();
     let executor = ui.attach_executor.clone();
-    if !ui
-        .attaches
-        .submit("attach".to_string(), move || executor(request))
-    {
+    // Single-slot key on purpose: mashing → must not queue a pile of attaches that each take
+    // over the screen in turn. The wall's joins use per-session keys so they can run at once.
+    if !ui.attaches.submit("attach".to_string(), move || {
+        executor(request).map(crate::AttachOutcome::Focus)
+    }) {
         return false;
     }
     ui.set_notice(format!("attaching… {id}"));
@@ -377,8 +378,9 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
         .or(ui.terminal_palette);
 
     if let Some(pty) = ui.attached.get_mut(&key) {
-        // Re-attach: reuse the live PTY, resizing it to the current content area. The
-        // per-PTY detach tracker is preserved so a half-typed input line still gates Left.
+        // The wall already holds a connection to this session and the user is zooming into
+        // that tile: reuse the live PTY, resized to the full content area. This is the only
+        // way a PTY exists here, since leaving a session otherwise closes it.
         pty.set_palette(palette);
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();

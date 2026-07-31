@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencode};
 use agent_viewer_core::opencode::OpencodeRuntime;
 use agent_viewer_core::platform::{Platform, current_platform};
-use agent_viewer_core::pty::{PtySession, TerminalPalette};
+use agent_viewer_core::pty::{
+    PtySession, TerminalPalette, VIEWPORT_SCROLLBACK_ROWS, spec_from_command,
+};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn, match_spawn_between};
 use agent_viewer_core::{Session, Status, mark_dead_dirs};
@@ -397,6 +399,19 @@ impl NoticeState {
     }
 }
 
+/// What a resolved attach plan is for. Both kinds ride the same runner and the same backend
+/// resolution; only what happens when they land differs.
+enum AttachOutcome {
+    /// A user attach: take over the screen with this session.
+    Focus(ops::AttachPlan),
+    /// A wall tile joining. Carries its own key so a failure can be reported against the
+    /// right tile, which is why the failure is an `Ok` here rather than a runner-level `Err`.
+    Wall {
+        key: Key,
+        plan: Result<ops::AttachPlan, String>,
+    },
+}
+
 /// Everything the run loop mutates, threaded through the key/tick handlers.
 struct Ui {
     app: App,
@@ -407,7 +422,7 @@ struct Ui {
     /// Inline spawn composer (persistent on the list view).
     composer: Composer,
     themes: ui::ThemeState,
-    /// Per-PTY left-arrow detach gate, keyed like `attached`. Reset only when a new PTY is
+    /// Per-PTY left-arrow exit gate, keyed like `attached`. Reset only when a new PTY is
     /// spawned; a re-attach reuses the previous pending count (the child's input line may
     /// still hold text). Pruned alongside its PTY.
     detach_trackers: HashMap<Key, DetachTracker>,
@@ -419,7 +434,7 @@ struct Ui {
     /// Backend mutation boundary used by every submission on the runner thread.
     mutation_executor: Arc<dyn Fn(ops::Mutation) -> Result<MutationOutcome, String> + Send + Sync>,
     /// Authoritative attach resolution runs off the render thread.
-    attaches: AttachRunner<ops::AttachPlan>,
+    attaches: AttachRunner<AttachOutcome>,
     /// Fresh backend attach boundary used by every attach worker.
     attach_executor: Arc<dyn Fn(TargetRequest) -> Result<ops::AttachPlan, String> + Send + Sync>,
     /// The composer's model catalog: seeded from the viewer DB, refreshed off-thread.
@@ -436,8 +451,10 @@ struct Ui {
     pending_reply: Option<PendingReply>,
     /// The exact attached viewport armed by Ctrl+Y and drained once by the outer terminal writer.
     pending_copy: Option<String>,
-    /// Detached-but-live PTYs, keyed by session. Reused on re-attach; dropped (killed)
-    /// on quit — conversation state persists in each backend's own store.
+    /// Live PTYs for whatever is on screen: the attached session, or the wall's tiles.
+    /// Nothing lingers here once it is off screen — leaving a session or closing the wall
+    /// drops (and so kills) its entry. Conversation state persists in each backend's own
+    /// store, so a session is rejoined by ID rather than kept warm.
     attached: HashMap<Key, PtySession>,
     /// The host terminal colors captured once before alternate screen entry.
     terminal_palette: Option<TerminalPalette>,
@@ -783,7 +800,7 @@ fn run(
 
         while let Some(result) = ui.attaches.poll() {
             match result {
-                Ok(plan) => {
+                Ok(AttachOutcome::Focus(plan)) => {
                     install_completed_attach_plan(
                         ui,
                         terminal,
@@ -792,6 +809,7 @@ fn run(
                         applied_mouse_capture,
                     )?;
                 }
+                Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
                 Err(notice) => ui.set_notice(notice),
             }
         }
@@ -823,9 +841,12 @@ fn run(
         // Drive any armed one-shot reply injection once we are safely in the attached run.
         pending_reply::drive_pending_reply(ui);
 
-        // Size every wall tile's child to the cell it will occupy. Off the render path
-        // because resize needs `&mut`, and using last frame's geometry (one frame of lag on
-        // entry, invisible in practice).
+        // Connect any wall tile that is not connected yet — including a session that only
+        // just started working, so the wall stays a live picture of what is running — then
+        // size every connected child to the cell it will occupy. Both are off the render
+        // path (resize needs `&mut`) and use last frame's geometry: one frame of lag on
+        // entry, invisible in practice.
+        request_wall_joins(ui);
         resize_wall_tiles(ui);
 
         // Build the attach view (if focused) before borrowing the frame.
@@ -921,6 +942,91 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
     })
 }
 
+/// Land a wall tile's connection. A failure is recorded against its tile rather than shown as
+/// a footer notice: nine tiles joining at once could otherwise stamp nine notices over each
+/// other, and the tile itself is where the user is looking.
+fn install_wall_join(ui: &mut Ui, key: Key, plan: Result<ops::AttachPlan, String>) {
+    // The wall closed (or this session stopped being live) while the join was in flight. Do
+    // not leave an orphan child running for a tile nobody will draw.
+    if !ui.wall.owns(&key) {
+        return;
+    }
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            ui.wall.failed.insert(key, error);
+            return;
+        }
+    };
+    let palette = ui
+        .themes
+        .active()
+        .terminal_palette()
+        .or(ui.terminal_palette);
+    // Size does not matter yet: `resize_wall_tiles` sets the real one from the region the
+    // next frame publishes, before the child has drawn anything worth keeping.
+    let mut spec = spec_from_command(&plan.command, 24, 80);
+    spec.palette = palette;
+    if plan.session.backend == BackendKind::Codex {
+        spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
+    }
+    match PtySession::spawn(spec) {
+        Ok(pty) => {
+            ui.attached.insert(key, pty);
+        }
+        Err(error) => {
+            ui.wall.failed.insert(key, error.to_string());
+        }
+    }
+}
+
+/// Ask the backend to resolve an attach for every wall tile that is not connected yet.
+///
+/// Each join is keyed per session so they run concurrently, unlike the single-slot `"attach"`
+/// key the user attach path uses (which deliberately drops a second request while one is in
+/// flight). `requested` makes this once-per-session-per-visit: without it a failed join would
+/// be retried on every tick forever.
+fn request_wall_joins(ui: &mut Ui) {
+    if !ui.wall.on {
+        return;
+    }
+    for key in ui::wall::tile_keys(&ui.app) {
+        if ui.wall.requested.contains(&key) {
+            continue;
+        }
+        let Some(session) = ui.app.session_for(&key) else {
+            continue;
+        };
+        let request = TargetRequest::from(session);
+        let executor = ui.attach_executor.clone();
+        let job_key = key.clone();
+        let runner_key = format!("wall:{}:{}", key.0.name(), key.1);
+        let submitted = ui.attaches.submit(runner_key, move || {
+            Ok(AttachOutcome::Wall {
+                key: job_key,
+                plan: executor(request),
+            })
+        });
+        if submitted {
+            ui.wall.requested.insert(key);
+        }
+    }
+}
+
+/// Close every connection the wall opened and forget the visit. Called when the wall closes,
+/// so nothing stays connected once it is off screen.
+fn close_wall(ui: &mut Ui) {
+    for key in std::mem::take(&mut ui.wall.requested) {
+        // The focused PTY is the one the user zoomed into; the attach view still needs it and
+        // closes it itself on the way out.
+        if ui.focused.as_ref() == Some(&key) {
+            continue;
+        }
+        ui.remove_pty(&key);
+    }
+    ui.wall.clear();
+}
+
 /// Resize each wall tile's PTY to the cell it will occupy, using the region the previous
 /// frame published. Only when a size actually changed — a SIGWINCH per tile per frame would
 /// keep every child redrawing forever. Never spawns anything: a tile with no PTY was already
@@ -933,8 +1039,9 @@ fn resize_wall_tiles(ui: &mut Ui) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let keys = ui::wall::tile_keys(&ui.app, &ui.attached);
-    for (key, rect) in keys.iter().zip(ui::wall::tile_rects(area, keys.len())) {
+    let keys = ui::wall::tile_keys(&ui.app);
+    let eligible = ui::wall::wall_sessions(&ui.app).len();
+    for (key, rect) in keys.iter().zip(ui::wall::tile_rects(area, eligible)) {
         let size = ui::wall::tile_inner(rect);
         if ui.wall.sized.get(key) == Some(&size) {
             continue;
@@ -947,23 +1054,22 @@ fn resize_wall_tiles(ui: &mut Ui) {
     ui.wall.sized.retain(|key, _| keys.contains(key));
 }
 
-/// Assemble the wall's tiles for this frame: the capped, list-ordered eligible sessions
-/// paired with the live PTYs they already have. None when the wall is off.
+/// Assemble the wall's tiles for this frame: the capped, list-ordered live sessions, each
+/// with its connection if one has landed yet. None when the wall is off.
 fn build_wall_view(ui: &Ui) -> Option<ui::WallView<'_>> {
     if !ui.wall.on {
         return None;
     }
-    let keys = ui::wall::tile_keys(&ui.app, &ui.attached);
-    let overflow = ui::wall::overflow(keys.len());
-    let tiles = keys
-        .iter()
-        .take(ui::wall::MAX_TILES)
+    let overflow = ui::wall::overflow(ui::wall::wall_sessions(&ui.app).len());
+    let tiles = ui::wall::tile_keys(&ui.app)
+        .into_iter()
         .filter_map(|key| {
-            let session = ui.app.session_for(key)?;
+            let session = ui.app.session_for(&key)?;
             Some(ui::WallTile {
                 project: agent_viewer_tui::app::project_label(&session.cwd),
                 session,
-                pty: ui.attached.get(key)?,
+                pty: ui.attached.get(&key),
+                error: ui.wall.failed.get(&key).map(String::as_str),
             })
         })
         .collect::<Vec<_>>();
@@ -1527,6 +1633,98 @@ mod tests {
         assert_eq!(plain_error.1, "codex: command failed: source unavailable");
         assert_eq!(plain_error.2, 0);
         assert_eq!(plain_last[0], vec![plain_local]);
+    }
+
+    fn working_session(id: &str) -> Session {
+        let mut session = session(BackendKind::Codex, id, 1_000, false);
+        session.status = Status::Working;
+        session
+    }
+
+    /// The wall joins each live session once per visit. A per-frame re-request would hammer
+    /// the backend (and, for Codex, the app-server) many times a second, and a join that
+    /// failed would be retried forever.
+    #[test]
+    fn the_wall_requests_each_join_once_not_once_per_frame() {
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let counted = TestArc::clone(&calls);
+        let mut ui = test_ui(vec![working_session("one"), working_session("two")]);
+        ui.attach_executor = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            // Resolution failing is fine here: what is under test is how many times it is
+            // asked, and a failure is the case that would otherwise retry forever.
+            Err("backend offline".to_string())
+        });
+        ui.wall.on = true;
+
+        for _ in 0..5 {
+            request_wall_joins(&mut ui);
+        }
+        // Drain so nothing is left "in flight" masking a re-request behind the runner's dedup.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ui.wall.failed.len() < 2 {
+            while let Some(Ok(AttachOutcome::Wall { key, plan })) = ui.attaches.poll() {
+                install_wall_join(&mut ui, key, plan);
+            }
+            assert!(Instant::now() < deadline, "wall joins did not resolve");
+            thread::yield_now();
+        }
+        assert!(!ui.attaches.in_flight("wall:codex:one"), "join not drained");
+        for _ in 0..5 {
+            request_wall_joins(&mut ui);
+        }
+
+        // `submit` marks its key in flight synchronously, so this reads the decision itself
+        // rather than racing the worker thread that would increment `calls`.
+        for key in ["wall:codex:one", "wall:codex:two"] {
+            assert!(
+                !ui.attaches.in_flight(key),
+                "{key} was re-requested after it had already resolved"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one resolution per live session, not per frame"
+        );
+        assert_eq!(ui.wall.failed.len(), 2, "each failure is kept on its tile");
+    }
+
+    /// Closing the wall must close what it opened. A leaked child keeps a real agent process
+    /// connected to a session nobody is looking at.
+    #[test]
+    fn closing_the_wall_closes_every_connection_it_opened() {
+        let mut ui = test_ui(vec![working_session("tile")]);
+        let key = (BackendKind::Codex, "tile".to_string());
+        let pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 6,
+            cols: 40,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("wall tile child");
+        let pid = pty.pid().expect("child pid");
+        ui.attached.insert(key.clone(), pty);
+        ui.wall.on = true;
+        ui.wall.requested.insert(key.clone());
+
+        ui.wall.on = false;
+        close_wall(&mut ui);
+
+        assert!(ui.attached.is_empty(), "wall connection leaked");
+        assert!(ui.wall.requested.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "tile child {pid} outlived the wall"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn test_ui(sessions: Vec<Session>) -> Ui {
@@ -2245,7 +2443,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let plan = loop {
             if let Some(result) = ui.attaches.poll() {
-                break result.expect("resolve event bridge attach");
+                // A user attach always resolves to Focus; a Wall join here would mean the
+                // runner crossed wires, so fail loudly rather than skip.
+                match result.expect("resolve event bridge attach") {
+                    AttachOutcome::Focus(plan) => break plan,
+                    AttachOutcome::Wall { .. } => panic!("expected a focus attach"),
+                }
             }
             assert!(
                 Instant::now() < deadline,

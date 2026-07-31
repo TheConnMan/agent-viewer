@@ -203,8 +203,8 @@ pub(super) fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/model", "pick from all available models"),
         ("/theme", "preview and select a theme"),
         ("Enter", "spawn composed task"),
-        ("← back", "detach (composer empty)"),
-        ("Ctrl+]", "detach (always)"),
+        ("← back", "back to the list (input line empty)"),
+        ("Ctrl+]", "back to the list (always)"),
         ("Enter/Space", "toggle group on a header"),
         // Paired onto one line: the popup already fills an 80x24 terminal, and a 23rd entry
         // pushes Ctrl+C off the bottom.
