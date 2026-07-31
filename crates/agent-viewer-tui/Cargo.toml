@@ -34,4 +34,13 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2"
 
 [dev-dependencies]
+# default-features off drops criterion's plotters/rayon trees; `cargo_bench_support` is the
+# only feature `cargo bench` needs to drive these targets.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "row_rebuild"
+harness = false
