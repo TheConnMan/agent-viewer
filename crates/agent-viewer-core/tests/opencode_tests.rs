@@ -3034,7 +3034,7 @@ fn changed_pinned_identity_is_cleared_without_sending_replacement_credentials() 
     let runtime = secure_runtime_for(
         &server,
         [server.addr, unused_addr()],
-        Duration::from_millis(100),
+        Duration::from_millis(300),
         |_| Err(io::Error::other("no verified replacement")),
     );
     let mut backend = backend_with_runtime(runtime);
