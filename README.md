@@ -326,8 +326,9 @@ separately specified decision. The triage inbox does not depend on it: it delive
 by typing into the attached session, which is the agent's own input path, not a reply API.
 
 This viewer binds `Space` to group collapse and expand, not to reply, which is a deliberate
-divergence from Fleet View, which binds `space` to reply — noted here so it is not mistaken
-for an oversight; see the constitution's Additional Constraints.
+divergence from Fleet View, which binds `space` to reply. Peek and reply were removed from this
+rebuild because they confused the interaction model, so the rebinding is a considered choice and
+not an oversight; revisiting either is a future, separately specified decision.
 
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.

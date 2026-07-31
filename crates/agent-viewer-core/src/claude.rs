@@ -142,9 +142,6 @@ pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabil
         archive: false,
         delete: true,
         stop: true,
-        needs_input: true,
-        pr_refs: true,
-        live_status: true,
     }
 }
 
