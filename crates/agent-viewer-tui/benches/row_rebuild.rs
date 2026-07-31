@@ -142,6 +142,7 @@ fn synthetic_sessions(dirs: &[PathBuf]) -> Vec<Session> {
             updated_at_ms: 1_783_500_000_000 + index as i64 * 997,
             hidden: index % 7 == 0,
             companion: index % 11 == 0,
+            subagent: false,
             summary: paragraph(&mut rng, 6, 40),
             pid: (index % 3 == 0).then_some(10_000 + index as u32),
             rollout_path: None,

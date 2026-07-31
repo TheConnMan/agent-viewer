@@ -134,6 +134,7 @@ fn synthetic_sessions(count: usize) -> Vec<Session> {
                 updated_at_ms: 1_783_500_000_000 + index as i64 * 997,
                 hidden: index % 7 == 0,
                 companion: index % 11 == 0,
+                subagent: false,
                 // The real cost driver: codex stores threads.preview here and it is long.
                 summary: paragraph(&mut rng, 40, 900),
                 pid: (index % 3 == 0).then_some(10_000 + index as u32),
