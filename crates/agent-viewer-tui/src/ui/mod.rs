@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui_image::Image;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -352,7 +352,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // reply buffer.
     let inner_w = input_inner_width(frame.area().width);
     // The wall owns the keyboard, so the composer is not drawn while it is on: an input box
-    // that cannot receive your input is a lie, and those rows are better spent on tiles.
+    // that cannot receive your input is a lie, and those rows are better spent on tiles. The
+    // one exception, `Mode::Compose`, floats over the grid after the footer instead of taking
+    // rows here — see below.
     let composer_h = if d.wall.is_some() {
         0
     } else {
@@ -459,7 +461,8 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // Reply mode replaces the spawn composer with a small reply input. Every other mode shows
     // the persistent spawn composer.
     if d.wall.is_some() {
-        // No composer on the wall: `composer_h` is zero, so there is nothing to draw into.
+        // No composer in the layout on the wall: `composer_h` is zero, so there is nothing to
+        // draw into. `Mode::Compose` paints its own floating box after the footer.
     } else if let Mode::Reply(m) = d.mode {
         let title = d
             .app
@@ -488,6 +491,56 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         d.wall.as_ref(),
         vertical[4],
     );
+
+    // The spawn composer over the wall, in the rows the list's composer occupies so the muscle
+    // memory holds. It floats rather than taking layout rows deliberately: real rows would
+    // shrink the grid, and resizing a tile SIGWINCHes its child agent into a full repaint —
+    // every session on screen redrawn because someone opened an input box.
+    if d.wall.is_some() && matches!(d.mode, Mode::Compose) {
+        let height = composer_box_height(d.composer.text(), inner_w, frame.area().height);
+        let overlay_area = Rect {
+            x: frame.area().x,
+            y: vertical[4].y.saturating_sub(height),
+            width: frame.area().width,
+            height,
+        };
+        // Clear plus the composer block's own surface background is what keeps tile text from
+        // bleeding through the box.
+        frame.render_widget(Clear, overlay_area);
+        composer::draw(
+            frame,
+            d.app,
+            d.composer,
+            d.logos,
+            theme,
+            overlay_area,
+            caret_visible(d.now_ms, theme.animation),
+        );
+        // The same popups the list gets, anchored to the floating box: `vertical[3]` is a
+        // zero-height slice while the wall is on, so it cannot anchor anything.
+        let highlight = d.composer.suggestion_highlight();
+        if d.themes.picker_open() {
+            overlay::draw_theme_picker(frame, d.themes, overlay_area);
+        } else if d.composer.is_model_command() {
+            overlay::draw_suggestions(
+                frame,
+                &d.composer.model_suggestions(),
+                highlight,
+                "",
+                theme,
+                overlay_area,
+            );
+        } else {
+            overlay::draw_suggestions(
+                frame,
+                &d.composer.suggestions(),
+                highlight,
+                "/",
+                theme,
+                overlay_area,
+            );
+        }
+    }
 
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup. Never on the wall — the composer
@@ -761,6 +814,19 @@ fn draw_footer(
     wall: Option<&WallView>,
     area: Rect,
 ) {
+    // The composer holds the keyboard over the grid, so the grid's chord list is the wrong
+    // hint: Shift+arrows and Ctrl+X are the tiles' and do nothing from in here, while the three
+    // keys that matter — send, switch agent, back out — are not on it at all.
+    if wall.is_some() && matches!(mode, Mode::Compose) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "new session · ⏎ start · ⇥ agent · ⇧⇥ model · Esc cancel",
+                fg(theme.muted),
+            ))),
+            area,
+        );
+        return;
+    }
     // The wall owns the footer while it is on (except for a live notice), because its keys
     // differ from the list's and the overflow count has nowhere else to go.
     if let Some(view) = wall
