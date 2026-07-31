@@ -497,7 +497,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // shrink the grid, and resizing a tile SIGWINCHes its child agent into a full repaint —
     // every session on screen redrawn because someone opened an input box.
     if d.wall.is_some() && matches!(d.mode, Mode::Compose) {
-        let height = composer_box_height(d.composer.text(), inner_w, frame.area().height);
+        // The box grows with the draft, but never past the footer: on a terminal short enough
+        // that a third of it still outruns the grid, `y` saturates at 0 while the height does
+        // not, and the row that gets covered is the compose hint telling you how to get out.
+        let height = composer_box_height(d.composer.text(), inner_w, frame.area().height)
+            .min(vertical[4].y.max(1));
         let overlay_area = Rect {
             x: frame.area().x,
             y: vertical[4].y.saturating_sub(height),
@@ -518,56 +522,14 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         );
         // The same popups the list gets, anchored to the floating box: `vertical[3]` is a
         // zero-height slice while the wall is on, so it cannot anchor anything.
-        let highlight = d.composer.suggestion_highlight();
-        if d.themes.picker_open() {
-            overlay::draw_theme_picker(frame, d.themes, overlay_area);
-        } else if d.composer.is_model_command() {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.model_suggestions(),
-                highlight,
-                "",
-                theme,
-                overlay_area,
-            );
-        } else {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.suggestions(),
-                highlight,
-                "/",
-                theme,
-                overlay_area,
-            );
-        }
+        draw_composer_popups(frame, &d, theme, overlay_area);
     }
 
     // Completion popup floating just above the composer box: the /model picker when a /model
     // command is being typed, else the slash-command popup. Never on the wall — the composer
     // it belongs to is not on screen.
     if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
-        let highlight = d.composer.suggestion_highlight();
-        if d.themes.picker_open() {
-            overlay::draw_theme_picker(frame, d.themes, vertical[3]);
-        } else if d.composer.is_model_command() {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.model_suggestions(),
-                highlight,
-                "",
-                theme,
-                vertical[3],
-            );
-        } else {
-            overlay::draw_suggestions(
-                frame,
-                &d.composer.suggestions(),
-                highlight,
-                "/",
-                theme,
-                vertical[3],
-            );
-        }
+        draw_composer_popups(frame, &d, theme, vertical[3]);
     }
 
     if matches!(d.mode, Mode::Help) {
@@ -578,6 +540,37 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     }
     if let Mode::Triage(state) = d.mode {
         triage::draw(frame, state, d.attach.as_ref(), d.now_ms, theme);
+    }
+}
+
+/// Draw whichever completion popup the composer currently wants, floating just above `anchor`:
+/// the theme picker, the `/model` picker, or the slash-command list.
+///
+/// One body for the list's composer and the wall's overlay, because which popup wins is an
+/// interlock rather than a lookup — the same one `handle_composer_popup_key` keeps on the key
+/// side. Two copies would drift the first time one of the guards changed.
+fn draw_composer_popups(frame: &mut Frame, d: &Draw, theme: &Theme, anchor: Rect) {
+    let highlight = d.composer.suggestion_highlight();
+    if d.themes.picker_open() {
+        overlay::draw_theme_picker(frame, d.themes, anchor);
+    } else if d.composer.is_model_command() {
+        overlay::draw_suggestions(
+            frame,
+            &d.composer.model_suggestions(),
+            highlight,
+            "",
+            theme,
+            anchor,
+        );
+    } else {
+        overlay::draw_suggestions(
+            frame,
+            &d.composer.suggestions(),
+            highlight,
+            "/",
+            theme,
+            anchor,
+        );
     }
 }
 
@@ -2257,6 +2250,35 @@ mod tests {
         assert!(
             !grid.contains("start something new"),
             "the draft must stay hidden while the tiles own the keyboard"
+        );
+    }
+
+    /// A slash command typed over the wall has to complete like it does in the list. The
+    /// popup anchors to the floating box rather than the composer's usual rows, which are a
+    /// zero-height slice while the grid is up — so without this the suggestions would render
+    /// off the top of the screen and the overlay would look like it had none.
+    #[test]
+    fn the_completion_popup_renders_over_the_wall_while_composing() {
+        let mut composer = Composer::new();
+        composer.set_commands(
+            vec!["implement".to_string()],
+            (composer.backend(), Some(std::path::PathBuf::from("/tmp"))),
+        );
+        for character in "/imp".chars() {
+            composer.push_char(character);
+        }
+        assert_eq!(composer.suggestions(), vec!["implement"]);
+
+        let (composing, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(
+            composing.contains("implement"),
+            "the completion popup is not on screen while composing over the wall"
+        );
+
+        let (grid, _) = wall_frame(&Mode::Normal, &composer);
+        assert!(
+            !grid.contains("implement"),
+            "the popup must stay hidden while the tiles own the keyboard"
         );
     }
 
