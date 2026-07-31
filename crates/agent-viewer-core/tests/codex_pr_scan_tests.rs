@@ -8,9 +8,7 @@ mod common;
 
 use agent_viewer_core::backend::Backend;
 use agent_viewer_core::codex::CodexBackend;
-use agent_viewer_core::codex::pr_scan::{
-    MAX_REFS_PER_SESSION, PrScanner, SCAN_BUDGET_BYTES, extract_pr_refs,
-};
+use agent_viewer_core::codex::pr_scan::{MAX_REFS_PER_SESSION, PrScanner, SCAN_BUDGET_BYTES};
 use std::io::Write;
 use std::path::Path;
 
@@ -41,6 +39,16 @@ fn hrefs(refs: &[agent_viewer_core::PrRef]) -> Vec<String> {
         .collect()
 }
 
+/// Drive the live incremental scanner over one rollout line of raw `text`. `refs_for` scans
+/// the raw line bytes, so this is the same code path production reaches URL extraction by.
+fn refs_in(text: &str) -> Vec<agent_viewer_core::PrRef> {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(&path, &format!("{text}\n"));
+    let mut budget = SCAN_BUDGET_BYTES;
+    PrScanner::new().refs_for(&path, &mut budget)
+}
+
 // --- pure extraction ---
 
 // The extractor keeps only real github PR links, dedupes repeats (agentos/399 appears 51
@@ -57,7 +65,7 @@ fn extract_keeps_distinct_github_prs_only() {
         "https://gitlab.com/o/r/pull/5 and https://github.com/example-org/example-repo ",
         "and https://api.github.com/repos/example-org/example-repo/pulls/12"
     );
-    let refs = extract_pr_refs(text);
+    let refs = refs_in(text);
     assert_eq!(
         hrefs(&refs),
         vec![
@@ -76,7 +84,7 @@ fn extract_keeps_distinct_github_prs_only() {
 fn extract_stops_at_json_delimiters() {
     let text = r#"{"url":"https://github.com/example-org/example-app/pull/399","n":1} (https://github.com/o/r/pull/7)"#;
     assert_eq!(
-        hrefs(&extract_pr_refs(text)),
+        hrefs(&refs_in(text)),
         vec![
             "https://github.com/example-org/example-app/pull/399".to_string(),
             "https://github.com/o/r/pull/7".to_string(),

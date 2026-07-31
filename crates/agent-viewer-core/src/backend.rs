@@ -153,9 +153,6 @@ pub struct Capabilities {
     pub archive: bool,
     pub delete: bool,
     pub stop: bool,
-    pub needs_input: bool,
-    pub pr_refs: bool,
-    pub live_status: bool,
 }
 
 impl Capabilities {
@@ -168,9 +165,6 @@ impl Capabilities {
             archive: false,
             delete: false,
             stop: false,
-            needs_input: false,
-            pr_refs: false,
-            live_status: false,
         }
     }
 }
@@ -307,56 +301,6 @@ pub(crate) fn squash(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A push notification from a backend that supports `subscribe`: either one session's status
-/// changed, or the backend's whole listing should be treated as stale and re-fetched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusEvent {
-    Changed {
-        backend: BackendKind,
-        id: String,
-        status: Status,
-    },
-    Invalidated {
-        backend: BackendKind,
-    },
-}
-
-/// The callback a subscriber hands to a backend's `subscribe`. It may be called from
-/// whatever thread the backend's push mechanism runs on (not necessarily the UI thread), so
-/// it must be `Send + Sync` and cheap.
-pub type StatusSink = std::sync::Arc<dyn Fn(StatusEvent) + Send + Sync>;
-
-/// A live push subscription. Dropping it unsubscribes: the backend's `stop` closure runs
-/// exactly once, on drop, so a subscription can never outlive its owner and leak a
-/// background thread or listener.
-pub struct Subscription {
-    stop: Option<Box<dyn FnOnce() + Send>>,
-}
-
-impl Subscription {
-    pub fn inactive() -> Subscription {
-        Subscription { stop: None }
-    }
-
-    pub fn new(stop: impl FnOnce() + Send + 'static) -> Subscription {
-        Subscription {
-            stop: Some(Box::new(stop)),
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.stop.is_some()
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            stop();
-        }
-    }
-}
-
 /// `Send` so the TUI can move the listing backends onto a dedicated refresh thread
 /// (each impl's state — rusqlite Connection, caches, PathBuf — is already Send).
 pub trait Backend: Send {
@@ -444,14 +388,6 @@ pub trait Backend: Send {
         &self,
         session: &Session,
     ) -> std::result::Result<std::process::Command, crate::error::AttachRefusal>;
-    /// Opt-in push notifications for status changes. The default is a no-op (an inactive
-    /// `Subscription`) so backends can adopt push incrementally: every backend already works
-    /// correctly on the refresh worker's poll loop, so overriding this is a pure
-    /// optimization, never a requirement, and the poll loop stays as the backstop regardless.
-    fn subscribe(&self, sink: StatusSink) -> crate::error::Result<Subscription> {
-        let _ = sink;
-        Ok(Subscription::inactive())
-    }
 }
 
 /// Remove duplicates while preserving first-seen order (case-sensitive exact match).

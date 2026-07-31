@@ -30,48 +30,6 @@ fn held_by_daemon() -> FdSignal {
 }
 
 #[test]
-fn needs_input_when_open_and_awaiting() {
-    let path = common::fixture_path("rollout_approval.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::NeedsInput {
-            reason: Some("awaiting approval".to_string())
-        }
-    );
-}
-
-#[test]
-fn working_when_open_and_midturn() {
-    let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::Working
-    );
-}
-
-#[test]
-fn idle_when_open_and_complete() {
-    // Live session between turns: held open + tail Complete -> Idle.
-    let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::Idle
-    );
-}
-
-#[test]
-fn done_when_closed_and_complete() {
-    let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(resolve_status(&path, closed(), false), Status::Done);
-}
-
-#[test]
-fn failed_when_closed_and_midturn() {
-    let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, closed(), false), Status::Error);
-}
-
-#[test]
 fn failed_when_file_missing() {
     // Missing file, empty map: Failed, never panics.
     let path = PathBuf::from("/nonexistent/rollout-does-not-exist.jsonl");

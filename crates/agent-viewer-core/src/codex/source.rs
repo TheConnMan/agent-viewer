@@ -47,14 +47,4 @@ impl Source {
     pub fn is_companion(&self) -> bool {
         matches!(self, Source::Exec | Source::Subagent(_))
     }
-
-    /// "cli" | "exec" | "vscode" | the Subagent label. For display.
-    pub fn label(&self) -> &str {
-        match self {
-            Source::Cli => "cli",
-            Source::Exec => "exec",
-            Source::VsCode => "vscode",
-            Source::Subagent(label) => label,
-        }
-    }
 }

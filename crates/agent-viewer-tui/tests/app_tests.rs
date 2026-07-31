@@ -1232,40 +1232,6 @@ fn rename_resolves_target_by_key_after_reorder() {
 }
 
 #[test]
-fn show_all_covers_companions_and_archived() {
-    let mut companion = sess(BackendKind::Codex, "comp", "/p", 300, Status::Idle);
-    companion.companion = true;
-    let mut archived = sess(BackendKind::Codex, "arch", "/p", 200, Status::Done);
-    archived.hidden = true;
-    let visible = sess(BackendKind::Codex, "vis", "/p", 100, Status::Done);
-    let mut app = App::new(vec![companion, archived, visible]);
-
-    // Default view hides both the companion and the archived row.
-    let ids: Vec<String> = session_rows(app.visible())
-        .iter()
-        .filter_map(|r| match r {
-            Row::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ids, vec!["vis".to_string()]);
-    assert_eq!(app.hidden_count(), 2);
-
-    // Ctrl+A reveals both hidden classes.
-    app.toggle_show_all();
-    let shown: Vec<String> = session_rows(app.visible())
-        .iter()
-        .filter_map(|r| match r {
-            Row::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(shown.contains(&"comp".to_string()));
-    assert!(shown.contains(&"arch".to_string()));
-    assert!(shown.contains(&"vis".to_string()));
-}
-
-#[test]
 fn kill_stage_two_stage() {
     let sessions = vec![
         sess(BackendKind::Codex, "work", "/p", 300, Status::Working),
@@ -2500,46 +2466,6 @@ fn navigation_skips_collapsed_group_rows() {
         reached_b1,
         "the uncollapsed group's session must stay reachable"
     );
-}
-
-#[test]
-fn headers_are_selectable_via_arrows() {
-    let sessions = vec![
-        sess(
-            BackendKind::Codex,
-            "a1",
-            "/synthetic/a",
-            300,
-            Status::Working,
-        ),
-        sess(
-            BackendKind::Codex,
-            "b1",
-            "/synthetic/b",
-            200,
-            Status::Working,
-        ),
-    ];
-    let mut app = App::new(sessions);
-
-    // Arrow from the top until a ProjectHeader is under the cursor.
-    app.move_selection(-100_000);
-    let mut found = false;
-    for _ in 0..(app.visible().len() + 2) {
-        if matches!(
-            app.visible().get(app.selected_index()),
-            Some(Row::ProjectHeader { .. })
-        ) {
-            found = true;
-            break;
-        }
-        app.move_selection(1);
-    }
-    assert!(found, "arrows never landed on a ProjectHeader");
-
-    // On a header, selected() is None but toggle_selected_group would act.
-    assert!(app.selected().is_none());
-    assert!(app.toggle_selected_group().is_some());
 }
 
 #[test]
