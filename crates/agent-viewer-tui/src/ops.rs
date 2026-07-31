@@ -8,7 +8,6 @@ use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::group::project_root;
-use agent_viewer_core::opencode::{OpencodeBackend, OpencodeRuntime};
 use agent_viewer_core::router::RouterOutcome;
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::{Session, SpawnResult, Status, ViewerDb, default_codex_home};
@@ -66,14 +65,10 @@ impl Mutation {
         Self::SpawnAuto {
             target,
             task,
-            preexisting_ids: [
-                BackendKind::Codex,
-                BackendKind::Claude,
-                BackendKind::Opencode,
-            ]
-            .into_iter()
-            .map(|backend| (backend, app.session_ids_for_backend(backend)))
-            .collect(),
+            preexisting_ids: [BackendKind::Codex, BackendKind::Claude]
+                .into_iter()
+                .map(|backend| (backend, app.session_ids_for_backend(backend)))
+                .collect(),
         }
     }
 
@@ -125,11 +120,10 @@ fn spawn_selection_from_mutation(
 }
 
 /// A fresh backend instance for a worker thread.
-fn fresh_backend(kind: BackendKind, opencode_runtime: &OpencodeRuntime) -> Box<dyn Backend> {
+fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
-        BackendKind::Opencode => Box::new(OpencodeBackend::with_runtime(opencode_runtime.clone())),
     }
 }
 
@@ -163,11 +157,8 @@ pub(crate) fn resolve_attach_with_backend(
     Ok(AttachPlan { session, command })
 }
 
-pub(crate) fn resolve_attach_with_opencode(
-    request: TargetRequest,
-    opencode_runtime: OpencodeRuntime,
-) -> Result<AttachPlan, String> {
-    let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+pub(crate) fn resolve_attach(request: TargetRequest) -> Result<AttachPlan, String> {
+    let mut backend = fresh_backend(request.backend());
     resolve_attach_with_backend(backend.as_mut(), request)
 }
 
@@ -188,21 +179,17 @@ where
     result
 }
 
-fn run_with_fresh_backend<F>(
-    request: TargetRequest,
-    opencode_runtime: &OpencodeRuntime,
-    action: F,
-) -> Result<MutationOutcome, String>
+fn run_with_fresh_backend<F>(request: TargetRequest, action: F) -> Result<MutationOutcome, String>
 where
     F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
 {
-    let mut backend = fresh_backend(request.backend(), opencode_runtime);
+    let mut backend = fresh_backend(request.backend());
     let db = ViewerDb::open_default().ok();
     run_targeted(backend.as_mut(), db.as_ref(), &request, action)
 }
 
 /// A session we just stopped can briefly still resolve as `Working`/`NeedsInput`: `claude stop`
-/// (and the codex/opencode equivalents) reports success once the interrupt is accepted, but the
+/// (and the codex equivalent) reports success once the interrupt is accepted, but the
 /// session's own status source (Claude's `claude agents --json`, a rollout file, etc.) settles a
 /// beat later. Poll `authoritative_target` again within this bounded window before concluding
 /// the session is genuinely active again, rather than refusing on the very next stale read.
@@ -324,14 +311,11 @@ fn run_spawn_with_backend(
 /// The directory a spawn target resolves to, for a spawn path with no backend of its own.
 /// A session target is resolved against the backend that OWNS the row, which is the only one
 /// that can answer for it.
-fn spawn_directory(
-    target: &SpawnTarget,
-    opencode_runtime: &OpencodeRuntime,
-) -> Result<std::path::PathBuf, String> {
+fn spawn_directory(target: &SpawnTarget) -> Result<std::path::PathBuf, String> {
     match target {
         SpawnTarget::ExplicitDirectory(directory) => Ok(directory.clone()),
         SpawnTarget::Session { request, mode, .. } => {
-            let mut owner = fresh_backend(request.backend(), opencode_runtime);
+            let mut owner = fresh_backend(request.backend());
             let session = authoritative_target(owner.as_mut(), request).map_err(target_failure)?;
             Ok(match mode {
                 SpawnDirectoryMode::WorkingDirectory => session.cwd,
@@ -351,11 +335,10 @@ fn run_spawn_auto(
     target: &SpawnTarget,
     task: &str,
     preexisting_ids: &HashMap<BackendKind, HashSet<String>>,
-    opencode_runtime: &OpencodeRuntime,
     db: Option<&ViewerDb>,
     route: impl FnOnce(&std::path::Path, &str) -> Result<RouterOutcome, String>,
 ) -> Result<MutationOutcome, String> {
-    let directory = spawn_directory(target, opencode_runtime)?;
+    let directory = spawn_directory(target)?;
     // BOTH stamps are kept, because the routed job is created somewhere between them and the
     // fallback has to bracket that whole interval. The classifier call plus the winning backend's
     // own spawn can burn most of the router's 180s deadline, and the router then polls seconds
@@ -367,7 +350,7 @@ fn run_spawn_auto(
     let spawned_at_ms = now_ms();
     // The winning provider's cached listing predates the job it now owns: fence it, same as a
     // direct spawn does, so the next tick refetches instead of waiting out the freshness window.
-    let winner = fresh_backend(outcome.provider, opencode_runtime);
+    let winner = fresh_backend(outcome.provider);
     invalidate_backend_scope(db, winner.as_ref());
     Ok(MutationOutcome {
         notice: outcome.notice(),
@@ -389,87 +372,70 @@ fn run_spawn_auto(
 /// Run one mutation to completion, applying its viewer-DB follow-up against a fresh
 /// connection so the render loop never blocks. Returns the user-facing notice and any
 /// successful spawn identity needed by the UI.
-#[cfg(test)]
 pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
-    run_mutation_with_opencode(m, OpencodeRuntime::new())
-}
-
-/// Run one mutation with the OpenCode runtime shared by listing and actions.
-pub(crate) fn run_mutation_with_opencode(
-    m: Mutation,
-    opencode_runtime: OpencodeRuntime,
-) -> Result<MutationOutcome, String> {
     match m {
-        Mutation::Stop(request) => {
-            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
-                if !backend.capabilities_for(session).stop {
-                    return Err(format!("{} does not support stop", session.backend.name()));
-                }
-                backend
-                    .stop(session)
-                    .map(|()| MutationOutcome {
-                        notice: format!("stopped: {}", session.title),
-                        spawned: None,
-                    })
-                    .map_err(|error| format!("stop failed: {error}"))
-            })
-        }
+        Mutation::Stop(request) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).stop {
+                return Err(format!("{} does not support stop", session.backend.name()));
+            }
+            backend
+                .stop(session)
+                .map(|()| MutationOutcome {
+                    notice: format!("stopped: {}", session.title),
+                    spawned: None,
+                })
+                .map_err(|error| format!("stop failed: {error}"))
+        }),
         Mutation::Remove {
             request,
             require_finished,
         } => {
-            let mut backend = fresh_backend(request.backend(), &opencode_runtime);
+            let mut backend = fresh_backend(request.backend());
             let db = ViewerDb::open_default().ok();
             run_remove(backend.as_mut(), db.as_ref(), &request, require_finished)
         }
-        Mutation::Rename(request, name) => {
-            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
-                if !backend.capabilities_for(session).rename {
-                    return Err(format!(
-                        "{} does not support rename",
-                        session.backend.name()
-                    ));
-                }
-                backend
-                    .rename(session, &name)
-                    .map(|()| MutationOutcome {
-                        notice: format!("renamed {}", session.backend.name()),
-                        spawned: None,
-                    })
-                    .map_err(|error| format!("rename failed: {error}"))
-            })
-        }
-        Mutation::Hide(request) => {
-            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
-                if !backend.capabilities_for(session).archive {
-                    return Err(format!("{} does not support hide", session.backend.name()));
-                }
-                backend
-                    .hide(&session.id)
-                    .map(|()| MutationOutcome {
-                        notice: format!("archived: {}", session.title),
-                        spawned: None,
-                    })
-                    .map_err(|error| format!("{}: {error}", session.backend.name()))
-            })
-        }
-        Mutation::Unhide(request) => {
-            run_with_fresh_backend(request, &opencode_runtime, |backend, session| {
-                if !backend.capabilities_for(session).archive {
-                    return Err(format!(
-                        "{} does not support unhide",
-                        session.backend.name()
-                    ));
-                }
-                backend
-                    .unhide(&session.id)
-                    .map(|()| MutationOutcome {
-                        notice: format!("unarchived: {}", session.title),
-                        spawned: None,
-                    })
-                    .map_err(|error| format!("{}: {error}", session.backend.name()))
-            })
-        }
+        Mutation::Rename(request, name) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).rename {
+                return Err(format!(
+                    "{} does not support rename",
+                    session.backend.name()
+                ));
+            }
+            backend
+                .rename(session, &name)
+                .map(|()| MutationOutcome {
+                    notice: format!("renamed {}", session.backend.name()),
+                    spawned: None,
+                })
+                .map_err(|error| format!("rename failed: {error}"))
+        }),
+        Mutation::Hide(request) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).archive {
+                return Err(format!("{} does not support hide", session.backend.name()));
+            }
+            backend
+                .hide(&session.id)
+                .map(|()| MutationOutcome {
+                    notice: format!("archived: {}", session.title),
+                    spawned: None,
+                })
+                .map_err(|error| format!("{}: {error}", session.backend.name()))
+        }),
+        Mutation::Unhide(request) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).archive {
+                return Err(format!(
+                    "{} does not support unhide",
+                    session.backend.name()
+                ));
+            }
+            backend
+                .unhide(&session.id)
+                .map(|()| MutationOutcome {
+                    notice: format!("unarchived: {}", session.title),
+                    spawned: None,
+                })
+                .map_err(|error| format!("{}: {error}", session.backend.name()))
+        }),
         Mutation::SpawnAuto {
             target,
             task,
@@ -480,7 +446,6 @@ pub(crate) fn run_mutation_with_opencode(
                 &target,
                 &task,
                 &preexisting_ids,
-                &opencode_runtime,
                 db.as_ref(),
                 agent_viewer_core::router::route,
             )
@@ -492,12 +457,12 @@ pub(crate) fn run_mutation_with_opencode(
             else {
                 unreachable!();
             };
-            let mut action_backend = fresh_backend(*backend, &opencode_runtime);
+            let mut action_backend = fresh_backend(*backend);
             let db = ViewerDb::open_default().ok();
             if let SpawnTarget::Session { request, mode, .. } = target
                 && request.backend() != *backend
             {
-                let mut authority_backend = fresh_backend(request.backend(), &opencode_runtime);
+                let mut authority_backend = fresh_backend(request.backend());
                 let directory = match authoritative_target(authority_backend.as_mut(), request) {
                     Ok(session) => match mode {
                         SpawnDirectoryMode::WorkingDirectory => session.cwd,
@@ -521,7 +486,6 @@ mod tests {
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::claude::ClaudeBackend;
-    use agent_viewer_core::opencode::OpencodeRuntime;
     use agent_viewer_core::spawn::now_ms;
     use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
@@ -544,7 +508,6 @@ mod tests {
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_spawn")),
             "a routed task",
             &HashMap::new(),
-            &OpencodeRuntime::new(),
             None,
             |_directory, _task| {
                 std::thread::sleep(Duration::from_millis(routing_ms));
@@ -598,7 +561,6 @@ mod tests {
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_invalidate")),
             "a routed task",
             &HashMap::new(),
-            &OpencodeRuntime::new(),
             Some(&db),
             |_directory, _task| {
                 Ok(RouterOutcome {
@@ -646,7 +608,6 @@ mod tests {
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_window")),
             "a routed task",
             &HashMap::new(),
-            &OpencodeRuntime::new(),
             None,
             |_directory, _task| {
                 std::thread::sleep(Duration::from_millis(routing_ms));

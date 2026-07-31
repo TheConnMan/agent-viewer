@@ -13,12 +13,6 @@ pub enum MarkSet {
     Glyph,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RowDensity {
-    Normal,
-    Compact,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Theme {
     pub id: String,
@@ -47,7 +41,6 @@ pub struct Theme {
     pub pulse_start: Color,
     pub pulse_end: Color,
     pub mark_set: MarkSet,
-    pub row_density: RowDensity,
     pub animation: bool,
     source_path: Option<PathBuf>,
     modified: Option<SystemTime>,
@@ -253,7 +246,6 @@ pub fn amber(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0xb5, 0x95, 0x50),
         pulse_end: rgb(0xf4, 0xc0, 0x72),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -285,7 +277,6 @@ pub fn terminal(glyph_marks: bool) -> Theme {
         pulse_start: Color::Yellow,
         pulse_end: Color::LightYellow,
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -317,7 +308,6 @@ pub fn paper(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x8a, 0x64, 0x10),
         pulse_end: rgb(0xa1, 0x65, 0x2a),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -349,7 +339,6 @@ pub fn mono16(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x8a, 0x8a, 0x8a),
         pulse_end: rgb(0xff, 0xff, 0xff),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -381,7 +370,6 @@ fn aubergine(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0xa8, 0x19, 0x48),
         pulse_end: rgb(0xff, 0x5c, 0x8a),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -413,7 +401,6 @@ fn hoth(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x5a, 0x9e, 0xbd),
         pulse_end: rgb(0x23, 0x78, 0xa5),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -445,7 +432,6 @@ fn catppuccin(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x89, 0xb4, 0xfa),
         pulse_end: rgb(0xcb, 0xa6, 0xf7),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -477,7 +463,6 @@ fn tokyonight(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x3d, 0x59, 0xa1),
         pulse_end: rgb(0x7a, 0xa2, 0xf7),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -509,7 +494,6 @@ fn gruvbox(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0xb5, 0x76, 0x14),
         pulse_end: rgb(0xfe, 0xc1, 0x5a),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -541,7 +525,6 @@ fn rosepine(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x90, 0x7a, 0xb8),
         pulse_end: rgb(0xdf, 0xb7, 0xf1),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,
@@ -573,7 +556,6 @@ fn nord(glyph_marks: bool) -> Theme {
         pulse_start: rgb(0x5e, 0x81, 0x90),
         pulse_end: rgb(0x88, 0xc0, 0xd0),
         mark_set: mark_set(glyph_marks),
-        row_density: RowDensity::Normal,
         animation: true,
         source_path: None,
         modified: None,

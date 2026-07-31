@@ -1,2 +1,0 @@
-this is not json at all
-{"timestamp": "2026-07-10T21:07:10.000Z", "type": "response_item", "payload": {"type": "message", "id": "user_msg", "role": "user", "content": [{"type": "input_text", "text": "ignored"}]}}

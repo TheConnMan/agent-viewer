@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Fold cwd to its project root:
@@ -32,37 +31,4 @@ pub fn project_root(cwd: &std::path::Path) -> std::path::PathBuf {
         }
     }
     cwd.to_path_buf()
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectGroup {
-    pub root: std::path::PathBuf,
-    pub sessions: Vec<crate::backend::Session>,
-}
-
-/// Group by project_root(cwd) ACROSS backends. Order groups by directory path
-/// (case-insensitive) so the list stays stable regardless of session activity;
-/// sort each group's sessions by start time (created_at_ms) ascending.
-pub fn group_by_project(sessions: Vec<crate::backend::Session>) -> Vec<ProjectGroup> {
-    let mut by_root: HashMap<PathBuf, Vec<crate::backend::Session>> = HashMap::new();
-    for session in sessions {
-        let root = project_root(&session.cwd);
-        by_root.entry(root).or_default().push(session);
-    }
-    let mut groups: Vec<ProjectGroup> = by_root
-        .into_iter()
-        .map(|(root, mut sessions)| {
-            sessions.sort_by_key(|s| s.created_at_ms);
-            ProjectGroup { root, sessions }
-        })
-        .collect();
-    // Stable order: by directory path, case-insensitive, independent of activity.
-    groups.sort_by(|a, b| {
-        a.root
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&b.root.to_string_lossy().to_lowercase())
-            .then_with(|| a.root.cmp(&b.root))
-    });
-    groups
 }

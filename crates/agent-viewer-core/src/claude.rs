@@ -142,10 +142,36 @@ pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabil
         archive: false,
         delete: true,
         stop: true,
-        needs_input: true,
-        pr_refs: true,
-        live_status: true,
     }
+}
+
+/// How long `claude agents --json --all` may take before the listing gives up on it.
+///
+/// Generous, because it runs on the refresh worker and the CLI does real work (it walks the
+/// jobs tree), and a deadline it loses empties the whole Claude backend for that tick. Its
+/// purpose is only to keep a WEDGED claude from parking that worker forever: the call had no
+/// deadline at all, and `std::process::Command::output` waits without bound.
+const AGENTS_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run `claude agents --json --all` under a deadline, returning its stdout.
+///
+/// A missing binary, a non-zero exit, a hang past `timeout`, or non-utf8 stdout are all the
+/// same answer: None, which the caller renders as a quiet empty backend rather than an error.
+pub fn agents_json(binary: &std::path::Path, timeout: std::time::Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("agents").arg("--json").arg("--all");
+    crate::spawn::run_with_timeout(cmd, timeout)
+}
+
+/// A file's mtime as epoch milliseconds, or None when it cannot be read.
+fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as i64)
 }
 
 pub fn capabilities_for_session_on_platform(
@@ -184,18 +210,10 @@ impl Backend for ClaudeBackend {
         capabilities_for_session_on_platform(crate::platform::current_platform(), session)
     }
     fn list(&mut self) -> Result<Vec<Session>> {
-        // A missing/failing binary or non-zero exit is a quiet empty backend, not an error.
-        // `--all` includes completed sessions (required to populate the DONE section).
-        let output = std::process::Command::new(&self.binary)
-            .arg("agents")
-            .arg("--json")
-            .arg("--all")
-            .output();
-        let output = match output {
-            Ok(output) if output.status.success() => output,
-            _ => return Ok(Vec::new()),
+        let Some(stdout) = agents_json(std::path::Path::new(&self.binary), AGENTS_LIST_TIMEOUT)
+        else {
+            return Ok(Vec::new());
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut sessions = parse_agents_json(&stdout)?;
         for session in &mut sessions {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
@@ -220,6 +238,19 @@ impl Backend for ClaudeBackend {
             if session.rollout_path.is_none() {
                 session.rollout_path =
                     canonical_transcript_path(&self.jobs_root, &session.cwd, &session.id);
+            }
+            // A `claude agents` entry can arrive with no `startedAt`, which parses to 0. Left
+            // there the row sorts at the epoch, in front of every real session, and it can
+            // never be matched to a spawn: spawn matching keys on created_at_ms landing inside
+            // a window seconds wide around the spawn instant, so the just-created row is
+            // invisible to the viewer that created it. Fall back to a real timestamp for the
+            // session: its job state.json mtime (already read into updated_at_ms above), else
+            // the transcript's own mtime.
+            if session.created_at_ms == 0 {
+                session.created_at_ms = Some(session.updated_at_ms)
+                    .filter(|updated| *updated > 0)
+                    .or_else(|| session.rollout_path.as_deref().and_then(file_mtime_ms))
+                    .unwrap_or(0);
             }
         }
         // Hide nested `claude -p` children. The entrypoint lives only in the per-process
@@ -449,15 +480,15 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
     Ok(true)
 }
 
-/// Companion filter for claude - the peer of the codex `Source::is_companion` rule and the
-/// opencode `is_run_mode_permission` rule, which claude previously had no equivalent of.
+/// Companion filter for claude - the peer of the codex `Source::is_companion` rule, which
+/// claude previously had no equivalent of.
 ///
 /// Every live claude process registers itself in `~/.claude/sessions/<pid>.json`, and
 /// `claude agents --json --all` returns all of them. That includes a NESTED `claude -p` (the
 /// Agent SDK's headless entrypoint) that another session shelled out to - a skill, a hook, an
 /// `/implement` planning pass. It is a real process, but not a fleet member anyone started,
 /// and it carries no `jobId`, so claude derives its name from the cwd as `<dir-basename>-<n>`
-/// ("opencode-server-runtime-69"). Those rows read as mystery sessions in the default view and
+/// ("agent-viewer-worker-69"). Those rows read as mystery sessions in the default view and
 /// vanish when the child exits, since the pid file is removed on exit.
 ///
 /// The discriminator is `entrypoint`, matched on the `sdk-` PREFIX so the whole Agent SDK
@@ -467,7 +498,7 @@ pub fn ensure_trusted(config_path: &std::path::Path, cwd: &std::path::Path) -> R
 /// of `id`/`jobId` is equally true of one. A `--bg` job and an interactive session BOTH report
 /// `entrypoint: "cli"`, which is exactly what makes the `sdk-` prefix the safe cut.
 ///
-/// Same safe direction as the opencode rule: anything unrecognized is treated as a real
+/// Same safe direction as the codex rule: anything unrecognized is treated as a real
 /// session, because a shown row one keypress from hidden beats a hidden row you cannot find.
 /// Companion only HIDES (Ctrl+A reveals); it never drops the row.
 pub fn is_sdk_entrypoint(entrypoint: Option<&str>) -> bool {
@@ -917,19 +948,20 @@ pub fn replace_atomic(_path: &std::path::Path, _body: &str) -> Result<()> {
 /// attachment/system/queue-operation/etc. Blocks are emitted in the order they appear, so
 /// prose written before a tool call stays before it. Return at most the LAST max_events
 /// events.
+///
+/// Only the final `TRANSCRIPT_TAIL_BYTES` of the file are read. A transcript grows without
+/// bound while a session works, and this runs on every refresh tick to render a handful of
+/// events, so parsing the whole file re-read megabytes per tick.
 pub fn read_claude_transcript(
     path: &std::path::Path,
     max_events: usize,
 ) -> Result<Vec<crate::backend::TailEvent>> {
     use crate::backend::TailEvent;
-    use std::io::BufRead;
 
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
+    let window = crate::read_tail_window(path, crate::TRANSCRIPT_TAIL_BYTES)?;
     let mut events = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let Some(value) = crate::parse_json_line(&line) else {
+    for line in window.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
             continue;
         };
         let is_user = match crate::json_str(&value, "type") {

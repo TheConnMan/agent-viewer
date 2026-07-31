@@ -929,7 +929,7 @@ fn done_section_is_uncapped() {
 
 #[test]
 fn toggle_group_mode_project_rows() {
-    // A codex and an opencode session sharing one cwd must merge into one project.
+    // A codex and a claude session sharing one cwd must merge into one project.
     let sessions = vec![
         sess(
             BackendKind::Codex,
@@ -939,7 +939,7 @@ fn toggle_group_mode_project_rows() {
             Status::Working,
         ),
         sess(
-            BackendKind::Opencode,
+            BackendKind::Claude,
             "oc",
             "/synthetic/shared",
             200,
@@ -1229,40 +1229,6 @@ fn rename_resolves_target_by_key_after_reorder() {
     // And re-pinning selection back onto the rename row works (keeps the edit under cursor).
     assert!(app.select_by_key(&target));
     assert_eq!(app.selected().map(|s| s.id.as_str()), Some("a"));
-}
-
-#[test]
-fn show_all_covers_companions_and_archived() {
-    let mut companion = sess(BackendKind::Codex, "comp", "/p", 300, Status::Idle);
-    companion.companion = true;
-    let mut archived = sess(BackendKind::Codex, "arch", "/p", 200, Status::Done);
-    archived.hidden = true;
-    let visible = sess(BackendKind::Codex, "vis", "/p", 100, Status::Done);
-    let mut app = App::new(vec![companion, archived, visible]);
-
-    // Default view hides both the companion and the archived row.
-    let ids: Vec<String> = session_rows(app.visible())
-        .iter()
-        .filter_map(|r| match r {
-            Row::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ids, vec!["vis".to_string()]);
-    assert_eq!(app.hidden_count(), 2);
-
-    // Ctrl+A reveals both hidden classes.
-    app.toggle_show_all();
-    let shown: Vec<String> = session_rows(app.visible())
-        .iter()
-        .filter_map(|r| match r {
-            Row::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(shown.contains(&"comp".to_string()));
-    assert!(shown.contains(&"arch".to_string()));
-    assert!(shown.contains(&"vis".to_string()));
 }
 
 #[test]
@@ -1846,11 +1812,9 @@ fn composer_edit_and_backend_cycle() {
     c.backspace(); // backspace on empty is a no-op, not a panic.
     assert!(c.is_empty());
 
-    // Tab cycles Claude -> Codex -> Opencode -> Claude.
+    // Tab cycles Claude -> Codex -> Claude.
     c.cycle_backend();
     assert_eq!(c.backend(), BackendKind::Codex);
-    c.cycle_backend();
-    assert_eq!(c.backend(), BackendKind::Opencode);
     c.cycle_backend();
     assert_eq!(c.backend(), BackendKind::Claude);
 
@@ -2060,24 +2024,7 @@ fn composer_cycle_model_over_discovered_list() {
 }
 
 #[test]
-fn composer_cycle_model_noop_on_opencode_and_single_item() {
-    // Opencode's list is huge, so Shift+Tab is a NO-OP there (the picker is the way).
-    let mut c = Composer::new();
-    c.cycle_backend(); // codex
-    c.cycle_backend(); // opencode
-    assert_eq!(c.backend(), BackendKind::Opencode);
-    c.set_models(
-        vec![
-            "default".into(),
-            "anthropic/claude".into(),
-            "openai/gpt".into(),
-        ],
-        BackendKind::Opencode,
-    );
-    assert_eq!(c.model(), "default");
-    c.cycle_model();
-    assert_eq!(c.model(), "default"); // unchanged despite a multi-item list
-
+fn composer_cycle_model_noop_on_single_item() {
     // A single-item list is a no-op on any backend.
     let mut c2 = Composer::new();
     c2.set_models(vec!["opus[1m]".into()], BackendKind::Claude);
@@ -2522,46 +2469,6 @@ fn navigation_skips_collapsed_group_rows() {
 }
 
 #[test]
-fn headers_are_selectable_via_arrows() {
-    let sessions = vec![
-        sess(
-            BackendKind::Codex,
-            "a1",
-            "/synthetic/a",
-            300,
-            Status::Working,
-        ),
-        sess(
-            BackendKind::Codex,
-            "b1",
-            "/synthetic/b",
-            200,
-            Status::Working,
-        ),
-    ];
-    let mut app = App::new(sessions);
-
-    // Arrow from the top until a ProjectHeader is under the cursor.
-    app.move_selection(-100_000);
-    let mut found = false;
-    for _ in 0..(app.visible().len() + 2) {
-        if matches!(
-            app.visible().get(app.selected_index()),
-            Some(Row::ProjectHeader { .. })
-        ) {
-            found = true;
-            break;
-        }
-        app.move_selection(1);
-    }
-    assert!(found, "arrows never landed on a ProjectHeader");
-
-    // On a header, selected() is None but toggle_selected_group would act.
-    assert!(app.selected().is_none());
-    assert!(app.toggle_selected_group().is_some());
-}
-
-#[test]
 fn toggle_selected_group_none_on_session_row() {
     let sessions = vec![
         sess(
@@ -2786,7 +2693,7 @@ fn composer_set_models_resets_when_the_pick_vanishes_from_the_refreshed_list() {
 
 #[test]
 fn composer_set_models_resets_the_pick_when_the_backend_changes() {
-    // Codex's pick is meaningless to opencode; a backend switch always lands on its default.
+    // Codex's pick is meaningless to claude; a backend switch always lands on its default.
     let mut c = Composer::new();
     c.cycle_backend(); // -> codex
     c.set_models(
@@ -2796,10 +2703,10 @@ fn composer_set_models_resets_the_pick_when_the_backend_changes() {
     c.cycle_model();
     assert_eq!(c.model(), "gpt-5.6-sol");
 
-    c.cycle_backend(); // -> opencode
+    c.cycle_backend(); // -> claude
     c.set_models(
         vec!["default".into(), "gpt-5.6-sol".into()],
-        BackendKind::Opencode,
+        BackendKind::Claude,
     );
     assert_eq!(c.model(), "default");
 }

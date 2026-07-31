@@ -30,48 +30,6 @@ fn held_by_daemon() -> FdSignal {
 }
 
 #[test]
-fn needs_input_when_open_and_awaiting() {
-    let path = common::fixture_path("rollout_approval.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::NeedsInput {
-            reason: Some("awaiting approval".to_string())
-        }
-    );
-}
-
-#[test]
-fn working_when_open_and_midturn() {
-    let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::Working
-    );
-}
-
-#[test]
-fn idle_when_open_and_complete() {
-    // Live session between turns: held open + tail Complete -> Idle.
-    let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(
-        resolve_status(&path, held_by_session(), false),
-        Status::Idle
-    );
-}
-
-#[test]
-fn done_when_closed_and_complete() {
-    let path = common::fixture_path("rollout_complete.jsonl");
-    assert_eq!(resolve_status(&path, closed(), false), Status::Done);
-}
-
-#[test]
-fn failed_when_closed_and_midturn() {
-    let path = common::fixture_path("rollout_midturn.jsonl");
-    assert_eq!(resolve_status(&path, closed(), false), Status::Error);
-}
-
-#[test]
 fn failed_when_file_missing() {
     // Missing file, empty map: Failed, never panics.
     let path = PathBuf::from("/nonexistent/rollout-does-not-exist.jsonl");
@@ -321,5 +279,59 @@ fn unavailable_process_evidence_never_claims_a_pid_or_daemon() {
     assert_eq!(
         resolver.resolve(&midturn, unavailable(), false),
         (Status::Unknown, None, false)
+    );
+}
+
+/// PRODUCTION PATH COVERAGE. Every rule above is asserted through the pure `resolve`, but
+/// `list` calls `resolve_scanned`, which canonicalizes the row's path and looks the fd signal up
+/// in the sweep itself. That step was untested: forcing `fd_signal` to `Unavailable` left the
+/// whole suite green while the running/done distinction collapsed on the real listing.
+#[test]
+fn resolve_scanned_reads_the_fd_signal_out_of_the_scan() {
+    use agent_viewer_core::codex::status::CodexProcessScan;
+    use std::collections::{HashMap, HashSet};
+
+    // A real file on disk: `resolve_scanned` canonicalizes before the lookup, so the scan's key
+    // has to be the canonical path, exactly as the /proc/<pid>/fd sweep records it.
+    let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
+    let canonical = std::fs::canonicalize(&path).expect("canonicalize the rollout");
+    let mut resolver = StatusResolver::new();
+
+    let held = CodexProcessScan::from_evidence(
+        HashMap::from([(
+            canonical,
+            RolloutOwner {
+                pid: 4242,
+                daemon: false,
+            },
+        )]),
+        HashSet::new(),
+        true,
+    );
+    assert_eq!(
+        resolver.resolve_scanned(&path, &held, false),
+        (Status::Idle, Some(4242), false),
+        "a rollout the sweep found open is a LIVE session between turns"
+    );
+
+    // Same file, same resolver (so the tail cache is warm): nothing holds it now.
+    let closed_scan = CodexProcessScan::from_evidence(HashMap::new(), HashSet::new(), true);
+    assert_eq!(
+        resolver.resolve_scanned(&path, &closed_scan, false),
+        (Status::Done, None, false),
+        "no holder plus a complete tail is Done"
+    );
+
+    // Only a platform without procfs may report unavailable, and it must not claim a pid.
+    let blind = CodexProcessScan::from_evidence(HashMap::new(), HashSet::new(), false);
+    assert_eq!(
+        resolver.resolve_scanned(&path, &blind, false),
+        (Status::Done, None, false)
+    );
+    let (_dir, midturn) = common::copy_fixture_to_temp("rollout_midturn.jsonl");
+    assert_eq!(
+        resolver.resolve_scanned(&midturn, &blind, false),
+        (Status::Unknown, None, false),
+        "an unreadable process table proves nothing about a mid-turn rollout"
     );
 }

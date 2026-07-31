@@ -7,8 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_viewer_core::backend::{Backend, BackendKind, all_backends_with_opencode};
-use agent_viewer_core::opencode::OpencodeRuntime;
+use agent_viewer_core::backend::{Backend, BackendKind, all_backends};
 use agent_viewer_core::platform::{Platform, current_platform};
 use agent_viewer_core::pty::{
     PtySession, PtySpec, TerminalPalette, VIEWPORT_SCROLLBACK_ROWS, spec_from_command,
@@ -64,16 +63,12 @@ const ACTIVITY_LOOKAHEAD: usize = 8;
 const TAIL_REFRESH_MS: i64 = 2_000;
 
 fn available_spawn_backends(platform: Platform, path: Option<&OsStr>) -> Vec<BackendKind> {
-    [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Opencode,
-    ]
-    .into_iter()
-    .filter(|backend| {
-        agent_viewer_core::router::find_on_path(platform, backend.name(), path).is_some()
-    })
-    .collect()
+    [BackendKind::Claude, BackendKind::Codex]
+        .into_iter()
+        .filter(|backend| {
+            agent_viewer_core::router::find_on_path(platform, backend.name(), path).is_some()
+        })
+        .collect()
 }
 
 type Key = (BackendKind, String);
@@ -300,6 +295,25 @@ impl<W: io::Write> Drop for BracketedPasteGuard<W> {
     }
 }
 
+/// The same guard for mouse reporting. `ratatui`'s panic hook restores raw mode and the
+/// alternate screen and nothing else, so a panic with any-motion tracking still on leaves the
+/// shell printing escape sequences for every mouse move until the user runs `reset`.
+struct MouseCaptureGuard<W: io::Write> {
+    writer: W,
+}
+
+impl<W: io::Write> MouseCaptureGuard<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: io::Write> Drop for MouseCaptureGuard<W> {
+    fn drop(&mut self) {
+        let _ = execute!(&mut self.writer, DisableMouseCapture);
+    }
+}
+
 /// Apply a changed mouse capture request once. UI state changes never write terminal control
 /// bytes themselves, so the live loop calls this after events and completed attach plans.
 fn sync_mouse_capture<W: io::Write>(
@@ -513,8 +527,14 @@ impl NoticeState {
 /// What a resolved attach plan is for. Both kinds ride the same runner and the same backend
 /// resolution; only what happens when they land differs.
 enum AttachOutcome {
-    /// A user attach: take over the screen with this session.
-    Focus(ops::AttachPlan),
+    /// A user attach: take over the screen with this session. `key` and `triage` record what
+    /// the user was looking at when it was submitted, so a plan that lands after they moved
+    /// on can be dropped instead of stealing the keyboard for the wrong session.
+    Focus {
+        key: Key,
+        triage: bool,
+        plan: ops::AttachPlan,
+    },
     /// A wall tile joining. Carries its own key so a failure can be reported against the
     /// right tile, which is why the failure is an `Ok` here rather than a runner-level `Err`.
     Wall {
@@ -728,8 +748,7 @@ fn main() -> io::Result<()> {
         Err(_) => None,
     };
 
-    let opencode_runtime = OpencodeRuntime::new();
-    let mut list_backends = all_backends_with_opencode(opencode_runtime.clone());
+    let mut list_backends = all_backends();
     let db = ViewerDb::open_default().ok();
     let persisted_theme = db.as_ref().and_then(ui::theme::persisted_theme);
     let startup_sprite = startup_sprite(db.as_ref());
@@ -800,8 +819,6 @@ fn main() -> io::Result<()> {
         models.request(backend);
     }
 
-    let mutation_runtime = opencode_runtime.clone();
-    let attach_runtime = opencode_runtime.clone();
     let mut composer = Composer::new();
     composer.set_available_backends(available_backends);
     let mut ui = Ui {
@@ -815,13 +832,9 @@ fn main() -> io::Result<()> {
         detach_trackers: HashMap::new(),
         last_backend_error: String::new(),
         mutations: MutationRunner::new(),
-        mutation_executor: mutation_executor(move |mutation| {
-            ops::run_mutation_with_opencode(mutation, mutation_runtime.clone())
-        }),
+        mutation_executor: mutation_executor(ops::run_mutation),
         attaches: AttachRunner::new(),
-        attach_executor: Arc::new(move |request| {
-            ops::resolve_attach_with_opencode(request, attach_runtime.clone())
-        }),
+        attach_executor: Arc::new(ops::resolve_attach),
         models,
         pulses: Pulses::new(),
         pr_status: PrStatusCache::new(),
@@ -856,21 +869,22 @@ fn main() -> io::Result<()> {
     // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
     // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
     // a mutation because either operation can dial the backend runtime.
-    let activity_backends = all_backends_with_opencode(opencode_runtime.clone());
+    let activity_backends = all_backends();
     let activity = ActivityWorker::new(activity_backends);
-    let tail = TailWorker::new(all_backends_with_opencode(opencode_runtime.clone()));
+    let tail = TailWorker::new(all_backends());
     let refresher = spawn_refresh_worker(list_backends, last, cursors);
-    let action_backends = all_backends_with_opencode(opencode_runtime);
+    let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
     // Mouse capture powers list selection and attached transcript scrolling for Codex and
-    // Claude. OpenCode attach turns it off for host terminal selection. Ctrl+T remains the
-    // manual override. Starts on to match `ui.mouse_capture`.
+    // Claude. Ctrl+T remains the manual override. Starts on to match `ui.mouse_capture`.
     let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let mut applied_mouse_capture = true;
     let result = {
         let _bracketed_paste = BracketedPasteGuard::new(io::stdout());
+        // Both modes come off on the way out of this scope, whether `run` returns or unwinds.
+        let _mouse_capture = MouseCaptureGuard::new(io::stdout());
         run(
             &mut terminal,
             &action_backends,
@@ -881,7 +895,6 @@ fn main() -> io::Result<()> {
             &mut applied_mouse_capture,
         )
     };
-    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -943,19 +956,13 @@ fn run(
         }
 
         while let Some(result) = ui.attaches.poll() {
-            match result {
-                Ok(AttachOutcome::Focus(plan)) => {
-                    install_completed_attach_plan(
-                        ui,
-                        terminal,
-                        plan,
-                        &mut io::stdout(),
-                        applied_mouse_capture,
-                    )?;
-                }
-                Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
-                Err(notice) => ui.set_notice(notice),
-            }
+            apply_attach_result(
+                ui,
+                terminal,
+                result,
+                &mut io::stdout(),
+                applied_mouse_capture,
+            )?;
         }
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
@@ -1088,6 +1095,56 @@ fn wants_fast_ticks(ui: &Ui) -> bool {
             }
         )
     })
+}
+
+/// Land one completed attach resolution.
+///
+/// Resolution runs off the render thread and can take seconds (a codex attach dials the
+/// app-server daemon). In that time the user can walk to another row, or close the view the
+/// attach was submitted from, so a landed plan is applied only while it still targets what
+/// they are looking at — the same ownership rule `install_wall_join` applies to a tile.
+fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
+    ui: &mut Ui,
+    terminal: &mut ratatui::Terminal<B>,
+    result: Result<AttachOutcome, String>,
+    writer: &mut W,
+    applied_mouse_capture: &mut bool,
+) -> io::Result<()> {
+    match result {
+        Ok(AttachOutcome::Focus { key, triage, plan }) => {
+            if !focus_attach_still_current(ui, &key, triage) {
+                // The plan is only a resolved command: nothing has been spawned for it yet, so
+                // dropping it here is the whole teardown.
+                drop(plan);
+                ui.set_notice(format!("attach cancelled: {} is no longer in focus", key.1));
+                return Ok(());
+            }
+            install_completed_attach_plan(ui, terminal, plan, writer, applied_mouse_capture)?;
+        }
+        Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
+        Err(notice) => ui.set_notice(notice),
+    }
+    Ok(())
+}
+
+/// Whether a completed focus attach still targets what the user is looking at: the same triage
+/// item in a still-open queue, or the still-selected row on the list. Anything else means the
+/// keystrokes it would capture belong to another session, or that it would reopen a view the
+/// user has already left.
+fn focus_attach_still_current(ui: &Ui, key: &Key, triage: bool) -> bool {
+    if triage {
+        let Mode::Triage(state) = &ui.mode else {
+            return false;
+        };
+        return state.current().map(|item| item.key()).as_ref() == Some(key);
+    }
+    matches!(ui.mode, Mode::Normal)
+        && ui
+            .app
+            .selected()
+            .map(|session| (session.backend, session.id.clone()))
+            .as_ref()
+            == Some(key)
 }
 
 /// Land a wall tile's connection. A failure is recorded against its tile rather than shown as
@@ -1402,7 +1459,6 @@ fn decode_stop_failure(msg: &str) -> Option<(BackendKind, &str, &str)> {
     let backend = match fields.next()? {
         "codex" => BackendKind::Codex,
         "claude" => BackendKind::Claude,
-        "opencode" => BackendKind::Opencode,
         _ => return None,
     };
     Some((backend, fields.next()?, fields.next()?))
@@ -1585,23 +1641,21 @@ mod tests {
     fn spawn_backend_discovery_only_returns_installed_clis() {
         let directory = tempfile::tempdir().expect("temporary executable directory");
         let suffix = if cfg!(windows) { ".exe" } else { "" };
-        for name in ["codex", "opencode"] {
-            let path = directory.path().join(format!("{name}{suffix}"));
-            std::fs::write(&path, "").expect("write executable");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&path)
-                    .expect("executable metadata")
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(path, permissions).expect("make executable");
-            }
+        let path = directory.path().join(format!("codex{suffix}"));
+        std::fs::write(&path, "").expect("write executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("make executable");
         }
 
         assert_eq!(
             available_spawn_backends(current_platform(), Some(directory.path().as_os_str())),
-            vec![BackendKind::Codex, BackendKind::Opencode]
+            vec![BackendKind::Codex]
         );
     }
 
@@ -2791,7 +2845,7 @@ mod tests {
                 // A user attach always resolves to Focus; a Wall join here would mean the
                 // runner crossed wires, so fail loudly rather than skip.
                 match result.expect("resolve event bridge attach") {
-                    AttachOutcome::Focus(plan) => break plan,
+                    AttachOutcome::Focus { plan, .. } => break plan,
                     AttachOutcome::Wall { .. } => panic!("expected a focus attach"),
                 }
             }
@@ -3266,16 +3320,13 @@ mod tests {
 
     #[test]
     fn spawn_without_identity_uses_nearest_same_cwd_time_match() {
-        let old = session(BackendKind::Opencode, "old", 1_000, false);
+        let old = session(BackendKind::Codex, "old", 1_000, false);
         let mut ui = test_ui(vec![old.clone()]);
-        assert!(
-            ui.app
-                .select_by_key(&(BackendKind::Opencode, old.id.clone()))
-        );
-        ui.pending_spawn = Some(pending(BackendKind::Opencode, None, 10_000));
+        assert!(ui.app.select_by_key(&(BackendKind::Codex, old.id.clone())));
+        ui.pending_spawn = Some(pending(BackendKind::Codex, None, 10_000));
 
-        let target = session(BackendKind::Opencode, "target", 10_150, false);
-        let farther = session(BackendKind::Opencode, "farther", 11_000, false);
+        let target = session(BackendKind::Codex, "target", 10_150, false);
+        let farther = session(BackendKind::Codex, "farther", 11_000, false);
         let wrong_backend = session(BackendKind::Claude, "wrong", 10_001, false);
         apply_listing(&mut ui, vec![farther, wrong_backend, old, target]);
 
@@ -3285,15 +3336,15 @@ mod tests {
 
     #[test]
     fn spawn_without_identity_waits_for_a_row_absent_before_submission() {
-        let selected = session(BackendKind::Opencode, "selected", 1_000, false);
-        let preexisting = session(BackendKind::Opencode, "preexisting", 9_999, false);
+        let selected = session(BackendKind::Codex, "selected", 1_000, false);
+        let preexisting = session(BackendKind::Codex, "preexisting", 9_999, false);
         let mut ui = test_ui(vec![selected.clone(), preexisting.clone()]);
         assert!(
             ui.app
-                .select_by_key(&(BackendKind::Opencode, selected.id.clone()))
+                .select_by_key(&(BackendKind::Codex, selected.id.clone()))
         );
         let pending = pending_with_preexisting(
-            BackendKind::Opencode,
+            BackendKind::Codex,
             None,
             10_000,
             &["selected", "preexisting"],
@@ -3305,7 +3356,7 @@ mod tests {
         assert_eq!(selected_id(&ui), Some("selected"));
         assert_eq!(ui.pending_spawn, Some(pending));
 
-        let spawned = session(BackendKind::Opencode, "spawned", 10_150, false);
+        let spawned = session(BackendKind::Codex, "spawned", 10_150, false);
         apply_listing(&mut ui, vec![preexisting, spawned, selected]);
 
         assert_eq!(selected_id(&ui), Some("spawned"));
@@ -3441,6 +3492,36 @@ mod tests {
                 .any(|bytes| bytes == b"\x1b[?2004l"),
             "panic cleanup must disable bracketed paste"
         );
+    }
+
+    /// The symmetric proof for mouse reporting: `ratatui`'s panic hook restores raw mode and
+    /// the alternate screen only, so without this guard a panic leaves any-motion tracking on
+    /// and the shell fills with escape sequences on every mouse move.
+    #[test]
+    fn mouse_capture_is_disabled_during_panic_unwinding() {
+        let bytes = TestArc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter(TestArc::clone(&bytes));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = MouseCaptureGuard::new(writer);
+            panic!("simulate tui panic");
+        }));
+
+        assert!(result.is_err());
+        let written = bytes.lock().unwrap().clone();
+        for sequence in [
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+        ] {
+            assert!(
+                written
+                    .windows(sequence.len())
+                    .any(|bytes| bytes == sequence),
+                "panic cleanup must disable mouse reporting ({})",
+                String::from_utf8_lossy(sequence)
+            );
+        }
     }
 
     #[test]

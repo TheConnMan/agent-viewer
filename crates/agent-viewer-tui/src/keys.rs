@@ -11,8 +11,8 @@ use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
-    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget, SpriteKind,
-    TAIL_MIN_TOTAL_WIDTH,
+    Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState,
+    PaletteTarget, SpriteKind, TAIL_MIN_TOTAL_WIDTH,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -64,12 +64,22 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
     // interrupt (0x03) so a runaway agent can be stopped, and a half-typed line abandoned,
     // without tearing down the viewer. (macOS Cmd+C is swallowed by the terminal as copy and
     // never reaches us; Ctrl+C is the portable interrupt on macOS and Windows alike.)
-    // The compose overlay counts as forwarding too: the tiles under it are still live children
+    // The triage panel is a live child exactly like the attach view is, so Ctrl+C there is an
+    // interrupt for the session being answered, not a request to tear the viewer down (and
+    // with it every other PTY it owns). Without a child in the panel there is nothing to
+    // interrupt, so the chord keeps its global meaning.
+    let triage_target = matches!(ui.mode, Mode::Triage(_))
+        && ui
+            .focused
+            .as_ref()
+            .is_some_and(|key| ui.attached.contains_key(key));
+    // The compose overlay counts for the same reason: the tiles under it are still live children
     // whose Ctrl+C the wall de-armed on purpose, and opening an input box over the grid must
     // not silently re-arm the chord as a teardown that kills every one of them.
     let forwarding = matches!(ui.mode, Mode::Attached)
         || wall_target.is_some()
-        || (matches!(ui.mode, Mode::Compose) && ui.wall.on);
+        || triage_target
+        || composing_over_wall(ui);
     if is_quit_chord(key, ctrl, forwarding) {
         ui.attached.clear(); // drop = kill owned children during viewer teardown
         return Ok(true);
@@ -114,8 +124,8 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
 }
 
 /// Route a mouse event. While attached, Codex wheel events scroll the local viewport because
-/// Codex discards native wheel reports. Other Codex pointer events and all Claude and external
-/// opencode events stay native. In the list, click or hover selects the row under the cursor
+/// Codex discards native wheel reports. Other Codex pointer events and all Claude events stay
+/// native. In the list, click or hover selects the row under the cursor
 /// and the wheel walks the selection using geometry recorded by the last draw. Modals own
 /// their surface, so mouse is inert there.
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
@@ -518,6 +528,16 @@ fn is_quit_chord(key: KeyEvent, ctrl: bool, forwarding: bool) -> bool {
     ctrl && matches!(key.code, KeyCode::Char('c')) && !forwarding
 }
 
+/// Whether the spawn composer is floating over the grid with the keyboard.
+///
+/// `Mode::Compose` is only ever entered from the wall's palette, so the two conditions cannot
+/// disagree today. It is one predicate anyway because three separate sites — the quit-chord
+/// guard here, the overlay draw, and the footer — each depend on the pair, and an entry point
+/// that ever opened the composer off the wall would otherwise break all three independently.
+fn composing_over_wall(ui: &Ui) -> bool {
+    matches!(ui.mode, Mode::Compose) && ui.wall.on
+}
+
 /// The wall tile that should receive keystrokes: the focused one, once it has a live child.
 ///
 /// `None` while the wall is off, when the focused tile is still connecting, and when its
@@ -888,7 +908,15 @@ fn sync_composer_popups(ui: &mut Ui) {
 
 fn open_palette(backends: &[Box<dyn Backend>], ui: &mut Ui) {
     let items = palette_items(backends, ui);
-    ui.mode = Mode::Palette(PaletteState::new(items));
+    // Every ACTION row is built for the row selected right now, so that identity is captured
+    // with them: a refresh landing while the palette is up can clamp the selection onto a
+    // different session, and Archive/Stop/Delete must never follow it there.
+    let action_target = ui.app.selected().map(|session| PaletteSessionTarget {
+        backend: session.backend,
+        id: session.id.clone(),
+        title: session.title.clone(),
+    });
+    ui.mode = Mode::Palette(PaletteState::new(items).with_action_target(action_target));
 }
 
 fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
@@ -1225,7 +1253,6 @@ fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Pat
             }
             commands
         }
-        Some(BackendKind::Opencode) => file_stems(&home.join(".config/opencode/command")),
         Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
         None => Vec::new(),
     };
@@ -1276,22 +1303,55 @@ fn handle_palette_key<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn cached_palette_target(
-    ui: &Ui,
-    target: &PaletteTarget,
-) -> Option<(TargetRequest, String, PaletteAction)> {
+/// What Enter on a palette row resolves to, once the row's session identity is re-checked
+/// against the listing as it stands now.
+enum PaletteExecution {
+    /// Not a row that acts on a session.
+    Other,
+    /// Run `action` against this session.
+    Session {
+        request: TargetRequest,
+        title: String,
+        action: PaletteAction,
+    },
+    /// The session the row was built for has left the listing since the palette opened.
+    Gone { title: String },
+}
+
+fn cached_palette_target(ui: &Ui, target: &PaletteTarget) -> PaletteExecution {
     match target {
         PaletteTarget::Action(action) => {
-            let session = ui.app.selected()?;
             let action = match action {
                 PaletteAction::Attach
                 | PaletteAction::Archive
                 | PaletteAction::Unarchive
                 | PaletteAction::Rename
                 | PaletteAction::StopOrRemove => *action,
-                _ => return None,
+                _ => return PaletteExecution::Other,
             };
-            Some((TargetRequest::from(session), session.title.clone(), action))
+            // The row the palette was OPENED on, never `selected()` as it stands now: a
+            // background refresh can drop that row and clamp the selection onto another
+            // session, and archiving or stopping that one is destructive and unasked for.
+            let Mode::Palette(state) = &ui.mode else {
+                return PaletteExecution::Other;
+            };
+            let Some(captured) = state.action_target() else {
+                return PaletteExecution::Other;
+            };
+            if ui
+                .app
+                .session_for(&(captured.backend, captured.id.clone()))
+                .is_none()
+            {
+                return PaletteExecution::Gone {
+                    title: captured.title.clone(),
+                };
+            }
+            PaletteExecution::Session {
+                request: TargetRequest::new(captured.backend, captured.id.clone()),
+                title: captured.title.clone(),
+                action,
+            }
         }
         PaletteTarget::Session { backend, id } => {
             let title = ui
@@ -1299,13 +1359,13 @@ fn cached_palette_target(
                 .session_for(&(*backend, id.clone()))
                 .map(|session| session.title.clone())
                 .unwrap_or_else(|| id.clone());
-            Some((
-                TargetRequest::new(*backend, id.clone()),
+            PaletteExecution::Session {
+                request: TargetRequest::new(*backend, id.clone()),
                 title,
-                PaletteAction::Attach,
-            ))
+                action: PaletteAction::Attach,
+            }
         }
-        _ => None,
+        _ => PaletteExecution::Other,
     }
 }
 
@@ -1347,13 +1407,28 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
     }) else {
         return Ok(());
     };
-    if let Some((request, title, action)) = cached_palette_target(ui, &item.target) {
-        if let PaletteTarget::Session { backend, id } = &item.target {
-            let _ = ui.app.select_by_key(&(*backend, id.clone()));
+    match cached_palette_target(ui, &item.target) {
+        PaletteExecution::Session {
+            request,
+            title,
+            action,
+        } => {
+            // Put the cursor back on the row the palette acted on, whichever group it came
+            // from: it is where the user's attention is, and the attach path only lands a
+            // resolved plan onto the session that is still selected.
+            let _ = ui
+                .app
+                .select_by_key(&(request.backend(), request.id().to_string()));
+            ui.mode = Mode::Normal;
+            execute_cached_palette_action(ui, request, title, action);
+            return Ok(());
         }
-        ui.mode = Mode::Normal;
-        execute_cached_palette_action(ui, request, title, action);
-        return Ok(());
+        PaletteExecution::Gone { title } => {
+            ui.mode = Mode::Normal;
+            ui.set_notice(format!("{title} is no longer listed"));
+            return Ok(());
+        }
+        PaletteExecution::Other => {}
     }
     if !item.enabled {
         if let Some(reason) = item.disabled_reason {
@@ -1419,7 +1494,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
 
 fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
     // Selects outright rather than Tab-cycling to it: cycling stops as soon as the backend
-    // matches, which under Auto is true on entry (Auto rides on top of opencode), so Auto would
+    // matches, which under Auto is true on entry (Auto rides on top of a real backend), so Auto
+    // would
     // survive the pick and `ensure_models` would put the "auto" entry back.
     ui.composer.select_backend(backend);
     let mut models = ui
@@ -2075,7 +2151,7 @@ pub(crate) mod tests {
     /// through `submit_attach`, so a `Wall` outcome here would mean the runner crossed wires.
     fn focus_plan(outcome: crate::AttachOutcome) -> crate::ops::AttachPlan {
         match outcome {
-            crate::AttachOutcome::Focus(plan) => plan,
+            crate::AttachOutcome::Focus { plan, .. } => plan,
             crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
         }
     }
@@ -2106,7 +2182,7 @@ pub(crate) mod tests {
 
     impl agent_viewer_core::Backend for AttachingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Opencode
+            BackendKind::Codex
         }
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
@@ -2121,7 +2197,7 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|id| {
                     let mut session = sess(id, "/tmp/agentviewer-attach", 100);
-                    session.backend = BackendKind::Opencode;
+                    session.backend = BackendKind::Codex;
                     session
                 })
                 .collect())
@@ -2198,7 +2274,7 @@ pub(crate) mod tests {
                     "printf 'READY'; ",
                     "sleep 30"
                 ),
-                BackendKind::Claude | BackendKind::Opencode => concat!(
+                BackendKind::Claude => concat!(
                     "stty raw -echo; ",
                     "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
                     "index=1; ",
@@ -3871,7 +3947,7 @@ pub(crate) mod tests {
 
     impl agent_viewer_core::Backend for RowScopedArchivingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Opencode
+            BackendKind::Codex
         }
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
@@ -4222,8 +4298,7 @@ pub(crate) mod tests {
     #[test]
     fn palette_models_only_include_available_backends() {
         let mut ui = test_ui_with(Vec::new());
-        ui.composer
-            .set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+        ui.composer.set_available_backends(vec![BackendKind::Codex]);
 
         let items = palette_items(&[], &ui);
         let model_backends = items
@@ -4234,10 +4309,7 @@ pub(crate) mod tests {
             })
             .collect::<HashSet<_>>();
 
-        assert_eq!(
-            model_backends,
-            HashSet::from([BackendKind::Codex, BackendKind::Opencode])
-        );
+        assert_eq!(model_backends, HashSet::from([BackendKind::Codex]));
     }
 
     #[test]
@@ -4284,10 +4356,10 @@ pub(crate) mod tests {
             ui.composer.cycle_backend();
         }
         ensure_models(&mut ui);
-        assert_eq!(ui.composer.backend(), BackendKind::Opencode);
+        assert_eq!(ui.composer.backend(), BackendKind::Codex);
         assert_eq!(ui.composer.model(), "auto");
 
-        select_palette_model(&mut ui, BackendKind::Opencode, "grok-4".to_string());
+        select_palette_model(&mut ui, BackendKind::Codex, "grok-4".to_string());
         ensure_models(&mut ui);
 
         assert!(
@@ -4501,20 +4573,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn attach_capture_defaults_are_backend_specific() {
+    fn attach_capture_defaults_enable_capture_for_every_backend() {
         let mut capture_states = Vec::new();
-        for backend in [
-            BackendKind::Codex,
-            BackendKind::Claude,
-            BackendKind::Opencode,
-        ] {
+        for backend in [BackendKind::Codex, BackendKind::Claude] {
             let mut session = sess("shared-attach", "/tmp/agentviewer-shared-attach", 100);
             session.backend = backend;
             // Avoid Claude's real trust preflight; this fake backend only exercises the shared
             // attach success transition after its command is accepted.
             session.short_id = Some("short".to_string());
             let mut ui = test_ui_with(vec![session]);
-            ui.mouse_capture = backend == BackendKind::Opencode;
+            ui.mouse_capture = false;
             select_session_row(&mut ui, "shared-attach");
             ui.attach_executor = std::sync::Arc::new(move |request| {
                 let mut authority = AnyAttachingBackend(backend);
@@ -4543,15 +4611,9 @@ pub(crate) mod tests {
             capture_states.push((backend, ui.mouse_capture));
         }
 
-        // `sess` is interactive, so the Opencode row represents the external attachable
-        // path. Managed Opencode is deliberately absent because it is not attachable.
         assert_eq!(
             capture_states,
-            vec![
-                (BackendKind::Codex, true),
-                (BackendKind::Claude, true),
-                (BackendKind::Opencode, false),
-            ],
+            vec![(BackendKind::Codex, true), (BackendKind::Claude, true)],
             "attach capture defaults must match each backend"
         );
     }
@@ -4669,7 +4731,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-b", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4898,7 +4960,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-activate", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4963,7 +5025,7 @@ pub(crate) mod tests {
         );
         assert!(
             ui.attached
-                .contains_key(&(BackendKind::Opencode, "b".to_string())),
+                .contains_key(&(BackendKind::Codex, "b".to_string())),
             "the clicked session must own an attached child"
         );
     }
@@ -4979,7 +5041,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5004,10 +5066,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ui.mouse_press.as_ref().map(|press| &press.target),
-            Some(&MouseTarget::Session(
-                BackendKind::Opencode,
-                "b".to_string()
-            ))
+            Some(&MouseTarget::Session(BackendKind::Codex, "b".to_string()))
         );
 
         // A refresh lands a newer session between "a" and "b", pushing "b" one row down.
@@ -5017,7 +5076,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut refreshed {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         ui.app.set_sessions(refreshed);
         let reflowed_idx = visible_session_index(&ui, "b");
@@ -5071,11 +5130,11 @@ pub(crate) mod tests {
         );
         assert!(
             ui.attached
-                .contains_key(&(BackendKind::Opencode, "b".to_string()))
+                .contains_key(&(BackendKind::Codex, "b".to_string()))
         );
         assert!(
             !ui.attached
-                .contains_key(&(BackendKind::Opencode, "c".to_string())),
+                .contains_key(&(BackendKind::Codex, "c".to_string())),
             "the row that slid under the cursor must never be attached"
         );
     }
@@ -5090,7 +5149,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow-drop", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5111,7 +5170,7 @@ pub(crate) mod tests {
             sess("c", "/tmp/agentviewer-mouse-reflow-drop", 200),
         ];
         for session in &mut refreshed {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         ui.app.set_sessions(refreshed);
         let newcomer_idx = visible_session_index(&ui, "c");
@@ -5151,7 +5210,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-unmatched", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5184,7 +5243,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-mismatch", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5230,7 +5289,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-off-list", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5267,7 +5326,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-consumed", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -5288,7 +5347,7 @@ pub(crate) mod tests {
         .expect("session button down");
         assert!(ui.attached.is_empty());
 
-        let key = (BackendKind::Opencode, "b".to_string());
+        let key = (BackendKind::Codex, "b".to_string());
         ui.attached.insert(key.clone(), mouse_recording_pty());
         wait_for_pty_screen(&ui, &key, "READY");
 
@@ -5373,7 +5432,7 @@ pub(crate) mod tests {
 
         for button in [MouseButton::Right, MouseButton::Middle] {
             let mut session = sess("a", "/tmp/agentviewer-mouse-other-button", 100);
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
             let mut ui = test_ui_with(vec![session]);
             let mut terminal = test_terminal();
             let target_idx = visible_session_index(&ui, "a");
@@ -5409,12 +5468,12 @@ pub(crate) mod tests {
             Mode::Filter,
             Mode::Help,
             Mode::Rename(RenameModal {
-                backend: BackendKind::Opencode,
+                backend: BackendKind::Codex,
                 id: "b".to_string(),
                 buffer: String::new(),
             }),
             Mode::Reply(ReplyModal {
-                backend: BackendKind::Opencode,
+                backend: BackendKind::Codex,
                 id: "b".to_string(),
                 buffer: String::new(),
             }),
@@ -5426,7 +5485,7 @@ pub(crate) mod tests {
                 sess("b", "/tmp/agentviewer-mouse-modal", 100),
             ];
             for session in &mut sessions {
-                session.backend = BackendKind::Opencode;
+                session.backend = BackendKind::Codex;
             }
             let mut ui = test_ui_with(sessions);
             let mut terminal = test_terminal();
@@ -5697,7 +5756,6 @@ pub(crate) mod tests {
 
                     wait_for_pty_screen(&ui, &key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
-                BackendKind::Opencode => unreachable!("only attached scroll backends"),
             }
 
             set_mouse_capture(&mut ui, false);
@@ -5760,80 +5818,8 @@ pub(crate) mod tests {
                     .expect("forward retained Claude wheel");
                     wait_for_pty_screen(&ui, &key, "WHEEL-2: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
-                BackendKind::Opencode => unreachable!("only attached scroll backends"),
             }
         }
-    }
-
-    #[test]
-    fn external_opencode_ctrl_t_opts_into_wheel_forwarding() {
-        let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
-        session.backend = BackendKind::Opencode;
-        let session_key = (BackendKind::Opencode, session.id.clone());
-        let mut ui = test_ui_with(vec![session]);
-        select_session_row(&mut ui, "a");
-        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AnyAttachingBackend(BackendKind::Opencode))];
-        ui.attach_executor = std::sync::Arc::new(|request| {
-            let mut authority = AnyAttachingBackend(BackendKind::Opencode);
-            crate::ops::resolve_attach_with_backend(&mut authority, request)
-        });
-        let mut terminal = test_terminal();
-
-        assert!(crate::actions::attach_selected(&mut ui));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let plan = loop {
-            if let Some(result) = ui.attaches.poll() {
-                break result.expect("resolve external opencode session");
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "external opencode attach did not resolve"
-            );
-            std::thread::yield_now();
-        };
-        assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
-                .expect("install external opencode session")
-        );
-        assert!(matches!(ui.mode, Mode::Attached));
-        assert!(
-            !ui.mouse_capture,
-            "external opencode must keep host text selection after attach"
-        );
-
-        let (_snapshot_tx, snapshots) = std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
-        let (wake, _wake_rx) = std::sync::mpsc::channel();
-        let refresher = crate::Refresher { snapshots, wake };
-        assert!(
-            !super::handle_key(
-                key(KeyCode::Char('t'), KeyModifiers::CONTROL),
-                &backends,
-                &refresher,
-                &mut ui,
-                &mut terminal,
-            )
-            .expect("opt into attached mouse capture"),
-            "Ctrl+T must not quit the viewer"
-        );
-        assert!(
-            ui.mouse_capture,
-            "Ctrl+T must opt into external opencode wheel forwarding"
-        );
-
-        wait_for_pty_screen(&ui, &session_key, "READY");
-
-        handle_mouse_event(
-            mouse(MouseEventKind::ScrollUp, 5, 5),
-            &backends,
-            &mut ui,
-            &mut terminal,
-        )
-        .expect("forward attached wheel event");
-
-        // The child must receive SGR wheel-up (button 64), not ESC [ A prompt-history input.
-        wait_for_pty_screen(&ui, &session_key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
-        assert!(matches!(ui.mode, Mode::Attached));
     }
 
     #[test]
@@ -6060,9 +6046,9 @@ pub(crate) mod tests {
     #[test]
     fn archive_action_dispatches_both_rows_for_fresh_resolution() {
         let mut external = sess("external", "/tmp/external", 200);
-        external.backend = BackendKind::Opencode;
+        external.backend = BackendKind::Codex;
         let mut managed = sess("managed", "/tmp/managed", 100);
-        managed.backend = BackendKind::Opencode;
+        managed.backend = BackendKind::Codex;
         managed.daemon_hosted = true;
         let mut ui = test_ui_with(vec![external, managed]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
@@ -6070,11 +6056,11 @@ pub(crate) mod tests {
 
         select_session_row(&mut ui, "external");
         crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("opencode:external:hide"));
+        assert!(ui.mutations.in_flight("codex:external:hide"));
 
         select_session_row(&mut ui, "managed");
         crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("opencode:managed:hide"));
+        assert!(ui.mutations.in_flight("codex:managed:hide"));
     }
 
     #[test]
@@ -6162,6 +6148,106 @@ pub(crate) mod tests {
             persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
             Some("terminal")
         );
+    }
+
+    // --- palette actions target the row the palette was opened on --------------------
+
+    /// Move the palette highlight onto a specific row, so the assertion is about what Enter
+    /// does to that row rather than about how the fuzzy ranker orders a query.
+    fn highlight_palette_target(ui: &mut Ui, wanted: &PaletteTarget) {
+        let Mode::Palette(palette) = &mut ui.mode else {
+            panic!("expected the palette to be open");
+        };
+        for _ in 0..palette.result_count() {
+            if palette.highlighted().map(|item| &item.target) == Some(wanted) {
+                return;
+            }
+            palette.move_highlight(1);
+        }
+        panic!("the palette does not offer {wanted:?}");
+    }
+
+    /// Report which session each archive mutation actually ran against.
+    fn recording_archive_executor(ui: &mut Ui) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let crate::ops::Mutation::Hide(request) = mutation else {
+                panic!("the palette archive row must only ever hide");
+            };
+            tx.lock()
+                .expect("mutation recorder")
+                .send(request.id().to_string())
+                .expect("record the archived session");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+        rx
+    }
+
+    /// The palette's ACTION rows read "the selected session", and the 1s refresh keeps running
+    /// while the palette is up. Enter must archive the row the palette was opened on, not
+    /// whichever row the selection was clamped onto in the meantime.
+    #[test]
+    fn a_palette_action_archives_the_row_it_was_opened_on_not_a_moved_selection() {
+        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
+        let archived = recording_archive_executor(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+        );
+
+        open_palette(&backends, &mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, bravo.id.clone()))
+        );
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::Archive));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert_eq!(
+            archived
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .as_deref(),
+            Ok("alpha"),
+            "the palette must archive the row it was opened on"
+        );
+    }
+
+    /// And when that row has left the listing entirely, the action is refused rather than
+    /// following the selection onto a session the user never chose.
+    #[test]
+    fn a_palette_action_whose_row_left_the_listing_notices_instead_of_acting() {
+        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
+        let archived = recording_archive_executor(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+        );
+
+        open_palette(&backends, &mut ui);
+        // The refresh drops the row the palette was opened on; the selection clamps onto the
+        // only row left.
+        ui.app.set_sessions(vec![bravo.clone()]);
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::Archive));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert!(
+            archived
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "no session may be archived once the palette's row is gone"
+        );
+        assert_eq!(ui.notice.text(), "alpha is no longer listed");
+        assert!(matches!(ui.mode, Mode::Normal));
     }
 
     // --- Ctrl+N triage inbox --------------------------------------------------------
@@ -6445,6 +6531,109 @@ pub(crate) mod tests {
             "typing into the session must never reach the composer"
         );
         assert_eq!(ui.app.selected_index(), selection_before);
+    }
+
+    /// Ctrl+C in the triage panel is an interrupt for the session being answered. Quitting
+    /// there tears down every PTY the viewer owns while a child is live, which is the opposite
+    /// of what a user stopping a runaway answer is asking for.
+    #[test]
+    fn ctrl_c_in_triage_interrupts_the_session_rather_than_quitting_the_viewer() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        let quit = press_normal_key(&mut ui, &backends, 'c', KeyModifiers::CONTROL);
+
+        assert!(!quit, "Ctrl+C must not tear the viewer down from triage");
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+        // `cat` runs with ISIG on, so 0x03 reaching it is observable as the child dying.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ui.attached.get_mut(&item).expect("panel child").is_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Ctrl+C must reach the session in the panel as an interrupt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// With nothing live in the panel there is no child to interrupt, so the chord keeps its
+    /// global meaning rather than becoming a dead key.
+    #[test]
+    fn ctrl_c_in_triage_without_a_live_child_still_quits() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert!(ui.attached.is_empty());
+
+        assert!(press_normal_key(
+            &mut ui,
+            &backends,
+            'c',
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    /// A triage visit lasts exactly as long as the item is in the panel: walking on closes the
+    /// child it left, so a long queue does not accumulate invisible processes.
+    #[test]
+    fn walking_to_the_next_item_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let first = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, first.clone());
+
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        assert!(
+            !ui.attached.contains_key(&first),
+            "the item the queue walked off must not stay connected off screen"
+        );
+        assert!(
+            !ui.detach_trackers.contains_key(&first),
+            "its per-PTY state goes with it"
+        );
+    }
+
+    /// Same on the way back: Ctrl+P is a move like any other.
+    #[test]
+    fn walking_back_closes_the_child_it_left() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        let second = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, second.clone());
+
+        press_triage(&mut ui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        assert!(!ui.attached.contains_key(&second));
+    }
+
+    #[test]
+    fn leaving_the_queue_closes_the_child_it_was_showing() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item.clone());
+
+        press_triage(&mut ui, KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&item),
+            "nothing stays connected once the queue is closed"
+        );
     }
 
     #[test]
