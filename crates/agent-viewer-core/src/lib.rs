@@ -3,16 +3,6 @@ pub mod claude;
 pub mod codex;
 pub mod error;
 pub mod group;
-#[cfg(target_os = "linux")]
-#[path = "opencode.rs"]
-mod opencode_impl;
-#[cfg(not(target_os = "linux"))]
-#[path = "opencode_portable.rs"]
-mod opencode_impl;
-pub mod opencode {
-    pub use crate::backend::opencode_capabilities_for_platform as capabilities_for_platform;
-    pub use crate::opencode_impl::*;
-}
 pub mod platform;
 pub mod pr_status;
 pub mod pty;
@@ -49,7 +39,7 @@ pub fn mark_dead_dirs(sessions: &mut [Session]) {
     }
 }
 
-/// Open a SQLite DB read-only with a 500ms busy timeout (Codex and opencode write
+/// Open a SQLite DB read-only with a 500ms busy timeout (Codex writes
 /// concurrently). Read-only flags mean the file is never created if missing.
 pub fn open_readonly(path: &std::path::Path) -> Result<rusqlite::Connection> {
     let conn =

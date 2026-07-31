@@ -1,4 +1,4 @@
-//! Optional brand logo marks rasterized once at startup from the three backend SVGs.
+//! Optional brand logo marks rasterized once at startup from the backend SVGs.
 //! List rows use fixed two cell protocols. Kitty, iTerm2, and Sixel composers use separate
 //! three cell protocols whose artwork is offset by half a cell. Halfblocks composers reuse
 //! the two cell list protocols because that fallback cannot represent a horizontal half cell.
@@ -14,7 +14,6 @@ use ratatui_image::protocol::Protocol;
 /// time so there is no runtime asset path to resolve.
 const CLAUDE_SVG: &str = include_str!("../assets/logos/claude.svg");
 const CODEX_SVG: &str = include_str!("../assets/logos/codex.svg");
-const OPENCODE_SVG: &str = include_str!("../assets/logos/opencode.svg");
 /// The Auto spawn entry is not a backend, so it carries a neutral robot mark instead of a brand.
 const AUTO_SVG: &str = include_str!("../assets/logos/auto.svg");
 
@@ -28,11 +27,9 @@ const RASTER_PX: u32 = 64;
 pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
-    opencode: Protocol,
     auto: Protocol,
     composer_claude: Option<Protocol>,
     composer_codex: Option<Protocol>,
-    composer_opencode: Option<Protocol>,
     composer_auto: Option<Protocol>,
 }
 
@@ -55,16 +52,13 @@ impl LogoMarks {
     fn from_picker(picker: &Picker) -> anyhow::Result<LogoMarks> {
         let (claude, composer_claude) = build_protocols(picker, CLAUDE_SVG)?;
         let (codex, composer_codex) = build_protocols(picker, CODEX_SVG)?;
-        let (opencode, composer_opencode) = build_protocols(picker, OPENCODE_SVG)?;
         let (auto, composer_auto) = build_protocols(picker, AUTO_SVG)?;
         Ok(LogoMarks {
             claude,
             codex,
-            opencode,
             auto,
             composer_claude,
             composer_codex,
-            composer_opencode,
             composer_auto,
         })
     }
@@ -74,7 +68,6 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => &self.claude,
             BackendKind::Codex => &self.codex,
-            BackendKind::Opencode => &self.opencode,
         }
     }
 
@@ -84,7 +77,6 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => self.composer_claude.as_ref().unwrap_or(&self.claude),
             BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
-            BackendKind::Opencode => self.composer_opencode.as_ref().unwrap_or(&self.opencode),
         }
     }
 

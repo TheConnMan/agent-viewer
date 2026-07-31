@@ -97,7 +97,6 @@ fn mark_for(backend: BackendKind, glyph: bool) -> &'static str {
     match backend {
         BackendKind::Claude => "✳",
         BackendKind::Codex => "◆",
-        BackendKind::Opencode => "■",
     }
 }
 
@@ -106,7 +105,6 @@ fn backend_mark_color(backend: BackendKind, theme: &Theme) -> ratatui::style::Co
     match backend {
         BackendKind::Claude => theme.cc,
         BackendKind::Codex => theme.cx,
-        BackendKind::Opencode => theme.oc,
     }
 }
 
@@ -1121,11 +1119,9 @@ mod tests {
         // Default (glyph = false): the textual tags.
         assert_eq!(mark_for(BackendKind::Claude, false), "[cc]");
         assert_eq!(mark_for(BackendKind::Codex, false), "[cx]");
-        assert_eq!(mark_for(BackendKind::Opencode, false), "[oc]");
         // Opt-in (glyph = true): the brand glyphs.
         assert_eq!(mark_for(BackendKind::Claude, true), "✳");
         assert_eq!(mark_for(BackendKind::Codex, true), "◆");
-        assert_eq!(mark_for(BackendKind::Opencode, true), "■");
     }
 
     #[test]
@@ -1133,11 +1129,7 @@ mod tests {
         set_logo_marks(true);
         assert!(logo_marks());
         let theme = theme::amber(false);
-        for b in [
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Opencode,
-        ] {
+        for b in [BackendKind::Claude, BackendKind::Codex] {
             assert_eq!(backend_mark(b, &theme), "    ");
             assert_eq!(mark_width(backend_mark(b, &theme)), 4);
         }

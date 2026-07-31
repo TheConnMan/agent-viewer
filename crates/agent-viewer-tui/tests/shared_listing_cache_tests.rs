@@ -321,10 +321,9 @@ fn source_completion_time_keeps_a_delayed_publication_fresh_for_another_viewer()
 #[test]
 fn missing_cache_calls_the_authoritative_source() {
     let (_directory, first, _second) = open_viewers();
-    let scope = scope(BackendKind::Opencode);
-    let expected = session(BackendKind::Opencode, "ses_123", None, true);
-    let mut backend =
-        CountedBackend::sessions(BackendKind::Opencode, &scope, vec![expected.clone()]);
+    let scope = scope(BackendKind::Claude);
+    let expected = session(BackendKind::Claude, "ses_123", None, true);
+    let mut backend = CountedBackend::sessions(BackendKind::Claude, &scope, vec![expected.clone()]);
     let mut cursor = RefreshCursor::default();
 
     let outcome = refresh_backend(Some(&first), &mut backend, &[], &mut cursor, 1_000);
@@ -380,14 +379,14 @@ fn authoritative_target_returns_the_fresh_row() {
 
 #[test]
 fn authoritative_target_reports_a_missing_row() {
-    let scope = scope(BackendKind::Opencode);
-    let request = TargetRequest::new(BackendKind::Opencode, "ses_123");
-    let mut backend = CountedBackend::sessions(BackendKind::Opencode, &scope, Vec::new());
+    let scope = scope(BackendKind::Claude);
+    let request = TargetRequest::new(BackendKind::Claude, "ses_123");
+    let mut backend = CountedBackend::sessions(BackendKind::Claude, &scope, Vec::new());
 
     let result = authoritative_target(&mut backend, &request);
 
     assert!(
-        matches!(result, Err(TargetResolution::Missing { notice }) if notice == "opencode session is no longer available")
+        matches!(result, Err(TargetResolution::Missing { notice }) if notice == "claude session is no longer available")
     );
     assert_eq!(backend.calls, 1);
 }

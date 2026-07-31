@@ -1,5 +1,5 @@
 //! ModelCache: the composer's model catalog, kept off the render loop. Discovery is a CLI
-//! shell-out (`opencode models` alone is ~3.8s cold), so it runs on a worker thread modeled
+//! shell-out (a cold probe can take seconds), so it runs on a worker thread modeled
 //! on `PrStatusCache`: results drain non-blocking via `poll()`, and the key path only ever
 //! reads memory. Lists are seeded from the viewer DB at startup, so after the first run the
 //! picker is populated on the first keystroke instead of after a multi-second probe.

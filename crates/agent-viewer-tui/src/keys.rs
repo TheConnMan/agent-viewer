@@ -115,8 +115,8 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
 }
 
 /// Route a mouse event. While attached, Codex wheel events scroll the local viewport because
-/// Codex discards native wheel reports. Other Codex pointer events and all Claude and external
-/// opencode events stay native. In the list, click or hover selects the row under the cursor
+/// Codex discards native wheel reports. Other Codex pointer events and all Claude events stay
+/// native. In the list, click or hover selects the row under the cursor
 /// and the wheel walks the selection using geometry recorded by the last draw. Modals own
 /// their surface, so mouse is inert there.
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
@@ -1118,7 +1118,6 @@ fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Pat
             }
             commands
         }
-        Some(BackendKind::Opencode) => file_stems(&home.join(".config/opencode/command")),
         Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
         None => Vec::new(),
     };
@@ -1346,7 +1345,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
 
 fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
     // Selects outright rather than Tab-cycling to it: cycling stops as soon as the backend
-    // matches, which under Auto is true on entry (Auto rides on top of opencode), so Auto would
+    // matches, which under Auto is true on entry (Auto rides on top of a real backend), so Auto
+    // would
     // survive the pick and `ensure_models` would put the "auto" entry back.
     ui.composer.select_backend(backend);
     let mut models = ui
@@ -2033,7 +2033,7 @@ pub(crate) mod tests {
 
     impl agent_viewer_core::Backend for AttachingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Opencode
+            BackendKind::Codex
         }
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
@@ -2048,7 +2048,7 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|id| {
                     let mut session = sess(id, "/tmp/agentviewer-attach", 100);
-                    session.backend = BackendKind::Opencode;
+                    session.backend = BackendKind::Codex;
                     session
                 })
                 .collect())
@@ -2125,7 +2125,7 @@ pub(crate) mod tests {
                     "printf 'READY'; ",
                     "sleep 30"
                 ),
-                BackendKind::Claude | BackendKind::Opencode => concat!(
+                BackendKind::Claude => concat!(
                     "stty raw -echo; ",
                     "printf '\\033[?1000h\\033[?1006hREADY\\r\\n'; ",
                     "index=1; ",
@@ -3226,7 +3226,7 @@ pub(crate) mod tests {
 
     impl agent_viewer_core::Backend for RowScopedArchivingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Opencode
+            BackendKind::Codex
         }
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
@@ -3537,8 +3537,7 @@ pub(crate) mod tests {
     #[test]
     fn palette_models_only_include_available_backends() {
         let mut ui = test_ui_with(Vec::new());
-        ui.composer
-            .set_available_backends(vec![BackendKind::Codex, BackendKind::Opencode]);
+        ui.composer.set_available_backends(vec![BackendKind::Codex]);
 
         let items = palette_items(&[], &ui);
         let model_backends = items
@@ -3549,10 +3548,7 @@ pub(crate) mod tests {
             })
             .collect::<HashSet<_>>();
 
-        assert_eq!(
-            model_backends,
-            HashSet::from([BackendKind::Codex, BackendKind::Opencode])
-        );
+        assert_eq!(model_backends, HashSet::from([BackendKind::Codex]));
     }
 
     #[test]
@@ -3599,10 +3595,10 @@ pub(crate) mod tests {
             ui.composer.cycle_backend();
         }
         ensure_models(&mut ui);
-        assert_eq!(ui.composer.backend(), BackendKind::Opencode);
+        assert_eq!(ui.composer.backend(), BackendKind::Codex);
         assert_eq!(ui.composer.model(), "auto");
 
-        select_palette_model(&mut ui, BackendKind::Opencode, "grok-4".to_string());
+        select_palette_model(&mut ui, BackendKind::Codex, "grok-4".to_string());
         ensure_models(&mut ui);
 
         assert!(
@@ -3816,20 +3812,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn attach_capture_defaults_are_backend_specific() {
+    fn attach_capture_defaults_enable_capture_for_every_backend() {
         let mut capture_states = Vec::new();
-        for backend in [
-            BackendKind::Codex,
-            BackendKind::Claude,
-            BackendKind::Opencode,
-        ] {
+        for backend in [BackendKind::Codex, BackendKind::Claude] {
             let mut session = sess("shared-attach", "/tmp/agentviewer-shared-attach", 100);
             session.backend = backend;
             // Avoid Claude's real trust preflight; this fake backend only exercises the shared
             // attach success transition after its command is accepted.
             session.short_id = Some("short".to_string());
             let mut ui = test_ui_with(vec![session]);
-            ui.mouse_capture = backend == BackendKind::Opencode;
+            ui.mouse_capture = false;
             select_session_row(&mut ui, "shared-attach");
             ui.attach_executor = std::sync::Arc::new(move |request| {
                 let mut authority = AnyAttachingBackend(backend);
@@ -3858,15 +3850,9 @@ pub(crate) mod tests {
             capture_states.push((backend, ui.mouse_capture));
         }
 
-        // `sess` is interactive, so the Opencode row represents the external attachable
-        // path. Managed Opencode is deliberately absent because it is not attachable.
         assert_eq!(
             capture_states,
-            vec![
-                (BackendKind::Codex, true),
-                (BackendKind::Claude, true),
-                (BackendKind::Opencode, false),
-            ],
+            vec![(BackendKind::Codex, true), (BackendKind::Claude, true)],
             "attach capture defaults must match each backend"
         );
     }
@@ -3984,7 +3970,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-b", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4213,7 +4199,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-activate", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4278,7 +4264,7 @@ pub(crate) mod tests {
         );
         assert!(
             ui.attached
-                .contains_key(&(BackendKind::Opencode, "b".to_string())),
+                .contains_key(&(BackendKind::Codex, "b".to_string())),
             "the clicked session must own an attached child"
         );
     }
@@ -4294,7 +4280,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4319,10 +4305,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ui.mouse_press.as_ref().map(|press| &press.target),
-            Some(&MouseTarget::Session(
-                BackendKind::Opencode,
-                "b".to_string()
-            ))
+            Some(&MouseTarget::Session(BackendKind::Codex, "b".to_string()))
         );
 
         // A refresh lands a newer session between "a" and "b", pushing "b" one row down.
@@ -4332,7 +4315,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow", 300),
         ];
         for session in &mut refreshed {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         ui.app.set_sessions(refreshed);
         let reflowed_idx = visible_session_index(&ui, "b");
@@ -4386,11 +4369,11 @@ pub(crate) mod tests {
         );
         assert!(
             ui.attached
-                .contains_key(&(BackendKind::Opencode, "b".to_string()))
+                .contains_key(&(BackendKind::Codex, "b".to_string()))
         );
         assert!(
             !ui.attached
-                .contains_key(&(BackendKind::Opencode, "c".to_string())),
+                .contains_key(&(BackendKind::Codex, "c".to_string())),
             "the row that slid under the cursor must never be attached"
         );
     }
@@ -4405,7 +4388,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-reflow-drop", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4426,7 +4409,7 @@ pub(crate) mod tests {
             sess("c", "/tmp/agentviewer-mouse-reflow-drop", 200),
         ];
         for session in &mut refreshed {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         ui.app.set_sessions(refreshed);
         let newcomer_idx = visible_session_index(&ui, "c");
@@ -4466,7 +4449,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-unmatched", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4499,7 +4482,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-mismatch", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4545,7 +4528,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-off-list", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4582,7 +4565,7 @@ pub(crate) mod tests {
             sess("b", "/tmp/agentviewer-mouse-consumed", 100),
         ];
         for session in &mut sessions {
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
         }
         let mut ui = test_ui_with(sessions);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(AttachingBackend)];
@@ -4603,7 +4586,7 @@ pub(crate) mod tests {
         .expect("session button down");
         assert!(ui.attached.is_empty());
 
-        let key = (BackendKind::Opencode, "b".to_string());
+        let key = (BackendKind::Codex, "b".to_string());
         ui.attached.insert(key.clone(), mouse_recording_pty());
         wait_for_pty_screen(&ui, &key, "READY");
 
@@ -4688,7 +4671,7 @@ pub(crate) mod tests {
 
         for button in [MouseButton::Right, MouseButton::Middle] {
             let mut session = sess("a", "/tmp/agentviewer-mouse-other-button", 100);
-            session.backend = BackendKind::Opencode;
+            session.backend = BackendKind::Codex;
             let mut ui = test_ui_with(vec![session]);
             let mut terminal = test_terminal();
             let target_idx = visible_session_index(&ui, "a");
@@ -4724,12 +4707,12 @@ pub(crate) mod tests {
             Mode::Filter,
             Mode::Help,
             Mode::Rename(RenameModal {
-                backend: BackendKind::Opencode,
+                backend: BackendKind::Codex,
                 id: "b".to_string(),
                 buffer: String::new(),
             }),
             Mode::Reply(ReplyModal {
-                backend: BackendKind::Opencode,
+                backend: BackendKind::Codex,
                 id: "b".to_string(),
                 buffer: String::new(),
             }),
@@ -4741,7 +4724,7 @@ pub(crate) mod tests {
                 sess("b", "/tmp/agentviewer-mouse-modal", 100),
             ];
             for session in &mut sessions {
-                session.backend = BackendKind::Opencode;
+                session.backend = BackendKind::Codex;
             }
             let mut ui = test_ui_with(sessions);
             let mut terminal = test_terminal();
@@ -5012,7 +4995,6 @@ pub(crate) mod tests {
 
                     wait_for_pty_screen(&ui, &key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
-                BackendKind::Opencode => unreachable!("only attached scroll backends"),
             }
 
             set_mouse_capture(&mut ui, false);
@@ -5075,80 +5057,8 @@ pub(crate) mod tests {
                     .expect("forward retained Claude wheel");
                     wait_for_pty_screen(&ui, &key, "WHEEL-2: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
-                BackendKind::Opencode => unreachable!("only attached scroll backends"),
             }
         }
-    }
-
-    #[test]
-    fn external_opencode_ctrl_t_opts_into_wheel_forwarding() {
-        let mut session = sess("a", "/tmp/agentviewer-scroll-attached", 100);
-        session.backend = BackendKind::Opencode;
-        let session_key = (BackendKind::Opencode, session.id.clone());
-        let mut ui = test_ui_with(vec![session]);
-        select_session_row(&mut ui, "a");
-        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
-            vec![Box::new(AnyAttachingBackend(BackendKind::Opencode))];
-        ui.attach_executor = std::sync::Arc::new(|request| {
-            let mut authority = AnyAttachingBackend(BackendKind::Opencode);
-            crate::ops::resolve_attach_with_backend(&mut authority, request)
-        });
-        let mut terminal = test_terminal();
-
-        assert!(crate::actions::attach_selected(&mut ui));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let plan = loop {
-            if let Some(result) = ui.attaches.poll() {
-                break result.expect("resolve external opencode session");
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "external opencode attach did not resolve"
-            );
-            std::thread::yield_now();
-        };
-        assert!(
-            crate::actions::install_attach_plan(&mut ui, &mut terminal, focus_plan(plan))
-                .expect("install external opencode session")
-        );
-        assert!(matches!(ui.mode, Mode::Attached));
-        assert!(
-            !ui.mouse_capture,
-            "external opencode must keep host text selection after attach"
-        );
-
-        let (_snapshot_tx, snapshots) = std::sync::mpsc::channel::<(Vec<Session>, String, usize)>();
-        let (wake, _wake_rx) = std::sync::mpsc::channel();
-        let refresher = crate::Refresher { snapshots, wake };
-        assert!(
-            !super::handle_key(
-                key(KeyCode::Char('t'), KeyModifiers::CONTROL),
-                &backends,
-                &refresher,
-                &mut ui,
-                &mut terminal,
-            )
-            .expect("opt into attached mouse capture"),
-            "Ctrl+T must not quit the viewer"
-        );
-        assert!(
-            ui.mouse_capture,
-            "Ctrl+T must opt into external opencode wheel forwarding"
-        );
-
-        wait_for_pty_screen(&ui, &session_key, "READY");
-
-        handle_mouse_event(
-            mouse(MouseEventKind::ScrollUp, 5, 5),
-            &backends,
-            &mut ui,
-            &mut terminal,
-        )
-        .expect("forward attached wheel event");
-
-        // The child must receive SGR wheel-up (button 64), not ESC [ A prompt-history input.
-        wait_for_pty_screen(&ui, &session_key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
-        assert!(matches!(ui.mode, Mode::Attached));
     }
 
     #[test]
@@ -5375,9 +5285,9 @@ pub(crate) mod tests {
     #[test]
     fn archive_action_dispatches_both_rows_for_fresh_resolution() {
         let mut external = sess("external", "/tmp/external", 200);
-        external.backend = BackendKind::Opencode;
+        external.backend = BackendKind::Codex;
         let mut managed = sess("managed", "/tmp/managed", 100);
-        managed.backend = BackendKind::Opencode;
+        managed.backend = BackendKind::Codex;
         managed.daemon_hosted = true;
         let mut ui = test_ui_with(vec![external, managed]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
@@ -5385,11 +5295,11 @@ pub(crate) mod tests {
 
         select_session_row(&mut ui, "external");
         crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("opencode:external:hide"));
+        assert!(ui.mutations.in_flight("codex:external:hide"));
 
         select_session_row(&mut ui, "managed");
         crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("opencode:managed:hide"));
+        assert!(ui.mutations.in_flight("codex:managed:hide"));
     }
 
     #[test]
