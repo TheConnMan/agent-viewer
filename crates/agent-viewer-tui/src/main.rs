@@ -460,6 +460,9 @@ struct Ui {
     /// The header mascot on screen. Ctrl+G cycles it so the candidate sprites can be compared
     /// live in one build.
     sprite: ui::SpriteKind,
+    /// Whether finished rows fade toward `faint` as they age. Off unless the viewer db says
+    /// otherwise; toggled from the command palette.
+    age_ramp: bool,
 }
 
 impl Ui {
@@ -588,6 +591,11 @@ fn main() -> io::Result<()> {
     let db = ViewerDb::open_default().ok();
     let persisted_theme = db.as_ref().and_then(ui::theme::persisted_theme);
     let startup_sprite = startup_sprite(db.as_ref());
+    // Unset (and no db at all) reads as off: the age ramp is opt-in.
+    let startup_age_ramp = db
+        .as_ref()
+        .and_then(|db| db.age_ramp().ok())
+        .unwrap_or(false);
     let (themes, theme_notices) = ui::ThemeState::load(
         ui::glyph_marks(),
         persisted_theme.as_deref(),
@@ -688,6 +696,7 @@ fn main() -> io::Result<()> {
         mouse_capture: true,
         mouse_press: None,
         sprite: startup_sprite,
+        age_ramp: startup_age_ramp,
     };
 
     // The composer's Auto entry is capability-gated on the router binary, resolved once here:
@@ -833,6 +842,7 @@ fn run(
                     list_hit: &ui.list_hit,
                     themes: &ui.themes,
                     sprite: ui.sprite,
+                    age_ramp: ui.age_ramp,
                 },
             );
         })?;
@@ -1490,6 +1500,7 @@ mod tests {
             mouse_press: None,
             terminal_palette: None,
             sprite: ui::SpriteKind::default(),
+            age_ramp: false,
         }
     }
 
@@ -2356,6 +2367,7 @@ mod tests {
                             list_hit: &ui.list_hit,
                             themes: &ui.themes,
                             sprite: ui.sprite,
+                            age_ramp: ui.age_ramp,
                         },
                     );
                 })
