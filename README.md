@@ -270,35 +270,28 @@ daemon and are joined live.
 
 `Ctrl+N` (or "Triage sessions waiting for input" in the `Ctrl+K` palette) opens a modal over
 the list that walks every session waiting for input, one at a time, longest wait first, with
-a `3 of 7` progress counter. Each item shows the last few
-turns, the question, the quick options the agent itself enumerated in that question, and a
-free-text answer box, with the next few items listed underneath.
+a `3 of 7` progress counter and the next few items named underneath.
 
-`1`..`9` pick a quick option and submit it, `Enter` submits the typed answer (or the
-highlighted option when nothing is typed), `→` skips, `←` goes back, and `Esc` leaves the
-queue. Running off the end closes the modal and reports how many were answered. The queue is
+The panel in the middle is the session itself, live — the same attach the list's `Enter`
+gives you, drawn into the panel instead of the whole screen. So you see the agent's own
+interface: its real question, its own numbered options, whatever it drew. Every key you press
+goes to it, and your answer is delivered by the agent's own input handling.
+
+Three chords are reserved for the queue: `Ctrl+N` next, `Ctrl+P` previous, `Ctrl+]` leave.
+Everything else — `Enter`, `Esc`, the arrows, digits, paste — belongs to the session, because
+those are how you answer a prompt. Running off the end closes the modal; it never wraps.
+
+Attaching is the existing attach, so triage inherits each backend's semantics exactly (Claude
+resumes the same thread; Codex goes through the app-server daemon) and invents no second way
+to reach a session. Sessions are attached one at a time as you reach them, never prefetched
+for the whole queue, and leaving the modal detaches without stopping anything. The queue is
 snapshotted when the modal opens, so a background refresh cannot reorder it mid-answer, and
 nothing in the modal touches the composer or the list selection.
 
-The queue is read-only over the session list: triage never attaches, spawns, joins, or
-mutates a session. Options are only ever the ones the agent wrote — a numbered pick submits
-that option's label verbatim, exactly as typing the label would, and none are synthesized.
-
-Codex and Claude both show their real last turns, read from the session's own transcript, so
-the question can be answered from the actual exchange rather than a one-line summary of it.
-Tool calls, tool results, and thinking blocks are dropped; what is left is your messages and
-the agent's prose. Each turn is capped at a few rows so the history can never crowd out the
-question. OpenCode's reader is keyed by session id rather than a transcript file, which the
-queue does not carry, so it falls back to its row summary. Transcripts are read on a
-background worker, one item at a time, never for the whole queue.
-
-Answers are handed to the reply path below, which means that today they are not delivered.
-
 Reply is deliberately out of scope for this rebuild. `Ctrl+E` is reserved in the key list but
 always reports a footer notice that reply is not supported. Revisiting it is a future,
-separately specified decision. Triage submits through that same path rather than growing a
-second one, so an answer currently reports the same notice; restoring reply delivery lights
-triage up with no further change.
+separately specified decision. The triage inbox does not depend on it: it delivers an answer
+by typing into the attached session, which is the agent's own input path, not a reply API.
 
 This viewer binds `Space` to group collapse and expand, not to reply, which is a deliberate
 divergence from Fleet View, which binds `space` to reply — noted here so it is not mistaken

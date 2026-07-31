@@ -9,9 +9,7 @@ use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_com
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
-use agent_viewer_tui::ui::{
-    ATTACHED_CHROME_ROWS, Mode, RenameModal, ReplyModal, TriageState, read_context, triage_queue,
-};
+use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal, TriageState, triage_queue};
 
 use crate::keys::set_mouse_capture;
 use crate::ops::{AttachPlan, Mutation};
@@ -175,118 +173,69 @@ pub(crate) fn open_triage(ui: &mut Ui) {
         return;
     }
     ui.mode = Mode::Triage(TriageState::new(items));
+    attach_triage_item(ui);
 }
 
-/// Deliver a triage answer through the EXISTING reply path — `Mode::Reply` + `send_reply` —
-/// never a second delivery mechanism of triage's own.
+/// Put the item under the cursor live in the panel, using the SAME attach the list's Enter
+/// uses — a resolved backend command in a `PtySession`, cached in `ui.attached` and keyed by
+/// session. Triage invents no second way to reach a session, so whatever attach semantics a
+/// backend has (claude resumes the same thread; codex goes through the app-server daemon)
+/// are exactly what triage inherits.
 ///
-/// `send_reply` is currently a stub that reports "reply is not supported" (reply was taken out
-/// of scope in the fleet-view reshape; see README). Triage deliberately does not revive it:
-/// what triage owns is the payload and the queue walk, and the day reply delivery is restored
-/// it lights up here with no change. On success the item is counted and the queue advances;
-/// running off the end closes the modal.
-pub(crate) fn submit_triage_answer<B: ratatui::backend::Backend>(
-    backends: &[Box<dyn Backend>],
-    ui: &mut Ui,
-    terminal: &mut ratatui::Terminal<B>,
-    payload: String,
-) -> io::Result<()> {
-    let Mode::Triage(state) = &ui.mode else {
-        return Ok(());
-    };
-    let Some((backend, id)) = state.current().map(|item| (item.backend, item.id.clone())) else {
-        return Ok(());
-    };
-    let Mode::Triage(mut state) = std::mem::replace(&mut ui.mode, Mode::Normal) else {
-        return Ok(());
-    };
-
-    ui.mode = Mode::Reply(ReplyModal {
-        backend,
-        id,
-        buffer: payload,
-    });
-    let notice_before = ui.notice.text().to_string();
-    send_reply(backends, ui, terminal)?;
-    // A restored reply path attaches, which owns the whole screen; there is no queue to walk
-    // back to in that case. A stubbed one leaves us in Reply mode, so triage resumes.
-    let took_over_the_screen = !matches!(ui.mode, Mode::Reply(_));
-    // Whatever the reply path had to say about this answer outranks the queue tally. Today it
-    // says "reply is not supported", and burying that under "triage: 1 answered" would tell
-    // the user their answer went somewhere.
-    let reply_spoke = ui.notice.text() != notice_before;
-
-    state.record_answer();
-    let answered = state.answered();
-    if took_over_the_screen {
-        return Ok(());
-    }
-    if state.advance() {
-        ui.mode = Mode::Triage(state);
-        return Ok(());
-    }
-    ui.mode = Mode::Normal;
-    if !reply_spoke {
-        ui.set_notice(format!("triage: {answered} answered"));
-    }
-    Ok(())
-}
-
-/// Queue an off-thread transcript read for the triage item under the cursor, once.
-///
-/// Codex and Claude both have a transcript reader in `-core`
-/// (`codex::rollout::read_transcript` and `claude::read_claude_transcript`); opencode's is
-/// keyed by (db path, session id) rather than a transcript file, which this item does not
-/// carry, so it records an empty context immediately and falls back to the summary line.
-/// Nothing is prefetched: a queue of forty blocked sessions costs one read, not forty.
-pub(crate) fn ensure_triage_context(ui: &mut Ui) {
+/// Attach resolution is off-thread, so this only submits; `install_attach_plan` lands the
+/// child. A session already attached from an earlier visit is reused, not respawned. Nothing
+/// is prefetched: walking a queue of forty costs one attach per item you actually look at.
+pub(crate) fn attach_triage_item(ui: &mut Ui) {
     let Mode::Triage(state) = &ui.mode else {
         return;
     };
-    let Some(item) = state.context_pending() else {
+    let Some(item) = state.current() else {
         return;
     };
-    let key: Key = (item.backend, item.id.clone());
-    let path = match item.backend {
-        BackendKind::Codex | BackendKind::Claude => item.rollout_path.clone(),
-        BackendKind::Opencode => None,
-    };
-    let Some(path) = path else {
-        if let Mode::Triage(state) = &mut ui.mode {
-            state.set_context(key.0, key.1, Vec::new());
-        }
+    let key: Key = item.key();
+    // The panel shows whatever is under `ui.focused`; point it at this item before the attach
+    // lands so a revisit renders its live child on the very next frame.
+    ui.focused = Some(key.clone());
+    let Some(session) = ui.app.session_for(&key).cloned() else {
+        ui.set_notice(format!("{} is no longer listed", item.title));
         return;
     };
-    let job = format!("{}:{}:triage-context", key.0.name(), key.1);
-    let backend = key.0;
-    ui.triage_context
-        .submit(job, move || Ok((key, read_context(backend, &path))));
-}
-
-/// Fold landed transcript reads into the open modal. A read that lands after the user has
-/// moved on is simply cached against its own session, never applied to the wrong item.
-pub(crate) fn install_triage_context(ui: &mut Ui) {
-    while let Some(result) = ui.triage_context.poll() {
-        let Ok(((backend, id), lines)) = result else {
-            continue;
-        };
-        if let Mode::Triage(state) = &mut ui.mode {
-            state.set_context(backend, id, lines);
-        }
+    ui.focused_session = Some(session.clone());
+    if ui.attached.contains_key(&key) {
+        return;
     }
+    submit_attach(ui, TargetRequest::from(&session));
 }
 
-/// `→` — skip to the next item without answering; running off the end closes the modal.
+/// `Ctrl+N` inside the modal — step to the next item; running off the end closes the modal.
 pub(crate) fn skip_triage_item(ui: &mut Ui) {
     let Mode::Triage(state) = &mut ui.mode else {
         return;
     };
     if state.advance() {
+        attach_triage_item(ui);
         return;
     }
-    let answered = state.answered();
+    close_triage(ui);
+}
+
+/// `Ctrl+P` inside the modal — step back to the previous item. A no-op on the first.
+pub(crate) fn back_triage_item(ui: &mut Ui) {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return;
+    };
+    if state.back() {
+        attach_triage_item(ui);
+    }
+}
+
+/// Leave the queue for the list. The children stay alive and stay in `ui.attached`: they are
+/// real sessions, and detaching from a session has never meant stopping it.
+pub(crate) fn close_triage(ui: &mut Ui) {
     ui.mode = Mode::Normal;
-    ui.set_notice(format!("triage: {answered} answered"));
+    ui.focused = None;
+    ui.focused_session = None;
+    ui.set_notice("triage: queue closed".to_string());
 }
 
 /// Submit the rename to the background runner (the app-server/UDS rename can take 1-2s).
@@ -450,8 +399,18 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let rows = size.height.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
-    let cols = size.width.max(1);
+    // The triage inbox hosts the child in a panel inside its chrome; full-screen attach gives
+    // it everything but the header and notice rows. A child sized to anything other than the
+    // rect it is drawn into wraps its own output at the wrong column.
+    let triage = matches!(ui.mode, Mode::Triage(_));
+    let (rows, cols) = if triage {
+        crate::ui::panel_pty_size(size.into()).unwrap_or((1, 1))
+    } else {
+        (
+            size.height.saturating_sub(ATTACHED_CHROME_ROWS).max(1),
+            size.width.max(1),
+        )
+    };
     let palette = ui
         .themes
         .active()
@@ -485,7 +444,11 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
 
     ui.focused = Some(key);
     ui.focused_session = Some(session);
-    ui.mode = Mode::Attached;
+    // Triage keeps its modal: the child it just landed belongs in the panel, not on the whole
+    // screen. Leaving the mode alone is what makes the queue survive an attach.
+    if !triage {
+        ui.mode = Mode::Attached;
+    }
     // Codex and Claude scroll immediately. External opencode keeps host text selection until
     // Ctrl+T opts into native wheel forwarding.
     set_mouse_capture(ui, capture_on_attach);

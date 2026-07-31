@@ -36,10 +36,7 @@ use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use sprite::SpriteKind;
 pub use theme::{Theme, ThemeState};
-pub use triage::{
-    TriageItem, TriageOption, TriageState, parse_options, question_prompt, read_context,
-    triage_queue,
-};
+pub use triage::{TriageItem, TriageLayout, TriageState, panel_pty_size, triage_queue};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
 pub type Pulses = HashMap<(BackendKind, String), i64>;
@@ -309,7 +306,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         frame.area(),
     );
 
-    if let Some(av) = d.attach {
+    // Full-screen attach owns the whole frame. Triage also has a live child, but hosts it in
+    // a panel inside its own chrome, so it falls through to the list draw below.
+    if matches!(d.mode, Mode::Attached)
+        && let Some(av) = &d.attach
+    {
         attach::draw(frame, av, d.notice, d.now_ms, theme);
         return;
     }
@@ -441,7 +442,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         palette::draw(frame, state, d.now_ms, theme);
     }
     if let Mode::Triage(state) = d.mode {
-        triage::draw(frame, state, d.now_ms, theme);
+        triage::draw(frame, state, d.attach.as_ref(), d.now_ms, theme);
     }
 }
 
@@ -678,7 +679,7 @@ fn draw_footer(
         Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
-        Mode::Triage(_) => Line::from("triage — Enter send · 1-9 pick · →/← skip/back · Esc leave"),
+        Mode::Triage(_) => Line::from(""),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -1806,104 +1807,73 @@ mod tests {
             assert!(rendered.contains(shortcut), "missing {shortcut}");
         }
     }
-
-    /// A one-item triage queue whose question is far too long for a single modal row.
-    fn long_question_triage() -> (TriageState, &'static str) {
-        const QUESTION: &str = "I'm not sure this is what I expected. The UI looks reasonable \
-             for it. Why do I need to detach? I don't actually ever use that detach function. \
-             I'm not sure what it does. I kind of expected either Ctrl+W just shows me all of \
-             the working sessions together, or I can select multiple sessions and add them to \
-             the grid.";
-        let mut session = Session {
-            backend: BackendKind::Claude,
-            id: "wall".into(),
-            short_id: None,
-            origin: agent_viewer_core::SessionOrigin::Background,
-            title: "Bonus: av-video-wall".into(),
-            cwd: "/home/me/git/acme/widget".into(),
-            git_branch: None,
-            status: Status::NeedsInput {
-                reason: Some(QUESTION.to_string()),
-            },
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            hidden: false,
-            companion: false,
-            summary: String::new(),
-            pid: None,
-            rollout_path: None,
-            pr_refs: Vec::new(),
-            daemon_hosted: false,
-        };
-        session.summary = QUESTION.to_string();
-        (TriageState::new(triage_queue(&[session])), QUESTION)
+    /// A three-item triage queue of blocked claude sessions.
+    fn triage_state() -> TriageState {
+        let items = (0..3)
+            .map(|index| Session {
+                backend: BackendKind::Claude,
+                id: format!("blocked-{index}"),
+                short_id: Some(format!("blocked-{index}")),
+                origin: agent_viewer_core::SessionOrigin::Background,
+                title: format!("Bonus: av-video-wall {index}"),
+                cwd: "/home/me/git/acme/widget".into(),
+                git_branch: None,
+                status: Status::NeedsInput {
+                    reason: Some("pick one".into()),
+                },
+                created_at_ms: 0,
+                updated_at_ms: index,
+                hidden: false,
+                companion: false,
+                summary: String::new(),
+                pid: None,
+                rollout_path: None,
+                pr_refs: Vec::new(),
+                daemon_hosted: false,
+            })
+            .collect::<Vec<_>>();
+        TriageState::new(triage_queue(&items))
     }
 
     #[test]
-    fn triage_renders_the_whole_question_across_as_many_rows_as_it_needs() {
-        let (state, question) = long_question_triage();
-        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(state));
-
-        // Every word of the question must be on screen somewhere: a question truncated to one
-        // row is the whole feature failing, because the answer depends on reading it.
+    fn triage_shows_the_queue_position_and_what_is_up_next() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
         let rendered = rows.concat();
-        for word in question.split_whitespace() {
-            assert!(
-                rendered.contains(word),
-                "question word {word:?} is missing from the modal"
-            );
-        }
-        // And it really is wrapped over several rows, not one very long one.
-        let question_rows = rows
-            .iter()
-            .filter(|row| row.contains("detach") || row.contains("expected"))
-            .count();
+
         assert!(
-            question_rows >= 2,
-            "expected the question to wrap over multiple rows, saw {question_rows}"
+            rendered.contains("1 of 3"),
+            "the progress affordance is missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("up next"),
+            "the queue preview is missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("av-video-wall 1") && rendered.contains("av-video-wall 2"),
+            "up next must name the sessions still queued: {rendered:?}"
         );
     }
 
+    /// The panel is the session, so the modal must say the keyboard belongs to it — otherwise
+    /// the reserved chords read as the only keys that work.
     #[test]
-    fn triage_shows_the_exchange_wrapped_not_a_truncated_one_liner() {
-        const TURN: &str = "assistant · I built the wall as a real attach so each tile is a \
-             live child, which is why detaching is involved at all. Do you want the tiles to \
-             be read-only instead?";
-        let (mut state, _) = long_question_triage();
-        state.set_context(BackendKind::Claude, "wall".into(), vec![TURN.to_string()]);
-        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(state));
-
+    fn triage_says_the_keys_go_to_the_session() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
         let rendered = rows.concat();
-        for word in TURN.split_whitespace() {
-            assert!(
-                rendered.contains(word),
-                "turn word {word:?} is missing; the exchange is what makes the question \
-                 answerable"
-            );
+
+        for hint in ["⌃N", "⌃]", "goes to the session"] {
+            assert!(rendered.contains(hint), "missing {hint} in {rendered:?}");
         }
-        assert!(
-            rows.iter().any(|row| row.contains("assistant ·")),
-            "the turn keeps its role label"
-        );
     }
 
+    /// Without a live child the panel must say so. A silently empty box reads as a session
+    /// that has nothing to ask, which is the opposite of why it is in the queue.
     #[test]
-    fn triage_answer_caret_follows_the_typed_text_instead_of_sitting_at_the_right_edge() {
-        let (mut state, _) = long_question_triage();
-        for character in "hello".chars() {
-            state.push_char(character);
-        }
-        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(state));
-
-        let answer_row = rows
-            .iter()
-            .find(|row| row.contains("❯ hello"))
-            .expect("the answer box shows the typed text");
-        let caret = answer_row.find('▏').expect("the caret is drawn");
-        let text_end = answer_row.find("hello").expect("typed text") + "hello".len();
-        assert_eq!(
-            caret, text_end,
-            "the caret must sit immediately after the typed text, not at the far right"
+    fn triage_without_a_live_child_says_it_is_attaching() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
+        assert!(
+            rows.concat().contains("attaching"),
+            "the panel must not render an unexplained empty box"
         );
     }
 
