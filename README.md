@@ -268,8 +268,9 @@ daemon and are joined live.
 
 ## Triage inbox
 
-`Ctrl+N` opens a modal over the list that walks every session waiting for input, one at a
-time, longest wait first, with a `3 of 7` progress counter. Each item shows the last few
+`Ctrl+N` (or "Triage sessions waiting for input" in the `Ctrl+K` palette) opens a modal over
+the list that walks every session waiting for input, one at a time, longest wait first, with
+a `3 of 7` progress counter. Each item shows the last few
 turns, the question, the quick options the agent itself enumerated in that question, and a
 free-text answer box, with the next few items listed underneath.
 
@@ -283,8 +284,12 @@ The queue is read-only over the session list: triage never attaches, spawns, joi
 mutates a session. Options are only ever the ones the agent wrote — a numbered pick submits
 that option's label verbatim, exactly as typing the label would, and none are synthesized.
 
-Only Codex sessions have a transcript reader, so only they show real turns; every other
-backend shows its row summary as the single context line. Transcripts are read on a
+Codex and Claude both show their real last turns, read from the session's own transcript, so
+the question can be answered from the actual exchange rather than a one-line summary of it.
+Tool calls, tool results, and thinking blocks are dropped; what is left is your messages and
+the agent's prose. Each turn is capped at a few rows so the history can never crowd out the
+question. OpenCode's reader is keyed by session id rather than a transcript file, which the
+queue does not carry, so it falls back to its row summary. Transcripts are read on a
 background worker, one item at a time, never for the whole queue.
 
 Answers are handed to the reply path below, which means that today they are not delivered.

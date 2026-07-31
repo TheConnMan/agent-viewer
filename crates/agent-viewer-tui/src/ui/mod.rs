@@ -1865,6 +1865,29 @@ mod tests {
     }
 
     #[test]
+    fn triage_shows_the_exchange_wrapped_not_a_truncated_one_liner() {
+        const TURN: &str = "assistant · I built the wall as a real attach so each tile is a \
+             live child, which is why detaching is involved at all. Do you want the tiles to \
+             be read-only instead?";
+        let (mut state, _) = long_question_triage();
+        state.set_context(BackendKind::Claude, "wall".into(), vec![TURN.to_string()]);
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(state));
+
+        let rendered = rows.concat();
+        for word in TURN.split_whitespace() {
+            assert!(
+                rendered.contains(word),
+                "turn word {word:?} is missing; the exchange is what makes the question \
+                 answerable"
+            );
+        }
+        assert!(
+            rows.iter().any(|row| row.contains("assistant ·")),
+            "the turn keeps its role label"
+        );
+    }
+
+    #[test]
     fn triage_answer_caret_follows_the_typed_text_instead_of_sitting_at_the_right_edge() {
         let (mut state, _) = long_question_triage();
         for character in "hello".chars() {
