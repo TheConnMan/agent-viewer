@@ -285,7 +285,17 @@ Hover or click a tile to focus it, or move with `Shift+↑↓←→`. The mouse 
 under the pointer back through what it has already printed, without moving the focus — that is
 the viewer's own viewport over the session's retained output, so it works the same whatever the
 backend does with mouse reports. `Ctrl+O` zooms the focused tile to the full attach view,
-reusing the connection the wall already holds. Everything else you type —
+reusing the connection the wall already holds.
+
+`Ctrl+X` retires the focused tile without leaving the grid, using the same two stages as the
+list: the first press stops the session, and a second press within two seconds removes it. A
+session that has already finished is not stopped again, so its first press only arms the
+removal and the footer reads `[press Ctrl+X again to remove]` until the window closes. Removing
+a session drops it from every view, and its tile and connection go with it. `Ctrl+K` opens the
+palette over the wall, aimed at the focused tile, for the actions the grid has no chord of its
+own for — archive, rename, stop or remove, or jumping to another session.
+
+Everything else you type —
 plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:
 `Esc` interrupts it and `Ctrl+C` clears its input line, exactly as they would if you had
 attached to it. `Ctrl+W` and `Ctrl+]` are the unconditional ways back to the list. The composer
