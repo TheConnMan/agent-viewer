@@ -148,14 +148,18 @@ pub fn parse_options(question: &str) -> Vec<TriageOption> {
         .collect()
 }
 
-/// PURE: the question with its enumerated option lines removed, collapsed to one line.
+/// PURE: the question with its enumerated option lines removed.
+///
+/// The agent's own line breaks are kept, because they are how it paragraphed its question;
+/// the renderer wraps from here. Nothing is dropped but the option lines, which are shown
+/// separately as the numbered picks.
 pub fn question_prompt(question: &str) -> String {
     let prompt = question
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && option_body(line).is_none())
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     if prompt.is_empty() {
         "pick an option".to_string()
     } else {
@@ -367,19 +371,31 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
     let available_width = frame_area.width.saturating_sub(4);
     let width = 92.min(available_width);
     let context = state.context().unwrap_or(&[]);
-    let desired_height = (2                                  // header + rule
+    let full = (width as usize).saturating_sub(2); // inside the modal border
+
+    // The question is the whole reason the modal exists, so it wraps to as many lines as it
+    // needs instead of being truncated to one. Everything else is fixed height, so the modal
+    // grows with the question rather than hiding it.
+    let question = wrap_question(&item.question, full);
+    let fixed_rows = 2                                       // header + rule
         + 1                                                  // item header
         + 1 + context.len().max(1)                           // LAST N TURNS + lines
-        + 1                                                  // question
         + item.options.len()
         + 3                                                  // answer box
         + 1 + state.upcoming().len()                         // UP NEXT + rows
-        + 1                                                  // hints
-        + 2) as u16; // borders
+        + 1; // hints
+    let desired_height = (fixed_rows + question.len() + 2) as u16; // + borders
     let height = desired_height.min(frame_area.height.saturating_sub(2));
     if width < 24 || height < 8 {
         return;
     }
+    // A question longer than the screen can hold gets the rows left over after the fixed
+    // regions, so a tall question can never push the answer box off the bottom.
+    let question_budget = (height as usize)
+        .saturating_sub(2)
+        .saturating_sub(fixed_rows)
+        .max(1);
+    let question = clamp_lines(question, question_budget);
 
     let mut area = centered_rect(50, 50, frame_area);
     area.width = width;
@@ -399,7 +415,6 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
     }
 
     let mut rows = Rows::new(inner);
-    let full = inner.width as usize;
 
     // Header: the progress affordance carries the meaning without color, so it survives mono16.
     let (position, total) = state.progress();
@@ -476,16 +491,17 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
         }
     }
 
-    rows.line(
-        frame,
-        Line::from(vec![
-            Span::styled("? ", fg(theme.accent)),
-            Span::styled(
-                field(&item.question, full.saturating_sub(2)),
-                fg(theme.text),
-            ),
-        ]),
-    );
+    // `? ` marks the first line; continuations indent under it so a wrapped question still
+    // reads as one question rather than as several.
+    for (index, line) in question.iter().enumerate() {
+        rows.line(
+            frame,
+            Line::from(vec![
+                Span::styled(if index == 0 { "? " } else { "  " }, fg(theme.accent)),
+                Span::styled(field(line, full.saturating_sub(2)), fg(theme.text)),
+            ]),
+        );
+    }
 
     for (index, option) in item.options.iter().enumerate() {
         let selected = index == state.highlight();
@@ -521,13 +537,20 @@ pub(super) fn draw(frame: &mut Frame, state: &TriageState, now_ms: i64, theme: &
     } else {
         (state.buffer().to_string(), theme.text)
     };
+    // The caret sits immediately after the text being typed, NOT at the far right of a padded
+    // field — pad after it. An answer wider than the box shows its tail, which is where the
+    // caret is, exactly like any other single-line input.
+    let answer_width = full.saturating_sub(4); // box borders + the "❯ " prompt
+    let shown = tail_fit(&answer, answer_width.saturating_sub(1));
+    let answer_pad = answer_width.saturating_sub(display(&shown) + 1);
     rows.boxed(
         frame,
         theme,
         Line::from(vec![
             Span::styled("❯ ", fg(theme.accent)),
-            Span::styled(field(&answer, full.saturating_sub(5)), fg(answer_color)),
+            Span::styled(shown, fg(answer_color)),
             Span::styled(caret, fg(theme.accent)),
+            Span::raw(" ".repeat(answer_pad)),
         ]),
     );
 
@@ -610,6 +633,51 @@ impl Rows {
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(line), inner);
     }
+}
+
+/// PURE: the question wrapped to the modal's inner width, allowing for the `? ` marker on the
+/// first line and the matching indent on continuations. Reuses the composer's wrapper rather
+/// than growing a second one; the agent's own line breaks are paragraph breaks.
+fn wrap_question(question: &str, full: usize) -> Vec<String> {
+    let budget = full.saturating_sub(2).max(1);
+    let lines = super::composer::wrap_by_width(question, budget, budget);
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+/// PURE: cut `lines` to at most `budget`, marking the last kept line so a question clipped by
+/// a short terminal is visibly clipped rather than silently ending mid-sentence.
+fn clamp_lines(mut lines: Vec<String>, budget: usize) -> Vec<String> {
+    if lines.len() <= budget {
+        return lines;
+    }
+    lines.truncate(budget);
+    if let Some(last) = lines.last_mut() {
+        last.push('…');
+    }
+    lines
+}
+
+/// PURE: the trailing `width` columns of `value` — what a single-line input shows when the
+/// text outruns the box, because the caret lives at the end.
+fn tail_fit(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for grapheme in value.graphemes(true).rev() {
+        let w = grapheme.width();
+        if used + w > width {
+            break;
+        }
+        used += w;
+        kept.push(grapheme);
+    }
+    kept.into_iter().rev().collect()
 }
 
 fn display(value: &str) -> usize {
