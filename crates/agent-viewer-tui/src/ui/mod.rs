@@ -1,5 +1,6 @@
 //! Rendering surface for the session list, composer, overlays, and attached terminal.
 
+pub mod age;
 mod attach;
 mod composer;
 mod header;
@@ -7,6 +8,7 @@ mod list;
 mod overlay;
 mod palette;
 mod sprite;
+mod tail;
 pub mod theme;
 pub mod wall;
 
@@ -35,6 +37,7 @@ pub use list::activity_ribbon;
 use list::{rename_buffer, rename_row_item, row_to_item};
 pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, PaletteTarget};
 pub use sprite::SpriteKind;
+pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
 pub use wall::{WallState, WallTile, WallView};
 
@@ -223,6 +226,12 @@ pub struct ListHit {
 }
 
 impl ListHit {
+    /// The width the list occupied last frame, which is what the tail pane's width gate
+    /// asks about. Zero before the first draw, i.e. "not measured yet", never "too narrow".
+    pub fn width(&self) -> u16 {
+        self.area.width
+    }
+
     pub fn rendered_range(
         &self,
         row_count: usize,
@@ -294,6 +303,13 @@ pub struct Draw<'a> {
     /// Which header mascot to draw. Cycled live with Ctrl+G while the candidates are being
     /// compared.
     pub sprite: SpriteKind,
+    /// Whether finished rows fade toward the theme's `faint` token as they age. Off by default,
+    /// toggled from the command palette, and a no-op under a non-truecolor theme.
+    pub age_ramp: bool,
+    /// The Ctrl+B tail pane, present only while it is open and a session is selected. It
+    /// takes its columns off the right of the list. Not drawn while the wall is up: it is a
+    /// panel beside the list, and the wall replaces the list.
+    pub tail: Option<TailView<'a>>,
     /// The video wall (Ctrl+W), when on. Present means the list region becomes a grid of
     /// live PTY tiles and the composer is not drawn at all (the focused tile owns the
     /// keyboard); the header and footer stay exactly where they were.
@@ -380,6 +396,23 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // the rename cursor is placed on the edit row by draw_list; Help/Filter show neither.
     // draw_list returns the frame's list geometry for mouse hit-testing; the slash popup (drawn
     // below, floating over the list's bottom) shadows part of it, so record that hole too.
+    // The tail pane takes a fixed slice off the right of the list area; the list keeps the
+    // rest and re-lays itself out at the narrower width. The wall stands the tail down: the
+    // tail is a panel beside the list, the wall replaces the list outright, and every tile
+    // already shows the live session the tail would be tailing.
+    let (list_area, tail_area) = match &d.tail {
+        Some(_) if d.wall.is_none() && vertical[1].width >= TAIL_MIN_TOTAL_WIDTH => {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(tail::tail_width(vertical[1].width)),
+                ])
+                .split(vertical[1]);
+            (split[0], Some(split[1]))
+        }
+        _ => (vertical[1], None),
+    };
     // The wall replaces the list region and nothing else, so it publishes that region for the
     // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
     let mut hit = match &d.wall {
@@ -398,10 +431,14 @@ pub fn draw(frame: &mut Frame, d: Draw) {
                 deco,
                 d.logos,
                 theme,
-                vertical[1],
+                d.age_ramp,
+                list_area,
             )
         }
     };
+    if let (Some(view), Some(area)) = (&d.tail, tail_area) {
+        tail::draw(frame, view, theme, area);
+    }
     if matches!(d.mode, Mode::Normal) && d.wall.is_none() {
         hit.blocked = overlay::popup_area(d.composer, d.themes, vertical[3]);
     }
@@ -492,6 +529,7 @@ fn draw_list(
     deco: ListDeco,
     logos: Option<&LogoMarks>,
     theme: &Theme,
+    age_ramp: bool,
     area: Rect,
 ) -> ListHit {
     let width = area.width as usize;
@@ -602,6 +640,7 @@ fn draw_list(
                         title_width,
                         elapsed_width,
                         theme,
+                        age_ramp,
                     ));
                     item_backends.push(Some(*backend));
                 }
@@ -619,6 +658,7 @@ fn draw_list(
                     title_width,
                     elapsed_width,
                     theme,
+                    age_ramp,
                 ));
                 item_backends.push(None);
                 item_to_row.push(target);
@@ -876,6 +916,8 @@ mod tests {
                         list_hit: &list_hit,
                         themes,
                         sprite: Default::default(),
+                        age_ramp: false,
+                        tail: None,
                         wall: None,
                         wall_rects: &RefCell::new(Vec::new()),
                     },
@@ -1115,6 +1157,7 @@ mod tests {
                     },
                     logos,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, 1),
                 );
             })
@@ -1233,6 +1276,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     area,
                 );
             })
@@ -1302,6 +1346,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1359,6 +1404,7 @@ mod tests {
                     ListDeco { rename: None },
                     None,
                     &theme,
+                    false,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1457,6 +1503,7 @@ mod tests {
                         ListDeco { rename: None },
                         None,
                         &theme,
+                        false,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -1534,6 +1581,7 @@ mod tests {
                         ListDeco { rename: None },
                         None,
                         &theme,
+                        false,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -1830,6 +1878,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
                     wall: None,
                     wall_rects: &RefCell::new(Vec::new()),
                 },
@@ -1861,13 +1911,9 @@ mod tests {
     /// The wall owns the keyboard, so the composer must not be on screen claiming to. Its
     /// rows go to the grid instead: the tile has to reach further down the frame than the
     /// list region ever did.
-    #[test]
-    fn the_composer_is_not_drawn_while_the_wall_is_on() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-        use ratatui::buffer::Cell;
-
-        let session = Session {
+    /// A plain working session for the wall render tests.
+    fn walled_test_session() -> Session {
+        Session {
             backend: BackendKind::Codex,
             id: "walled".to_string(),
             short_id: None,
@@ -1885,7 +1931,89 @@ mod tests {
             rollout_path: None,
             pr_refs: Vec::new(),
             daemon_hosted: false,
-        };
+        }
+    }
+
+    /// The tail pane is a panel beside the list; the wall replaces the list outright, and
+    /// every tile already shows the live session the tail would be tailing. So the wall takes
+    /// the whole region and the tail stands down rather than both fighting for the columns.
+    #[test]
+    fn the_tail_pane_stands_down_while_the_wall_is_up() {
+        let session = walled_test_session();
+        let app = App::new(vec![session.clone()]);
+        let composer = Composer::new();
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::new();
+        let list_hit = RefCell::new(ListHit::default());
+        let themes = ThemeState::default();
+        let rects = RefCell::new(Vec::new());
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        term.draw(|frame| {
+            draw(
+                frame,
+                Draw {
+                    app: &app,
+                    workspace: Path::new("/tmp"),
+                    mode: &Mode::Normal,
+                    notice: "",
+                    composer: &composer,
+                    pulses: &pulses,
+                    now_ms: 0,
+                    attach: None,
+                    pr_status: &pr_status,
+                    logos: None,
+                    list_hit: &list_hit,
+                    themes: &themes,
+                    sprite: Default::default(),
+                    age_ramp: false,
+                    // The pane is open, and wide enough that it would take its columns.
+                    tail: Some(TailView {
+                        session: Some(&session),
+                        events: None,
+                        live: None,
+                    }),
+                    wall: Some(WallView {
+                        tiles: vec![WallTile {
+                            session: &session,
+                            project: String::new(),
+                            pty: None,
+                            error: None,
+                        }],
+                        selected: 0,
+                        overflow: 0,
+                    }),
+                    wall_rects: &rects,
+                },
+            );
+        })
+        .unwrap();
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        // The wall owns the full width...
+        assert_eq!(rects.borrow()[0].width, 160);
+        // ...and, more to the point, the pane is not painted over the top of it. The wall
+        // draws into the whole region either way, so overpainting is the failure mode here,
+        // not a narrower grid.
+        assert!(
+            !rendered.contains("tail"),
+            "the tail pane rendered on top of the wall"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_not_drawn_while_the_wall_is_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Cell;
+
+        let session = walled_test_session();
         let app = App::new(vec![session.clone()]);
         let composer = Composer::new();
         let pulses = Pulses::new();
@@ -1911,6 +2039,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
                     wall: Some(WallView {
                         tiles: vec![WallTile {
                             session: &session,
@@ -1946,7 +2076,9 @@ mod tests {
         let (rows, _) = render_viewer(80, 24, "", Mode::Help);
         let rendered = rows.concat();
 
-        for shortcut in ["Ctrl+A", "Ctrl+D", "Ctrl+U", "Ctrl+C"] {
+        // Ctrl+C is last in the list and Ctrl+B is the newest entry, so between them these
+        // catch a list that has outgrown the popup.
+        for shortcut in ["Ctrl+A", "Ctrl+B", "Ctrl+D", "Ctrl+U", "Ctrl+]", "Ctrl+C"] {
             assert!(rendered.contains(shortcut), "missing {shortcut}");
         }
     }
@@ -2021,6 +2153,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
                     wall: None,
                     wall_rects: &RefCell::new(Vec::new()),
                 },
@@ -2131,6 +2265,8 @@ mod tests {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
                     wall: None,
                     wall_rects: &RefCell::new(Vec::new()),
                 },

@@ -387,6 +387,21 @@ impl Backend for CodexBackend {
         Ok(sessions)
     }
 
+    fn tail(&self, session: &Session, max_events: usize) -> Result<Vec<crate::TailEvent>> {
+        let Some(path) = session
+            .rollout_path
+            .as_deref()
+            .filter(|path| path.is_file())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut events = rollout::read_transcript(path)?;
+        if events.len() > max_events {
+            events = events.split_off(events.len() - max_events);
+        }
+        Ok(events)
+    }
+
     fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
         let Some(path) = session
             .rollout_path

@@ -287,6 +287,64 @@ pub struct Session {
     pub daemon_hosted: bool,
 }
 
+/// One entry of a session's recent transcript, oldest first.
+///
+/// Prose keeps its original text (the caller wraps it); a tool event is the tool's own name
+/// plus the one argument worth showing, already squashed onto a single line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailEvent {
+    Agent(String),
+    User(String),
+    Tool { name: String, detail: String },
+}
+
+/// Keys the three backends use for the one argument worth showing on a tool line, tried in
+/// this order. Codex writes `cmd`, Claude writes `command`/`file_path`, opencode writes
+/// `filePath`; the rest are the next-best identifying argument when none of those is present.
+const TOOL_DETAIL_KEYS: [&str; 9] = [
+    "cmd",
+    "command",
+    "file_path",
+    "filePath",
+    "path",
+    "pattern",
+    "query",
+    "skill",
+    "description",
+];
+
+/// The one argument worth showing for a tool call, pulled out of its input object. A
+/// `command` given as an argv array joins with spaces. Nothing recognized is an empty
+/// detail, never an error: a tool line still carries its name.
+pub(crate) fn tool_detail(input: &serde_json::Value) -> String {
+    for key in TOOL_DETAIL_KEYS {
+        let Some(value) = input.get(key) else {
+            continue;
+        };
+        let text = match value {
+            serde_json::Value::String(text) => squash(text),
+            serde_json::Value::Array(items) => squash(
+                &items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => continue,
+        };
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Collapse every run of whitespace to one space, so a multi-line shell script renders as
+/// one tool line instead of silently eating the rest of the pane.
+pub(crate) fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// A push notification from a backend that supports `subscribe`: either one session's status
 /// changed, or the backend's whole listing should be treated as stale and re-fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +425,14 @@ pub trait Backend: Send {
         window: std::time::Duration,
     ) -> crate::error::Result<Vec<i64>> {
         let _ = (session, window);
+        Ok(Vec::new())
+    }
+    /// The last `max_events` transcript events for `session`, oldest first, for the tail
+    /// pane. Reads the backend's own store and NEVER starts a process: the pane retargets on
+    /// every arrow key, so a spawn here would be one agent process per keystroke. Empty when
+    /// the backend cannot say.
+    fn tail(&self, session: &Session, max_events: usize) -> crate::error::Result<Vec<TailEvent>> {
+        let _ = (session, max_events);
         Ok(Vec::new())
     }
     /// Returns the direct child PID when the viewer forked it and the exact backend session

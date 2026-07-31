@@ -1,11 +1,11 @@
 mod common;
 
-use agent_viewer_core::Status;
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, SessionOrigin};
 use agent_viewer_core::opencode::{
     OpencodeBackend, OpencodeRuntime, OpencodeRuntimeTestConfig, is_run_mode_permission,
-    opencode_status, parse_opencode_models, read_opencode_last_message,
+    opencode_status, parse_opencode_models, read_opencode_tail,
 };
+use agent_viewer_core::{Status, TailEvent};
 use base64::Engine;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -1425,36 +1425,60 @@ fn opencode_lists_companion_flag() {
 // --- v2: last-message reader (peek) ---
 
 #[test]
-fn opencode_last_message_returns_newest_text_concatenated() {
+fn opencode_tail_returns_prose_and_tool_parts_oldest_first() {
     let schema = common::read_fixture("opencode_message_schema.sql");
     let inserts = [
         "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
          VALUES ('ses_1',NULL,'/home/user/oc-proj','Proj',1000,3000,NULL)",
+        // A user turn.
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+         VALUES ('msg_ask','ses_1',500,500,'{\"role\":\"user\"}')",
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+         VALUES ('prt_ask','msg_ask','ses_1',500,500,'{\"type\":\"text\",\"text\":\"fix the limiter\"}')",
         // Older assistant message with a single text part.
         "INSERT INTO message (id, session_id, time_created, time_updated, data) \
          VALUES ('msg_old','ses_1',1000,1000,'{\"role\":\"assistant\"}')",
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
          VALUES ('prt_old','msg_old','ses_1',1000,1000,'{\"type\":\"text\",\"text\":\"older reply\"}')",
-        // Newer assistant message: a tool part THEN a text part (tool must be skipped).
+        // Newer assistant message: a tool part THEN a text part. The tool part is an event
+        // now, detailed from state.input, and it keeps its place ahead of the text.
         "INSERT INTO message (id, session_id, time_created, time_updated, data) \
          VALUES ('msg_new','ses_1',2000,2000,'{\"role\":\"assistant\"}')",
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
-         VALUES ('prt_new_tool','msg_new','ses_1',2001,2001,'{\"type\":\"tool\",\"tool\":\"bash\"}')",
+         VALUES ('prt_new_tool','msg_new','ses_1',2001,2001,'{\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"input\":{\"command\":\"cargo test limiter\"}}}')",
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
          VALUES ('prt_new_text','msg_new','ses_1',2002,2002,'{\"type\":\"text\",\"text\":\"newer reply text\"}')",
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
 
-    let item = read_opencode_last_message(&path, "ses_1")
-        .expect("read ok")
-        .expect("a text message exists");
-    assert_eq!(item.role, "assistant");
-    // The NEWER message's text only, tool part skipped.
-    assert_eq!(item.text, "newer reply text");
+    assert_eq!(
+        read_opencode_tail(&path, "ses_1", 100).expect("read ok"),
+        vec![
+            TailEvent::User("fix the limiter".to_string()),
+            TailEvent::Agent("older reply".to_string()),
+            TailEvent::Tool {
+                name: "bash".to_string(),
+                detail: "cargo test limiter".to_string(),
+            },
+            TailEvent::Agent("newer reply text".to_string()),
+        ]
+    );
+
+    // max_events caps to the LAST two.
+    assert_eq!(
+        read_opencode_tail(&path, "ses_1", 2).expect("read ok"),
+        vec![
+            TailEvent::Tool {
+                name: "bash".to_string(),
+                detail: "cargo test limiter".to_string(),
+            },
+            TailEvent::Agent("newer reply text".to_string()),
+        ]
+    );
 }
 
 #[test]
-fn opencode_last_message_skips_whitespace_only_newest() {
+fn opencode_tail_drops_whitespace_only_prose() {
     let schema = common::read_fixture("opencode_message_schema.sql");
     let inserts = [
         "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
@@ -1465,7 +1489,7 @@ fn opencode_last_message_skips_whitespace_only_newest() {
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
          VALUES ('prt_old','msg_old','ses_1',1000,1000,'{\"type\":\"text\",\"text\":\"real prior message\"}')",
         // Newest message whose only text part is whitespace (newline-only around a tool
-        // transition) -> it must be skipped so the real prior message surfaces.
+        // transition) -> it must not render as a blank line in the pane.
         "INSERT INTO message (id, session_id, time_created, time_updated, data) \
          VALUES ('msg_new','ses_1',2000,2000,'{\"role\":\"assistant\"}')",
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
@@ -1473,46 +1497,42 @@ fn opencode_last_message_skips_whitespace_only_newest() {
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
 
-    let item = read_opencode_last_message(&path, "ses_1")
-        .expect("read ok")
-        .expect("a text message exists");
-    assert_eq!(item.text, "real prior message");
+    assert_eq!(
+        read_opencode_tail(&path, "ses_1", 100).expect("read ok"),
+        vec![TailEvent::Agent("real prior message".to_string())]
+    );
 }
 
 #[test]
-fn opencode_last_message_none_when_no_text_message() {
+fn opencode_tail_is_empty_for_unknown_session_and_missing_db() {
     let schema = common::read_fixture("opencode_message_schema.sql");
     let inserts = [
         "INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) \
          VALUES ('ses_1',NULL,'/home/user/oc-proj','Proj',1000,3000,NULL)",
-        // A message whose only part is a tool part -> no text -> Ok(None).
         "INSERT INTO message (id, session_id, time_created, time_updated, data) \
          VALUES ('msg_1','ses_1',1000,1000,'{\"role\":\"assistant\"}')",
+        // A nameless tool part is not an event.
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
-         VALUES ('prt_1','msg_1','ses_1',1000,1000,'{\"type\":\"tool\",\"tool\":\"bash\"}')",
+         VALUES ('prt_1','msg_1','ses_1',1000,1000,'{\"type\":\"tool\",\"tool\":\"\"}')",
     ];
     let (_dir, path) = common::temp_db(&schema, &inserts);
-    // Also nothing for an unknown session id.
     assert!(
-        read_opencode_last_message(&path, "ses_1")
+        read_opencode_tail(&path, "ses_1", 100)
             .expect("read ok")
-            .is_none()
+            .is_empty()
     );
     assert!(
-        read_opencode_last_message(&path, "nope")
+        read_opencode_tail(&path, "nope", 100)
             .expect("read ok")
-            .is_none()
+            .is_empty()
     );
-}
 
-#[test]
-fn opencode_last_message_missing_db_is_none() {
     let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
     assert!(
-        read_opencode_last_message(&missing, "ses_1")
+        read_opencode_tail(&missing, "ses_1", 100)
             .expect("read ok")
-            .is_none()
+            .is_empty()
     );
 }
 

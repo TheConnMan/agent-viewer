@@ -59,6 +59,8 @@ fn render(app: &App, workspace: &Path, width: u16) -> Vec<String> {
                     list_hit: &list_hit,
                     themes: &themes,
                     sprite: Default::default(),
+                    age_ramp: false,
+                    tail: None,
                     wall: None,
                     wall_rects: &std::cell::RefCell::new(Vec::new()),
                 },
