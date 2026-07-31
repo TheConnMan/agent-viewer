@@ -21,7 +21,7 @@ use crate::actions::{
     open_filter, open_rename, open_rename_request, open_reply, send_reply, spawn_from_composer,
     submit_attach, toggle_group_if_header, toggle_wall,
 };
-use crate::{Refresher, Ui};
+use crate::{Key, Refresher, Ui};
 
 const ATTACHED_CODEX_WHEEL_ROWS: usize = 3;
 
@@ -250,6 +250,15 @@ pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
 
 /// Route one terminal paste without interpreting embedded newlines as key presses.
 pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
+    // A paste on the wall belongs to the focused tile, exactly like a keystroke. Without this
+    // it would land in the composer that is not even drawn, so the text would appear to
+    // vanish and could then be spawned as a task after leaving the wall.
+    if matches!(ui.mode, Mode::Normal) && ui.wall.on {
+        if let Some(fkey) = wall_input_target(ui) {
+            paste_into_pty(text, &fkey, ui);
+        }
+        return;
+    }
     match &mut ui.mode {
         Mode::Normal => ui.composer.push_str(text),
         Mode::Attached => {
@@ -257,42 +266,7 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
             let Some(fkey) = ui.focused.clone() else {
                 return;
             };
-            let bracketed_paste = ui
-                .attached
-                .get(&fkey)
-                .is_some_and(|pty| pty.with_screen(|screen| screen.bracketed_paste()));
-            if let Some(tracker) = ui.detach_trackers.get_mut(&fkey) {
-                if bracketed_paste {
-                    for _ in text.chars() {
-                        tracker.on_char();
-                    }
-                } else {
-                    let mut chars = text.chars().peekable();
-                    while let Some(c) = chars.next() {
-                        match c {
-                            '\r' => {
-                                tracker.on_enter();
-                                if chars.peek() == Some(&'\n') {
-                                    chars.next();
-                                }
-                            }
-                            '\n' => tracker.on_enter(),
-                            '\u{8}' | '\u{7f}' => tracker.on_backspace(),
-                            _ => tracker.on_char(),
-                        }
-                    }
-                }
-            }
-            if let Some(pty) = ui.attached.get_mut(&fkey) {
-                if bracketed_paste {
-                    let mut bytes = b"\x1b[200~".to_vec();
-                    bytes.extend_from_slice(text.as_bytes());
-                    bytes.extend_from_slice(b"\x1b[201~");
-                    let _ = pty.write_input(&bytes);
-                } else {
-                    let _ = pty.write_input(text.as_bytes());
-                }
-            }
+            paste_into_pty(text, &fkey, ui);
         }
         Mode::Filter => {
             let mut filter = ui.app.filter().to_string();
@@ -303,6 +277,49 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
         Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
         Mode::Palette(palette) => palette.push_str(&single_line_paste(text)),
         Mode::Help => {}
+    }
+}
+
+/// Write pasted text into one PTY, keeping its Left-gate tracker in step. Shared by the
+/// attach view and the wall so both honour the child's bracketed-paste mode.
+fn paste_into_pty(text: &str, fkey: &Key, ui: &mut Ui) {
+    {
+        let bracketed_paste = ui
+            .attached
+            .get(fkey)
+            .is_some_and(|pty| pty.with_screen(|screen| screen.bracketed_paste()));
+        if let Some(tracker) = ui.detach_trackers.get_mut(fkey) {
+            if bracketed_paste {
+                for _ in text.chars() {
+                    tracker.on_char();
+                }
+            } else {
+                let mut chars = text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\r' => {
+                            tracker.on_enter();
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                        }
+                        '\n' => tracker.on_enter(),
+                        '\u{8}' | '\u{7f}' => tracker.on_backspace(),
+                        _ => tracker.on_char(),
+                    }
+                }
+            }
+        }
+        if let Some(pty) = ui.attached.get_mut(fkey) {
+            if bracketed_paste {
+                let mut bytes = b"\x1b[200~".to_vec();
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                let _ = pty.write_input(&bytes);
+            } else {
+                let _ = pty.write_input(text.as_bytes());
+            }
+        }
     }
 }
 
@@ -422,9 +439,7 @@ fn wall_input_target(ui: &mut Ui) -> Option<(BackendKind, String)> {
         return None;
     }
     let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
-    let key = keys
-        .get(ui.wall.selected.min(keys.len().checked_sub(1)?))?
-        .clone();
+    let key = keys.get(ui.wall.focus_index(&keys))?.clone();
     let live = ui
         .attached
         .get_mut(&key)
@@ -480,6 +495,17 @@ fn handle_wall_key(key: KeyEvent, ctrl: bool, target: Option<(BackendKind, Strin
     // typed in behind them. A reply armed at some other tile is untouched.
     if ui.pending_reply.as_ref().map(|pending| &pending.key) == Some(&fkey) {
         ui.pending_reply = None;
+    }
+    // Feed the same Left-gate tracker the attach view keeps. Zooming in with Ctrl+O reuses
+    // this PTY, and without this the reused session would start with an "empty input line"
+    // tracker — so the first Left after typing on the wall would back out instead of moving
+    // the cursor, mid-edit.
+    let tracker = ui.detach_trackers.entry(fkey.clone()).or_default();
+    match key.code {
+        KeyCode::Char(_) => tracker.on_char(),
+        KeyCode::Backspace => tracker.on_backspace(),
+        KeyCode::Enter => tracker.on_enter(),
+        _ => {}
     }
     if let Some(bytes) = key_to_bytes(key)
         && let Some(pty) = ui.attached.get_mut(&fkey)
@@ -1853,6 +1879,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// The index the wall's focus currently resolves to. The focus is stored by key, so a
+    /// test must ask the same question the input path does rather than reading a field.
+    fn wall_focus(ui: &Ui) -> usize {
+        let keys =
+            agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
+        ui.wall.focus_index(&keys)
+    }
+
     fn wall_ui_with_one_live_tile() -> Ui {
         let mut session = sess("live-tile", "/tmp/agentviewer-wall", 100);
         session.status = Status::Working;
@@ -1924,7 +1958,7 @@ pub(crate) mod tests {
             ratatui::layout::Rect::new(0, 0, 40, 10),
             ratatui::layout::Rect::new(40, 0, 40, 10),
         ];
-        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(wall_focus(&ui), 0);
 
         handle_mouse(
             MouseEvent {
@@ -1935,7 +1969,7 @@ pub(crate) mod tests {
             },
             &mut ui,
         );
-        assert_eq!(ui.wall.selected, 1, "hover must focus the tile under it");
+        assert_eq!(wall_focus(&ui), 1, "hover must focus the tile under it");
 
         // A click on the first tile focuses it back, for terminals that report no motion.
         handle_mouse(
@@ -1947,7 +1981,7 @@ pub(crate) mod tests {
             },
             &mut ui,
         );
-        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(wall_focus(&ui), 0);
 
         // Off every tile, the focus stays where it was rather than jumping to a default.
         handle_mouse(
@@ -1959,7 +1993,114 @@ pub(crate) mod tests {
             },
             &mut ui,
         );
-        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(wall_focus(&ui), 0);
+        kill_attached(&mut ui);
+    }
+
+    /// A tile that ages out of the recency window must take its connection with it. Left
+    /// alone, the child sits there invisible until the wall closes, and the MAX_TILES process
+    /// budget drifts upward as expired slots are refilled.
+    #[test]
+    fn a_tile_leaving_the_wall_closes_its_connection() {
+        let mut staying = sess("staying", "/tmp/agentviewer-wall", 100);
+        staying.status = Status::Working;
+        let mut leaving = sess("leaving", "/tmp/agentviewer-wall", 200);
+        leaving.status = Status::Working;
+        let leaving_key = (leaving.backend, leaving.id.clone());
+        let mut ui = test_ui_with(vec![staying, leaving.clone()]);
+        for key in [
+            (BackendKind::Claude, "staying".to_string()),
+            leaving_key.clone(),
+        ] {
+            ui.attached.insert(key.clone(), wall_tile_pty());
+            ui.wall.requested.insert(key);
+        }
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+        ui.wall.requested.insert(leaving_key.clone());
+        assert!(ui.attached.contains_key(&leaving_key));
+
+        // The session stops and its last activity ages past the window, so it is no longer
+        // tiled. Everything else about the wall is unchanged.
+        let mut stopped = leaving;
+        stopped.status = Status::Done;
+        stopped.updated_at_ms =
+            agent_viewer_core::spawn::now_ms() - agent_viewer_tui::ui::wall::RECENT_MS - 60_000;
+        let staying_session = ui
+            .app
+            .session_for(&(BackendKind::Claude, "staying".to_string()))
+            .cloned()
+            .expect("staying session");
+        ui.app.set_sessions(vec![staying_session, stopped]);
+        crate::prune_wall_tiles(&mut ui, agent_viewer_core::spawn::now_ms());
+
+        assert!(
+            !ui.attached.contains_key(&leaving_key),
+            "an expired tile kept its child alive"
+        );
+        assert!(
+            !ui.wall.requested.contains(&leaving_key),
+            "an expired tile stayed in the ownership set, so a join could still land"
+        );
+        assert!(
+            ui.attached
+                .contains_key(&(BackendKind::Claude, "staying".to_string())),
+            "pruning must not touch a tile that is still on the wall"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Paste is input too. On the wall it must reach the focused tile, not the composer that
+    /// is not even drawn — text landing there vanishes, then spawns as a task later.
+    #[test]
+    fn pasting_on_the_wall_reaches_the_focused_tile() {
+        let mut session = sess("pasted-into", "/tmp/agentviewer-wall", 100);
+        session.status = Status::Working;
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session]);
+        ui.attached.insert(
+            target.clone(),
+            PtySession::spawn(PtySpec {
+                program: "cat".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                envs: Vec::new(),
+                rows: 6,
+                cols: 40,
+                palette: None,
+                scrollback_rows: 0,
+            })
+            .expect("echoing tile child"),
+        );
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        handle_paste("pasted", &mut ui);
+
+        wait_for_pty_screen(&ui, &target, "pasted");
+        assert_eq!(
+            ui.composer.text(),
+            "",
+            "the paste must not have gone into the hidden composer"
+        );
+        kill_attached(&mut ui);
+    }
+
+    /// Zooming in with Ctrl+O reuses the wall's PTY, so the Left-gate tracker has to already
+    /// know the line is mid-edit. Otherwise the first Left backs out instead of moving the
+    /// cursor, right after you typed something.
+    #[test]
+    fn typing_on_the_wall_arms_the_left_gate_for_the_zoomed_view() {
+        let mut ui = wall_ui_with_one_live_tile();
+        let key = (BackendKind::Claude, "live-tile".to_string());
+        press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
+
+        press_normal_key(&mut ui, &[], 'x', KeyModifiers::NONE);
+
+        assert!(
+            ui.detach_trackers
+                .get(&key)
+                .is_some_and(|tracker| !tracker.detach_on_left()),
+            "a half-typed wall line must not read as an empty input line"
+        );
         kill_attached(&mut ui);
     }
 
@@ -2039,7 +2180,7 @@ pub(crate) mod tests {
             ui.attached.insert(key.clone(), wall_tile_pty());
         }
         press_normal_key(&mut ui, &[], 'w', KeyModifiers::CONTROL);
-        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(wall_focus(&ui), 0);
         let ordered =
             agent_viewer_tui::ui::wall::tile_keys(&ui.app, agent_viewer_core::spawn::now_ms());
         assert_eq!(ordered.len(), 2);
@@ -2048,13 +2189,14 @@ pub(crate) mod tests {
         // input surface.
         press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(
-            ui.wall.selected, 0,
+            wall_focus(&ui),
+            0,
             "a bare arrow must go to the tile, not move the focus"
         );
 
         // Two tiles are a 2x1 row, so Ctrl+Right moves and Ctrl+Down does not.
         press_normal_code(&mut ui, &[], KeyCode::Right, KeyModifiers::CONTROL);
-        assert_eq!(ui.wall.selected, 1);
+        assert_eq!(wall_focus(&ui), 1);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),
             Some(ordered[1].1.clone()),
@@ -2062,10 +2204,10 @@ pub(crate) mod tests {
         );
 
         press_normal_code(&mut ui, &[], KeyCode::Down, KeyModifiers::CONTROL);
-        assert_eq!(ui.wall.selected, 1, "a 2x1 grid has no second row");
+        assert_eq!(wall_focus(&ui), 1, "a 2x1 grid has no second row");
 
         press_normal_code(&mut ui, &[], KeyCode::Left, KeyModifiers::CONTROL);
-        assert_eq!(ui.wall.selected, 0);
+        assert_eq!(wall_focus(&ui), 0);
         assert_eq!(
             ui.app.selected().map(|s| s.id.clone()),
             Some(ordered[0].1.clone())

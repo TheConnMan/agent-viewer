@@ -49,6 +49,7 @@ pub(crate) fn toggle_wall(ui: &mut Ui) {
     let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
     match keys.first() {
         Some(key) => {
+            ui.wall.set_focus(&keys, 0);
             ui.app.select_by_key(key);
             let plural = if keys.len() == 1 { "" } else { "s" };
             ui.set_notice(format!(
@@ -60,19 +61,19 @@ pub(crate) fn toggle_wall(ui: &mut Ui) {
     }
 }
 
-/// Arrow movement inside the wall grid. Clamps at the edges like the list does, and pins the
-/// list selection onto the tile so Ctrl+R/Ctrl+X/Ctrl+E/Enter all act on the tile in view.
 /// Focus one tile outright, by index. The mouse path: hover or click puts the keyboard on
 /// whatever is under the pointer, so typing lands where you are looking.
 pub(crate) fn focus_wall_tile(ui: &mut Ui, index: usize) {
     let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
-    let Some(key) = keys.get(index) else {
+    let Some(key) = keys.get(index).cloned() else {
         return;
     };
-    ui.wall.selected = index;
-    ui.app.select_by_key(key);
+    ui.wall.set_focus(&keys, index);
+    ui.app.select_by_key(&key);
 }
 
+/// Ctrl+arrow movement inside the wall grid. Clamps at the edges like the list does, and pins
+/// the list selection onto the tile so Ctrl+O zooms the tile that has the keyboard.
 pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
     let keys = agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms());
     let count = keys.len();
@@ -81,12 +82,12 @@ pub(crate) fn move_wall_selection(ui: &mut Ui, dx: i32, dy: i32) {
     }
     let (cols, rows) = agent_viewer_tui::ui::wall::grid_dims(count);
     let (cols, rows) = (i32::from(cols), i32::from(rows));
-    let current = ui.wall.selected.min(count - 1) as i32;
+    let current = ui.wall.focus_index(&keys) as i32;
     let column = (current % cols + dx).clamp(0, cols - 1);
     let row = (current / cols + dy).clamp(0, rows - 1);
     // A short last row clamps back onto its final tile rather than landing on a hole.
     let selected = ((row * cols + column) as usize).min(count - 1);
-    ui.wall.selected = selected;
+    ui.wall.set_focus(&keys, selected);
     ui.app.select_by_key(&keys[selected]);
 }
 

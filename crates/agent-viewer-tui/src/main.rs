@@ -847,6 +847,7 @@ fn run(
         // size every connected child to the cell it will occupy. Both are off the render
         // path (resize needs `&mut`) and use last frame's geometry: one frame of lag on
         // entry, invisible in practice.
+        prune_wall_tiles(ui, now);
         request_wall_joins(ui, now);
         resize_wall_tiles(ui, now);
 
@@ -981,6 +982,37 @@ fn install_wall_join(ui: &mut Ui, key: Key, plan: Result<ops::AttachPlan, String
     }
 }
 
+/// Drop every connection the wall no longer has a tile for. A session ages out of the recency
+/// window, or stops being live, while the wall is still up; without this its child would sit
+/// there invisible until the wall closed, and the process budget `MAX_TILES` is supposed to
+/// enforce would drift upward as expired slots were replaced.
+///
+/// Removing the key from `requested` also invalidates any join still in flight for it, because
+/// `install_wall_join` bails on `!wall.owns(&key)` before it spawns anything.
+///
+/// The zoomed session is exempt: the attach view is holding it and closes it on the way out.
+fn prune_wall_tiles(ui: &mut Ui, now_ms: i64) {
+    if !ui.wall.on {
+        return;
+    }
+    let keys = ui::wall::tile_keys(&ui.app, now_ms);
+    let expired: Vec<Key> = ui
+        .wall
+        .requested
+        .iter()
+        .filter(|key| !keys.contains(key))
+        .cloned()
+        .collect();
+    for key in expired {
+        ui.wall.requested.remove(&key);
+        ui.wall.failed.remove(&key);
+        ui.wall.sized.remove(&key);
+        if ui.focused.as_ref() != Some(&key) {
+            ui.remove_pty(&key);
+        }
+    }
+}
+
 /// Ask the backend to resolve an attach for every wall tile that is not connected yet.
 ///
 /// Each join is keyed per session so they run concurrently, unlike the single-slot `"attach"`
@@ -1074,7 +1106,7 @@ fn build_wall_view(ui: &Ui, now_ms: i64) -> Option<ui::WallView<'_>> {
         })
         .collect::<Vec<_>>();
     Some(ui::WallView {
-        selected: ui.wall.selected.min(tiles.len().saturating_sub(1)),
+        selected: ui.wall.focus_index(&ui::wall::tile_keys(&ui.app, now_ms)),
         tiles,
         overflow,
     })
