@@ -10,6 +10,7 @@ mod palette;
 mod sprite;
 mod tail;
 pub mod theme;
+mod triage;
 pub mod wall;
 
 use crate::app::{App, Composer, Row};
@@ -39,6 +40,7 @@ pub use palette::{PaletteAction, PaletteGroup, PaletteItem, PaletteState, Palett
 pub use sprite::SpriteKind;
 pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
+pub use triage::{TriageItem, TriageLayout, TriageState, panel_pty_size, triage_queue};
 pub use wall::{WallState, WallTile, WallView};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -194,6 +196,8 @@ pub enum Mode {
     Filter,
     Rename(RenameModal),
     Reply(ReplyModal),
+    /// The Ctrl+N triage inbox: a modal walk over the needs-input queue, drawn over the list.
+    Triage(TriageState),
     Help,
     Attached,
 }
@@ -329,7 +333,11 @@ pub fn draw(frame: &mut Frame, d: Draw) {
         frame.area(),
     );
 
-    if let Some(av) = d.attach {
+    // Full-screen attach owns the whole frame. Triage also has a live child, but hosts it in
+    // a panel inside its own chrome, so it falls through to the list draw below.
+    if matches!(d.mode, Mode::Attached)
+        && let Some(av) = &d.attach
+    {
         attach::draw(frame, av, d.notice, d.now_ms, theme);
         return;
     }
@@ -509,6 +517,9 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     }
     if let Mode::Palette(state) = d.mode {
         palette::draw(frame, state, d.now_ms, theme);
+    }
+    if let Mode::Triage(state) = d.mode {
+        triage::draw(frame, state, d.attach.as_ref(), d.now_ms, theme);
     }
 }
 
@@ -776,6 +787,7 @@ fn draw_footer(
         Mode::Palette(_) => Line::from(""),
         Mode::Rename(_) => Line::from("rename in row — Enter apply · Esc cancel"),
         Mode::Reply(_) => Line::from("reply — Enter send · Esc cancel"),
+        Mode::Triage(_) => Line::from(""),
         Mode::Help => Line::from("help — Esc/? to close"),
         Mode::Attached => Line::from(""),
         Mode::Normal => {
@@ -796,7 +808,7 @@ fn draw_footer(
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+N triage · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
                     ),
                     fg(theme.muted),
                 ))
@@ -2081,6 +2093,75 @@ mod tests {
         for shortcut in ["Ctrl+A", "Ctrl+B", "Ctrl+D", "Ctrl+U", "Ctrl+]", "Ctrl+C"] {
             assert!(rendered.contains(shortcut), "missing {shortcut}");
         }
+    }
+    /// A three-item triage queue of blocked claude sessions.
+    fn triage_state() -> TriageState {
+        let items = (0..3)
+            .map(|index| Session {
+                backend: BackendKind::Claude,
+                id: format!("blocked-{index}"),
+                short_id: Some(format!("blocked-{index}")),
+                origin: agent_viewer_core::SessionOrigin::Background,
+                title: format!("Bonus: av-video-wall {index}"),
+                cwd: "/home/me/git/acme/widget".into(),
+                git_branch: None,
+                status: Status::NeedsInput {
+                    reason: Some("pick one".into()),
+                },
+                created_at_ms: 0,
+                updated_at_ms: index,
+                hidden: false,
+                companion: false,
+                summary: String::new(),
+                pid: None,
+                rollout_path: None,
+                pr_refs: Vec::new(),
+                daemon_hosted: false,
+            })
+            .collect::<Vec<_>>();
+        TriageState::new(triage_queue(&items))
+    }
+
+    #[test]
+    fn triage_shows_the_queue_position_and_what_is_up_next() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
+        let rendered = rows.concat();
+
+        assert!(
+            rendered.contains("1 of 3"),
+            "the progress affordance is missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("up next"),
+            "the queue preview is missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("av-video-wall 1") && rendered.contains("av-video-wall 2"),
+            "up next must name the sessions still queued: {rendered:?}"
+        );
+    }
+
+    /// The panel is the session, so the modal must say the keyboard belongs to it — otherwise
+    /// the reserved chords read as the only keys that work.
+    #[test]
+    fn triage_says_the_keys_go_to_the_session() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
+        let rendered = rows.concat();
+
+        for hint in ["⌃N", "⌃]", "goes to the session"] {
+            assert!(rendered.contains(hint), "missing {hint} in {rendered:?}");
+        }
+    }
+
+    /// Without a live child the panel must say so. A silently empty box reads as a session
+    /// that has nothing to ask, which is the opposite of why it is in the queue.
+    #[test]
+    fn triage_without_a_live_child_says_it_is_attaching() {
+        let (rows, _) = render_viewer(120, 44, "", Mode::Triage(triage_state()));
+        assert!(
+            rows.concat().contains("attaching"),
+            "the panel must not render an unexplained empty box"
+        );
     }
 
     fn composer_bounds(rows: &[String]) -> (usize, usize) {

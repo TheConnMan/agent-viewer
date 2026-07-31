@@ -17,10 +17,11 @@ use agent_viewer_tui::ui::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
-    activate_selected, apply_rename, attach_selected, ensure_completions, ensure_models,
-    focus_wall_tile, hide_request, hide_selected, kill_request, kill_selected, move_wall_selection,
-    open_filter, open_rename, open_rename_request, open_reply, scroll_wall_tile, send_reply,
-    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
+    activate_selected, apply_rename, attach_selected, back_triage_item, close_triage,
+    ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected, kill_request,
+    kill_selected, move_wall_selection, open_filter, open_rename, open_rename_request, open_reply,
+    open_triage, scroll_wall_tile, send_reply, skip_triage_item, spawn_from_composer,
+    submit_attach, toggle_group_if_header, toggle_wall,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -99,6 +100,7 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         }
         Mode::Rename(_) => handle_rename_key(key.code, ui),
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
+        Mode::Triage(_) => handle_triage_key(key, ui)?,
     }
     Ok(false)
 }
@@ -289,6 +291,17 @@ pub(crate) fn handle_paste(text: &str, ui: &mut Ui) {
         Mode::Rename(modal) => modal.buffer.push_str(&single_line_paste(text)),
         Mode::Reply(modal) => modal.buffer.push_str(&normalize_paste(text)),
         Mode::Palette(palette) => palette.push_str(&single_line_paste(text)),
+        // A paste in triage belongs to the session in the panel, exactly like a keystroke.
+        Mode::Triage(_) => {
+            if let Some(focused) = ui.focused.clone()
+                && let Some(pty) = ui.attached.get_mut(&focused)
+            {
+                let mut bytes = b"\x1b[200~".to_vec();
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                let _ = pty.write_input(&bytes);
+            }
+        }
         Mode::Help => {}
     }
 }
@@ -615,6 +628,7 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
             KeyCode::Char('k') => open_palette(backends, ui),
             KeyCode::Char('b') => toggle_tail(ui),
             KeyCode::Char('w') => toggle_wall(ui),
+            KeyCode::Char('n') => open_triage(ui),
             KeyCode::Char('g') => cycle_sprite(ui),
             _ => {}
         }
@@ -883,6 +897,16 @@ fn palette_action_items(
             "answer a session that needs input",
             Some("⌃E"),
             Some("unavailable · reply is not supported".to_string()),
+        ),
+        action_item(
+            PaletteAction::Triage,
+            "Triage sessions waiting for input",
+            "walk the needs-input queue, longest wait first",
+            Some("⌃N"),
+            // Not gated on the selected row: triage is a queue over every session, so the
+            // only thing that can disable it is an empty queue, which the action reports
+            // itself as a footer notice.
+            None,
         ),
         action_item(
             PaletteAction::StopOrRemove,
@@ -1179,6 +1203,7 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::Unarchive => hide_selected(backends, ui, false),
             PaletteAction::Rename => open_rename(backends, ui),
             PaletteAction::Reply => open_reply(backends, ui),
+            PaletteAction::Triage => open_triage(ui),
             PaletteAction::StopOrRemove => kill_selected(backends, ui),
             PaletteAction::ShowAll => ui.app.toggle_show_all(),
             PaletteAction::Group => ui.app.toggle_group_mode(),
@@ -1370,6 +1395,76 @@ fn handle_reply_key<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Triage-inbox key handling. Digits submit their quick option outright, Enter submits the
+/// typed answer (or the highlighted option), the arrows walk the queue and the option list, and
+/// Esc leaves the queue — exactly one level, back to the list.
+///
+/// Nothing here touches `ui.composer` or the list selection: walking the inbox is not walking
+/// the list, and the composer must hold whatever was in it when Ctrl+N was pressed.
+/// Triage key routing: three reserved chords drive the queue, EVERY other key is written to
+/// the attached child.
+///
+/// The panel is a real session, so the agent's own input handling is the answer path — there
+/// is no payload, no option parsing, and no second delivery shape. That is also why the
+/// reserved set is this small: every chord taken here is a chord the session can never see,
+/// and the session is the thing you came to talk to.
+fn handle_triage_key(key: KeyEvent, ui: &mut Ui) -> io::Result<()> {
+    match triage_command(key) {
+        Some(TriageCommand::Next) => skip_triage_item(ui),
+        Some(TriageCommand::Previous) => back_triage_item(ui),
+        Some(TriageCommand::Leave) => close_triage(ui),
+        None => forward_to_triage_child(key, ui),
+    }
+    Ok(())
+}
+
+/// The three chords triage keeps for itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TriageCommand {
+    Next,
+    Previous,
+    Leave,
+}
+
+/// PURE: the queue command a keystroke means, or None when it belongs to the session.
+///
+/// Ctrl+] already means "detach" in the full-screen attach view, so it means "leave" here too.
+/// Ctrl+N is the chord that opened the modal, which makes it the obvious "next". Bare Esc,
+/// Enter, arrows and digits are all deliberately NOT reserved: they are how you answer a
+/// prompt, and stealing them would break the thing the panel exists for.
+///
+/// Ctrl+] arrives under two encodings, exactly as the attached path documents: terminals send
+/// raw byte 0x1D, which crossterm's legacy unix parser folds onto Char('5')+CTRL, while the
+/// kitty keyboard protocol delivers the literal Char(']')+CTRL. Matching only the literal
+/// leaves the chord dead in most terminals — which is what a live run found.
+fn triage_command(key: KeyEvent) -> Option<TriageCommand> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('n') => Some(TriageCommand::Next),
+        KeyCode::Char('p') => Some(TriageCommand::Previous),
+        KeyCode::Char(']') | KeyCode::Char('5') => Some(TriageCommand::Leave),
+        _ => None,
+    }
+}
+
+/// Write a keystroke to the child in the panel, using the same encoder the full-screen attach
+/// view uses. No child (still attaching, or the attach failed) drops the keystroke rather than
+/// buffering it: replaying a burst of typing into a session that appears later would deliver
+/// an answer the user could not see themselves typing.
+fn forward_to_triage_child(key: KeyEvent, ui: &mut Ui) {
+    let Some(bytes) = key_to_bytes(key) else {
+        return;
+    };
+    let Some(focused) = ui.focused.clone() else {
+        return;
+    };
+    if let Some(pty) = ui.attached.get_mut(&focused) {
+        let _ = pty.write_input(&bytes);
+    }
+}
+
 /// The pure reply-compose state machine: Esc cancels, Backspace/Char edit the buffer.
 fn edit_reply(code: KeyCode, ui: &mut Ui) {
     let Mode::Reply(modal) = &mut ui.mode else {
@@ -1390,14 +1485,15 @@ pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
         handle_attached_key, handle_key, handle_mouse, handle_mouse_event, handle_palette_key,
-        handle_paste, handle_rename_key, is_quit_chord, open_filter, open_palette, palette_items,
-        set_mouse_capture, wall_input_target,
+        handle_paste, handle_rename_key, handle_triage_key, is_quit_chord, open_filter,
+        open_palette, palette_items, set_mouse_capture, wall_input_target,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
+    use agent_viewer_tui::ui::TriageState;
     use agent_viewer_tui::ui::{AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -5162,6 +5258,289 @@ pub(crate) mod tests {
             persisted_theme(ui.db.as_ref().expect("viewer db")).as_deref(),
             Some("terminal")
         );
+    }
+
+    // --- Ctrl+N triage inbox --------------------------------------------------------
+
+    fn blocked_session(id: &str, updated_at_ms: i64) -> Session {
+        let mut session = sess(id, "/home/me/git/acme/widget", updated_at_ms);
+        session.status = agent_viewer_core::Status::NeedsInput {
+            reason: Some("Pick a direction.".to_string()),
+        };
+        session
+    }
+
+    fn press_triage(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers) {
+        handle_triage_key(key(code, modifiers), ui).expect("triage key routing");
+    }
+
+    fn press_palette_code(
+        ui: &mut Ui,
+        backends: &[Box<dyn agent_viewer_core::Backend>],
+        code: KeyCode,
+    ) {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("fixed terminal");
+        handle_palette_key(key(code, KeyModifiers::NONE), backends, ui, &mut terminal)
+            .expect("palette key routing");
+    }
+
+    fn triage_state(ui: &Ui) -> &TriageState {
+        match &ui.mode {
+            Mode::Triage(state) => state,
+            _ => panic!("expected the triage modal to be open"),
+        }
+    }
+
+    /// Put a real child in the panel, standing in for the attached session. `cat` echoes what
+    /// it is sent, so the pty screen is direct evidence of what actually reached the session.
+    fn attach_a_child(ui: &mut Ui, key: crate::Key) {
+        let pty = agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "cat".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            envs: Vec::new(),
+            rows: 10,
+            cols: 40,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("panel child");
+        ui.focused = Some(key.clone());
+        ui.attached.insert(key, pty);
+    }
+
+    fn screen_contains(ui: &Ui, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let key = ui.focused.clone().expect("a focused child");
+        while std::time::Instant::now() < deadline {
+            let seen = ui.attached[&key].with_screen(|screen| screen.contents());
+            if seen.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn ctrl_n_opens_triage_on_the_needs_input_queue_oldest_first() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("newer", 3_000),
+            sess("busy", "/tmp", 2_000),
+            blocked_session("older", 1_000),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Triage(_)), "Ctrl+N opens triage");
+        let state = triage_state(&ui);
+        assert_eq!(state.len(), 2, "only the blocked sessions are queued");
+        assert_eq!(
+            state.current().map(|item| item.id.as_str()),
+            Some("older"),
+            "the longest wait is first"
+        );
+    }
+
+    #[test]
+    fn ctrl_n_on_an_empty_queue_notices_instead_of_opening_a_modal() {
+        let mut ui = test_ui_with(vec![sess("busy", "/tmp", 1_000)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "no modal over an empty queue"
+        );
+        assert_eq!(ui.notice.text(), "nothing waiting for input");
+    }
+
+    #[test]
+    fn ctrl_n_does_not_collide_with_an_already_claimed_chord() {
+        let claimed = [
+            KeyCode::Char('a'),
+            KeyCode::Char('d'),
+            KeyCode::Char('f'),
+            KeyCode::Char('k'),
+            KeyCode::Char('r'),
+            KeyCode::Char('u'),
+        ];
+        assert!(
+            !claimed.contains(&KeyCode::Char('n')),
+            "Ctrl+N must not be an already-claimed chord"
+        );
+    }
+
+    #[test]
+    fn the_command_palette_offers_triage_and_opens_it() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'k', KeyModifiers::CONTROL);
+        let listed = match &ui.mode {
+            Mode::Palette(state) => state
+                .results()
+                .find(|item| item.target == PaletteTarget::Action(PaletteAction::Triage))
+                .cloned(),
+            _ => panic!("Ctrl+K opens the palette"),
+        }
+        .expect("triage is offered in the palette");
+        assert!(
+            listed.enabled,
+            "triage is a queue over every session, so no selected row can disable it"
+        );
+
+        for character in "triage".chars() {
+            press_palette_code(&mut ui, &backends, KeyCode::Char(character));
+        }
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert!(
+            matches!(ui.mode, Mode::Triage(_)),
+            "running the palette entry opens the same modal Ctrl+N does"
+        );
+    }
+
+    /// The whole point of the panel: what you type reaches the agent, not a buffer of ours.
+    #[test]
+    fn typing_in_triage_reaches_the_session_rather_than_a_local_buffer() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item);
+
+        for character in "artifact-first".chars() {
+            press_triage(&mut ui, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press_triage(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(
+            screen_contains(&ui, "artifact-first"),
+            "the answer must arrive at the session itself"
+        );
+        assert!(
+            matches!(ui.mode, Mode::Triage(_)),
+            "answering keeps you in the queue"
+        );
+    }
+
+    /// Esc, Enter, arrows and digits are how you answer an agent's prompt. Reserving any of
+    /// them for the queue would break the panel for the sessions it exists to serve.
+    #[test]
+    fn escape_and_the_arrows_belong_to_the_session_not_the_queue() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item);
+
+        for code in [KeyCode::Esc, KeyCode::Down, KeyCode::Char('2')] {
+            press_triage(&mut ui, code, KeyModifiers::NONE);
+            assert!(
+                matches!(ui.mode, Mode::Triage(_)),
+                "{code:?} must not close or redirect the modal"
+            );
+        }
+        assert!(
+            screen_contains(&ui, "2"),
+            "a digit types into the session like any other key"
+        );
+    }
+
+    #[test]
+    fn ctrl_n_walks_the_queue_and_ctrl_p_walks_back() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("older", 100),
+            blocked_session("newer", 200),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert_eq!(triage_state(&ui).progress(), (1, 2));
+
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(triage_state(&ui).progress(), (2, 2));
+        assert_eq!(
+            triage_state(&ui).current().map(|item| item.id.as_str()),
+            Some("newer")
+        );
+
+        press_triage(&mut ui, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(triage_state(&ui).progress(), (1, 2));
+    }
+
+    #[test]
+    fn walking_past_the_last_item_closes_the_modal_without_wrapping() {
+        let mut ui = test_ui_with(vec![blocked_session("only", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+
+        press_triage(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        assert!(
+            matches!(ui.mode, Mode::Normal),
+            "running off the end lands on the list rather than wrapping to the top"
+        );
+    }
+
+    /// Both encodings of Ctrl+] must leave. A live run found the literal-only match left the
+    /// chord dead in the terminal, because crossterm's legacy parser folds 0x1D onto Ctrl+5.
+    #[test]
+    fn both_encodings_of_ctrl_bracket_leave_the_queue() {
+        for code in [KeyCode::Char(']'), KeyCode::Char('5')] {
+            let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+            press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+            assert!(matches!(ui.mode, Mode::Triage(_)));
+
+            press_triage(&mut ui, code, KeyModifiers::CONTROL);
+
+            assert!(
+                matches!(ui.mode, Mode::Normal),
+                "{code:?} with CTRL must leave the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_bracket_leaves_the_queue_and_leaves_the_composer_and_selection_alone() {
+        let mut ui = test_ui_with(vec![
+            blocked_session("blocked", 100),
+            sess("other", "/tmp", 200),
+            sess("third", "/tmp", 300),
+        ]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        for character in "half a task".chars() {
+            press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
+        }
+        press_normal_code(&mut ui, &backends, KeyCode::Down, KeyModifiers::NONE);
+        let composer_before = ui.composer.text().to_string();
+        let selection_before = ui.app.selected_index();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let item = triage_state(&ui).current().expect("an item").key();
+        attach_a_child(&mut ui, item);
+        for character in "an answer".chars() {
+            press_triage(&mut ui, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press_triage(&mut ui, KeyCode::Char(']'), KeyModifiers::CONTROL);
+
+        assert!(matches!(ui.mode, Mode::Normal), "Ctrl+] lands on the list");
+        assert_eq!(
+            ui.composer.text(),
+            composer_before,
+            "typing into the session must never reach the composer"
+        );
+        assert_eq!(ui.app.selected_index(), selection_before);
     }
 
     #[test]

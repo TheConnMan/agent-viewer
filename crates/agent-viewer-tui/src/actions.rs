@@ -9,7 +9,7 @@ use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_com
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
-use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal};
+use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal, TriageState, triage_queue};
 use crossterm::event::{MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
@@ -266,6 +266,83 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// `Ctrl+N` — open the triage inbox on the needs-input queue, oldest first.
+///
+/// The queue is snapshotted here and not rebuilt while the modal is up: the 1s background
+/// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
+/// opens nothing — a footer notice, and the list is untouched.
+pub(crate) fn open_triage(ui: &mut Ui) {
+    let items = triage_queue(ui.app.sessions());
+    if items.is_empty() {
+        ui.set_notice("nothing waiting for input".to_string());
+        return;
+    }
+    ui.mode = Mode::Triage(TriageState::new(items));
+    attach_triage_item(ui);
+}
+
+/// Put the item under the cursor live in the panel, using the SAME attach the list's Enter
+/// uses — a resolved backend command in a `PtySession`, cached in `ui.attached` and keyed by
+/// session. Triage invents no second way to reach a session, so whatever attach semantics a
+/// backend has (claude resumes the same thread; codex goes through the app-server daemon)
+/// are exactly what triage inherits.
+///
+/// Attach resolution is off-thread, so this only submits; `install_attach_plan` lands the
+/// child. A session already attached from an earlier visit is reused, not respawned. Nothing
+/// is prefetched: walking a queue of forty costs one attach per item you actually look at.
+pub(crate) fn attach_triage_item(ui: &mut Ui) {
+    let Mode::Triage(state) = &ui.mode else {
+        return;
+    };
+    let Some(item) = state.current() else {
+        return;
+    };
+    let key: Key = item.key();
+    // The panel shows whatever is under `ui.focused`; point it at this item before the attach
+    // lands so a revisit renders its live child on the very next frame.
+    ui.focused = Some(key.clone());
+    let Some(session) = ui.app.session_for(&key).cloned() else {
+        ui.set_notice(format!("{} is no longer listed", item.title));
+        return;
+    };
+    ui.focused_session = Some(session.clone());
+    if ui.attached.contains_key(&key) {
+        return;
+    }
+    submit_attach(ui, TargetRequest::from(&session));
+}
+
+/// `Ctrl+N` inside the modal — step to the next item; running off the end closes the modal.
+pub(crate) fn skip_triage_item(ui: &mut Ui) {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return;
+    };
+    if state.advance() {
+        attach_triage_item(ui);
+        return;
+    }
+    close_triage(ui);
+}
+
+/// `Ctrl+P` inside the modal — step back to the previous item. A no-op on the first.
+pub(crate) fn back_triage_item(ui: &mut Ui) {
+    let Mode::Triage(state) = &mut ui.mode else {
+        return;
+    };
+    if state.back() {
+        attach_triage_item(ui);
+    }
+}
+
+/// Leave the queue for the list. The children stay alive and stay in `ui.attached`: they are
+/// real sessions, and detaching from a session has never meant stopping it.
+pub(crate) fn close_triage(ui: &mut Ui) {
+    ui.mode = Mode::Normal;
+    ui.focused = None;
+    ui.focused_session = None;
+    ui.set_notice("triage: queue closed".to_string());
+}
+
 /// Submit the rename to the background runner (the app-server/UDS rename can take 1-2s).
 pub(crate) fn apply_rename(ui: &mut Ui) {
     let Mode::Rename(modal) = &ui.mode else {
@@ -428,8 +505,18 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let rows = size.height.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
-    let cols = size.width.max(1);
+    // The triage inbox hosts the child in a panel inside its chrome; full-screen attach gives
+    // it everything but the header and notice rows. A child sized to anything other than the
+    // rect it is drawn into wraps its own output at the wrong column.
+    let triage = matches!(ui.mode, Mode::Triage(_));
+    let (rows, cols) = if triage {
+        crate::ui::panel_pty_size(size.into()).unwrap_or((1, 1))
+    } else {
+        (
+            size.height.saturating_sub(ATTACHED_CHROME_ROWS).max(1),
+            size.width.max(1),
+        )
+    };
     let palette = ui
         .themes
         .active()
@@ -464,7 +551,11 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
 
     ui.focused = Some(key);
     ui.focused_session = Some(session);
-    ui.mode = Mode::Attached;
+    // Triage keeps its modal: the child it just landed belongs in the panel, not on the whole
+    // screen. Leaving the mode alone is what makes the queue survive an attach.
+    if !triage {
+        ui.mode = Mode::Attached;
+    }
     // Codex and Claude scroll immediately. External opencode keeps host text selection until
     // Ctrl+T opts into native wheel forwarding.
     set_mouse_capture(ui, capture_on_attach);
