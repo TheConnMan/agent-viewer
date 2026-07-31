@@ -2,5 +2,12 @@
 resolver = "3"
 members = ["crates/*"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/TheConnMan/agent-viewer"
+rust-version = "1.95"
+
 [patch.crates-io]
 vt100 = { path = "vendor/vt100" }
