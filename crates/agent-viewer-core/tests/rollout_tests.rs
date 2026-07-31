@@ -24,6 +24,7 @@ fn codex_session(rollout_path: Option<PathBuf>) -> Session {
         updated_at_ms: 0,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path,

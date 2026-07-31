@@ -85,14 +85,20 @@ pub(crate) const TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
 ///
 /// The leading line is usually a fragment; every caller feeds the result to `parse_json_line`,
 /// which drops it silently along with any other malformed line.
+///
+/// The READER is bounded, not just the seek. `read_to_end` from the seek offset keeps reading
+/// past the length that was sampled a moment earlier, so against a rollout a live session is
+/// still appending to it returns the window PLUS everything written during the read - a
+/// listing/tail worker that stays busy for as long as the writer keeps going, on a 2s tick.
+/// `take` caps the read at the window no matter how fast the file grows.
 pub(crate) fn read_tail_window(path: &std::path::Path, window: u64) -> Result<String> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    let mut buf = Vec::with_capacity(usize::try_from(len.min(window)).unwrap_or(0));
+    file.take(window).read_to_end(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -182,4 +188,70 @@ pub(crate) fn activity_window(window: std::time::Duration) -> (i64, i64) {
     let now = crate::spawn::now_ms();
     let width = i64::try_from(window.as_millis()).unwrap_or(i64::MAX);
     (now.saturating_sub(width), now)
+}
+
+#[cfg(test)]
+mod tail_window_tests {
+    use super::read_tail_window;
+    use std::io::Write;
+
+    /// The flat post-condition: a file far larger than the window yields at most the window.
+    #[test]
+    fn read_tail_window_never_returns_more_than_the_window() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("static.log");
+        std::fs::write(&path, "a".repeat(64 * 1024)).expect("write file");
+
+        let text = read_tail_window(&path, 4_096).expect("read tail");
+
+        assert_eq!(text.len(), 4_096, "the window is both the cap and the read");
+    }
+
+    /// A file SHORTER than the window still returns all of it (the cap must not become a floor).
+    #[test]
+    fn read_tail_window_returns_a_short_file_whole() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("short.log");
+        std::fs::write(&path, "tiny").expect("write file");
+
+        assert_eq!(read_tail_window(&path, 4_096).expect("read tail"), "tiny");
+    }
+
+    /// THE REGRESSION. The read used to be `read_to_end` from the seek offset, which follows
+    /// bytes appended after the length was sampled: against a file a live session is still
+    /// writing, one tail read returns the window plus everything the writer produced during
+    /// it. The assertion is absolute (never more than the window), so it cannot fail on a
+    /// bounded reader no matter how the threads interleave - only an unbounded one trips it.
+    #[test]
+    fn read_tail_window_stays_bounded_while_the_file_is_being_appended_to() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("growing.log");
+        std::fs::write(&path, "s".repeat(128 * 1024)).expect("seed file");
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .expect("open for append");
+            let chunk = "w".repeat(64 * 1024);
+            for _ in 0..512 {
+                file.write_all(chunk.as_bytes()).expect("append chunk");
+            }
+        });
+
+        let mut reads = 0_u32;
+        while !writer.is_finished() {
+            let text = read_tail_window(&path, 4_096).expect("read tail");
+            assert!(
+                text.len() <= 4_096,
+                "tail read ran past its window: {} bytes",
+                text.len()
+            );
+            reads += 1;
+        }
+        writer.join().expect("writer thread");
+
+        assert!(reads > 0, "the reader never raced the writer");
+    }
 }

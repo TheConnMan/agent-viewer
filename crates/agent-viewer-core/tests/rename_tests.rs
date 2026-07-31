@@ -18,6 +18,7 @@ fn claude_session(short_id: Option<&str>) -> agent_viewer_core::Session {
         updated_at_ms: 0,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path: None,

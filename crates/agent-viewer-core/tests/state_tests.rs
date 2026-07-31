@@ -24,6 +24,7 @@ fn sess(backend: BackendKind, id: &str, cwd: &str, created_at_ms: i64, status: S
         updated_at_ms: created_at_ms,
         hidden: false,
         companion: false,
+        subagent: false,
         summary: String::new(),
         pid: None,
         rollout_path: None,
