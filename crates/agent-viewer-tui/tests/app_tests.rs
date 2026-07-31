@@ -491,6 +491,7 @@ fn hold_rows_cannot_be_revealed_and_do_not_change_hidden_count() {
 
 #[test]
 fn refresh_of_selected_session_to_hold_falls_back_safely() {
+    let sibling_root = PathBuf::from("/synthetic/refresh_with_sibling");
     let mut selected = sess(
         BackendKind::Codex,
         "selected",
@@ -519,11 +520,117 @@ fn refresh_of_selected_session_to_hold_falls_back_safely() {
     renamed.title = "Hold".to_string();
     app.set_sessions(vec![renamed, sibling]);
 
-    assert_eq!(
-        app.selected().map(|session| session.id.as_str()),
-        Some("sibling")
-    );
     assert!(!has_session(&app, "selected"));
+    let sibling_header_index = app
+        .visible()
+        .iter()
+        .position(|row| matches!(row, Row::ProjectHeader { root, .. } if root == &sibling_root))
+        .expect("project header remains visible after Hold hides its only selected session");
+    assert_eq!(app.selected_index(), sibling_header_index);
+    assert!(app.selected().is_none());
+    assert_eq!(
+        app.toggle_selected_group(),
+        Some((GroupKey::Project(sibling_root), true))
+    );
+
+    let preceding = sess(
+        BackendKind::Codex,
+        "preceding",
+        "/synthetic/refresh_middle",
+        100,
+        Status::Idle,
+    );
+    let middle = sess(
+        BackendKind::Codex,
+        "middle",
+        "/synthetic/refresh_middle",
+        200,
+        Status::Idle,
+    );
+    let following = sess(
+        BackendKind::Codex,
+        "following",
+        "/synthetic/refresh_middle",
+        300,
+        Status::Idle,
+    );
+    let mut middle_app = App::new(vec![preceding.clone(), middle, following.clone()]);
+    select(&mut middle_app, "middle");
+
+    let mut hidden_middle = sess(
+        BackendKind::Codex,
+        "middle",
+        "/synthetic/refresh_middle",
+        200,
+        Status::Idle,
+    );
+    hidden_middle.title = "Hold".to_string();
+    middle_app.set_sessions(vec![preceding, hidden_middle, following]);
+
+    assert_eq!(
+        middle_app.selected().map(|session| session.id.as_str()),
+        Some("preceding")
+    );
+    assert!(!has_session(&middle_app, "middle"));
+
+    let disappearing_preceding_root = PathBuf::from("/synthetic/refresh_disappearing_preceding");
+    let disappearing_preceding = sess(
+        BackendKind::Codex,
+        "disappearing_preceding",
+        "/synthetic/refresh_disappearing_preceding",
+        100,
+        Status::Idle,
+    );
+    let disappearing_selected = sess(
+        BackendKind::Codex,
+        "disappearing_selected",
+        "/synthetic/refresh_disappearing_preceding",
+        200,
+        Status::Idle,
+    );
+    let disappearing_following = sess(
+        BackendKind::Codex,
+        "disappearing_following",
+        "/synthetic/refresh_disappearing_preceding",
+        300,
+        Status::Idle,
+    );
+    let mut disappearing_preceding_app = App::new(vec![
+        disappearing_preceding,
+        disappearing_selected,
+        disappearing_following.clone(),
+    ]);
+    select(&mut disappearing_preceding_app, "disappearing_selected");
+
+    let mut hidden_disappearing_selected = sess(
+        BackendKind::Codex,
+        "disappearing_selected",
+        "/synthetic/refresh_disappearing_preceding",
+        200,
+        Status::Idle,
+    );
+    hidden_disappearing_selected.title = "Hold".to_string();
+    disappearing_preceding_app
+        .set_sessions(vec![hidden_disappearing_selected, disappearing_following]);
+
+    let disappearing_preceding_header_index = disappearing_preceding_app
+        .visible()
+        .iter()
+        .position(|row| matches!(row, Row::ProjectHeader { root, .. } if root == &disappearing_preceding_root))
+        .expect("project header survives when the preceding session disappears");
+    assert_eq!(
+        disappearing_preceding_app.selected_index(),
+        disappearing_preceding_header_index
+    );
+    assert!(disappearing_preceding_app.selected().is_none());
+    assert!(!has_session(
+        &disappearing_preceding_app,
+        "disappearing_selected"
+    ));
+    assert!(has_session(
+        &disappearing_preceding_app,
+        "disappearing_following"
+    ));
 
     let root = PathBuf::from("/synthetic/refresh_without_sibling");
     let only = sess(
@@ -555,6 +662,14 @@ fn refresh_of_selected_session_to_hold_falls_back_safely() {
         } if row_root == &root
     )));
     assert!(session_rows(only_app.visible()).is_empty());
+    let only_header_index = only_app
+        .visible()
+        .iter()
+        .position(
+            |row| matches!(row, Row::ProjectHeader { root: row_root, .. } if row_root == &root),
+        )
+        .expect("project header remains visible after its only session becomes Hold");
+    assert_eq!(only_app.selected_index(), only_header_index);
     assert!(only_app.selected().is_none());
     assert_eq!(
         only_app.toggle_selected_group(),
