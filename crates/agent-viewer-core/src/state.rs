@@ -291,7 +291,27 @@ fn create_state_parent(path: &Path) -> Result<()> {
     let mut current = path;
     while !current.exists() {
         missing.push(current);
-        current = current.parent().unwrap_or(current);
+        // `unwrap_or(current)` here was a fixpoint. An absolute path always terminates on `/`,
+        // but a RELATIVE one walks down to `""`, whose `parent()` is None - so the loop spun
+        // forever while `missing` grew without bound. That is not a hypothetical shape: with
+        // HOME unset or empty `home_dir()` returns an empty path and `open_default` joins onto
+        // it, producing exactly this relative path. Running off the top means there is no
+        // directory to create, so the state path is unusable and the caller (whose call site is
+        // `open_default().ok()`) degrades to running without viewer state.
+        let Some(parent) = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no usable parent directory for state path {}",
+                    path.display()
+                ),
+            )
+            .into());
+        };
+        current = parent;
     }
 
     for directory in missing.into_iter().rev() {
