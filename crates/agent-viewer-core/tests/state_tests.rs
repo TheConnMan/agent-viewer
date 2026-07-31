@@ -175,6 +175,37 @@ fn viewer_db_open_keeps_database_and_sqlite_sidecars_owner_only() {
     }
 }
 
+/// `open` creates its state path's missing ancestors by walking upward. A RELATIVE path runs
+/// off the top of that walk (`Path::new("").parent()` is None), and that is exactly the shape
+/// `open_default` builds when HOME is unset or empty. The walk has to terminate and report
+/// failure so the TUI's `open_default().ok()` degrades to running without viewer state.
+///
+/// The regression this guards is an infinite loop, so the call runs on its own thread behind a
+/// deadline: a reintroduced fixpoint fails this test instead of hanging the whole suite.
+#[test]
+fn viewer_db_open_terminates_on_a_rootless_relative_path() {
+    let probe = PathBuf::from("agent-viewer-rootless-probe/state/viewer.db");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let probed = probe.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(ViewerDb::open(&probed).is_err());
+    });
+
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(is_err) => assert!(
+            is_err,
+            "a state path with no usable parent must report failure, not a usable database"
+        ),
+        Err(_) => panic!(
+            "ViewerDb::open never returned for a rootless relative path: the ancestor walk does not terminate"
+        ),
+    }
+    assert!(
+        !PathBuf::from("agent-viewer-rootless-probe").exists(),
+        "an abandoned ancestor walk must not create directories in the working directory"
+    );
+}
+
 #[test]
 fn viewer_db_spawn_roundtrip() {
     let (_dir, path) = temp_db_path();
