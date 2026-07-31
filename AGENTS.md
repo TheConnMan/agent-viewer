@@ -27,7 +27,7 @@ detection, or the mutation path; those facts were verified live on this box and 
 
 ## What this is
 
-A Rust workspace: a terminal viewer for coding-agent sessions (Codex, Claude Code, opencode),
+A Rust workspace: a terminal viewer for coding-agent sessions (Codex, Claude Code),
 modeled on `claude agents`. Two crates:
 
 - `crates/agent-viewer-core` (lib) - registry readers, rollout parsers, status resolver,
@@ -51,8 +51,8 @@ fails, so an unformatted file turns the whole workflow red. Run `cargo fmt --all
 check when it reports hunks.
 
 The TUI expects a `~/.codex/state_*.sqlite` on the box (the Codex backend's source of truth).
-The Claude and opencode backends appear automatically when their CLIs and data exist and list
-empty otherwise, so a missing backend is never an error.
+The Claude backend appears automatically when its CLI and data exist and lists empty
+otherwise, so a missing backend is never an error.
 
 ## Cargo is wrapped on this box - bypass it when output is the evidence
 
@@ -156,7 +156,7 @@ run is not a two-minute compile.
 - **Never hardcode the state file version.** Glob `state_*.sqlite` and pick the highest version
   number. Same for any versioned Codex path.
 - **Mutations delegate to CLI subcommands or the app-server, never the DB.**
-  Archive/unarchive/resume go through `codex ...` (and the Claude/opencode equivalents), never a
+  Archive/unarchive/resume go through `codex ...` (and the Claude equivalents), never a
   direct DB write. Two documented exceptions:
   - Codex spawn and stop speak JSON-RPC to the `codex app-server` daemon (`thread/start` plus
     `turn/start`, and `turn/interrupt`), because a `codex exec` spawn hosts its app-server in

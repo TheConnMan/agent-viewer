@@ -12,13 +12,11 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent-viewer-core"
 version = "0.1.0"
 dependencies = [
- "base64",
  "libc",
  "portable-pty",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

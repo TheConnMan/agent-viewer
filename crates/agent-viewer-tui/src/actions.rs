@@ -147,8 +147,8 @@ pub(crate) fn open_filter(ui: &mut Ui) {
 
 /// The slash-command names for a backend (scanned from disk; missing dir -> empty, no error).
 /// claude: skill dir names under ~/.claude/skills plus <target>/.claude/skills (project
-/// skills). opencode: file stems under ~/.config/opencode/command. codex: file stems under
-/// ~/.codex/prompts. All home paths go through core's `home_dir`.
+/// skills). codex: file stems under ~/.codex/prompts. All home paths go through core's
+/// `home_dir`.
 fn scan_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<String> {
     let home = agent_viewer_core::home_dir();
     let mut cmds = match backend {
@@ -159,7 +159,6 @@ fn scan_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<
             }
             v
         }
-        BackendKind::Opencode => file_stems(&home.join(".config/opencode/command")),
         BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
     };
     cmds.sort();
@@ -602,8 +601,7 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     if !triage {
         ui.mode = Mode::Attached;
     }
-    // Codex and Claude scroll immediately. External opencode keeps host text selection until
-    // Ctrl+T opts into native wheel forwarding.
+    // Codex and Claude scroll immediately.
     set_mouse_capture(ui, capture_on_attach);
     Ok(true)
 }
@@ -637,7 +635,7 @@ pub(crate) fn spawn_from_composer(
         return;
     }
     let task = ui.composer.text().to_string();
-    // "default" (codex/opencode) passes no model flag; any other value is a real model.
+    // "default" (codex) passes no model flag; any other value is a real model.
     let model_str = ui.composer.model();
     let model = (model_str != "default").then_some(model_str);
     let notice = match model {
@@ -1167,10 +1165,9 @@ mod tests {
                 panic!("an auto submission must never reach a backend spawn");
             };
             // The row selection needs the winning provider's preexisting ids, and which
-            // provider wins is unknown until the router answers, so all three are captured.
+            // provider wins is unknown until the router answers, so both are captured.
             assert!(preexisting_ids.contains_key(&BackendKind::Claude));
             assert!(preexisting_ids.contains_key(&BackendKind::Codex));
-            assert!(preexisting_ids.contains_key(&BackendKind::Opencode));
             recorded.lock().unwrap().push(task);
             Ok(MutationOutcome {
                 notice: "auto: codex effort xhigh (codex weekly 87%, claude 52%)".to_string(),

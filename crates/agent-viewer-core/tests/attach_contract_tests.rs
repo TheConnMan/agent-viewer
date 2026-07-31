@@ -1,6 +1,6 @@
-//! attach_command wiring for the claude and opencode backends (v2.1 contract, no network).
-//! Claude splits live-vs-done; opencode drops the invalid `run -s -i` form. Commands are
-//! built, not run, so we assert via std::process::Command getters.
+//! attach_command wiring for the claude and codex backends (v2.1 contract, no network).
+//! Claude splits live-vs-done. Commands are built, not run, so we assert via
+//! std::process::Command getters.
 
 use agent_viewer_core::backend::{Backend, BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::claude::{
@@ -10,9 +10,6 @@ use agent_viewer_core::claude::{
 use agent_viewer_core::codex::{
     AttachRoute, attach_route_for_platform,
     capabilities_for_platform as codex_capabilities_for_platform,
-};
-use agent_viewer_core::opencode::{
-    OpencodeBackend, capabilities_for_platform as opencode_capabilities_for_platform,
 };
 use agent_viewer_core::platform::Platform;
 use std::ffi::OsStr;
@@ -39,28 +36,6 @@ fn claude_session(
         companion: false,
         summary: String::new(),
         pid,
-        rollout_path: None,
-        pr_refs: Vec::new(),
-        daemon_hosted: false,
-    }
-}
-
-fn opencode_session(cwd: PathBuf) -> Session {
-    Session {
-        backend: BackendKind::Opencode,
-        id: "ses_abc".to_string(),
-        short_id: None,
-        origin: SessionOrigin::Interactive,
-        title: "t".to_string(),
-        cwd,
-        git_branch: None,
-        status: Status::Done,
-        created_at_ms: 0,
-        updated_at_ms: 0,
-        hidden: false,
-        companion: false,
-        summary: String::new(),
-        pid: None,
         rollout_path: None,
         pr_refs: Vec::new(),
         daemon_hosted: false,
@@ -143,22 +118,6 @@ fn portable_codex_capabilities_disable_unsafe_process_actions() {
 }
 
 #[test]
-fn portable_opencode_capabilities_keep_only_compatibility_actions() {
-    for platform in [Platform::Macos, Platform::Windows] {
-        let caps = opencode_capabilities_for_platform(platform);
-        assert!(caps.spawn);
-        assert!(caps.attach);
-        assert!(!caps.delete);
-        assert!(!caps.rename);
-        assert!(!caps.archive);
-        assert!(!caps.stop);
-        assert!(!caps.needs_input);
-        assert!(!caps.pr_refs);
-        assert!(!caps.live_status);
-    }
-}
-
-#[test]
 fn windows_claude_capabilities_refuse_rename() {
     let caps = claude_capabilities_for_platform(Platform::Windows);
     assert!(!caps.rename);
@@ -215,23 +174,6 @@ fn portable_claude_delete_requires_a_finished_row_with_valid_short_id() {
                 "{platform:?} must not delete a finished row without a valid short id"
             );
         }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-#[test]
-fn portable_opencode_remove_is_unsupported_for_an_unknown_row() {
-    let session = Session {
-        status: Status::Unknown,
-        ..opencode_session(PathBuf::from("/some/proj"))
-    };
-    let error = OpencodeBackend::new()
-        .remove(&session)
-        .expect_err("portable OpenCode remove must refuse before invoking the CLI");
-
-    match error {
-        agent_viewer_core::Error::Unsupported(name) => assert_eq!(name, "opencode"),
-        other => panic!("expected Unsupported(\"opencode\"), got {other:?}"),
     }
 }
 
@@ -340,32 +282,4 @@ fn claude_attach_empty_short_id_falls_back_and_leaves_cwd_unset() {
     // A deleted cwd must not be set, or spawning the resume command would fail.
     assert_eq!(cmd.get_current_dir(), None);
     assert_eq!(env_set(&cmd, "CLAUDE_AGENTS_SELECT"), None);
-}
-
-// --- Opencode: `opencode -s <id>` (the old `run -s <id> -i --dir` was invalid) ---
-
-#[test]
-fn opencode_attach_uses_session_flag_in_existing_cwd() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let session = opencode_session(dir.path().to_path_buf());
-    let backend = OpencodeBackend::new();
-    let cmd = backend
-        .attach_command(&session)
-        .expect("opencode supports attach");
-
-    assert_eq!(cmd.get_program(), OsStr::new("opencode"));
-    assert_eq!(args_of(&cmd), vec![OsStr::new("-s"), OsStr::new("ses_abc")]);
-    assert_eq!(cmd.get_current_dir(), Some(dir.path()));
-}
-
-#[test]
-fn opencode_attach_leaves_cwd_unset_when_dir_missing() {
-    let session = opencode_session(PathBuf::from("/nonexistent/opencode-dir"));
-    let backend = OpencodeBackend::new();
-    let cmd = backend
-        .attach_command(&session)
-        .expect("opencode supports attach");
-
-    assert_eq!(args_of(&cmd), vec![OsStr::new("-s"), OsStr::new("ses_abc")]);
-    assert_eq!(cmd.get_current_dir(), None);
 }

@@ -9,7 +9,7 @@ pub fn now_ms() -> i64 {
 }
 
 /// The spawn "name"/"title" derived from a task prompt: the first 40 chars (char-, not
-/// byte-bounded). Shared by the claude `--name` and opencode `--title` spawn flags.
+/// byte-bounded). Used by the claude `--name` spawn flag.
 pub fn truncated_title(task: &str) -> String {
     task.chars().take(40).collect()
 }
@@ -24,8 +24,7 @@ pub fn viewer_log_path(prefix: &str) -> std::path::PathBuf {
 }
 
 /// Run a command to completion; non-zero exit -> Err(Error::Command(stderr)).
-/// The shared shape for every shell-out mutation (codex archive/unarchive,
-/// opencode delete/rename).
+/// The shared shape for every shell-out mutation (codex archive/unarchive).
 pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
     let output = cmd.output()?;
     if output.status.success() {
@@ -37,16 +36,16 @@ pub(crate) fn run_checked(cmd: &mut std::process::Command) -> Result<()> {
     }
 }
 
-/// How long a model-discovery shell-out (`codex debug models`, `opencode models`) may take.
-/// Generous because these run on a worker thread, never the render loop: `opencode models`
-/// alone takes ~3.8s cold on this box, and a deadline it can lose silently empties the
-/// composer's picker down to the built-in default.
+/// How long a model-discovery shell-out (`codex debug models`) may take.
+/// Generous because these run on a worker thread, never the render loop: a cold probe can
+/// take seconds on this box, and a deadline it can lose silently empties the composer's
+/// picker down to the built-in default.
 pub const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run `cmd`, returning captured stdout as a String if it exits 0 within `timeout`.
 /// On timeout the child is killed; any failure (spawn error, non-zero exit, timeout,
 /// non-utf8 stdout) returns None. Used to bound the best-effort model-discovery shell-outs
-/// (`codex debug models`, `opencode models`) so a hung CLI cannot freeze the caller
+/// (`codex debug models`) so a hung CLI cannot freeze the caller
 /// indefinitely: there, every failure means the same thing (no catalog today), so the reason
 /// is genuinely not worth carrying.
 pub(crate) fn run_with_timeout(
@@ -296,7 +295,7 @@ fn reap_detached(mut child: std::process::Child) -> u32 {
 }
 
 /// SIGTERM with a pid-reuse guard: read /proc/<pid>/comm; it must start with
-/// `expected_comm_prefix` ("codex" / "opencode"), else Err(Command("comm mismatch")).
+/// `expected_comm_prefix` ("codex"), else Err(Command("comm mismatch")).
 /// If getpgid(pid) == pid (process leads its own group) send SIGTERM to the group
 /// (-pid), else to the single pid. ESRCH (already gone) -> Ok(()). Never SIGKILL in v2.
 #[cfg(target_os = "linux")]
