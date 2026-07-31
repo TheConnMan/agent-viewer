@@ -121,6 +121,36 @@ summary, transcript path, PR refs, and `updated_at`. For activity, `linkScanPath
 authoritative when present. Otherwise, resolve an existing canonical projects transcript from
 the row `cwd` and `sessionId` under the same config root.
 
+**`state` is a self-report and it goes stale; `tempo` is the liveness field.** The agents row's
+`state` is written when a turn ends and records what the session believed it was doing, not
+whether it is running. A session that ended a turn saying "6 bg threads spawned; awaiting PRs"
+is recorded `working` and stays `working` indefinitely, because nothing rewrites the label until
+another turn runs. Taking it verbatim put a finished overnight campaign in the working group for
+over two hours with no process behind it. The row's `pid` does not rescue this: the stale row
+still published one, and it pointed at a `claude bg-spare` PTY host, not a live turn.
+
+`state.json` carries `tempo`, which the agents output does not project, and that is the field
+that tracks execution. So `state == "working" && tempo == "idle"` demotes the row to `Idle`
+during the same state.json read that fills summary and PR refs. `Idle` is still a LIVE state,
+so the row keeps stop and attach and only leaves the working group.
+
+Measured on this box 2026-07-31 across all 21 live jobs, `state`/`tempo` pairs: 12 done+idle,
+3 stopped+idle, 2 done+active, 1 blocked+active, 1 working+active, 2 working+idle. The single
+working+active job had rewritten its state.json 90 seconds earlier; both working+idle jobs had
+been quiet for over an hour.
+
+**The stale label does not time out or self-heal.** The specimen job (`8fe26ef1`) held
+`working` from 11:40:20Z, when its last turn ended, until 13:55:52Z. What cleared it was the
+user sending that session a new message, which ran a turn and rewrote the label to `done` at
+13:56:25Z. 2h15m stale, ended by a human poke. That is the whole problem: the label corrects
+itself exactly when someone is already interacting with the session and no longer needs the
+viewer to tell them whether it is alive.
+
+`inFlight.tasks` was evaluated and
+**rejected** as part of the rule: it counts subagent tasks, so the genuinely running job read
+`tasks: 0` while a finished one read `tasks: 3`, which is backwards as a liveness signal.
+An absent `tempo` is absent evidence and never demotes.
+
 **Companions.** Every live claude process registers itself at `~/.claude/sessions/<pid>.json`,
 and the agents list returns all of them. That includes a nested `claude -p`, the Agent SDK's
 headless entrypoint, which another session shelled out to from a Bash call: a skill, a hook, an

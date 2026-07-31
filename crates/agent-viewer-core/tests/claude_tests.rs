@@ -337,6 +337,103 @@ fn parse_job_state_working_uses_detail_and_empty_default() {
     assert_eq!(empty.transcript_path, None);
 }
 
+/// Write an executable stub `claude` and do not return until it can actually be exec'd.
+///
+/// Writing an executable and immediately spawning it races against every other thread in this
+/// test binary: if one of them forks while our write fd is still open, the child inherits the
+/// fd and our exec fails `ETXTBSY` (`ExecutableFileBusy`, os error 26). Measured at 15% of
+/// spawns under 8 concurrent fork/exec threads. `ClaudeBackend::list` turns a failed spawn
+/// into a quiet empty list by design, so the race surfaces as a baffling "no session titled
+/// ..." rather than as a spawn error. Probing here retries until the write fd is gone
+/// everywhere, which is the condition ETXTBSY is reporting, so the later `list()` spawn is
+/// safe. This asserts nothing about behavior; it only removes the harness race.
+fn write_stub_claude(path: &std::path::Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..200 {
+        match std::process::Command::new(path).output() {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("stub claude at {} is not runnable: {e}", path.display()),
+        }
+    }
+    panic!("stub claude at {} stayed ETXTBSY", path.display());
+}
+
+#[test]
+fn parse_job_state_flags_working_state_with_idle_tempo() {
+    // `state` is a self-reported label that sticks after the last turn ends: a session that
+    // said "awaiting PRs" stays "working" forever. `tempo` is the field that tracks whether
+    // turns are actually running, so working+idle is the stale combination.
+    let stale = parse_job_state(&common::read_fixture("claude_state_working_idle_tempo.json"));
+    assert!(stale.idle_despite_working);
+
+    // A genuinely live job carries the same `state` and must NOT be flagged.
+    let live = parse_job_state(&common::read_fixture("claude_state_working_active_tempo.json"));
+    assert!(!live.idle_despite_working);
+
+    // `tempo: idle` under any other state is ordinary and carries no flag: every finished job
+    // on the box reads done+idle, and flagging those would demote rows that are already Done.
+    assert!(!parse_job_state(r#"{"state": "done", "tempo": "idle"}"#).idle_despite_working);
+    assert!(!parse_job_state(r#"{"state": "stopped", "tempo": "idle"}"#).idle_despite_working);
+    assert!(!parse_job_state(r#"{"state": "blocked", "tempo": "idle"}"#).idle_despite_working);
+
+    // Absent `tempo` is absent evidence, never an inferred demotion.
+    assert!(!parse_job_state(&common::read_fixture("claude_state_working.json")).idle_despite_working);
+    assert!(!parse_job_state("{}").idle_despite_working);
+}
+
+#[test]
+fn claude_list_demotes_working_row_whose_tempo_is_idle() {
+    // End-to-end over `list()`: `claude agents --json` reports BOTH of these as "working",
+    // and only the state.json `tempo` separates the finished-but-mislabelled one from the
+    // genuinely running one.
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    let agents = serde_json::json!([
+        {
+            "id": "stale001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": "session_stale",
+            "name": "Overnight Campaign",
+            "state": "working"
+        },
+        {
+            "id": "live0001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 2000,
+            "sessionId": "session_live",
+            "name": "Live Fix",
+            "state": "working"
+        }
+    ]);
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
+
+    let jobs_root = dir.path().join("jobs");
+    for (short_id, fixture) in [
+        ("stale001", "claude_state_working_idle_tempo.json"),
+        ("live0001", "claude_state_working_active_tempo.json"),
+    ] {
+        let state_path = jobs_root.join(short_id).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, common::read_fixture(fixture)).unwrap();
+    }
+
+    let mut backend = ClaudeBackend::with_roots(
+        binary.to_str().unwrap(),
+        jobs_root,
+        dir.path().join("sessions"),
+    );
+    let sessions = backend.list().expect("list claude sessions");
+    assert_eq!(by_title(&sessions, "Overnight Campaign").status, Status::Idle);
+    assert_eq!(by_title(&sessions, "Live Fix").status, Status::Working);
+}
+
 #[test]
 fn read_claude_transcript_extracts_text_and_tool_use_tail() {
     let path = common::fixture_path("claude_transcript.jsonl");
