@@ -1,0 +1,7 @@
+{
+  "state": "working",
+  "tempo": "idle",
+  "detail": "6 bg threads spawned on critical fixes; awaiting PRs",
+  "inFlight": { "tasks": 0, "queued": 0, "kinds": [] },
+  "linkScanPath": "/home/user/.claude/jobs/idle0001/transcript.jsonl"
+}
