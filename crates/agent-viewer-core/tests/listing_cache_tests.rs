@@ -89,6 +89,35 @@ fn claimed_for(
     }
 }
 
+/// A listing big enough for a payload rewrite to be visible in the write ahead log. The real
+/// snapshot on this box is tens of megabytes; a few hundred kilobytes is enough to separate
+/// "rewrote the payload" from "stamped the metadata" without slowing the suite down.
+fn bulk_sessions(count: usize) -> Vec<Session> {
+    (0..count)
+        .map(|index| {
+            let mut session = complete_session(BackendKind::Codex);
+            session.id = format!("0198f1e2-4c18-7bc3-9f42-c8c8d91e{index:04}");
+            session.title = format!("Coordinate shared listings {index}");
+            session
+        })
+        .collect()
+}
+
+fn wal_len(path: &Path) -> u64 {
+    std::fs::metadata(PathBuf::from(format!("{}-wal", path.display())))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Fold the write ahead log back into the database so the next measurement starts from a
+/// known floor. Best effort: a failed checkpoint only raises the baseline, and every
+/// assertion here is on the DELTA.
+fn checkpoint(path: &Path) {
+    if let Ok(connection) = Connection::open(path) {
+        let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -506,7 +535,7 @@ fn invalid_json_is_a_cache_miss_and_invalidation_fences_the_old_lease() {
     Connection::open(path)
         .expect("corrupt cache row")
         .execute(
-            "UPDATE backend_listing_cache SET snapshot_json = ?1 WHERE scope = ?2",
+            "UPDATE backend_listing_snapshot SET snapshot_json = ?1 WHERE scope = ?2",
             params!["{not valid JSON", codex.as_str()],
         )
         .expect("write malformed snapshot JSON");
@@ -592,7 +621,7 @@ fn decoded_cache_snapshot_cannot_be_republished_as_an_empty_payload() {
     let raw_payload: Option<String> = Connection::open(path)
         .expect("inspect viewer database")
         .query_row(
-            "SELECT snapshot_json FROM backend_listing_cache \
+            "SELECT snapshot_json FROM backend_listing_snapshot \
              WHERE backend = ?1 AND scope = ?2",
             params![BackendKind::Codex.name(), codex.as_str()],
             |sqlite_row| sqlite_row.get(0),
@@ -650,7 +679,7 @@ fn matching_published_generation_returns_unchanged_without_decoding_json() {
     Connection::open(path)
         .expect("open cache for malformed payload")
         .execute(
-            "UPDATE backend_listing_cache SET snapshot_json = ?1 \
+            "UPDATE backend_listing_snapshot SET snapshot_json = ?1 \
              WHERE backend = ?2 AND scope = ?3",
             params!["{malformed", BackendKind::Codex.name(), codex.as_str()],
         )
@@ -766,6 +795,171 @@ fn refresh_lease_preserves_published_generation_until_successful_publication() {
         }
         other => panic!("expected refreshed snapshot, got {other:?}"),
     }
+}
+
+/// A refresh cycle that finds nothing changed must not rewrite the payload, and taking the
+/// lease for it must not rewrite the payload either. Measured on the live box before this was
+/// fixed: a 24 MB snapshot, republished every 2 s tick, left a 71 MB write ahead log. The
+/// assertion is on bytes written, because that IS the defect - a generation counter would go
+/// green with the whole payload still going to disk every cycle.
+#[test]
+fn an_unchanged_refresh_cycle_does_not_rewrite_the_stored_payload() {
+    let (_directory, path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let rows = bulk_sessions(1_200);
+    let payload_len = serde_json::to_string(&rows)
+        .expect("serialize bulk listing")
+        .len() as u64;
+    assert!(
+        payload_len > 400_000,
+        "the payload must be large enough to dominate any metadata write, got {payload_len}"
+    );
+    let lease = claimed(&first, &codex, 10);
+    assert_eq!(
+        first
+            .publish_listing(&lease, snapshot(rows.clone()), 11)
+            .expect("publish initial listing"),
+        ListingCacheWrite::Published
+    );
+
+    checkpoint(&path);
+    let before = wal_len(&path);
+    let republish = claimed(&first, &codex, 11 + FRESHNESS_MS);
+    let write = first
+        .publish_listing(&republish, snapshot(rows.clone()), 12 + FRESHNESS_MS)
+        .expect("republish an identical listing");
+    let written = wal_len(&path).saturating_sub(before);
+
+    assert_eq!(write, ListingCacheWrite::Published);
+    assert!(
+        written < payload_len / 4,
+        "an unchanged refresh cycle wrote {written} bytes for a {payload_len} byte payload"
+    );
+    match first
+        .read_listing_snapshot(&codex, 13 + FRESHNESS_MS)
+        .expect("read the republished listing")
+    {
+        ListingCacheRead::Fresh(snapshot) => assert_eq!(snapshot.sessions(), rows),
+        other => panic!("the skipped payload write must leave a fresh snapshot, got {other:?}"),
+    }
+}
+
+/// An existing viewer.db carries its listing payload in the old `backend_listing_cache` column.
+/// Opening it must release that column - a payload left there keeps every metadata write
+/// rewriting the whole record - and the scope must degrade to a plain cache miss that the next
+/// refresh republishes, never an error that takes the backend out.
+#[test]
+fn opening_a_database_with_a_legacy_payload_column_releases_it_and_reads_as_a_miss() {
+    let (_directory, path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let row = complete_session(BackendKind::Codex);
+    let lease = claimed(&first, &codex, 10);
+    first
+        .publish_listing(&lease, snapshot(vec![row.clone()]), 11)
+        .expect("publish a snapshot to move into the legacy column");
+    drop(first);
+
+    let legacy = Connection::open(&path).expect("rewrite the database in its pre split shape");
+    legacy
+        .execute(
+            "UPDATE backend_listing_cache SET snapshot_json = \
+             (SELECT snapshot_json FROM backend_listing_snapshot \
+              WHERE backend = backend_listing_cache.backend AND scope = backend_listing_cache.scope)",
+            [],
+        )
+        .expect("move the payload back into the legacy column");
+    legacy
+        .execute("DELETE FROM backend_listing_snapshot", [])
+        .expect("drop the split payload row");
+    drop(legacy);
+
+    let reopened = ViewerDb::open(&path).expect("reopen a database carrying a legacy payload");
+    let legacy_payload: Option<String> = Connection::open(&path)
+        .expect("inspect the reopened database")
+        .query_row(
+            "SELECT snapshot_json FROM backend_listing_cache WHERE backend = ?1 AND scope = ?2",
+            params![BackendKind::Codex.name(), codex.as_str()],
+            |sqlite_row| sqlite_row.get(0),
+        )
+        .expect("read the legacy payload column");
+
+    assert_eq!(
+        legacy_payload, None,
+        "the legacy payload column must be released so metadata writes stay small"
+    );
+    assert!(
+        matches!(
+            reopened
+                .read_listing_snapshot(&codex, 12)
+                .expect("read a scope whose payload predates the split"),
+            ListingCacheRead::Miss
+        ),
+        "a payload that predates the split must read as a miss, not an error"
+    );
+    let republished = claimed(&reopened, &codex, 13);
+    assert_eq!(
+        reopened
+            .publish_listing(&republished, snapshot(vec![row]), 14)
+            .expect("republish after the migration miss"),
+        ListingCacheWrite::Published
+    );
+}
+
+/// Freshness is a wall clock comparison, so a backward clock step leaves a stamp in the
+/// future. Comparing only the upper bound pins that snapshot as fresh until the clock catches
+/// up, which can be hours: nobody refreshes and every viewer serves stale rows.
+#[test]
+fn a_snapshot_stamped_in_the_future_reads_as_stale_and_stays_claimable() {
+    let (_directory, _path, first, _second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let row = complete_session(BackendKind::Codex);
+    let lease = claimed(&first, &codex, 10);
+    let ahead_of_the_clock = 6 * 60 * 60 * 1_000;
+    first
+        .publish_listing(&lease, snapshot(vec![row.clone()]), ahead_of_the_clock)
+        .expect("publish a snapshot stamped by a clock that later rolled back");
+
+    match first
+        .read_listing_snapshot(&codex, 11)
+        .expect("read after the clock rolled back")
+    {
+        ListingCacheRead::Stale(snapshot) => assert_eq!(snapshot.sessions(), &[row]),
+        other => panic!("a future stamp must read as stale, not fresh, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            first
+                .claim_listing_refresh(Some(&codex), None, 12, FRESHNESS_MS, LEASE_MS)
+                .expect("claim after the clock rolled back"),
+            ListingCacheClaim::Claimed(_)
+        ),
+        "a future stamp must not keep every viewer out of the refresh"
+    );
+}
+
+/// Same rollback, applied to the lease deadline: a deadline further out than any live viewer
+/// could have written holds the scope hostage for the whole difference, and no viewer refreshes
+/// until it passes.
+#[test]
+fn a_lease_deadline_beyond_the_horizon_does_not_hold_the_scope() {
+    let (_directory, _path, first, second) = open_viewers();
+    let root = tempfile::tempdir().expect("Codex home");
+    let codex = advertised_scope(&CodexBackend::new(root.path().join("codex")));
+    let ahead_of_the_clock = 24 * 60 * 60 * 1_000;
+    let _stranded = claimed(&first, &codex, ahead_of_the_clock);
+
+    assert!(
+        matches!(
+            second
+                .claim_listing_refresh(Some(&codex), None, 10, FRESHNESS_MS, LEASE_MS)
+                .expect("claim after the clock rolled back"),
+            ListingCacheClaim::Claimed(_)
+        ),
+        "a lease deadline a day out must be treated as expired, not held"
+    );
 }
 
 #[test]
