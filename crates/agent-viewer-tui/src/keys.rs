@@ -1052,15 +1052,17 @@ fn palette_action_items(
     ui: &Ui,
     tail_open: bool,
 ) -> Vec<PaletteItem> {
-    let mut items: Vec<PaletteItem> = [
-        action_item(
-            PaletteAction::Attach,
-            "Attach session",
-            "open the selected session",
-            Some("⏎"),
-            capability_reason(selected, capabilities.attach, "attach"),
-        ),
-        action_item(
+    let is_claude_without_archive = selected
+        .is_some_and(|session| session.backend == BackendKind::Claude && !capabilities.archive);
+    let mut items = vec![action_item(
+        PaletteAction::Attach,
+        "Attach session",
+        "open the selected session",
+        Some("⏎"),
+        capability_reason(selected, capabilities.attach, "attach"),
+    )];
+    if !is_claude_without_archive {
+        items.push(action_item(
             PaletteAction::Archive,
             "Archive session",
             "hide the selected session",
@@ -1069,7 +1071,9 @@ fn palette_action_items(
                 .filter(|session| session.hidden)
                 .map(|_| "unavailable · session is already archived".to_string())
                 .or_else(|| capability_reason(selected, capabilities.archive, "archive")),
-        ),
+        ));
+    }
+    items.extend([
         action_item(
             PaletteAction::Unarchive,
             "Unarchive session",
@@ -1161,9 +1165,7 @@ fn palette_action_items(
             // terminal was resized narrow while the pane was up.
             if tail_open { None } else { tail_refusal(ui) },
         ),
-    ]
-    .into_iter()
-    .collect();
+    ]);
     // Wall only, because starting a task is the one thing the grid otherwise cannot do: the
     // composer is not drawn there, so every spawn used to mean leaving the wall and coming
     // back. Off the wall the composer is already on screen with the keyboard, so the entry
@@ -1394,9 +1396,7 @@ fn execute_cached_palette_action(
         PaletteAction::Attach => {
             submit_attach(ui, request);
         }
-        PaletteAction::Archive => {
-            hide_request(ui, request, title, true);
-        }
+        PaletteAction::Archive => hide_request(ui, request, title, true),
         PaletteAction::Unarchive => {
             hide_request(ui, request, title, false);
         }
@@ -2802,6 +2802,7 @@ pub(crate) mod tests {
         first.status = Status::Working;
         let mut second = sess("wall-retire", "/tmp/agentviewer-wall", 200);
         second.status = Status::Working;
+        second.short_id = Some("wall-retire".to_string());
         let keys = [
             (first.backend, first.id.clone()),
             (second.backend, second.id.clone()),
@@ -2886,6 +2887,62 @@ pub(crate) mod tests {
             Some("wall-retire".to_string()),
             "the palette must be aimed at the focused tile"
         );
+        kill_attached(&mut ui);
+    }
+
+    #[test]
+    fn wall_quickswitcher_uses_the_ctrl_x_action_for_claude() {
+        let mut ui = wall_ui_focused_on_the_second_tile();
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(agent_viewer_core::claude::ClaudeBackend::new())];
+
+        press_normal_key(&mut ui, &backends, 'k', KeyModifiers::CONTROL);
+
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("Ctrl+K opens the wall quickswitcher");
+        };
+        assert!(!palette.results().any(|item| item.name == "Archive session"));
+        assert!(palette.results().any(|item| {
+            item.name == "Stop or remove session"
+                && matches!(
+                    item.target,
+                    PaletteTarget::Action(PaletteAction::StopOrRemove)
+                )
+                && item.enabled
+        }));
+
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let seen = match mutation {
+                crate::ops::Mutation::Stop(request) => format!("stop:{}", request.id()),
+                crate::ops::Mutation::Remove { request, .. } => {
+                    format!("remove:{}", request.id())
+                }
+                _ => panic!("unexpected quickswitcher mutation"),
+            };
+            seen_tx.send(seen).expect("report quickswitcher mutation");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::StopOrRemove));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+        assert_eq!(
+            seen_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok("stop:wall-retire".to_string())
+        );
+        drain_one_mutation(&mut ui);
+
+        press_normal_key(&mut ui, &backends, 'k', KeyModifiers::CONTROL);
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::StopOrRemove));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+        assert_eq!(
+            seen_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok("remove:wall-retire".to_string())
+        );
+        drain_one_mutation(&mut ui);
         kill_attached(&mut ui);
     }
 
@@ -4226,11 +4283,9 @@ pub(crate) mod tests {
 
     #[test]
     fn cached_palette_action_dispatches_before_fresh_authorization() {
-        let mut ui = test_ui_with(vec![sess(
-            "external",
-            "/tmp/agentviewer-palette-disabled",
-            100,
-        )]);
+        let mut external = sess("external", "/tmp/agentviewer-palette-disabled", 100);
+        external.backend = BackendKind::Codex;
+        let mut ui = test_ui_with(vec![external]);
         select_session_row(&mut ui, "external");
         assert!(!press_normal_key(&mut ui, &[], 'k', KeyModifiers::CONTROL));
         let mut terminal = test_terminal();
@@ -4252,7 +4307,7 @@ pub(crate) mod tests {
         .expect("accept disabled action");
 
         assert!(matches!(ui.mode, Mode::Normal));
-        assert!(ui.mutations.in_flight("claude:external:hide"));
+        assert!(ui.mutations.in_flight("codex:external:hide"));
     }
 
     /// Picking a model explicitly is a decision to use that provider, so it must leave Auto even
