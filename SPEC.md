@@ -109,10 +109,28 @@ user sending that session a new message, which ran a turn and rewrote the label 
 itself exactly when someone is already interacting with the session and no longer needs the
 viewer to tell them whether it is alive.
 
-`inFlight.tasks` was evaluated and
+A bare `inFlight.tasks` count was evaluated and
 **rejected** as part of the rule: it counts subagent tasks, so the genuinely running job read
 `tasks: 0` while a finished one read `tasks: 3`, which is backwards as a liveness signal.
 An absent `tempo` is absent evidence and never demotes.
+
+**A running shell suppresses the demotion.** `tempo` tracks model turns, not the child
+processes a turn started, so a session parked on a long `Bash` call (a suite, a build, an
+`until ... done` watcher) runs no turn for as long as it waits and reads working+idle exactly
+like the stale pair. Measured 2026-08-01: of five live jobs, the one working+idle job held
+`inFlight: {tasks: 8, kinds: ["local_bash"]}` with eight real shell processes behind it (one
+of them an `until ! pgrep -f pytest; do sleep 30; done` watcher, pid 3088578), and the viewer
+showed it Idle while it was the busiest session on the box.
+
+The signal is `inFlight.kinds` containing `local_bash` **with a non-zero `tasks`**. The KIND
+is what makes `inFlight` usable here where the raw count was not: `local_agent` entries stay
+excluded, so the rejected subagent evidence above is unaffected. Both halves are required
+because the sibling `fan` array was observed holding an `agent` entry against `tasks: 0` on a
+job that had moved on, so a kind name with no count behind it is a stale label, not evidence.
+`fan[].kind == "shell"` is therefore NOT the signal, even though it lists the same shells.
+
+`claude agents --json` publishes `status` on live rows, but it read `busy` for all five live
+jobs including the truly quiet ones, so it does not discriminate and is not part of the rule.
 
 **Companions.** Every live claude process registers itself at `~/.claude/sessions/<pid>.json`,
 and the agents list returns all of them. That includes a nested `claude -p`, the Agent SDK's

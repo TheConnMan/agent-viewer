@@ -392,6 +392,42 @@ fn parse_job_state_flags_working_state_with_idle_tempo() {
 }
 
 #[test]
+fn parse_job_state_keeps_working_when_shells_are_still_in_flight() {
+    // `tempo` tracks model turns, not child processes. A session blocked on a long shell
+    // (a build, a suite, an `until ... done` watcher) runs no turn while it waits, so it
+    // reads working+idle and the tempo rule alone demotes a genuinely busy job to Idle.
+    // `inFlight.kinds` naming `local_bash` is the counter-evidence: real work is in flight.
+    let shells = parse_job_state(&common::read_fixture(
+        "claude_state_working_idle_shells.json",
+    ));
+    assert!(!shells.idle_despite_working);
+    assert!(shells.shells_in_flight);
+
+    // The demotion still fires when the same job reports no in-flight shell.
+    let quiet = parse_job_state(&common::read_fixture(
+        "claude_state_working_idle_tempo.json",
+    ));
+    assert!(quiet.idle_despite_working);
+    assert!(!quiet.shells_in_flight);
+
+    // Subagents are NOT shells: `local_agent` counts were already rejected as a liveness
+    // signal (a finished job read 3), so they must not rescue the row.
+    let agents = parse_job_state(
+        r#"{"state":"working","tempo":"idle","inFlight":{"tasks":3,"kinds":["local_agent"]}}"#,
+    );
+    assert!(agents.idle_despite_working);
+    assert!(!agents.shells_in_flight);
+
+    // Half-stale `inFlight` objects prove nothing: a kind with a zero task count is not
+    // evidence of a running shell.
+    let stale = parse_job_state(
+        r#"{"state":"working","tempo":"idle","inFlight":{"tasks":0,"kinds":["local_bash"]}}"#,
+    );
+    assert!(stale.idle_despite_working);
+    assert!(!stale.shells_in_flight);
+}
+
+#[test]
 fn claude_list_demotes_working_row_whose_tempo_is_idle() {
     // End-to-end over `list()`: `claude agents --json` reports BOTH of these as "working",
     // and only the state.json `tempo` separates the finished-but-mislabelled one from the
@@ -416,6 +452,15 @@ fn claude_list_demotes_working_row_whose_tempo_is_idle() {
             "sessionId": "session_live",
             "name": "Live Fix",
             "state": "working"
+        },
+        {
+            "id": "shell001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 3000,
+            "sessionId": "session_shell",
+            "name": "Waiting On Suite",
+            "state": "working"
         }
     ]);
     write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
@@ -424,6 +469,7 @@ fn claude_list_demotes_working_row_whose_tempo_is_idle() {
     for (short_id, fixture) in [
         ("stale001", "claude_state_working_idle_tempo.json"),
         ("live0001", "claude_state_working_active_tempo.json"),
+        ("shell001", "claude_state_working_idle_shells.json"),
     ] {
         let state_path = jobs_root.join(short_id).join("state.json");
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
@@ -441,6 +487,12 @@ fn claude_list_demotes_working_row_whose_tempo_is_idle() {
         Status::Idle
     );
     assert_eq!(by_title(&sessions, "Live Fix").status, Status::Working);
+    // Same working+idle pair as the stale row, but this one is parked on 8 running shells.
+    // Demoting it hides a genuinely busy session from the working group.
+    assert_eq!(
+        by_title(&sessions, "Waiting On Suite").status,
+        Status::Working
+    );
 }
 
 #[test]

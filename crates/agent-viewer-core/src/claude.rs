@@ -226,7 +226,8 @@ impl Backend for ClaudeBackend {
                     // `claude agents --json` echoes the stale `working` label verbatim, so the
                     // demotion has to happen here, against the state.json the agents output
                     // does not publish `tempo` from. Idle is still a LIVE state: the row keeps
-                    // its stop/attach capabilities, it just leaves the working group.
+                    // its stop/attach capabilities, it just leaves the working group. A job
+                    // parked on a running shell is NOT demoted; `parse_job_state` owns that.
                     if detail.idle_despite_working && matches!(session.status, Status::Working) {
                         session.status = Status::Idle;
                     }
@@ -697,9 +698,13 @@ pub struct JobDetail {
     pub transcript_path: Option<std::path::PathBuf>,
     /// `children[].id` where `kind == "pr"` — the associated pull requests.
     pub prs: Vec<PrRef>,
-    /// `state == "working" && tempo == "idle"`: the job labelled itself working and then
-    /// stopped running turns. `list()` demotes such a row to `Idle`; see `parse_job_state`.
+    /// `state == "working" && tempo == "idle"` with nothing in flight: the job labelled itself
+    /// working and then stopped running turns. `list()` demotes such a row to `Idle`; see
+    /// `parse_job_state`.
     pub idle_despite_working: bool,
+    /// `inFlight` reports at least one running `local_bash` task: the session is parked on a
+    /// shell it started. Suppresses `idle_despite_working`; see `parse_job_state`.
+    pub shells_in_flight: bool,
 }
 
 /// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath, tempo;
@@ -713,16 +718,30 @@ pub struct JobDetail {
 ///
 /// Measured on this box 2026-07-31 across 21 live jobs: `working`+`active` occurred only on a
 /// job whose state.json had been rewritten 90 seconds earlier, while both `working`+`idle`
-/// jobs had been quiet for over an hour. `inFlight.tasks` is deliberately NOT part of the
-/// rule, because it counts subagent tasks: a genuinely running job read 0 while a finished
-/// one read 3, which is backwards as a liveness signal.
+/// jobs had been quiet for over an hour. A bare `inFlight.tasks` count is deliberately NOT
+/// part of the rule, because it counts subagent tasks too: a genuinely running job read 0
+/// while a finished one read 3, which is backwards as a liveness signal.
+///
+/// EXCEPT when a shell is still running. `tempo` tracks model turns, so a session blocked on
+/// a long `Bash` call (a suite, a build, an `until ... done` watcher) runs no turn for as
+/// long as it waits and reads exactly like the stale pair. Measured on this box 2026-08-01,
+/// the one working+idle job of five live jobs held 8 in-flight shells with real processes
+/// behind them, and the viewer showed it Idle. `inFlight.kinds` containing `local_bash` with
+/// a non-zero task count is the counter-evidence, and it is the KIND that makes it usable
+/// where the raw count was not: `local_agent` entries stay excluded. Both halves are required
+/// because `fan` was observed holding an `agent` entry against `tasks: 0`, so a name with no
+/// count behind it is stale, not evidence.
 pub fn parse_job_state(text: &str) -> JobDetail {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return JobDetail::default();
     };
+    let shells_in_flight = value
+        .get("inFlight")
+        .is_some_and(|in_flight| in_flight_shell_count(in_flight) > 0);
     // Both halves must be present and explicit: a missing `tempo` is absent evidence, never an
-    // inferred demotion.
-    let idle_despite_working = crate::json_str(&value, "state") == Some("working")
+    // inferred demotion. A running shell is positive evidence of work and overrides the pair.
+    let idle_despite_working = !shells_in_flight
+        && crate::json_str(&value, "state") == Some("working")
         && crate::json_str(&value, "tempo") == Some("idle");
     let needs = crate::json_str(&value, "needs");
     let summary = if crate::json_str(&value, "state") == Some("blocked")
@@ -757,7 +776,24 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         transcript_path,
         prs,
         idle_despite_working,
+        shells_in_flight,
     }
+}
+
+/// Running shell count from a job state.json `inFlight` object: `tasks` when `kinds` names
+/// `local_bash`, else 0. A kind with no task count behind it is a stale label, not a shell.
+fn in_flight_shell_count(in_flight: &serde_json::Value) -> u64 {
+    let names_bash = in_flight
+        .get("kinds")
+        .and_then(|kinds| kinds.as_array())
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("local_bash")));
+    if !names_bash {
+        return 0;
+    }
+    in_flight
+        .get("tasks")
+        .and_then(|tasks| tasks.as_u64())
+        .unwrap_or(0)
 }
 
 /// $CLAUDE_CONFIG_DIR/jobs if set, else $HOME/.claude/jobs.
