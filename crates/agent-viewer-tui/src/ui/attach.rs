@@ -1,4 +1,4 @@
-use super::{AttachView, fg, status_glyph, truncate};
+use super::{AttachView, fg, mark_for, status_glyph, truncate};
 use crate::ui::theme::Theme;
 use agent_viewer_core::pty::TerminalPalette;
 use ratatui::Frame;
@@ -122,7 +122,7 @@ fn draw_header(
     };
     let left = format!(
         " {glyph} {} {}  {}",
-        session.backend.tag(),
+        mark_for(session.backend, true),
         session.title,
         session.cwd.display()
     );
@@ -230,5 +230,25 @@ mod tests {
             "notice must not overwrite transcript rows"
         );
         pty.kill();
+    }
+
+    #[test]
+    fn attached_header_uses_backend_glyphs() {
+        let theme = crate::ui::theme::amber(false);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 1)).unwrap();
+
+        for (backend, expected) in [(BackendKind::Claude, "✳"), (BackendKind::Codex, "◆")] {
+            let mut session = attached_session();
+            session.backend = backend;
+            terminal
+                .draw(|frame| draw_header(frame, &session, false, 0, &theme, frame.area()))
+                .expect("draw attached header");
+
+            let header = (0..terminal.backend().buffer().area.width)
+                .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+                .collect::<String>();
+            assert!(header.contains(expected), "header was {header:?}");
+            assert!(!header.contains(backend.tag()), "header was {header:?}");
+        }
     }
 }
