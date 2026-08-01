@@ -898,7 +898,7 @@ fn draw_footer(
                 let showing = if app.show_all() { "all · " } else { "" };
                 Line::from(Span::styled(
                     format!(
-                        "{hidden_txt}{showing}type task · Ctrl+K palette · Ctrl+N triage · Ctrl+G sprite · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+S group · Ctrl+A all · Ctrl+D archive · Ctrl+U unarchive · Ctrl+F filter · ? help · Ctrl+C quit"
+                        "{hidden_txt}{showing}type task · Ctrl+K palette · Tab agent · ⇧Tab model · /model pick · Enter spawn/attach · Space group header · ? help"
                     ),
                     fg(theme.muted),
                 ))
