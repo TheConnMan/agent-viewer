@@ -1,0 +1,15 @@
+{
+  "state": "working",
+  "tempo": "idle",
+  "detail": "4 Codex findings fixed + mutation proofs (20/20); running full suite",
+  "inFlight": { "tasks": 8, "queued": 0, "kinds": ["local_bash"] },
+  "fan": [
+    {
+      "id": "bi2huzz70",
+      "kind": "shell",
+      "label": "until ! pgrep -f \"test_indexing_performance\" >/dev/null 2>&1; do sleep 30; done",
+      "startedAt": 1785591881602
+    }
+  ],
+  "linkScanPath": "/home/user/.claude/jobs/shell001/transcript.jsonl"
+}
