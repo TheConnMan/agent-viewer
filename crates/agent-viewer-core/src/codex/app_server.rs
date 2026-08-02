@@ -58,10 +58,12 @@ const CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const READ_SLICE: Duration = Duration::from_millis(250);
 
-/// `codex app-server daemon version` is a fast local probe (34ms measured on this box); the
-/// deadline only exists so a wedged CLI cannot hang an attach keypress.
+/// `codex app-server daemon version` is normally a fast local probe (34ms measured on this
+/// box), but its registry reads can lag behind I/O pressure. The attach resolver runs off the
+/// UI thread, so leave enough room for that transient without allowing a wedged CLI to wait
+/// forever.
 #[cfg(target_os = "linux")]
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Budget for `codex app-server daemon start` plus the re-probes that follow it. The start
 /// itself returned in 0.5s on this box, and it prints `"status":"started"` rather than
