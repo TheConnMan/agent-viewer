@@ -1144,10 +1144,9 @@ fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
     Ok(())
 }
 
-/// Whether a completed focus attach still targets what the user is looking at: the same triage
-/// item in a still-open queue, or the still-selected row on the list. Anything else means the
-/// keystrokes it would capture belong to another session, or that it would reopen a view the
-/// user has already left.
+/// Whether a completed focus attach still has an owning view. A list activation targets the row
+/// captured at submission, so later cursor movement does not cancel it. Triage is different:
+/// its panel can show only its current item, so a queued result must still belong to that item.
 fn focus_attach_still_current(ui: &Ui, key: &Key, triage: bool) -> bool {
     if triage {
         let Mode::Triage(state) = &ui.mode else {
@@ -1156,12 +1155,6 @@ fn focus_attach_still_current(ui: &Ui, key: &Key, triage: bool) -> bool {
         return state.current().map(|item| item.key()).as_ref() == Some(key);
     }
     matches!(ui.mode, Mode::Normal)
-        && ui
-            .app
-            .selected()
-            .map(|session| (session.backend, session.id.clone()))
-            .as_ref()
-            == Some(key)
 }
 
 /// Land a wall tile's connection. A failure is recorded against its tile rather than shown as
