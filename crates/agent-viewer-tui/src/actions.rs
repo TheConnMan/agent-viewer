@@ -1677,11 +1677,10 @@ mod async_attach_tests {
         ui.attached.get_mut(&key).expect("attached child").kill();
     }
 
-    /// The interleaving the review found: the resolution blocks, the user walks to another
-    /// row, and the late plan arrives. Installing it there hands every following keystroke to
-    /// a session the user is not looking at.
+    /// A row activation remains intentional while the backend resolves. Moving the list cursor
+    /// must not cancel the original request or redirect it to the row now under the cursor.
     #[test]
-    fn a_landed_focus_attach_is_dropped_when_the_selection_moved_on() {
+    fn a_landed_focus_attach_opens_its_original_row_after_the_selection_moves() {
         let first = sess("left_behind", "/tmp/agentviewer_left_behind", 100);
         let second = sess("moved_to", "/tmp/agentviewer_moved_to", 200);
         let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
@@ -1700,19 +1699,11 @@ mod async_attach_tests {
         );
         land_attach(&mut ui, result);
 
-        assert!(
-            ui.attached.is_empty(),
-            "a late attach must not spawn a child for the row the user left"
-        );
-        assert!(ui.focused.is_none());
-        assert!(
-            matches!(ui.mode, Mode::Normal),
-            "the list must not be taken over by a session the user moved off"
-        );
-        assert_eq!(
-            ui.notice.text, "attach cancelled: left_behind is no longer in focus",
-            "a dropped attach says so rather than vanishing"
-        );
+        let key = (BackendKind::Claude, first.id.clone());
+        assert!(ui.attached.contains_key(&key));
+        assert_eq!(ui.focused.as_ref(), Some(&key));
+        assert!(matches!(ui.mode, Mode::Attached));
+        ui.attached.get_mut(&key).expect("attached child").kill();
     }
 
     /// The control for the error-path drop test below: a FAILED resolution that lands while
@@ -1737,12 +1728,10 @@ mod async_attach_tests {
         assert!(matches!(ui.mode, Mode::Normal));
     }
 
-    /// THE REGRESSION, the error-path twin of the drop test above. A resolution failure used
-    /// to surface as a bare footer notice with nothing tying it to the row it came from, so a
-    /// stale failure from an attach the user had already walked away from stamped itself over
-    /// whatever they were looking at - reading as if the CURRENT row had just failed.
+    /// An activation remains intentional even when the cursor moves, so its failure remains
+    /// visible instead of being reported as a cancelled request.
     #[test]
-    fn a_landed_attach_failure_is_dropped_when_the_selection_moved_on() {
+    fn a_landed_attach_failure_is_shown_when_the_selection_moves_on() {
         let first = sess("failing_left", "/tmp/agentviewer_failing_left", 100);
         let second = sess("failing_moved", "/tmp/agentviewer_failing_moved", 200);
         let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
@@ -1760,10 +1749,7 @@ mod async_attach_tests {
         );
         land_attach(&mut ui, result);
 
-        assert_eq!(
-            ui.notice.text, "attach cancelled: failing_left is no longer in focus",
-            "a failure for a row the user left must not read as the current row failing"
-        );
+        assert_eq!(ui.notice.text, "codex session is no longer available");
         assert!(ui.attached.is_empty());
         assert!(matches!(ui.mode, Mode::Normal));
     }
