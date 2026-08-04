@@ -936,9 +936,10 @@ session earns a tile while it is working or awaiting input and keeps it for `REC
 (fifteen minutes) after it stops, because that moment is exactly when the wall is most useful:
 the reply you want to type is the one that follows the result you watched arrive. `MAX_TILES` is
 9, and it is a process budget rather than a rendering one, since each tile is a live child being
-resized and re-parsed; above it the footer carries the overflow count and still-running sessions
-take the slots ahead of recently-stopped ones. `Ctrl+O` zooms the focused tile to the full attach
-view, reusing the connection the wall already holds rather than spawning a second child.
+resized and re-parsed; above it the footer carries the overflow count. All eligible sessions are
+ordered by creation time ascending, with backend then ID as deterministic ties; the earliest take
+the slots. Status changes never alter a tile's position. `Ctrl+O` zooms the focused tile to the
+full attach view, reusing the connection the wall already holds rather than spawning a second child.
 
 An expired tile has to be pruned explicitly (`prune_wall_tiles`, run each frame before the join
 pass). Without it the expired session's key stays in `wall.requested` and its child stays in
