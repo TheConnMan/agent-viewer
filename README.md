@@ -269,9 +269,10 @@ instead of vanishing at that moment.
 
 The grid is 1x1 for one session, 2x1 for two, 2x2 for three or four, 3x2 for five or six, and
 3x3 up to nine. Nine is the cap, because every tile is a live child process; beyond that the
-footer reads `showing 9 of N` rather than dropping the rest silently, and still-running
-sessions take the slots ahead of recently-stopped ones so a busy agent is never the one pushed
-into the overflow. Each tile carries its
+footer reads `showing 9 of N` rather than dropping the rest silently. All eligible sessions,
+whether still running or recently stopped, are ordered by creation time ascending; equal times
+break by backend and then ID. The earliest nine take the slots, and status changes do not move a
+tile. Each tile carries its
 state glyph, backend mark, title, project, and elapsed time, dropping the project then the
 elapsed as tiles get narrower.
 
@@ -282,8 +283,8 @@ that has finished goes solid green, one that broke goes red, and one that is sti
 keeps the plain border — most of a busy wall is working, and a wall that shouts everywhere
 shouts nowhere. Focus is a separate channel: the tile with the keyboard takes a thick, bold
 border plus the caret in its header, so pointing at a tile never hides what that tile is doing.
-Only the border of a blocked tile moves; the rest of the wall holds still, and the grid never
-reorders itself, so you keep your place in whatever you were reading. A theme with animation
+Only the border of a blocked tile moves; tiles retain their creation-time position even when a
+session changes status, so you keep your place in whatever you were reading. A theme with animation
 off holds the attention colour solid instead of flashing.
 
 Hover or click a tile to focus it, or move with `Shift+↑↓←→`. The mouse wheel scrolls the tile

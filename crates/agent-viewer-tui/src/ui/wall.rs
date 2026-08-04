@@ -45,9 +45,8 @@ const CARET_COLS: usize = 2;
 pub struct WallState {
     pub on: bool,
     /// The session whose tile has the keyboard, held by key rather than by position. A
-    /// refresh can reorder tiles (a status flip under state grouping, a new project sorting
-    /// in earlier), and an index would silently slide the focus — and the next thing typed —
-    /// onto a different agent.
+    /// refresh can change membership by inserting an earlier eligible session or removing
+    /// one, and an index would silently slide the focus onto a different agent.
     pub focus: Option<(BackendKind, String)>,
     /// Where the focus last resolved to, so a focused session leaving the wall lands on a
     /// neighbouring tile instead of snapping back to the first.
@@ -123,29 +122,23 @@ pub struct WallView<'a> {
 
 // --- Membership -----------------------------------------------------------------
 
-/// Every session the wall should tile: still-live ones first, then recently-stopped ones,
-/// each group in `visible()` order so the wall reads in the same sequence as the list it
-/// replaced.
+/// Every session the wall should tile, ordered by creation time so status transitions never
+/// reshuffle the grid.
 ///
 /// Membership is state plus recency. The wall connects whatever is not connected yet rather
 /// than showing only what happened to be connected already — the whole point is that one
 /// keypress shows you everything that is running.
 ///
-/// The two-band ordering exists because of the cap: in plain list order, nine sessions that
-/// stopped in the last fifteen minutes could fill every slot and push a working session into
-/// the overflow count, which is precisely the thing the wall exists to show. Ranking is stable
-/// within each band, so the grid still tracks the list.
-///
 /// Never iterate `attached` here — `HashMap` order is unspecified and the grid would shuffle
 /// between frames.
 pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
-    let mut live = Vec::new();
-    let mut recent = Vec::new();
+    let mut sessions = Vec::new();
     for row in app.visible() {
         let Row::Session {
             backend,
             id,
             status,
+            created_at_ms,
             updated_at_ms,
             ..
         } = row
@@ -155,15 +148,31 @@ pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
         if !tiled(status, *updated_at_ms, now_ms) {
             continue;
         }
-        if is_live(status) {
-            &mut live
-        } else {
-            &mut recent
-        }
-        .push((*backend, id.clone()));
+        sessions.push((*created_at_ms, *backend, id.clone()));
     }
-    live.append(&mut recent);
-    live
+    sessions.sort_by(
+        |(left_created_at_ms, left_backend, left_id),
+         (right_created_at_ms, right_backend, right_id)| {
+            left_created_at_ms
+                .cmp(right_created_at_ms)
+                .then_with(|| {
+                    let left_backend = match left_backend {
+                        BackendKind::Codex => 0,
+                        BackendKind::Claude => 1,
+                    };
+                    let right_backend = match right_backend {
+                        BackendKind::Codex => 0,
+                        BackendKind::Claude => 1,
+                    };
+                    left_backend.cmp(&right_backend)
+                })
+                .then_with(|| left_id.cmp(right_id))
+        },
+    );
+    sessions
+        .into_iter()
+        .map(|(_, backend, id)| (backend, id))
+        .collect()
 }
 
 /// Whether a session is still going, as opposed to being held by the recency window.
@@ -614,52 +623,137 @@ mod tests {
         .expect("wall tile child")
     }
 
-    /// The cap is a process budget, so it must not be spent on sessions that have stopped
-    /// while something still running waits in the overflow count. That is the wall's whole
-    /// job.
+    /// The cap retains the earliest eligible sessions, regardless of whether they are live.
     #[test]
-    fn live_sessions_take_the_capped_slots_ahead_of_recently_stopped_ones() {
-        // Nine stopped sessions ahead of one working session in list order.
-        let mut sessions: Vec<Session> = (0..9)
-            .map(|i| session(&format!("stopped-{i}"), Status::Idle))
-            .collect();
-        sessions.push(session("still-working", Status::Working));
+    fn an_earlier_recently_stopped_session_is_retained_ahead_of_a_newer_live_session() {
+        let mut sessions = Vec::new();
+        for (id, status, created_at_ms) in [
+            ("early-stopped", Status::Idle, 1_000),
+            ("working-01", Status::Working, 1_100),
+            ("working-02", Status::Working, 1_200),
+            ("working-03", Status::Working, 1_300),
+            ("working-04", Status::Working, 1_400),
+            ("working-05", Status::Working, 1_500),
+            ("working-06", Status::Working, 1_600),
+            ("working-07", Status::Working, 1_700),
+            ("working-08", Status::Working, 1_800),
+            ("newer-live", Status::Working, 1_900),
+        ] {
+            let mut session = session(id, status);
+            session.created_at_ms = created_at_ms;
+            session.updated_at_ms = NOW - 1;
+            sessions.push(session);
+        }
         let app = App::new(sessions);
 
         let keys = tile_keys(&app, NOW);
 
         assert_eq!(keys.len(), MAX_TILES);
-        assert_eq!(
-            keys[0].1, "still-working",
-            "a working session must not be pushed into the overflow by stopped ones"
-        );
-        // And the stopped ones keep their list order behind it.
-        assert_eq!(keys[1].1, "stopped-0");
+        assert_eq!(keys[0].1, "early-stopped");
+        assert!(keys.iter().all(|(_, id)| id != "newer-live"));
         assert_eq!(overflow(wall_sessions(&app, NOW).len()), 1);
+    }
+
+    #[test]
+    fn creation_order_and_ties_stay_stable_when_an_early_session_finishes() {
+        const WALL_NOW: i64 = 1_775_000_600_000;
+        let mut sessions = Vec::new();
+        for (id, backend, created_at_ms, project) in [
+            ("latest", BackendKind::Codex, 1_775_000_420_000, "a-latest"),
+            (
+                "zeta",
+                BackendKind::Claude,
+                1_775_000_120_000,
+                "b-claude-zeta",
+            ),
+            (
+                "alpha",
+                BackendKind::Claude,
+                1_775_000_120_000,
+                "c-claude-alpha",
+            ),
+            (
+                "zeta",
+                BackendKind::Codex,
+                1_775_000_120_000,
+                "d-codex-zeta",
+            ),
+            (
+                "alpha",
+                BackendKind::Codex,
+                1_775_000_120_000,
+                "e-codex-alpha",
+            ),
+            ("middle", BackendKind::Codex, 1_775_000_300_000, "f-middle"),
+            ("early", BackendKind::Codex, 1_775_000_000_000, "z-early"),
+        ] {
+            let mut session = session(id, Status::Working);
+            session.backend = backend;
+            session.created_at_ms = created_at_ms;
+            session.updated_at_ms = WALL_NOW - 1;
+            session.cwd = format!("/wall-order-test/{project}").into();
+            sessions.push(session);
+        }
+        let expected = vec![
+            (BackendKind::Codex, "early".to_string()),
+            (BackendKind::Codex, "alpha".to_string()),
+            (BackendKind::Codex, "zeta".to_string()),
+            (BackendKind::Claude, "alpha".to_string()),
+            (BackendKind::Claude, "zeta".to_string()),
+            (BackendKind::Codex, "middle".to_string()),
+            (BackendKind::Codex, "latest".to_string()),
+        ];
+
+        let mut app = App::new(sessions.clone());
+        let source_order: Vec<(BackendKind, String)> = app
+            .visible()
+            .iter()
+            .filter_map(|row| match row {
+                Row::Session { backend, id, .. } => Some((*backend, id.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(
+            source_order, expected,
+            "the fixture must require wall sorting"
+        );
+        let before = tile_keys(&app, WALL_NOW);
+        assert_eq!(before, expected);
+
+        sessions
+            .iter_mut()
+            .find(|session| session.id == "early")
+            .expect("early session")
+            .status = Status::Done;
+        app.set_sessions(sessions);
+        let after = tile_keys(&app, WALL_NOW);
+
+        assert_eq!(after, expected);
+        assert_eq!(after, before, "a status transition must not reorder tiles");
     }
 
     /// Focus is stored by key so a reorder cannot slide it onto a different agent.
     #[test]
-    fn the_focus_follows_its_session_when_the_tiles_reorder() {
-        let first = App::new(vec![
-            session("alpha", Status::Working),
-            session("beta", Status::Working),
-        ]);
+    fn the_focus_follows_its_session_when_an_earlier_tile_appears() {
+        let mut alpha = session("alpha", Status::Working);
+        alpha.created_at_ms = 1_000;
+        let mut beta = session("beta", Status::Working);
+        beta.created_at_ms = 2_000;
+        let first = App::new(vec![alpha.clone(), beta.clone()]);
         let mut wall = WallState::default();
         let keys = tile_keys(&first, NOW);
         wall.set_focus(&keys, 1);
         assert_eq!(wall.focus_index(&keys), 1);
 
-        // A refresh puts beta first; the focus must stay on beta, not on whatever is at 1.
-        let reordered = App::new(vec![
-            session("beta", Status::Working),
-            session("alpha", Status::Working),
-        ]);
+        // A refresh finds an earlier eligible session, shifting beta to a later tile.
+        let mut earlier = session("earlier", Status::Working);
+        earlier.created_at_ms = 500;
+        let reordered = App::new(vec![beta, earlier, alpha]);
         let keys = tile_keys(&reordered, NOW);
-        assert_eq!(keys[0].1, "beta");
+        assert_eq!(keys[0].1, "earlier");
         assert_eq!(
             wall.focus_index(&keys),
-            0,
+            2,
             "the focus slid onto another session when the tiles reordered"
         );
     }
