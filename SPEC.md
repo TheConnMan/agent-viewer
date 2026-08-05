@@ -188,16 +188,21 @@ Claude records its PRs in `jobs/<short>/state.json` (`children[]` where `kind ==
 records them nowhere: the registry has no PR column, and `threads.git_branch` is captured when
 the thread starts, so it is stale the moment the agent branches (measured: the thread that
 opened `example-org/example-repo/pull/1089` still reports `task/fix-interactive-clippy`). Branch lookups
-are therefore not a usable source, and the rollout transcript is — the same thread's JSONL
-carries all three PR URLs it touched.
+are therefore not a usable source. The rollout transcript is the source only when it proves that
+the same thread successfully opened the PR.
 
-So `codex::pr_scan` scans rollouts for `github.com/<owner>/<repo>/pull/<n>`. That means a
-session badges every PR it *mentions*, not only one it created; a review session pointing at the
-PR under review is the intended reading. Cost rules, all load-bearing at this box's scale (4,963
-threads, 1.8 GB of rollouts, of which 1.3 GB is `archived_sessions`):
+`codex::pr_scan` records a pending `response_item` custom tool call only when its name is `exec`,
+its input contains `gh pr create`, and it has a `call_id`. It badges a PR only after a later
+`custom_tool_call_output` with that same `call_id` contains a nested command result with
+`exit_code == 0` and a `github.com/<owner>/<repo>/pull/<n>` URL. An unpaired or failed command
+does not badge a PR. URLs in messages, unrelated tool output, or other calls are incidental and
+are excluded. Cost rules, all load bearing at this box's scale (4,963 threads, 1.8 GB of
+rollouts, of which 1.3 GB is `archived_sessions`):
 
-- **Per-file offset.** A rollout is read once, then only where it grew, and not at all while its
-  length is unchanged. Without it, `list` would re-read gigabytes every second.
+- **Per file offset and pairing state.** A rollout is read once, then only where it grew, and
+  not at all while its length is unchanged. Pending calls survive incremental reads so a command
+  and its result can arrive on different ticks. Without this, `list` would re-read gigabytes
+  every second.
 - **Complete lines only.** Rollouts are appended live, so the trailing partial line is left for
   the next tick. Parsing it would mint a truncated number (`pull/10` for an in-flight `1089`),
   and refs are sticky, so that badge would never heal.
@@ -205,8 +210,9 @@ threads, 1.8 GB of rollouts, of which 1.3 GB is `archived_sessions`):
   last. Measured cold on this box: every visible codex row that has a PR is badged within ~14
   ticks, the newest within one or two, and the archive trickles in behind it. There is no
   on-disk cache, so this repeats once per launch.
-- **`MAX_REFS_PER_SESSION`**, keeping the most recent. Each ref costs a live `gh` fetch in the
-  TUI's status cache, and one real batch-review rollout mentions 115 distinct PRs.
+- **`MAX_REFS_PER_SESSION`**, keeping the most recent successful refs. Each ref costs a live
+  `gh` fetch in the TUI's status cache, and one real batch creation rollout successfully opened
+  115 distinct PRs.
 
 ## Status detection — TWO signals, both required
 
