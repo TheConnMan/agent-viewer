@@ -62,7 +62,7 @@ columns. The state as a word in the state's color (`Working`, `Needs input`, `Id
 summary and any pull request badge. Elapsed time alone sits flush right. Sessions with
 associated pull requests show `#315` for one PR or `2 PRs` for several. Claude jobs take those
 from the job record; Codex sessions take them from the GitHub pull request links in their own
-transcript, so a Codex session badges the PRs it opened or reviewed, and a fresh viewer fills
+transcript, so a Codex session badges only PRs it successfully opened, and a fresh viewer fills
 the badges in over its first few seconds. The badge is
 colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
