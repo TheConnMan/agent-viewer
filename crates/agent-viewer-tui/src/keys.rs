@@ -3921,6 +3921,23 @@ pub(crate) mod tests {
         assert_eq!(ui.app.selected_index(), selected);
     }
 
+    #[test]
+    fn agent_runner_rows_refuse_the_tail_pane_instead_of_rendering_a_conversation() {
+        let mut retained = sess("retained-run", "", 100);
+        retained.backend = BackendKind::AgentRunner;
+        retained.rollout_path = None;
+        let mut ui = test_ui_with(vec![retained]);
+
+        assert!(!press_normal_key(&mut ui, &[], 'b', KeyModifiers::CONTROL));
+
+        assert!(!ui.tail_open);
+        assert!(
+            ui.notice.text().contains("native attach"),
+            "the refusal must point to the real Codex TUI, got {:?}",
+            ui.notice.text()
+        );
+    }
+
     /// Draw one list frame at `width`, which is what populates `list_hit` with the real
     /// measured list geometry the tail pane's width gate reads.
     fn render_list_frame(ui: &Ui, width: u16) {

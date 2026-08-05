@@ -274,3 +274,199 @@ fn claude_attach_empty_short_id_falls_back_and_leaves_cwd_unset() {
     assert_eq!(cmd.get_current_dir(), None);
     assert_eq!(env_set(&cmd, "CLAUDE_AGENTS_SELECT"), None);
 }
+
+#[cfg(target_os = "linux")]
+mod agent_runner_contracts {
+    use agent_viewer_core::agent_runner::AgentRunnerBackend;
+    use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const THREAD_ID: &str = "019fce12-3456-789a-bcde-f0123456789a";
+    const TRANSCRIPT_SENTINEL: &str = "PRIVATE TRANSCRIPT MUST NEVER RENDER";
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write fake executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake executable runnable");
+    }
+
+    fn run(
+        run_id: &str,
+        runner: &str,
+        provider: &str,
+        status: &str,
+        native_session_id: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": run_id,
+            "request_id": format!("request-{run_id}"),
+            "runner": runner,
+            "provider": provider,
+            "native_session_id": native_session_id,
+            "native_turn_id": null,
+            "snapshot_id": format!("snapshot-{run_id}"),
+            "status": status,
+            "outcome": {
+                "kind": "succeeded",
+                "private_transcript": TRANSCRIPT_SENTINEL
+            },
+            "submitted_at": "2026-08-05T00:00:00Z",
+            "started_at": "2026-08-05T00:00:01Z",
+            "finished_at": "2026-08-05T00:01:00Z",
+            "updated_at": "2026-08-05T00:01:00Z"
+        })
+    }
+
+    fn list_response(runs: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "ok": true,
+            "data": {
+                "runs": runs,
+                "next_before": null
+            }
+        })
+        .to_string()
+    }
+
+    fn backend_for_list(response: &str) -> (tempfile::TempDir, AgentRunnerBackend) {
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        write_executable(
+            &runner,
+            &format!(
+                "#!/bin/sh\n[ \"$*\" = \"--json run list\" ] || exit 91\nprintf '%s\\n' '{}'\n",
+                response.replace('\'', "'\\''")
+            ),
+        );
+        let backend = AgentRunnerBackend::with_binary(runner);
+        (dir, backend)
+    }
+
+    #[test]
+    fn discovery_lists_only_reviewable_retained_kubernetes_codex_runs() {
+        let response = list_response(vec![
+            run(
+                "eligible",
+                "kubernetes",
+                "codex",
+                "reviewable",
+                Some(THREAD_ID),
+            ),
+            run(
+                "still-running",
+                "kubernetes",
+                "codex",
+                "running",
+                Some(THREAD_ID),
+            ),
+            run(
+                "wrong-runner",
+                "local",
+                "codex",
+                "reviewable",
+                Some(THREAD_ID),
+            ),
+            run(
+                "wrong-provider",
+                "kubernetes",
+                "claude",
+                "reviewable",
+                Some(THREAD_ID),
+            ),
+            run(
+                "missing-native-thread",
+                "kubernetes",
+                "codex",
+                "reviewable",
+                None,
+            ),
+        ]);
+        let (_dir, mut backend) = backend_for_list(&response);
+
+        let sessions = backend.list().expect("list retained runs");
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.backend, BackendKind::AgentRunner);
+        assert_eq!(session.id, "eligible");
+        assert_eq!(session.status, Status::Done);
+        assert!(session.cwd.as_os_str().is_empty());
+        assert_eq!(session.rollout_path, None);
+        assert!(!session.summary.contains(TRANSCRIPT_SENTINEL));
+        assert!(
+            backend
+                .tail(session, usize::MAX)
+                .expect("runner has no transcript surface")
+                .is_empty(),
+            "Agent Runner discovery must not turn public outcome data into a transcript"
+        );
+    }
+
+    #[test]
+    fn agent_runner_rows_are_attach_only_and_have_no_synthetic_conversation_surface() {
+        let response = list_response(vec![run(
+            "eligible",
+            "kubernetes",
+            "codex",
+            "reviewable",
+            Some(THREAD_ID),
+        )]);
+        let (_dir, mut backend) = backend_for_list(&response);
+        let session = backend.list().unwrap().remove(0);
+
+        assert_eq!(
+            backend.capabilities_for(&session),
+            Capabilities {
+                attach: true,
+                ..Capabilities::none()
+            }
+        );
+        assert!(backend.available_models().is_empty());
+        assert!(backend.tail(&session, 12).unwrap().is_empty());
+        assert!(
+            backend
+                .turn_activity(&session, std::time::Duration::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .spawn(Path::new("/tmp"), "task", None, None)
+                .is_err()
+        );
+        assert!(backend.stop(&session).is_err());
+        assert!(backend.remove(&session).is_err());
+        assert!(backend.rename(&session, "name").is_err());
+        assert!(backend.hide(&session.id).is_err());
+        assert!(backend.unhide(&session.id).is_err());
+    }
+
+    #[test]
+    fn an_unavailable_controller_is_a_bounded_listing_failure() {
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        write_executable(
+            &runner,
+            "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"ok\":false,\"error\":{\"code\":\"controller_unavailable\",\"message\":\"controller socket unavailable\",\"details\":{}}}' >&2\nexit 3\n",
+        );
+        let mut backend = AgentRunnerBackend::with_binary(runner);
+
+        let error = backend
+            .list()
+            .expect_err("controller failure must be visible");
+        let message = error.to_string();
+        assert!(message.contains("controller_unavailable"));
+        assert!(message.contains("controller socket unavailable"));
+        assert!(!message.contains('\n') && message.len() < 512);
+    }
+
+    #[test]
+    fn a_missing_agent_runner_binary_lists_empty_without_affecting_other_backends() {
+        let mut backend =
+            AgentRunnerBackend::with_binary(PathBuf::from("/definitely/missing/agent-runner"));
+
+        assert!(backend.list().expect("missing optional backend").is_empty());
+    }
+}
