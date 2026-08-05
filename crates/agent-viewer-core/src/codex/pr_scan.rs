@@ -12,12 +12,13 @@
 //! backlog over a few ticks instead of reading every rollout on the box in one.
 
 use crate::backend::PrRef;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Most PRs kept per session. Every ref costs a live `gh` fetch in the TUI's status cache,
-/// and a batch-review session can mention over a hundred distinct PRs.
+/// Most successfully created PRs kept per session. Every ref costs a live `gh` fetch in the
+/// TUI's status cache, and one session can create more PRs than the viewer should retain.
 pub const MAX_REFS_PER_SESSION: usize = 4;
 
 /// Bytes of rollout the scanner may read per listing tick, across all sessions.
@@ -52,8 +53,8 @@ fn scan_pr_keys(text: &str, mut on_key: impl FnMut(String, String, u64)) {
 }
 
 /// Append a ref unless its canonical href is already present, holding the list at
-/// `MAX_REFS_PER_SESSION` by dropping the oldest — the PR a session opened lands late in the
-/// transcript, after any PRs it merely read.
+/// `MAX_REFS_PER_SESSION` by dropping the oldest successful creation. This retains the most
+/// recently created refs when one session creates many PRs.
 fn push_capped(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) {
     let href = format!("https://github.com/{owner}/{repo}/pull/{number}");
     if refs
@@ -71,6 +72,67 @@ fn push_capped(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) 
     }
 }
 
+/// Scan one complete rollout line. A PR is attributed to the session only when an `exec`
+/// call that creates a PR is paired with its successful command result. Rollout prose and
+/// unrelated tool output may contain arbitrary PR links and are deliberately ignored.
+fn scan_response_item(line: &str, entry: &mut Entry) {
+    let Ok(item) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("response_item") {
+        return;
+    }
+    let Some(payload) = item.get("payload").and_then(Value::as_object) else {
+        return;
+    };
+
+    match payload.get("type").and_then(Value::as_str) {
+        Some("custom_tool_call") => {
+            if payload.get("name").and_then(Value::as_str) != Some("exec") {
+                return;
+            }
+            let Some(input) = payload.get("input").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                return;
+            };
+            if input.contains("gh pr create") {
+                entry.pending_pr_creates.insert(call_id.to_owned());
+            }
+        }
+        Some("custom_tool_call_output") => {
+            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                return;
+            };
+            if !entry.pending_pr_creates.remove(call_id) {
+                return;
+            }
+            let Some(output) = payload.get("output").and_then(Value::as_array) else {
+                return;
+            };
+            for item in output {
+                let Some(text) = item.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(result) = serde_json::from_str::<Value>(text) else {
+                    continue;
+                };
+                if result.get("exit_code").and_then(Value::as_i64) != Some(0) {
+                    continue;
+                }
+                let Some(command_output) = result.get("output").and_then(Value::as_str) else {
+                    continue;
+                };
+                scan_pr_keys(command_output, |owner, repo, number| {
+                    push_capped(&mut entry.refs, owner, repo, number)
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// What the scanner remembers about one rollout file.
 #[derive(Default)]
 struct Entry {
@@ -82,6 +144,9 @@ struct Entry {
     /// mint a truncated PR number, and refs are sticky, so that badge would never heal.
     offset: u64,
     refs: Vec<PrRef>,
+    /// `gh pr create` exec calls whose matching result has not arrived yet. This must persist
+    /// across ticks because a call and its output commonly land in separate appended chunks.
+    pending_pr_creates: HashSet<String>,
 }
 
 /// Incremental per-rollout PR-ref scanner. Held by the codex backend across ticks.
@@ -127,9 +192,9 @@ impl PrScanner {
                 entry.scanned_len = entry.offset + buf.len() as u64;
                 if let Some(last_newline) = buf.iter().rposition(|byte| *byte == b'\n') {
                     let text = String::from_utf8_lossy(&buf[..=last_newline]);
-                    scan_pr_keys(&text, |owner, repo, number| {
-                        push_capped(&mut entry.refs, owner, repo, number)
-                    });
+                    for line in text.lines() {
+                        scan_response_item(line, &mut entry);
+                    }
                     entry.offset += last_newline as u64 + 1;
                 }
             }

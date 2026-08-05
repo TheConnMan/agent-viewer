@@ -1,8 +1,8 @@
-//! Codex PR refs: the rollout JSONL is the only place a codex session records the PRs it
-//! touched (the registry has no PR column, and `threads.git_branch` is captured at thread
-//! start so it goes stale the moment the agent branches). These cover the pure URL
-//! extraction, the incremental (offset-keyed) scanner that keeps the per-tick cost bounded,
-//! and the end-to-end population of `Session.pr_refs` from `CodexBackend::list`.
+//! Codex PR refs come from the successful `gh pr create` call and result in the rollout JSONL.
+//! The registry has no PR column, and `threads.git_branch` is captured at thread start so it
+//! goes stale the moment the agent branches. These cover URL parsing within successful
+//! creation results, the incremental scanner that keeps the per-tick cost bounded, and the
+//! end-to-end population of `Session.pr_refs` from `CodexBackend::list`.
 
 mod common;
 
@@ -23,6 +23,54 @@ fn line(text: &str) -> String {
     )
 }
 
+fn custom_tool_call(call_id: &str, name: &str, input: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": name,
+                "input": input,
+            }
+        })
+    )
+}
+
+fn gh_pr_create_call(call_id: &str) -> String {
+    custom_tool_call(
+        call_id,
+        "exec",
+        r#"const r = await tools.exec_command({cmd:"gh pr create"});"#,
+    )
+}
+
+fn command_output(call_id: &str, exit_code: i32, output: &str) -> String {
+    let result = serde_json::json!({
+        "chunk_id": "test",
+        "wall_time_seconds": 1.4,
+        "exit_code": exit_code,
+        "original_token_count": 20,
+        "output": output,
+    })
+    .to_string();
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                    {"type": "input_text", "text": result},
+                ],
+            }
+        })
+    )
+}
+
 fn append(path: &Path, contents: &str) {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -39,12 +87,12 @@ fn hrefs(refs: &[agent_viewer_core::PrRef]) -> Vec<String> {
         .collect()
 }
 
-/// Drive the live incremental scanner over one rollout line of raw `text`. `refs_for` scans
-/// the raw line bytes, so this is the same code path production reaches URL extraction by.
+/// Drive the live incremental scanner over successful `gh pr create` output.
 fn refs_in(text: &str) -> Vec<agent_viewer_core::PrRef> {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("rollout.jsonl");
-    append(&path, &format!("{text}\n"));
+    append(&path, &gh_pr_create_call("call_extract"));
+    append(&path, &command_output("call_extract", 0, text));
     let mut budget = SCAN_BUDGET_BYTES;
     PrScanner::new().refs_for(&path, &mut budget)
 }
@@ -99,9 +147,14 @@ fn scanner_reports_pr_written_into_the_rollout() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("rollout.jsonl");
     append(&path, &line("no links here"));
+    append(&path, &gh_pr_create_call("call_created"));
     append(
         &path,
-        &line("created https://github.com/curie-eng/curie/pull/1089"),
+        &command_output(
+            "call_created",
+            0,
+            "https://github.com/curie-eng/curie/pull/1089",
+        ),
     );
 
     let mut scanner = PrScanner::new();
@@ -110,6 +163,104 @@ fn scanner_reports_pr_written_into_the_rollout() {
         hrefs(&scanner.refs_for(&path, &mut budget)),
         vec!["https://github.com/curie-eng/curie/pull/1089".to_string()]
     );
+}
+
+#[test]
+fn scanner_reports_only_pr_created_by_matching_gh_command() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let created_url = "https://github.com/curie-eng/curie/pull/1089";
+
+    append(
+        &path,
+        &line("reviewing https://github.com/curie-eng/curie/pull/1088"),
+    );
+    append(&path, &gh_pr_create_call("call_FRPkAWWvQ5m9v9AkofnESCvX"));
+    append(
+        &path,
+        &command_output(
+            "call_unrelated",
+            0,
+            "https://github.com/curie-eng/curie/pull/1087",
+        ),
+    );
+    append(
+        &path,
+        &command_output("call_FRPkAWWvQ5m9v9AkofnESCvX", 0, created_url),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert_eq!(
+        hrefs(&scanner.refs_for(&path, &mut budget)),
+        vec![created_url.to_string()]
+    );
+}
+
+#[test]
+fn scanner_ignores_pr_from_failed_matching_gh_command() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let failed_url = "https://github.com/curie-eng/curie/pull/1090";
+
+    append(&path, &gh_pr_create_call("call_failed_create"));
+    append(&path, &command_output("call_failed_create", 1, failed_url));
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert!(scanner.refs_for(&path, &mut budget).is_empty());
+}
+
+#[test]
+fn scanner_ignores_pr_from_matching_nonexec_call() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &custom_tool_call(
+            "call_nonexec",
+            "read_file",
+            r#"const r = await tools.exec_command({cmd:"gh pr create"});"#,
+        ),
+    );
+    append(
+        &path,
+        &command_output(
+            "call_nonexec",
+            0,
+            "https://github.com/curie-eng/curie/pull/1091",
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert!(scanner.refs_for(&path, &mut budget).is_empty());
+}
+
+#[test]
+fn scanner_ignores_pr_from_exec_that_did_not_create_one() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &custom_tool_call(
+            "call_noncreate",
+            "exec",
+            r#"const r = await tools.exec_command({cmd:"gh pr view"});"#,
+        ),
+    );
+    append(
+        &path,
+        &command_output(
+            "call_noncreate",
+            0,
+            "https://github.com/curie-eng/curie/pull/1092",
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert!(scanner.refs_for(&path, &mut budget).is_empty());
 }
 
 // The whole point of the offset cache: a second pass over an unchanged file reads zero
@@ -122,17 +273,14 @@ fn scanner_reads_only_the_appended_bytes() {
     let path = dir.path().join("rollout.jsonl");
     let filler = line(&"x".repeat(4000));
     append(&path, &filler);
-    append(
-        &path,
-        &line("created https://github.com/curie-eng/curie/pull/1088"),
-    );
+    append(&path, &gh_pr_create_call("call_1088"));
     let cold_len = std::fs::metadata(&path).expect("stat").len();
 
     let mut scanner = PrScanner::new();
 
     let mut budget = SCAN_BUDGET_BYTES;
     let first = scanner.refs_for(&path, &mut budget);
-    assert_eq!(first.len(), 1);
+    assert!(first.is_empty(), "the call has no result yet");
     assert_eq!(SCAN_BUDGET_BYTES - budget, cold_len, "cold pass reads all");
 
     // Unchanged file: no read at all, same answer.
@@ -140,8 +288,21 @@ fn scanner_reads_only_the_appended_bytes() {
     assert_eq!(hrefs(&scanner.refs_for(&path, &mut budget)), hrefs(&first));
     assert_eq!(budget, SCAN_BUDGET_BYTES, "unchanged file must not re-read");
 
-    // Grown file: only the appended bytes are read, and the new PR shows up.
-    let delta = line("then https://github.com/curie-eng/curie/pull/1089");
+    // Grown file: the pending call result and a new create both arrive in the appended bytes.
+    let delta = format!(
+        "{}{}{}",
+        command_output(
+            "call_1088",
+            0,
+            "https://github.com/curie-eng/curie/pull/1088",
+        ),
+        gh_pr_create_call("call_1089"),
+        command_output(
+            "call_1089",
+            0,
+            "https://github.com/curie-eng/curie/pull/1089",
+        )
+    );
     append(&path, &delta);
     let mut budget = SCAN_BUDGET_BYTES;
     let grown = scanner.refs_for(&path, &mut budget);
@@ -169,7 +330,12 @@ fn scanner_ignores_a_partial_line_until_its_newline_lands() {
     // A complete line FOLLOWED by a half-written one, which is what a live rollout looks like
     // mid-turn: the scan must consume the complete line and stop at the newline.
     append(&path, &line("thinking about it"));
-    let full = line("created https://github.com/curie-eng/curie/pull/1089");
+    append(&path, &gh_pr_create_call("call_partial"));
+    let full = command_output(
+        "call_partial",
+        0,
+        "https://github.com/curie-eng/curie/pull/1089",
+    );
     let (head, tail) = full.split_at(full.find("1089").expect("number in line") + 2);
     append(&path, head);
 
@@ -199,7 +365,12 @@ fn scanner_caps_refs_keeping_the_most_recent() {
     let path = dir.path().join("rollout.jsonl");
     let last = MAX_REFS_PER_SESSION + 5;
     for n in 1..=last {
-        append(&path, &line(&format!("https://github.com/o/r/pull/{n}")));
+        let call_id = format!("call_{n}");
+        append(&path, &gh_pr_create_call(&call_id));
+        append(
+            &path,
+            &command_output(&call_id, 0, &format!("https://github.com/o/r/pull/{n}")),
+        );
     }
 
     let mut scanner = PrScanner::new();
@@ -219,9 +390,14 @@ fn scanner_caps_refs_keeping_the_most_recent() {
 fn scanner_defers_a_cold_file_when_the_budget_is_spent() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("rollout.jsonl");
+    append(&path, &gh_pr_create_call("call_deferred"));
     append(
         &path,
-        &line("created https://github.com/curie-eng/curie/pull/1089"),
+        &command_output(
+            "call_deferred",
+            0,
+            "https://github.com/curie-eng/curie/pull/1089",
+        ),
     );
 
     let mut scanner = PrScanner::new();
@@ -243,13 +419,25 @@ fn scanner_rescans_after_the_file_shrinks() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let path = dir.path().join("rollout.jsonl");
     append(&path, &line(&"x".repeat(500)));
-    append(&path, &line("https://github.com/o/r/pull/1"));
+    append(&path, &gh_pr_create_call("call_one"));
+    append(
+        &path,
+        &command_output("call_one", 0, "https://github.com/o/r/pull/1"),
+    );
 
     let mut scanner = PrScanner::new();
     let mut budget = SCAN_BUDGET_BYTES;
     assert_eq!(scanner.refs_for(&path, &mut budget).len(), 1);
 
-    std::fs::write(&path, line("https://github.com/o/r/pull/2")).expect("rewrite rollout");
+    std::fs::write(
+        &path,
+        format!(
+            "{}{}",
+            gh_pr_create_call("call_two"),
+            command_output("call_two", 0, "https://github.com/o/r/pull/2"),
+        ),
+    )
+    .expect("rewrite rollout");
     let mut budget = SCAN_BUDGET_BYTES;
     assert_eq!(
         hrefs(&scanner.refs_for(&path, &mut budget)),
@@ -286,9 +474,14 @@ fn list_populates_pr_refs_from_the_rollout() {
     let schema = common::read_fixture("threads_schema.sql");
     let dir = tempfile::TempDir::new().expect("tempdir");
     let with_pr = dir.path().join("with_pr.jsonl");
+    append(&with_pr, &gh_pr_create_call("call_backend"));
     append(
         &with_pr,
-        &line("opened https://github.com/curie-eng/curie/pull/1089"),
+        &command_output(
+            "call_backend",
+            0,
+            "https://github.com/curie-eng/curie/pull/1089",
+        ),
     );
     let without_pr = dir.path().join("without_pr.jsonl");
     append(&without_pr, &line("no PR here"));
