@@ -1184,6 +1184,7 @@ mod tests {
         let plan = crate::ops::AttachPlan {
             session: session.clone(),
             command,
+            release: None,
         };
 
         assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
@@ -1217,6 +1218,7 @@ mod tests {
         let initial_plan = crate::ops::AttachPlan {
             session: session.clone(),
             command: initial_command,
+            release: None,
         };
         assert!(
             install_attach_plan(&mut ui, &mut initial_terminal, initial_plan)
@@ -1237,6 +1239,7 @@ mod tests {
         let retained_plan = crate::ops::AttachPlan {
             session,
             command: retained_command,
+            release: None,
         };
 
         assert!(
@@ -1511,6 +1514,23 @@ mod async_attach_tests {
         AttachPlan {
             session: session.clone(),
             command,
+            release: None,
+        }
+    }
+
+    fn leased_sleeping_plan(
+        session: &Session,
+        runner: &std::path::Path,
+        lease_id: &str,
+    ) -> AttachPlan {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let mut release = std::process::Command::new(runner);
+        release.args(["--json", "run", "attach-release", lease_id]);
+        AttachPlan {
+            session: session.clone(),
+            command,
+            release: Some(release),
         }
     }
 
@@ -1637,6 +1657,7 @@ mod async_attach_tests {
         let plan = AttachPlan {
             session: fresh.clone(),
             command,
+            release: None,
         };
         let mut ui = test_ui_with(vec![displayed]);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
@@ -1712,6 +1733,63 @@ mod async_attach_tests {
         assert_eq!(
             ui.notice.text, "attach cancelled: left_behind is no longer in focus",
             "a dropped attach says so rather than vanishing"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cancelling_after_lease_issue_but_before_pty_spawn_releases_the_lease() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let release_log = dir.path().join("release.log");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                release_log.display()
+            ),
+        )
+        .expect("write fake agent runner");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake agent runner runnable");
+
+        let mut first = sess("leased_left_behind", "", 100);
+        first.backend = BackendKind::AgentRunner;
+        let mut second = sess("moved_to", "/tmp/agentviewer_moved_to", 200);
+        second.backend = BackendKind::AgentRunner;
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        let planned = first.clone();
+        let runner_for_plan = runner.clone();
+        ui.attach_executor = Arc::new(move |_| {
+            Ok(leased_sleeping_plan(
+                &planned,
+                &runner_for_plan,
+                "lease-cancelled",
+            ))
+        });
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, first.id.clone()))
+        );
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, second.id.clone()))
+        );
+        land_attach(&mut ui, result);
+
+        assert!(
+            ui.attached.is_empty(),
+            "a cancelled plan must not spawn Codex"
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("lease release was invoked"),
+            "--json run attach-release lease-cancelled\n"
         );
     }
 

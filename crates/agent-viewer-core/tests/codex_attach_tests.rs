@@ -547,3 +547,319 @@ fn codex_advertises_stop_for_a_daemon_hosted_row_that_has_no_pid() {
             .stop
     );
 }
+
+#[cfg(target_os = "linux")]
+mod agent_runner_native_attach_contracts {
+    use agent_viewer_core::agent_runner::AgentRunnerBackend;
+    use agent_viewer_core::backend::{Backend, BackendKind, Session, SessionOrigin, Status};
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    const RUN_ID: &str = "retained-run";
+    const THREAD_ID: &str = "019fce12-3456-789a-bcde-f0123456789a";
+    const VERSION: &str = "0.146.0";
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write fake executable");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake executable runnable");
+    }
+
+    fn session() -> Session {
+        Session {
+            backend: BackendKind::AgentRunner,
+            id: RUN_ID.to_string(),
+            short_id: None,
+            origin: SessionOrigin::Background,
+            title: "retained Agent Runner run".to_string(),
+            cwd: std::path::PathBuf::new(),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            hidden: false,
+            companion: false,
+            subagent: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    fn success_for_version(lease_id: &str, endpoint: &str, version: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "ok": true,
+            "data": {
+                "lease_id": lease_id,
+                "endpoint": endpoint,
+                "expires_at": "2026-08-05T00:05:00Z",
+                "native_thread_id": THREAD_ID,
+                "compatible_codex_version": version
+            }
+        })
+        .to_string()
+    }
+
+    fn success(lease_id: &str, endpoint: &str) -> String {
+        success_for_version(lease_id, endpoint, VERSION)
+    }
+
+    fn command_log(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn static_backend(
+        response: &str,
+        attach_exit: i32,
+    ) -> (tempfile::TempDir, AgentRunnerBackend, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let log = dir.path().join("runner.log");
+        let escaped_response = response.replace('\'', "'\\''");
+        let response_command = if attach_exit == 0 {
+            format!("printf '%s\\n' '{escaped_response}'")
+        } else {
+            format!("printf '%s\\n' '{escaped_response}' >&2")
+        };
+        write_executable(
+            &runner,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  \"--json run attach {RUN_ID}\") {response_command}; exit {attach_exit} ;;\n  \"--json run attach-release \"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
+                log.display()
+            ),
+        );
+        let backend = AgentRunnerBackend::with_binary(runner);
+        (dir, backend, log)
+    }
+
+    fn args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn retained_run_launches_the_native_codex_tui_with_exact_remote_resume_argv() {
+        let endpoint = "unix:///tmp/agent-runner/lease-a.sock";
+        let (_dir, backend, log) = static_backend(&success("lease-a", endpoint), 0);
+
+        let prepared = backend
+            .prepare_attach(&session())
+            .expect("prepare retained native attach");
+
+        assert_eq!(prepared.command().get_program(), OsStr::new("codex"));
+        assert_eq!(
+            args(prepared.command()),
+            ["--no-alt-screen", "resume", "--remote", endpoint, THREAD_ID,]
+        );
+        assert_eq!(prepared.command().get_current_dir(), None);
+        assert_eq!(prepared.lease_id(), "lease-a");
+        prepared.release().expect("release accepted lease");
+        assert_eq!(
+            command_log(&log),
+            [
+                format!("--json run attach {RUN_ID}"),
+                "--json run attach-release lease-a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_issues_a_fresh_lease_for_the_same_native_thread() {
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let count = dir.path().join("attach.count");
+        let log = dir.path().join("runner.log");
+        let first = success("lease-first", "unix:///tmp/agent-runner/first.sock");
+        let second = success("lease-second", "unix:///tmp/agent-runner/second.sock");
+        write_executable(
+            &runner,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  \"--json run attach {RUN_ID}\")\n    n=0; [ -f '{}' ] && n=$(cat '{}'); n=$((n + 1)); printf '%s' \"$n\" > '{}';\n    if [ \"$n\" = 1 ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi ;;\n  \"--json run attach-release \"*) exit 0 ;;\n  *) exit 91 ;;\nesac\n",
+                log.display(),
+                count.display(),
+                count.display(),
+                count.display(),
+                first.replace('\'', "'\\''"),
+                second.replace('\'', "'\\''"),
+            ),
+        );
+        let backend = AgentRunnerBackend::with_binary(runner);
+
+        let first_attach = backend.prepare_attach(&session()).expect("first attach");
+        assert_eq!(first_attach.lease_id(), "lease-first");
+        assert_eq!(args(first_attach.command()).last().unwrap(), THREAD_ID);
+        let first_endpoint = args(first_attach.command())[3].clone();
+        first_attach.release().expect("release first lease");
+
+        let second_attach = backend.prepare_attach(&session()).expect("reconnect");
+        assert_eq!(second_attach.lease_id(), "lease-second");
+        assert_eq!(args(second_attach.command()).last().unwrap(), THREAD_ID);
+        assert_ne!(
+            first_endpoint,
+            args(second_attach.command())[3],
+            "reconnect must use the newly issued endpoint"
+        );
+        second_attach.release().expect("release second lease");
+
+        assert_eq!(
+            command_log(&log),
+            [
+                format!("--json run attach {RUN_ID}"),
+                "--json run attach-release lease-first".to_string(),
+                format!("--json run attach {RUN_ID}"),
+                "--json run attach-release lease-second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_or_secret_bearing_attach_metadata_is_refused_and_released_when_identified() {
+        let cases = [
+            (
+                "tcp endpoint",
+                serde_json::json!({
+                    "lease_id": "lease-tcp",
+                    "endpoint": "ws://127.0.0.1:49152",
+                    "expires_at": "2026-08-05T00:05:00Z",
+                    "native_thread_id": THREAD_ID,
+                    "compatible_codex_version": VERSION
+                }),
+                "lease-tcp",
+            ),
+            (
+                "relative unix endpoint",
+                serde_json::json!({
+                    "lease_id": "lease-relative",
+                    "endpoint": "unix://relative.sock",
+                    "expires_at": "2026-08-05T00:05:00Z",
+                    "native_thread_id": THREAD_ID,
+                    "compatible_codex_version": VERSION
+                }),
+                "lease-relative",
+            ),
+            (
+                "credential field",
+                serde_json::json!({
+                    "lease_id": "lease-secret",
+                    "endpoint": "unix:///tmp/agent-runner/secret.sock",
+                    "expires_at": "2026-08-05T00:05:00Z",
+                    "native_thread_id": THREAD_ID,
+                    "compatible_codex_version": VERSION,
+                    "capability_token": "DO_NOT_ACCEPT_THIS_SECRET"
+                }),
+                "lease-secret",
+            ),
+            (
+                "transcript field",
+                serde_json::json!({
+                    "lease_id": "lease-transcript",
+                    "endpoint": "unix:///tmp/agent-runner/transcript.sock",
+                    "expires_at": "2026-08-05T00:05:00Z",
+                    "native_thread_id": THREAD_ID,
+                    "compatible_codex_version": VERSION,
+                    "transcript": "PRIVATE TRANSCRIPT MUST NEVER RENDER"
+                }),
+                "lease-transcript",
+            ),
+        ];
+
+        for (name, data, lease_id) in cases {
+            let response = serde_json::json!({
+                "schema_version": 1,
+                "ok": true,
+                "data": data
+            })
+            .to_string();
+            let (_dir, backend, log) = static_backend(&response, 0);
+
+            let refusal = match backend.prepare_attach(&session()) {
+                Ok(_) => panic!("unsafe metadata reached Codex for {name}"),
+                Err(refusal) => refusal,
+            };
+            let reason = refusal.reason.to_lowercase();
+            assert!(
+                reason.contains("attach") || reason.contains("metadata"),
+                "{name} produced an unhelpful refusal: {reason:?}"
+            );
+            assert!(!reason.contains("do_not_accept_this_secret"));
+            assert!(!reason.contains("private transcript"));
+            assert_eq!(
+                command_log(&log),
+                [
+                    format!("--json run attach {RUN_ID}"),
+                    format!("--json run attach-release {lease_id}"),
+                ],
+                "{name} must release the refused lease"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_local_codex_version_mismatch_refuses_and_releases_before_spawn() {
+        let response = success_for_version(
+            "lease-version",
+            "unix:///tmp/agent-runner/version.sock",
+            "0.0.0",
+        );
+        let (_dir, backend, log) = static_backend(&response, 0);
+
+        let refusal = match backend.prepare_attach(&session()) {
+            Ok(_) => panic!("an experimental transport requires exact version parity"),
+            Err(refusal) => refusal,
+        };
+
+        assert!(refusal.reason.contains("0.0.0"));
+        assert!(refusal.reason.contains("local Codex"));
+        assert_eq!(
+            command_log(&log),
+            [
+                format!("--json run attach {RUN_ID}"),
+                "--json run attach-release lease-version".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn controller_pod_and_active_lease_failures_are_bounded_refusals_without_resume() {
+        let cases = [
+            ("controller_unavailable", "controller socket unavailable"),
+            ("pod_unavailable", "retained Pod is unavailable"),
+            ("attach_in_use", "another native attach is active"),
+        ];
+
+        for (code, message) in cases {
+            let response = serde_json::json!({
+                "schema_version": 1,
+                "ok": false,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "details": {}
+                }
+            })
+            .to_string();
+            let (_dir, backend, log) = static_backend(&response, 3);
+
+            let refusal = match backend.prepare_attach(&session()) {
+                Ok(_) => panic!("controller refusal must stop before Codex spawn"),
+                Err(refusal) => refusal,
+            };
+
+            assert!(refusal.reason.contains(code), "got {:?}", refusal.reason);
+            assert!(refusal.reason.contains(message), "got {:?}", refusal.reason);
+            assert!(!refusal.reason.contains('\n'));
+            assert!(refusal.reason.len() < 512);
+            assert_eq!(command_log(&log), [format!("--json run attach {RUN_ID}")]);
+        }
+    }
+}

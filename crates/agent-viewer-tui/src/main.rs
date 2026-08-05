@@ -1660,19 +1660,40 @@ mod tests {
         let suffix = if cfg!(windows) { ".exe" } else { "" };
         let path = directory.path().join(format!("codex{suffix}"));
         std::fs::write(&path, "").expect("write executable");
+        let agent_runner = directory.path().join(format!("agent-runner{suffix}"));
+        std::fs::write(&agent_runner, "").expect("write Agent Runner executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&path)
-                .expect("executable metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).expect("make executable");
+            for executable in [path, agent_runner] {
+                let mut permissions = std::fs::metadata(&executable)
+                    .expect("executable metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(executable, permissions).expect("make executable");
+            }
         }
 
         assert_eq!(
             available_spawn_backends(current_platform(), Some(directory.path().as_os_str())),
             vec![BackendKind::Codex]
+        );
+    }
+
+    #[test]
+    fn agent_runner_rows_are_excluded_from_the_video_wall() {
+        let mut retained = session(
+            BackendKind::AgentRunner,
+            "retained-native-run",
+            now_ms(),
+            false,
+        );
+        retained.status = Status::Working;
+        let ui = test_ui(vec![retained]);
+
+        assert!(
+            agent_viewer_tui::ui::wall::tile_keys(&ui.app, now_ms()).is_empty(),
+            "Agent Runner is a deliberate full screen handoff, never a synthetic wall tile"
         );
     }
 
@@ -2095,6 +2116,78 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exited_agent_runner_native_tui_releases_its_lease_and_restores_the_list() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let release_log = dir.path().join("release.log");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                release_log.display()
+            ),
+        )
+        .expect("write fake agent runner");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake agent runner runnable");
+
+        let retained = session(
+            BackendKind::AgentRunner,
+            "retained-native-run",
+            1_000,
+            false,
+        );
+        let mut ui = test_ui(vec![retained.clone()]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'native codex tui'; exit 0"]);
+        let mut release = std::process::Command::new(&runner);
+        release.args(["--json", "run", "attach-release", "lease-native-exit"]);
+
+        assert!(
+            actions::install_attach_plan(
+                &mut ui,
+                &mut terminal,
+                ops::AttachPlan {
+                    session: retained.clone(),
+                    command,
+                    release: Some(release),
+                },
+            )
+            .expect("install native attach")
+        );
+        let key = (BackendKind::AgentRunner, retained.id.clone());
+        assert!(matches!(ui.mode, Mode::Attached));
+        assert_eq!(ui.focused.as_ref(), Some(&key));
+        assert_eq!(
+            ui.attached[&key].with_screen(|screen| screen.size()),
+            (36 - ui::ATTACHED_CHROME_ROWS, 120),
+            "the native child receives the full attach content area"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ui.attached.get_mut(&key).expect("native child").is_exited() {
+            assert!(Instant::now() < deadline, "native child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        prune_exited(&mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(ui.focused.is_none());
+        assert!(ui.focused_session.is_none());
+        assert!(ui.attached.is_empty());
+        assert!(ui.mouse_capture, "the restored list owns mouse capture");
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("lease release was invoked"),
+            "--json run attach-release lease-native-exit\n"
+        );
+    }
+
     fn test_ui(sessions: Vec<Session>) -> Ui {
         Ui {
             app: App::new(sessions),
@@ -2281,6 +2374,7 @@ mod tests {
             ops::AttachPlan {
                 session: blocked.clone(),
                 command,
+                release: None,
             },
         )
         .expect("install the attach");
