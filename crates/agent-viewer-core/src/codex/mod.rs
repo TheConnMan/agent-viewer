@@ -64,7 +64,12 @@ pub fn spawn_route(daemon: Option<&app_server::Daemon>, exec_opt_in: bool) -> Sp
 }
 
 /// IMPURE: has the operator opted into the unjoinable `codex exec` spawn path?
-fn exec_spawn_opt_in() -> bool {
+///
+/// Public because it also decides whether a codex spawn routes: `agent-router` only ever
+/// dispatches through the app-server daemon, so a routed spawn cannot honour this opt-in. The
+/// TUI reads it and calls this backend directly instead, which keeps the escape hatch meaning
+/// what it says rather than being silently ignored.
+pub fn exec_spawn_opt_in() -> bool {
     std::env::var(EXEC_SPAWN_ENV).as_deref() == Ok("1")
 }
 

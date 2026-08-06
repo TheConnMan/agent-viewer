@@ -44,27 +44,45 @@ pub(crate) enum Mutation {
         preexisting_ids: HashSet<String>,
         notice: String,
     },
-    /// Spawn through `agent-router`: the router classifies the task, weighs weekly usage
-    /// headroom, and dispatches to whichever backend won, so the provider is only known once
-    /// it returns. Auto is not a `Backend` (it lists nothing), which is why this variant does
-    /// not go through the trait at all.
+    /// Spawn through `agent-router`, which dispatches the job itself and hands back its
+    /// decision. This variant does not go through the `Backend` trait at all: on the Auto path
+    /// the provider is not known until the router answers, and Auto is not a `Backend` anyway
+    /// (it lists nothing).
+    ///
+    /// `provider` is `None` for Auto and `Some` when the composer named one, which the router
+    /// takes as an override. A pinned route still comes here rather than calling the backend
+    /// directly, because the router is what gives the job a derived name and a decision-log row.
     ///
     /// Deliberately carries NO timestamps: the interval a routed row is matched against is
-    /// stamped on the worker, around the router call itself (see `run_spawn_auto`).
-    SpawnAuto {
+    /// stamped on the worker, around the router call itself (see `run_spawn_routed`).
+    SpawnRouted {
         target: SpawnTarget,
         task: String,
-        /// Per-backend session ids as of submission: the winning provider's set is the one the
-        /// row selection needs, and which that is cannot be known until the router answers.
+        provider: Option<BackendKind>,
+        model: Option<String>,
+        /// Per-backend session ids as of submission: the dispatching provider's set is the one
+        /// the row selection needs, and on Auto which that is cannot be known until the router
+        /// answers.
         preexisting_ids: HashMap<BackendKind, HashSet<String>>,
     },
 }
 
 impl Mutation {
-    pub(crate) fn spawn_auto(app: &App, target: SpawnTarget, task: String) -> Self {
-        Self::SpawnAuto {
+    pub(crate) fn spawn_routed(
+        app: &App,
+        target: SpawnTarget,
+        task: String,
+        provider: Option<BackendKind>,
+        model: Option<String>,
+    ) -> Self {
+        Self::SpawnRouted {
             target,
             task,
+            provider,
+            model,
+            // Collected for both backends even on a pinned route: it costs one cheap id scan,
+            // and it keeps the submission snapshot independent of a dispatch that has not
+            // happened yet.
             preexisting_ids: [BackendKind::Codex, BackendKind::Claude]
                 .into_iter()
                 .map(|backend| (backend, app.session_ids_for_backend(backend)))
@@ -326,17 +344,26 @@ fn spawn_directory(target: &SpawnTarget) -> Result<std::path::PathBuf, String> {
 }
 
 /// Route one task through `agent-router` and turn its decision into the footer notice plus the
-/// row selection for whichever backend won. Every router failure (missing binary, non-zero
-/// exit, timeout, unreadable json) is an Err the user reads: nothing is spawned, and there is
-/// no fallback to a guessed provider.
+/// row selection for whichever backend dispatched it. Every router failure (missing binary,
+/// non-zero exit, timeout, unreadable json, a pinned provider the router did not honour) is an
+/// Err the user reads: nothing is spawned, and there is no fallback to a guessed provider — nor,
+/// on a pinned route, a silent retry straight at the backend, which would produce exactly the
+/// unnamed untracked job routing exists to stop.
 ///
 /// `route` is a parameter so the stamping rule below is testable without a router on PATH.
-fn run_spawn_auto(
+fn run_spawn_routed(
     target: &SpawnTarget,
     task: &str,
+    provider: Option<BackendKind>,
+    model: Option<&str>,
     preexisting_ids: &HashMap<BackendKind, HashSet<String>>,
     db: Option<&ViewerDb>,
-    route: impl FnOnce(&std::path::Path, &str) -> Result<RouterOutcome, String>,
+    route: impl FnOnce(
+        &std::path::Path,
+        &str,
+        Option<BackendKind>,
+        Option<&str>,
+    ) -> Result<RouterOutcome, String>,
 ) -> Result<MutationOutcome, String> {
     let directory = spawn_directory(target)?;
     // BOTH stamps are kept, because the routed job is created somewhere between them and the
@@ -346,9 +373,9 @@ fn run_spawn_auto(
     // already too old (that window reaches only 2s back); matched against the invocation alone the
     // window can expire before the row appears.
     let submitted_at_ms = now_ms();
-    let outcome = route(&directory, task)?;
+    let outcome = route(&directory, task, provider, model)?;
     let spawned_at_ms = now_ms();
-    // The winning provider's cached listing predates the job it now owns: fence it, same as a
+    // The dispatching provider's cached listing predates the job it now owns: fence it, same as a
     // direct spawn does, so the next tick refetches instead of waiting out the freshness window.
     let winner = fresh_backend(outcome.provider);
     invalidate_backend_scope(db, winner.as_ref());
@@ -436,15 +463,19 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
                 })
                 .map_err(|error| format!("{}: {error}", session.backend.name()))
         }),
-        Mutation::SpawnAuto {
+        Mutation::SpawnRouted {
             target,
             task,
+            provider,
+            model,
             preexisting_ids,
         } => {
             let db = ViewerDb::open_default().ok();
-            run_spawn_auto(
+            run_spawn_routed(
                 &target,
                 &task,
+                provider,
+                model.as_deref(),
                 &preexisting_ids,
                 db.as_ref(),
                 agent_viewer_core::router::route,
@@ -481,7 +512,7 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mutation, RouterOutcome, run_remove, run_spawn_auto, run_spawn_with_backend,
+        Mutation, RouterOutcome, run_remove, run_spawn_routed, run_spawn_with_backend,
         spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
@@ -504,14 +535,17 @@ mod tests {
         let submitted_at = now_ms();
         let routing_ms = 60;
 
-        let outcome = run_spawn_auto(
+        let outcome = run_spawn_routed(
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_spawn")),
             "a routed task",
+            None,
+            None,
             &HashMap::new(),
             None,
-            |_directory, _task| {
+            |_directory, _task, _provider, _model| {
                 std::thread::sleep(Duration::from_millis(routing_ms));
                 Ok(RouterOutcome {
+                    requested: None,
                     provider: BackendKind::Codex,
                     model: None,
                     effort: Some("xhigh".to_string()),
@@ -557,13 +591,16 @@ mod tests {
             panic!("the first claim must win the lease, got {claim:?}");
         };
 
-        run_spawn_auto(
+        run_spawn_routed(
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_invalidate")),
             "a routed task",
+            None,
+            None,
             &HashMap::new(),
             Some(&db),
-            |_directory, _task| {
+            |_directory, _task, _provider, _model| {
                 Ok(RouterOutcome {
+                    requested: None,
                     provider: BackendKind::Claude,
                     model: None,
                     effort: None,
@@ -604,14 +641,17 @@ mod tests {
         let before_call = now_ms();
         let routing_ms = 60;
 
-        let outcome = run_spawn_auto(
+        let outcome = run_spawn_routed(
             &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_window")),
             "a routed task",
+            None,
+            None,
             &HashMap::new(),
             None,
-            |_directory, _task| {
+            |_directory, _task, _provider, _model| {
                 std::thread::sleep(Duration::from_millis(routing_ms));
                 Ok(RouterOutcome {
+                    requested: None,
                     provider: BackendKind::Claude,
                     model: None,
                     effort: None,
