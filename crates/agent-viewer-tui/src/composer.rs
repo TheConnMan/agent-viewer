@@ -126,6 +126,13 @@ impl Composer {
         self.auto
     }
 
+    /// Whether `agent-router` was found on PATH at startup. It gates more than the Auto entry:
+    /// a spawn on a concrete backend routes through the router too (pinned with `--provider`)
+    /// whenever this is true, and only falls back to calling the backend directly when it is not.
+    pub fn router_available(&self) -> bool {
+        self.auto_available
+    }
+
     /// Offer (or withdraw) the Auto entry. Withdrawing it while it is selected falls back to
     /// the concrete backend underneath, so the selector can never point at a missing router.
     pub fn set_auto_available(&mut self, available: bool) {

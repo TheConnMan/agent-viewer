@@ -1,10 +1,15 @@
-//! The `agent-router` shell-out behind the composer's Auto entry.
+//! The `agent-router` shell-out every spawn goes through when the router is installed.
+//!
+//! Two callers, one path. Auto sends no provider and the router classifies the task, weighs
+//! weekly usage headroom, and picks the provider plus model/effort. A composer sitting on a
+//! concrete backend sends that backend as `--provider`, which the router honours as an
+//! override: no classification runs, but the job still gets the router's derived name and its
+//! decision-log row, which is the whole reason an explicitly chosen provider routes at all
+//! rather than calling the backend directly.
 //!
 //! Auto is deliberately NOT a backend: it lists nothing, owns no sessions, and never
-//! implements `Backend`. It exists only in the spawn flow, where the router classifies the
-//! task, weighs weekly usage headroom, picks the provider plus model/effort, and dispatches
-//! the job itself. The job then appears through the winning backend's normal listing path,
-//! which is why the viewer only needs the decision, not a session of its own.
+//! implements `Backend`. Either way the job appears through the dispatching backend's normal
+//! listing path, which is why the viewer only needs the decision, not a session of its own.
 //!
 //! Everything here is a shell-out plus JSON parsing, exactly how the viewer already treats
 //! the `codex` and `claude` CLIs: no cargo dependency in either direction.
@@ -95,6 +100,10 @@ pub fn available() -> bool {
 pub struct RouterOutcome {
     /// The backend that won, whose listing the new job appears in.
     pub provider: BackendKind,
+    /// What the viewer asked for: `None` on the Auto path, `Some` when the composer named a
+    /// provider and the router ran with that override. Not parsed from the JSON — the router
+    /// reports the decision, and only the caller knows whether it was free to make one.
+    pub requested: Option<BackendKind>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// The backend's own identity (codex thread id, claude short id) when
@@ -112,8 +121,18 @@ pub struct RouterOutcome {
 impl RouterOutcome {
     /// PURE: the one-line footer notice for a routed spawn. The full rationale is a paragraph,
     /// so the footer carries the decision and the headroom that shaped it, not the prose.
+    ///
+    /// An overridden route reads as an ordinary spawn (`spawned on codex …`) rather than
+    /// `auto:`, because nothing was decided for the user, and it drops the gate list: the only
+    /// gate an override ever fires is `explicit_provider`, which repeats what the line says.
+    /// The headroom stays on both, since it is the same free reading either way.
     pub fn notice(&self) -> String {
-        let mut line = format!("auto: {}", self.provider.name());
+        let routed_by_provider = self.requested.is_none();
+        let mut line = if routed_by_provider {
+            format!("auto: {}", self.provider.name())
+        } else {
+            format!("spawned on {}", self.provider.name())
+        };
         if let Some(model) = &self.model {
             line.push(' ');
             line.push_str(model);
@@ -124,7 +143,7 @@ impl RouterOutcome {
         if let Some(job) = self.job_id.as_deref().or(self.job_name.as_deref()) {
             line.push_str(&format!(" job {}", one_line(job)));
         }
-        if !self.gates.is_empty() {
+        if routed_by_provider && !self.gates.is_empty() {
             line.push_str(&format!(" gates[{}]", self.gates.join(",")));
         }
         format!(
@@ -134,15 +153,31 @@ impl RouterOutcome {
     }
 }
 
-/// PURE: parse `agent-router run --json` stdout into a decision.
+/// PURE: parse `agent-router run --json` stdout into a decision. `requested` is the provider
+/// the caller pinned, or `None` for Auto.
 ///
 /// Every failure is reported as a message the user can act on rather than a default: a
 /// decision the viewer cannot read must never become a silent spawn on a guessed provider.
-pub fn parse_outcome(stdout: &str) -> std::result::Result<RouterOutcome, String> {
+pub fn parse_outcome(
+    stdout: &str,
+    requested: Option<BackendKind>,
+) -> std::result::Result<RouterOutcome, String> {
     let value: serde_json::Value = serde_json::from_str(stdout)
         .map_err(|e| format!("`{ROUTER_BIN}` printed unreadable json: {e}"))?;
     let provider = required_str(&value, "provider")?;
     let provider = provider_kind(provider)?;
+    // An override that did not take is not a spawn to relabel: the job is running on a backend
+    // the user did not pick, and every downstream identity (which listing to fence, which
+    // preexisting id set to exclude, which row to select) would be read off the wrong one.
+    if let Some(requested) = requested
+        && requested != provider
+    {
+        return Err(format!(
+            "`{ROUTER_BIN}` was pinned to {} but dispatched to {}",
+            requested.name(),
+            provider.name()
+        ));
+    }
     let dry_run = required_bool(&value, "dry_run")?;
     if dry_run {
         return Err(format!("`{ROUTER_BIN}` json reports dry_run true"));
@@ -175,6 +210,7 @@ pub fn parse_outcome(stdout: &str) -> std::result::Result<RouterOutcome, String>
     }
     Ok(RouterOutcome {
         provider,
+        requested,
         model: nullable_string(&value, "model")?,
         effort: nullable_string(&value, "effort")?,
         job_id,
@@ -186,32 +222,54 @@ pub fn parse_outcome(stdout: &str) -> std::result::Result<RouterOutcome, String>
     })
 }
 
-/// PURE: the argv for one routing run. `--json` only; no `--model`, since the router owns model
-/// and effort selection.
+/// PURE: the argv for one routing run.
+///
+/// `provider` is `None` for Auto, which sends the router's own `auto` literal and no `--model`,
+/// since the router then owns model and effort selection. A pinned provider sends its name plus
+/// the composer's model when one was chosen; `--model` is refused by the router without an
+/// explicit `--provider`, which is exactly the pairing here.
+///
+/// Effort is never sent on either path: the composer has no effort control, so a pinned route
+/// leaves it to the backend's own default exactly as a direct spawn did.
 ///
 /// The task is separated from the options by a literal `--`: it is user text and can begin with a
 /// hyphen (`--help ...`, `-v ...`), which the router's own clap would otherwise parse as an option
 /// and fail on instead of routing.
-pub fn route_command(dir: &Path, task: &str) -> std::process::Command {
+pub fn route_command(
+    dir: &Path,
+    task: &str,
+    provider: Option<BackendKind>,
+    model: Option<&str>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(ROUTER_BIN);
     cmd.arg("run")
         .arg("--json")
         .arg("--dir")
         .arg(dir)
         .arg("--provider")
-        .arg("auto")
-        .arg("--")
-        .arg(task);
+        .arg(provider.map_or("auto", BackendKind::name));
+    if let Some(model) = model.filter(|_| provider.is_some()) {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg("--").arg(task);
     cmd
 }
 
 /// IMPURE: route one task and let the router dispatch it. Every error is collapsed to one
 /// line before it reaches the caller: it lands in the single-line footer, and both the
 /// described argv (which embeds the raw task) and the router's stderr can carry newlines.
-pub fn route(dir: &Path, task: &str) -> std::result::Result<RouterOutcome, String> {
-    let stdout = crate::spawn::run_reporting_failure(route_command(dir, task), ROUTER_TIMEOUT)
-        .map_err(|error| one_line(&error))?;
-    parse_outcome(&stdout).map_err(|error| one_line(&error))
+pub fn route(
+    dir: &Path,
+    task: &str,
+    provider: Option<BackendKind>,
+    model: Option<&str>,
+) -> std::result::Result<RouterOutcome, String> {
+    let stdout = crate::spawn::run_reporting_failure(
+        route_command(dir, task, provider, model),
+        ROUTER_TIMEOUT,
+    )
+    .map_err(|error| one_line(&error))?;
+    parse_outcome(&stdout, provider).map_err(|error| one_line(&error))
 }
 
 /// PURE: whitespace runs (newlines included) collapsed to single spaces. The router's job name
