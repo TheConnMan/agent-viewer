@@ -2,6 +2,7 @@
 pub enum BackendKind {
     Codex,
     Claude,
+    AgentRunner,
 }
 
 /// A nonsecret namespace for one concrete backend listing source.
@@ -107,28 +108,29 @@ pub struct SpawnResult {
 }
 
 impl BackendKind {
-    /// "codex" | "claude"
+    /// Stable backend identifier.
     pub fn name(self) -> &'static str {
         match self {
             BackendKind::Codex => "codex",
             BackendKind::Claude => "claude",
+            BackendKind::AgentRunner => "agent-runner",
         }
     }
-    /// The model label a spawn uses when the user has picked nothing: the leading entry of
-    /// `available_models`, and the composer's placeholder while discovery is still running.
-    /// Codex takes "default" (its CLI resolves it itself); claude has no
-    /// such passthrough, so its label is a real model id.
+    /// The leading model label for backend presentation. Only spawn capable backends offer it in
+    /// the composer.
     pub fn default_model(self) -> &'static str {
         match self {
             BackendKind::Codex => "default",
             BackendKind::Claude => "opus[1m]",
+            BackendKind::AgentRunner => "default",
         }
     }
-    /// "[cx]" | "[cc]"  (row + composer prefix)
+    /// Textual row prefix. Spawn capable backends also use it in the composer.
     pub fn tag(self) -> &'static str {
         match self {
             BackendKind::Codex => "[cx]",
             BackendKind::Claude => "[cc]",
+            BackendKind::AgentRunner => "[ar]",
         }
     }
 }
@@ -418,6 +420,7 @@ pub fn all_backends() -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
         Box::new(crate::claude::ClaudeBackend::new()),
+        Box::new(crate::agent_runner::AgentRunnerBackend::new()),
     ]
 }
 

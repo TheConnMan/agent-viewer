@@ -1,3 +1,4 @@
+pub mod agent_runner;
 pub mod backend;
 pub mod claude;
 pub mod codex;
