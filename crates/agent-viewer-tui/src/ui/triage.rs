@@ -68,7 +68,10 @@ impl TriageItem {
 pub fn triage_queue(sessions: &[Session]) -> Vec<TriageItem> {
     let mut items = sessions
         .iter()
-        .filter(|session| matches!(session.status, Status::NeedsInput { .. }))
+        .filter(|session| {
+            session.backend != BackendKind::AgentRunner
+                && matches!(session.status, Status::NeedsInput { .. })
+        })
         .map(|session| TriageItem {
             backend: session.backend,
             id: session.id.clone(),

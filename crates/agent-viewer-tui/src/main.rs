@@ -240,6 +240,9 @@ fn request_tail(tail: &TailWorker, ui: &mut Ui, now_ms: i64) {
     let Some(session) = ui.app.selected() else {
         return;
     };
+    if session.backend == BackendKind::AgentRunner {
+        return;
+    }
     let key = (session.backend, session.id.clone());
     let fresh = ui.tail.as_ref().is_some_and(|entry| {
         entry.key == key
@@ -646,6 +649,14 @@ impl Ui {
         if self.pending_reply.as_ref().map(|pr| &pr.key) == Some(key) {
             self.pending_reply = None;
         }
+    }
+}
+
+impl Drop for Ui {
+    fn drop(&mut self) {
+        self.attached.clear();
+        self.detach_trackers.clear();
+        self.attaches.shutdown_releases();
     }
 }
 
@@ -1121,7 +1132,11 @@ fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
                 // The plan is only a resolved command: nothing has been spawned for it yet, so
                 // dropping it here is the whole teardown. A failure is dropped on the same
                 // terms - it describes a session the user has already left.
-                drop(plan);
+                if let Ok(plan) = plan
+                    && let Some(release) = plan.into_release()
+                {
+                    ui.attaches.release_command(release);
+                }
                 ui.set_notice(format!("attach cancelled: {} is no longer in focus", key.1));
                 return Ok(());
             }
@@ -1476,6 +1491,7 @@ fn decode_stop_failure(msg: &str) -> Option<(BackendKind, &str, &str)> {
     let backend = match fields.next()? {
         "codex" => BackendKind::Codex,
         "claude" => BackendKind::Claude,
+        "agent-runner" => BackendKind::AgentRunner,
         _ => return None,
     };
     Some((backend, fields.next()?, fields.next()?))
@@ -1559,11 +1575,21 @@ fn prune_exited(ui: &mut Ui) {
     let focused = ui.focused.clone();
     let keys: Vec<Key> = ui.attached.keys().cloned().collect();
     for key in keys {
-        if Some(&key) == focused.as_ref() {
+        let exited = ui.attached.get_mut(&key).is_some_and(|pty| pty.is_exited());
+        if !exited {
             continue;
         }
-        if ui.attached.get_mut(&key).is_some_and(|pty| pty.is_exited()) {
-            ui.remove_pty(&key);
+        if Some(&key) == focused.as_ref() && key.0 != BackendKind::AgentRunner {
+            continue;
+        }
+        ui.remove_pty(&key);
+        if Some(&key) == focused.as_ref() {
+            ui.focused = None;
+            ui.focused_session = None;
+            ui.focused_exited = false;
+            ui.mode = Mode::Normal;
+            ui.mouse_capture = true;
+            ui.mouse_press = None;
         }
     }
 }
@@ -2176,12 +2202,14 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         prune_exited(&mut ui);
+        prune_exited(&mut ui);
 
         assert!(matches!(ui.mode, Mode::Normal));
         assert!(ui.focused.is_none());
         assert!(ui.focused_session.is_none());
         assert!(ui.attached.is_empty());
         assert!(ui.mouse_capture, "the restored list owns mouse capture");
+        drop(ui);
         assert_eq!(
             std::fs::read_to_string(release_log).expect("lease release was invoked"),
             "--json run attach-release lease-native-exit\n"

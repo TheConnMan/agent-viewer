@@ -26,6 +26,28 @@ config surfaces, or features not requested.
   sharing `-core`, deployed like the `bonus-drain`/`bg-schedule` viewers with token-guarded
   write routes) but do NOT build it now. Leave `-core` cleanly separable so v2 can reuse it.
 
+## Agent Runner native attach
+
+Agent Runner is an attach only backend for retained, reviewable Kubernetes Codex runs. Listing
+follows every bounded `next_before` page from `agent-runner --json run list` and exposes no
+transcript, event cursor, terminal frame, or credential field. Attach requests
+`agent-runner --json run attach <run id>`. A valid response is bounded metadata containing a lease
+identity, local Unix endpoint, expiry, native thread identity, and the compatible Codex version.
+The viewer accepts only version 0.146.0 after checking its local `codex --version`, then starts the existing PTY flow with
+`codex --no-alt-screen resume --remote <endpoint> <native thread id>`.
+
+The Unix endpoint is a local controller capability boundary, not a direct Pod connection. The
+controller alone reaches Kubernetes and injects upstream authorization. Before it returns a lease,
+the controller verifies the authenticated gateway server version from its WebSocket response header.
+The app server `initialize` user agent identifies the client and is not server version validation.
+The viewer must not receive an app server capability, Pod credential, loopback TCP endpoint, or
+transcript. It runs
+`agent-runner --json run attach-release <lease id>` when attach is cancelled, the PTY exits, or
+the viewer drops the attach plan. A stale PTY is replaced before a reconnect obtains a new lease
+and resumes the same native thread. This prevents duplicate live leases. Agent Runner rows are
+excluded from spawn, stop, removal, rename, archive, tail, triage, and video wall paths. They use
+native TUI attachment only.
+
 ## Enumeration — the source of truth (requirements 2, 3-read, 4)
 
 Codex maintains a global session registry. Read it and its name index read only.
@@ -907,8 +929,9 @@ the live bottom or content outside the viewport.
 
 Attached PTY sizing reserves exactly two chrome rows. On initial attach, retained reattach, and
 resize, the PTY width matches the terminal width and its height is the terminal height minus
-two, with a minimum of one row. An exited retained PTY keeps its final screen, and `Ctrl+Y`
-remains available for that visible content.
+two, with a minimum of one row. An exited retained local Codex or Claude PTY keeps its final
+screen, and `Ctrl+Y` remains available for that visible content. An exited Agent Runner PTY
+instead releases its lease, removes the retained terminal, and restores the session list.
 
 `Ctrl+Y` is claimed only in attached mode before ordinary child forwarding. It never reaches
 the child, changes mouse capture, changes scrolling, or alters `Ctrl+C` child interrupt

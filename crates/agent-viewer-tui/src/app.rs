@@ -775,6 +775,7 @@ impl App {
                 let backend_key = |backend| match backend {
                     BackendKind::Codex => 0,
                     BackendKind::Claude => 1,
+                    BackendKind::AgentRunner => 2,
                 };
                 self.sessions[a]
                     .created_at_ms
