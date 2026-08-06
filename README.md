@@ -127,20 +127,35 @@ that contains it and keeps that selection. It uses the exact returned identifier
 exact returned job name, otherwise bounded cwd and invocation-interval matching while excluding
 rows that existed before submission.
 
-### Auto (agent-router)
+### agent-router
 
 Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
-project when its CLI is on your `PATH`: the composer then STARTS on a third `auto` entry
-(one `Tab` reaches the concrete agents, and the entry sits last in the cycle). It
-has a single `auto` model, because the router chooses the provider, model, and reasoning
-effort itself, scaled to the task's classified complexity: on `Enter` the viewer runs
-`agent-router run --json --dir <target> --provider auto -- "<task>"`, and the router classifies the task, weighs
-the weekly usage headroom of each subscription, and dispatches the job. The footer then shows
-the decision (for example `auto: codex gpt-5.6-luna effort low job 0199… (codex weekly 3%, claude 47%)`),
-and the new session appears and is selected through the winning agent's normal listing. Without
-the binary installed the entry never appears at all and the composer starts on Claude, and a
-router that fails (missing, non-zero exit, timeout, unreadable output) is a footer error with
-nothing spawned, never a fallback to a guessed provider.
+project whenever its CLI is on your `PATH` — **every** spawn, not only the `auto` one. The
+router names the job and records the decision, so a job started from the viewer is tracked the
+same way as one dispatched from anywhere else.
+
+With the router installed the composer STARTS on a third `auto` entry (one `Tab` reaches the
+concrete agents, and the entry sits last in the cycle). It has a single `auto` model, because
+the router chooses the provider, model, and reasoning effort itself, scaled to the task's
+classified complexity: on `Enter` the viewer runs
+`agent-router run --json --dir <target> --provider auto -- "<task>"`, and the router classifies
+the task, weighs the weekly usage headroom of each subscription, and dispatches the job. The
+footer then shows the decision (for example
+`auto: codex gpt-5.6-luna effort low job 0199… (codex weekly 3%, claude 47%)`).
+
+Picking a concrete agent chooses the provider, not a way around the router: the run becomes
+`agent-router run --json --dir <target> --provider claude --model 'opus[1m]' -- "<task>"`, the
+router honours that override without classifying anything, and the job still gets its derived
+name and decision-log row. The footer reads as an ordinary spawn
+(`spawned on claude opus[1m] job Fix The Parser (codex weekly 3%, claude 47%)`). Codex's
+`default` model sends no `--model` at all, leaving that choice to the router as before.
+
+Either way the new session appears and is selected through the dispatching agent's normal
+listing. Without the binary installed the `auto` entry never appears, the composer starts on
+Claude, and spawns call the agent's own CLI directly exactly as they used to. A router that
+fails (non-zero exit, timeout, unreadable output, or a pinned provider it did not honour) is a
+footer error with nothing spawned — never a fallback to a guessed provider, and never a silent
+retry straight at the agent.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
 model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or

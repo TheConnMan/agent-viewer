@@ -630,7 +630,7 @@ pub(crate) fn spawn_from_composer(
         return false;
     };
     if ui.composer.is_auto() {
-        return spawn_through_router(refresher, ui, target);
+        return spawn_through_router(refresher, ui, target, None, None);
     }
     let backend_kind = ui.composer.backend();
     let Some(backend) = backend_of(backends, backend_kind) else {
@@ -641,10 +641,26 @@ pub(crate) fn spawn_from_composer(
         return false;
     }
     let task = ui.composer.text().to_string();
-    // "default" (codex) passes no model flag; any other value is a real model.
-    let model_str = ui.composer.model();
-    let model = (model_str != "default").then_some(model_str);
-    let notice = match model {
+    // "default" (codex) passes no model flag; any other value is a real model. Owned rather than
+    // borrowed so the composer's borrow ends before the routed path takes `ui` mutably.
+    let model = {
+        let model_str = ui.composer.model();
+        (model_str != "default").then(|| model_str.to_string())
+    };
+    // A named provider still goes through the router, pinned with `--provider`: the backend that
+    // runs the job is the one the user picked either way, and routing is what earns it a derived
+    // job name and a row in the router's decision log. The direct backend call below is the
+    // fallback for a box with no router installed.
+    //
+    // The codex exec opt-in is the one carve-out. It selects a spawn path (`codex exec`, no
+    // daemon) that the router does not offer, so routing would silently ignore an env var the
+    // operator set deliberately.
+    let exec_pinned =
+        backend_kind == BackendKind::Codex && agent_viewer_core::codex::exec_spawn_opt_in();
+    if ui.composer.router_available() && !exec_pinned {
+        return spawn_through_router(refresher, ui, target, Some(backend_kind), model);
+    }
+    let notice = match model.as_deref() {
         Some(m) => format!("spawned on {} {m}", backend_kind.name()),
         None => format!("spawned on {}", backend_kind.name()),
     };
@@ -658,7 +674,7 @@ pub(crate) fn spawn_from_composer(
         backend_kind,
         target,
         task.clone(),
-        model.map(str::to_string),
+        model,
         now_ms(),
         notice,
     );
@@ -674,22 +690,38 @@ pub(crate) fn spawn_from_composer(
     true
 }
 
-/// The Auto path: hand the task to `agent-router`, which classifies it, weighs weekly usage
-/// headroom, and dispatches to whichever backend won. No backend is consulted here — Auto is
-/// not one — and no model is passed, because the router owns model and effort selection.
-fn spawn_through_router(refresher: &Refresher, ui: &mut Ui, target: SpawnTarget) -> bool {
+/// Hand the task to `agent-router`, which dispatches it and reports back what it did. No backend
+/// is consulted here: on the Auto path (`provider` None) there is no backend to consult until the
+/// router classifies the task, and on a pinned route the router runs the chosen one itself.
+///
+/// `model` rides along only on a pinned route, since `--model` needs an explicit `--provider`;
+/// Auto passes none, because the router owns model and effort selection there.
+fn spawn_through_router(
+    refresher: &Refresher,
+    ui: &mut Ui,
+    target: SpawnTarget,
+    provider: Option<BackendKind>,
+    model: Option<String>,
+) -> bool {
     let task = ui.composer.text().to_string();
     // Same dedup shape as a backend spawn, so a double Enter cannot route the same task twice
-    // while the first classifier call is still out.
-    let key = format!("auto:{task}:spawn");
+    // while the first router call is still out. Keyed by the pinned provider (or `auto`) so the
+    // same task aimed at a different backend is still a distinct submission.
+    let key = format!(
+        "{}:{task}:spawn",
+        provider.map_or("auto", BackendKind::name)
+    );
     // No submission timestamp: the router's own return is what stamps the routed spawn, since
     // classification plus dispatch can outlive the 30s row-matching window from here.
-    let mutation = Mutation::spawn_auto(&ui.app, target, task);
+    let mutation = Mutation::spawn_routed(&ui.app, target, task, provider, model);
     let executor = ui.mutation_executor.clone();
     if !ui.mutations.submit(key, move || executor(mutation)) {
         return false;
     }
-    ui.set_notice("routing… via agent-router".to_string());
+    ui.set_notice(match provider {
+        Some(kind) => format!("routing… via agent-router on {}", kind.name()),
+        None => "routing… via agent-router".to_string(),
+    });
     ui.composer.clear();
     refresher.force();
     true
@@ -1128,14 +1160,20 @@ mod tests {
         let recorded = Arc::clone(&routed);
         let mut ui = test_ui_with(vec![sess("router_target", "/tmp/agentviewer_auto", 100)]);
         ui.mutation_executor = Arc::new(move |mutation| {
-            let Mutation::SpawnAuto {
+            let Mutation::SpawnRouted {
                 task,
+                provider,
+                model,
                 preexisting_ids,
                 ..
             } = mutation
             else {
                 panic!("an auto submission must never reach a backend spawn");
             };
+            // Auto pins nothing: the router classifies, and `--model` is refused without an
+            // explicit `--provider` anyway.
+            assert_eq!(provider, None);
+            assert_eq!(model, None);
             // The row selection needs the winning provider's preexisting ids, and which
             // provider wins is unknown until the router answers, so both are captured.
             assert!(preexisting_ids.contains_key(&BackendKind::Claude));
@@ -1165,6 +1203,97 @@ mod tests {
         assert_eq!(
             *routed.lock().unwrap(),
             vec!["route this somewhere".to_string()]
+        );
+    }
+
+    /// A concrete backend is a choice of provider, not a choice to bypass the router: the job
+    /// still routes, pinned with that provider and the composer's model, so it gets the router's
+    /// derived name and its decision-log row like every other spawn.
+    #[test]
+    fn a_named_backend_submission_routes_with_the_provider_pinned() {
+        let pinned = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&pinned);
+        let mut ui = test_ui_with(vec![sess("router_target", "/tmp/agentviewer_pinned", 100)]);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            let Mutation::SpawnRouted {
+                task,
+                provider,
+                model,
+                ..
+            } = mutation
+            else {
+                panic!("with a router installed a named backend must still route");
+            };
+            recorded.lock().unwrap().push((task, provider, model));
+            Ok(MutationOutcome {
+                notice: "spawned on claude opus[1m] job Add A Test (codex weekly 3%, claude 47%)"
+                    .to_string(),
+                spawned: None,
+            })
+        });
+        ui.composer.set_auto_available(true);
+        // Sitting on the concrete backend, not Auto: this is the case that used to bypass the
+        // router entirely and call the backend's own spawn.
+        assert!(!ui.composer.is_auto());
+        ui.composer
+            .set_models(vec!["opus[1m]".to_string()], BackendKind::Claude);
+        ui.composer.push_str("route this on claude");
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(SpawnBackend { spawn: true })];
+        spawn_from_composer(&backends, &inert_refresher(), &mut ui);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(Instant::now() < deadline, "pinned mutation did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *pinned.lock().unwrap(),
+            vec![(
+                "route this on claude".to_string(),
+                Some(BackendKind::Claude),
+                Some("opus[1m]".to_string()),
+            )]
+        );
+    }
+
+    /// Without a router on PATH the viewer must still spawn: the backend's own path is the
+    /// fallback, not an error, matching the backends-appear-when-present posture.
+    #[test]
+    fn a_named_backend_submission_falls_back_to_the_backend_without_a_router() {
+        let direct = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&direct);
+        let mut ui = test_ui_with(vec![sess(
+            "router_target",
+            "/tmp/agentviewer_norouter",
+            100,
+        )]);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            let Mutation::Spawn { task, backend, .. } = mutation else {
+                panic!("without a router a named backend must spawn directly");
+            };
+            recorded.lock().unwrap().push((task, backend));
+            Ok(MutationOutcome {
+                notice: "spawned on claude".to_string(),
+                spawned: None,
+            })
+        });
+        ui.composer.set_auto_available(false);
+        ui.composer.push_str("spawn this directly");
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(SpawnBackend { spawn: true })];
+        spawn_from_composer(&backends, &inert_refresher(), &mut ui);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(Instant::now() < deadline, "direct mutation did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *direct.lock().unwrap(),
+            vec![("spawn this directly".to_string(), BackendKind::Claude)]
         );
     }
 

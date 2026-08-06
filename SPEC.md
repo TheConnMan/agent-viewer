@@ -668,11 +668,42 @@ accepted: the worker re-reads the file immediately before each write, so it merg
 rather than reverting it, which is the same race Claude's own fleet view runs. No viewer-local
 name override is involved, so the list can never disagree with `claude agents`.
 
-## Auto spawn — `agent-router`, and why it is not a backend
+## Routed spawn — `agent-router`, and why it is not a backend
 
-The composer's fourth selector entry, `auto`, delegates the provider choice to the
-`agent-router` CLI: `agent-router run --json --dir <target> --provider auto -- "<task>"`, parsed into a
-`RouterOutcome` by `core/router.rs`.
+Every spawn goes through the `agent-router` CLI when it is installed, parsed into a
+`RouterOutcome` by `core/router.rs`. Two shapes of the same call:
+
+- **Auto** (the composer's fourth selector entry):
+  `agent-router run --json --dir <target> --provider auto -- "<task>"`. The router classifies
+  and chooses.
+- **A pinned provider** (the composer sitting on a concrete backend):
+  `agent-router run --json --dir <target> --provider <name> [--model <model>] -- "<task>"`. The
+  router runs the named backend without classifying.
+
+**A named provider routes rather than calling the backend directly**, which is the whole point:
+the router is what derives a job name (the direct claude path named jobs with a raw truncated
+prefix of the task, and the direct codex path never sent `thread/name/set` at all) and what
+writes the decision-log row that makes a viewer-started job visible to `agent-router log` and
+`agent-router status` alongside every other dispatch. The backend that runs the job is the one
+the user picked either way, so nothing about the choice is taken from them.
+
+Two carve-outs, both deliberate:
+
+- **No router on `PATH`** — spawns call the backend's own CLI exactly as before. The router is
+  an enhancement, not a dependency.
+- **`AGENT_VIEWER_CODEX_EXEC_SPAWN=1`** — the codex exec opt-in selects a spawn path the router
+  does not offer (`codex exec`, no daemon), so honouring it means not routing. Routing anyway
+  would silently ignore an env var the operator set deliberately.
+
+`--model` carries the composer's selection on a pinned route only: the router refuses it without
+an explicit `--provider`, so an Auto route must never send one. Codex's `default` model is the
+composer's no-model state and reaches the router as no flag, leaving that resolution where it
+already was. Effort is never sent on either path, because the composer has no effort control.
+
+**A pinned route that came back on the other provider is an error, not a relabelled spawn.**
+Every downstream identity — which listing to fence, which preexisting-id set to exclude, which
+row to select — is read off `outcome.provider`, so a dispatch that ignored the pin would be
+tracked against a backend the job is not running on.
 
 Concrete composer providers are discovered once from `PATH` at startup. The Tab cycle, model
 palette, model cache seed, and model probes include only providers with an installed executable.
@@ -683,21 +714,25 @@ palette, model cache seed, and model probes include only providers with an insta
   the existing `SpawnSelection` mechanism (the router's exact returned id when available,
   otherwise its exact returned job name, then bounded cwd and invocation-interval matching while
   excluding that provider's preexisting ids).
-- **The entry is capability-gated on the binary**, resolved once at startup with a PATH lookup
-  (`router::available()`), matching the backends-appear-when-present posture: no router means no
-  entry, which is not an error state.
+- **The binary is probed once at startup** with a PATH lookup (`router::available()`), matching
+  the backends-appear-when-present posture: no router means no `auto` entry, which is not an
+  error state. The same flag (`Composer::router_available`) is what decides whether a spawn on a
+  concrete backend routes or calls that backend directly, so both paths agree on one probe
+  rather than re-resolving PATH per keystroke.
 - **When the router is present, Auto is the composer's STARTING selection**
   (`Composer::default_to_auto`, called once at startup after the availability probe): routed
   spawns are the default posture, and one `Tab` reaches the concrete backends. Without the
   router the composer starts on the first installed concrete backend.
-- **No model is passed.** The router owns model and reasoning-effort selection, so the picker
-  offers a single `auto` entry and the CLI is invoked without `--model`.
-- **Every router failure is a footer error with nothing spawned** — missing binary, non-zero
-  exit (carrying its stderr), timeout, or unreadable JSON, including a provider name the viewer
-  does not know. There is deliberately no fallback to a hardcoded provider: a decision the
-  viewer cannot read must not become a silent spawn somewhere.
-- It runs on the mutation worker like every other spawn, since a routed dispatch pays for a
-  classifier call plus the winning backend's own spawn.
+- **On Auto no model is passed.** The router owns model and reasoning-effort selection there, so
+  the picker offers a single `auto` entry and the CLI is invoked without `--model`.
+- **Every router failure is a footer error with nothing spawned** — non-zero exit (carrying its
+  stderr), timeout, unreadable JSON, a provider name the viewer does not know, or a pinned
+  provider the router did not honour. There is deliberately no fallback to a hardcoded provider,
+  and on a pinned route no retry straight at the backend: a decision the viewer cannot read must
+  not become a silent spawn somewhere, and a routing bypass would produce exactly the unnamed
+  untracked job routing exists to stop.
+- It runs on the mutation worker like every other spawn, since a routed dispatch pays for the
+  router call plus the dispatching backend's own spawn.
 
 ## Crate layout
 
@@ -718,8 +753,9 @@ Cargo workspace, two crates plus one vendored dependency. Live-refresh the regis
   `attach_route`, `stop_route`).
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
   trust bootstrap, and spawn/attach/stop/remove/rename.
-- `router.rs` is the `agent-router` shell-out behind the composer's Auto entry. Deliberately not
-  a `Backend`: it enumerates nothing and owns no sessions.
+- `router.rs` is the `agent-router` shell-out every spawn goes through when the binary is
+  installed, on Auto and on a pinned provider alike. Deliberately not a `Backend`: it enumerates
+  nothing and owns no sessions.
 - `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
   badge color.
 - `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the
