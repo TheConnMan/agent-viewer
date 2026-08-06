@@ -551,14 +551,22 @@ fn codex_advertises_stop_for_a_daemon_hosted_row_that_has_no_pid() {
 #[cfg(target_os = "linux")]
 mod agent_runner_native_attach_contracts {
     use agent_viewer_core::agent_runner::AgentRunnerBackend;
-    use agent_viewer_core::backend::{Backend, BackendKind, Session, SessionOrigin, Status};
+    use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
 
     const RUN_ID: &str = "retained-run";
     const THREAD_ID: &str = "019fce12-3456-789a-bcde-f0123456789a";
     const VERSION: &str = "0.146.0";
+    static AGENT_RUNNER_COMMAND_LOCK: Mutex<()> = Mutex::new(());
+
+    fn command_environment_guard() -> MutexGuard<'static, ()> {
+        AGENT_RUNNER_COMMAND_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn write_executable(path: &Path, body: &str) {
         std::fs::write(path, body).expect("write fake executable");
@@ -649,21 +657,31 @@ mod agent_runner_native_attach_contracts {
 
     #[test]
     fn retained_run_launches_the_native_codex_tui_with_exact_remote_resume_argv() {
+        let _guard = command_environment_guard();
         let endpoint = "unix:///tmp/agent-runner/lease-a.sock";
         let (_dir, backend, log) = static_backend(&success("lease-a", endpoint), 0);
 
-        let prepared = backend
+        let (command, mut release) = backend
             .prepare_attach(&session())
-            .expect("prepare retained native attach");
+            .expect("prepare retained native attach")
+            .into_commands();
 
-        assert_eq!(prepared.command().get_program(), OsStr::new("codex"));
+        assert_eq!(command.get_program(), OsStr::new("codex"));
         assert_eq!(
-            args(prepared.command()),
+            args(&command),
             ["--no-alt-screen", "resume", "--remote", endpoint, THREAD_ID,]
         );
-        assert_eq!(prepared.command().get_current_dir(), None);
-        assert_eq!(prepared.lease_id(), "lease-a");
-        prepared.release().expect("release accepted lease");
+        assert_eq!(command.get_current_dir(), None);
+        assert_eq!(
+            args(&release),
+            ["--json", "run", "attach-release", "lease-a"]
+        );
+        assert!(
+            release
+                .status()
+                .expect("run accepted lease release")
+                .success()
+        );
         assert_eq!(
             command_log(&log),
             [
@@ -675,6 +693,7 @@ mod agent_runner_native_attach_contracts {
 
     #[test]
     fn reconnect_issues_a_fresh_lease_for_the_same_native_thread() {
+        let _guard = command_environment_guard();
         let dir = tempfile::TempDir::new().expect("fake command directory");
         let runner = dir.path().join("agent-runner");
         let count = dir.path().join("attach.count");
@@ -695,21 +714,43 @@ mod agent_runner_native_attach_contracts {
         );
         let backend = AgentRunnerBackend::with_binary(runner);
 
-        let first_attach = backend.prepare_attach(&session()).expect("first attach");
-        assert_eq!(first_attach.lease_id(), "lease-first");
-        assert_eq!(args(first_attach.command()).last().unwrap(), THREAD_ID);
-        let first_endpoint = args(first_attach.command())[3].clone();
-        first_attach.release().expect("release first lease");
+        let (first_command, mut first_release) = backend
+            .prepare_attach(&session())
+            .expect("first attach")
+            .into_commands();
+        assert_eq!(args(&first_command).last().unwrap(), THREAD_ID);
+        assert_eq!(
+            args(&first_release),
+            ["--json", "run", "attach-release", "lease-first"]
+        );
+        let first_endpoint = args(&first_command)[3].clone();
+        assert!(
+            first_release
+                .status()
+                .expect("release first lease")
+                .success()
+        );
 
-        let second_attach = backend.prepare_attach(&session()).expect("reconnect");
-        assert_eq!(second_attach.lease_id(), "lease-second");
-        assert_eq!(args(second_attach.command()).last().unwrap(), THREAD_ID);
+        let (second_command, mut second_release) = backend
+            .prepare_attach(&session())
+            .expect("reconnect")
+            .into_commands();
+        assert_eq!(args(&second_command).last().unwrap(), THREAD_ID);
+        assert_eq!(
+            args(&second_release),
+            ["--json", "run", "attach-release", "lease-second"]
+        );
         assert_ne!(
             first_endpoint,
-            args(second_attach.command())[3],
+            args(&second_command)[3],
             "reconnect must use the newly issued endpoint"
         );
-        second_attach.release().expect("release second lease");
+        assert!(
+            second_release
+                .status()
+                .expect("release second lease")
+                .success()
+        );
 
         assert_eq!(
             command_log(&log),
@@ -724,6 +765,7 @@ mod agent_runner_native_attach_contracts {
 
     #[test]
     fn malformed_or_secret_bearing_attach_metadata_is_refused_and_released_when_identified() {
+        let _guard = command_environment_guard();
         let cases = [
             (
                 "tcp endpoint",
@@ -806,6 +848,7 @@ mod agent_runner_native_attach_contracts {
 
     #[test]
     fn exact_local_codex_version_mismatch_refuses_and_releases_before_spawn() {
+        let _guard = command_environment_guard();
         let response = success_for_version(
             "lease-version",
             "unix:///tmp/agent-runner/version.sock",
@@ -831,6 +874,7 @@ mod agent_runner_native_attach_contracts {
 
     #[test]
     fn controller_pod_and_active_lease_failures_are_bounded_refusals_without_resume() {
+        let _guard = command_environment_guard();
         let cases = [
             ("controller_unavailable", "controller socket unavailable"),
             ("pod_unavailable", "retained Pod is unavailable"),

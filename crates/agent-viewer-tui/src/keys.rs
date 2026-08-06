@@ -460,6 +460,16 @@ fn apply_mouse_capture_state(ui: &mut Ui, on: bool) {
 /// has not been drawn yet, which is not evidence of a narrow terminal. Shared by the Ctrl+B
 /// chord and the palette entry so both refuse for the same reason, in the same words.
 pub(crate) fn tail_refusal(ui: &Ui) -> Option<String> {
+    if ui
+        .app
+        .selected()
+        .is_some_and(|session| session.backend == BackendKind::AgentRunner)
+    {
+        return Some(
+            "Agent Runner runs are available through native attach, not transcript tail"
+                .to_string(),
+        );
+    }
     let width = ui.list_hit.borrow().width();
     (width > 0 && width < TAIL_MIN_TOTAL_WIDTH)
         .then(|| format!("tail pane needs {TAIL_MIN_TOTAL_WIDTH} columns and this one is {width}"))
@@ -1269,6 +1279,7 @@ fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Pat
             commands
         }
         Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
+        Some(BackendKind::AgentRunner) => Vec::new(),
         None => Vec::new(),
     };
     commands.extend(["model".to_string(), "theme".to_string()]);
@@ -2298,6 +2309,7 @@ pub(crate) mod tests {
                     "done; ",
                     "sleep 30"
                 ),
+                BackendKind::AgentRunner => unreachable!("Agent Runner is not a wall backend"),
             };
             command.args(["-c", script]);
             Ok(command)
@@ -5685,6 +5697,7 @@ pub(crate) mod tests {
 
                     wait_for_pty_screen(&ui, &key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
+                BackendKind::AgentRunner => unreachable!("spawn backends exclude Agent Runner"),
             }
 
             set_mouse_capture(&mut ui, false);
@@ -5747,6 +5760,7 @@ pub(crate) mod tests {
                     .expect("forward retained Claude wheel");
                     wait_for_pty_screen(&ui, &key, "WHEEL-2: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
+                BackendKind::AgentRunner => unreachable!("spawn backends exclude Agent Runner"),
             }
         }
     }

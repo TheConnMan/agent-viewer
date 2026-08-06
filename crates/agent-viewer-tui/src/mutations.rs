@@ -8,6 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
+use std::time::Duration;
 
 use agent_viewer_core::BackendKind;
 
@@ -52,6 +53,7 @@ pub struct BackgroundRunner<T> {
     rx: Receiver<(String, Result<T, String>)>,
     in_flight: HashSet<String>,
     dependents: HashMap<String, Option<BackgroundJob<T>>>,
+    release_worker: Option<ReleaseWorker>,
 }
 
 pub type MutationRunner = BackgroundRunner<MutationOutcome>;
@@ -71,7 +73,24 @@ impl<T: Send + 'static> BackgroundRunner<T> {
             rx,
             in_flight: HashSet::new(),
             dependents: HashMap::new(),
+            release_worker: None,
         }
+    }
+
+    pub fn release_handle(&mut self) -> ReleaseHandle {
+        self.release_worker
+            .get_or_insert_with(ReleaseWorker::new)
+            .handle()
+    }
+
+    pub fn release_command(&mut self, release: std::process::Command) {
+        self.release_worker
+            .get_or_insert_with(ReleaseWorker::new)
+            .release(release);
+    }
+
+    pub fn shutdown_releases(&mut self) {
+        self.release_worker.take();
     }
 
     /// Run `op` on a worker thread under `key`. Returns false (a no-op) when `key` is
@@ -144,6 +163,96 @@ impl<T: Send + 'static> BackgroundRunner<T> {
 
     pub fn in_flight(&self, key: &str) -> bool {
         self.in_flight.contains(key)
+    }
+}
+
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+const RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RELEASE_START_TIMEOUT: Duration = Duration::from_millis(100);
+
+struct ReleaseJob {
+    command: std::process::Command,
+    started: Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReleaseHandle {
+    sender: Sender<ReleaseJob>,
+}
+
+impl ReleaseHandle {
+    pub fn release(&self, command: std::process::Command) {
+        let (started, wait_for_start) = channel();
+        if self.sender.send(ReleaseJob { command, started }).is_ok() {
+            let _ = wait_for_start.recv_timeout(RELEASE_START_TIMEOUT);
+        }
+    }
+}
+
+struct ReleaseWorker {
+    handle: Option<ReleaseHandle>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl ReleaseWorker {
+    fn new() -> ReleaseWorker {
+        let (sender, receiver) = channel::<ReleaseJob>();
+        let join = thread::spawn(move || {
+            for release in receiver {
+                run_release(release);
+            }
+        });
+        ReleaseWorker {
+            handle: Some(ReleaseHandle { sender }),
+            join: Some(join),
+        }
+    }
+
+    fn handle(&self) -> ReleaseHandle {
+        self.handle
+            .as_ref()
+            .expect("release worker is running")
+            .clone()
+    }
+
+    fn release(&self, release: std::process::Command) {
+        self.handle().release(release);
+    }
+}
+
+impl Drop for ReleaseWorker {
+    fn drop(&mut self) {
+        self.handle.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn run_release(mut release: ReleaseJob) {
+    release
+        .command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = release.command.spawn() else {
+        let _ = release.started.send(());
+        return;
+    };
+    thread::sleep(RELEASE_POLL_INTERVAL);
+    let _ = release.started.send(());
+    let deadline = std::time::Instant::now() + RELEASE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(RELEASE_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
     }
 }
 

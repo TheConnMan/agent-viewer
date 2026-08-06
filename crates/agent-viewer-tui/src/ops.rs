@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use agent_viewer_core::agent_runner::AgentRunnerBackend;
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
@@ -20,6 +21,39 @@ use agent_viewer_tui::shared_listing::{
 pub(crate) struct AttachPlan {
     pub(crate) session: Session,
     pub(crate) command: std::process::Command,
+    pub(crate) release: Option<std::process::Command>,
+}
+
+impl AttachPlan {
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (
+        Session,
+        std::process::Command,
+        Option<std::process::Command>,
+    ) {
+        let command = std::mem::replace(
+            &mut self.command,
+            std::process::Command::new("agent-viewer-unused-command"),
+        );
+        let release = self.release.take();
+        (self.session.clone(), command, release)
+    }
+
+    pub(crate) fn into_release(mut self) -> Option<std::process::Command> {
+        self.release.take()
+    }
+}
+
+impl Drop for AttachPlan {
+    fn drop(&mut self) {
+        if let Some(mut release) = self.release.take() {
+            release
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _ = release.status();
+        }
+    }
 }
 
 /// A blocking backend mutation, run on a worker thread with all data owned (Send).
@@ -124,6 +158,7 @@ fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
+        BackendKind::AgentRunner => Box::new(AgentRunnerBackend::new()),
     }
 }
 
@@ -154,10 +189,27 @@ pub(crate) fn resolve_attach_with_backend(
     let command = backend
         .attach_command(&session)
         .map_err(|refusal| refusal.reason)?;
-    Ok(AttachPlan { session, command })
+    Ok(AttachPlan {
+        session,
+        command,
+        release: None,
+    })
 }
 
 pub(crate) fn resolve_attach(request: TargetRequest) -> Result<AttachPlan, String> {
+    if request.backend() == BackendKind::AgentRunner {
+        let mut backend = AgentRunnerBackend::new();
+        let session = authoritative_target(&mut backend, &request).map_err(target_failure)?;
+        let prepared = backend
+            .prepare_attach(&session)
+            .map_err(|refusal| refusal.reason)?;
+        let (command, release) = prepared.into_commands();
+        return Ok(AttachPlan {
+            session,
+            command,
+            release: Some(release),
+        });
+    }
     let mut backend = fresh_backend(request.backend());
     resolve_attach_with_backend(backend.as_mut(), request)
 }

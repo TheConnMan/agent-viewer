@@ -281,9 +281,17 @@ mod agent_runner_contracts {
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
 
     const THREAD_ID: &str = "019fce12-3456-789a-bcde-f0123456789a";
     const TRANSCRIPT_SENTINEL: &str = "PRIVATE TRANSCRIPT MUST NEVER RENDER";
+    static AGENT_RUNNER_COMMAND_LOCK: Mutex<()> = Mutex::new(());
+
+    fn command_environment_guard() -> MutexGuard<'static, ()> {
+        AGENT_RUNNER_COMMAND_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn write_executable(path: &Path, body: &str) {
         std::fs::write(path, body).expect("write fake executable");
@@ -319,12 +327,19 @@ mod agent_runner_contracts {
     }
 
     fn list_response(runs: Vec<serde_json::Value>) -> String {
+        list_response_with_cursor(runs, None)
+    }
+
+    fn list_response_with_cursor(
+        runs: Vec<serde_json::Value>,
+        next_before: Option<&str>,
+    ) -> String {
         serde_json::json!({
             "schema_version": 1,
             "ok": true,
             "data": {
                 "runs": runs,
-                "next_before": null
+                "next_before": next_before
             }
         })
         .to_string()
@@ -336,7 +351,7 @@ mod agent_runner_contracts {
         write_executable(
             &runner,
             &format!(
-                "#!/bin/sh\n[ \"$*\" = \"--json run list\" ] || exit 91\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\n[ \"$*\" = \"--json run list --status reviewable --limit 200\" ] || exit 91\nprintf '%s\\n' '{}'\n",
                 response.replace('\'', "'\\''")
             ),
         );
@@ -346,6 +361,7 @@ mod agent_runner_contracts {
 
     #[test]
     fn discovery_lists_only_reviewable_retained_kubernetes_codex_runs() {
+        let _guard = command_environment_guard();
         let response = list_response(vec![
             run(
                 "eligible",
@@ -405,7 +421,68 @@ mod agent_runner_contracts {
     }
 
     #[test]
+    fn discovery_filters_reviewable_runs_at_the_controller_and_reads_every_page() {
+        let _guard = command_environment_guard();
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let log = dir.path().join("runner.log");
+        let first = list_response_with_cursor(
+            vec![run(
+                "newer-eligible",
+                "kubernetes",
+                "codex",
+                "reviewable",
+                Some(THREAD_ID),
+            )],
+            Some("cursor-for-older-runs"),
+        );
+        let second = list_response_with_cursor(
+            vec![run(
+                "older-eligible",
+                "kubernetes",
+                "codex",
+                "reviewable",
+                Some(THREAD_ID),
+            )],
+            None,
+        );
+        write_executable(
+            &runner,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  \"--json run list --status reviewable --limit 200\") printf '%s\\n' '{}' ;;\n  \"--json run list --status reviewable --limit 200 --before cursor-for-older-runs\") printf '%s\\n' '{}' ;;\n  *) exit 91 ;;\nesac\n",
+                log.display(),
+                first.replace('\'', "'\\''"),
+                second.replace('\'', "'\\''"),
+            ),
+        );
+        let mut backend = AgentRunnerBackend::with_binary(runner);
+
+        let sessions = backend.list().expect("list every reviewable page");
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer-eligible", "older-eligible"]
+        );
+        assert!(
+            sessions
+                .iter()
+                .all(|session| !session.summary.contains(TRANSCRIPT_SENTINEL))
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).expect("read list command log"),
+            concat!(
+                "--json run list --status reviewable --limit 200\n",
+                "--json run list --status reviewable --limit 200 --before cursor-for-older-runs\n"
+            )
+        );
+    }
+
+    #[test]
     fn agent_runner_rows_are_attach_only_and_have_no_synthetic_conversation_surface() {
+        let _guard = command_environment_guard();
         let response = list_response(vec![run(
             "eligible",
             "kubernetes",
@@ -445,6 +522,7 @@ mod agent_runner_contracts {
 
     #[test]
     fn an_unavailable_controller_is_a_bounded_listing_failure() {
+        let _guard = command_environment_guard();
         let dir = tempfile::TempDir::new().expect("fake command directory");
         let runner = dir.path().join("agent-runner");
         write_executable(
@@ -464,6 +542,7 @@ mod agent_runner_contracts {
 
     #[test]
     fn a_missing_agent_runner_binary_lists_empty_without_affecting_other_backends() {
+        let _guard = command_environment_guard();
         let mut backend =
             AgentRunnerBackend::with_binary(PathBuf::from("/definitely/missing/agent-runner"));
 

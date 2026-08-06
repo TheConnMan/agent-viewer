@@ -68,6 +68,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => &self.claude,
             BackendKind::Codex => &self.codex,
+            BackendKind::AgentRunner => &self.codex,
         }
     }
 
@@ -77,6 +78,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => self.composer_claude.as_ref().unwrap_or(&self.claude),
             BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
+            BackendKind::AgentRunner => self.composer_codex.as_ref().unwrap_or(&self.codex),
         }
     }
 
