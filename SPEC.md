@@ -209,13 +209,28 @@ opened `curie-eng/curie/pull/1089` still reports `task/fix-interactive-clippy`).
 are therefore not a usable source. The rollout transcript is the source only when it proves that
 the same thread successfully opened the PR.
 
-`codex::pr_scan` records a pending `response_item` custom tool call only when its name is `exec`,
-its input contains `gh pr create`, and it has a `call_id`. It badges a PR only after a later
-`custom_tool_call_output` with that same `call_id` contains a nested command result with
-`exit_code == 0` and a `github.com/<owner>/<repo>/pull/<n>` URL. An unpaired or failed command
-does not badge a PR. URLs in messages, unrelated tool output, or other calls are incidental and
-are excluded. Cost rules, all load bearing at this box's scale (4,963 threads, 1.8 GB of
-rollouts, of which 1.3 GB is `archived_sessions`):
+A thread opens a PR through one of two channels, and both are read, because reading only the
+first badged nothing at all on this box:
+
+- **`gh pr create`.** `codex::pr_scan` records a pending `response_item` custom tool call when
+  its name is `exec`, its input contains `gh pr create`, and it has a `call_id`. It badges the
+  `github.com/<owner>/<repo>/pull/<n>` URLs in the paired `custom_tool_call_output`, unless that
+  result failed. Codex writes that result two ways and both are live: plain text content items
+  under a `Script completed` / `Script failed` header (the common shape, and the one the URL
+  actually arrives in), and, when the result is chunked or truncated, an item whose text is a
+  JSON object carrying `exit_code` and `output`. Requiring the JSON shape is what emptied every
+  codex badge in `f34fc87`.
+- **The GitHub connector.** `tools.mcp__codex_apps__github_create_pull_request` returns only
+  `Action completed.` to the model, so the URL is read off the `event_msg`
+  `mcp_tool_call_end` whose `invocation.tool` ends with `create_pull_request`, at
+  `result.Ok.structuredContent.url`. `isError` or a non-`Ok` result badges nothing.
+
+A `gh pr create` that outlives its call returns a shell `session_id` and empty output, and its
+URL lands in a later call polling that id (`write_stdin({session_id: N})`). Those sessions are
+followed, so the poll counts as part of the creation; a poll of any other session does not.
+An unpaired or failed command does not badge a PR, and URLs in messages, unrelated tool output,
+or other calls are incidental and are excluded. Cost rules, all load bearing at this box's scale
+(4,963 threads, 1.8 GB of rollouts, of which 1.3 GB is `archived_sessions`):
 
 - **Per file offset and pairing state.** A rollout is read once, then only where it grew, and
   not at all while its length is unchanged. Pending calls survive incremental reads so a command

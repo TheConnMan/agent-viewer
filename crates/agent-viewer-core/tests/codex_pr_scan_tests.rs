@@ -1,8 +1,10 @@
-//! Codex PR refs come from the successful `gh pr create` call and result in the rollout JSONL.
-//! The registry has no PR column, and `threads.git_branch` is captured at thread start so it
-//! goes stale the moment the agent branches. These cover URL parsing within successful
-//! creation results, the incremental scanner that keeps the per-tick cost bounded, and the
-//! end-to-end population of `Session.pr_refs` from `CodexBackend::list`.
+//! Codex PR refs come from the rollout JSONL, from the two channels a thread opens a PR
+//! through: a successful `gh pr create` call and its result, and a GitHub connector
+//! `create_pull_request` tool call. The registry has no PR column, and `threads.git_branch` is
+//! captured at thread start so it goes stale the moment the agent branches. These cover the
+//! live result shapes of both channels, URL parsing within them, the incremental scanner that
+//! keeps the per-tick cost bounded, and the end-to-end population of `Session.pr_refs` from
+//! `CodexBackend::list`.
 
 mod common;
 
@@ -46,7 +48,34 @@ fn gh_pr_create_call(call_id: &str) -> String {
     )
 }
 
+/// The exec result shape live rollouts actually carry: a plain-text status header item
+/// followed by a plain-text item holding the command's own output. `gh pr create` prints
+/// just the PR URL, so that second item is where the badge comes from.
 fn command_output(call_id: &str, exit_code: i32, output: &str) -> String {
+    let header = if exit_code == 0 {
+        "Script completed\nWall time 2.4 seconds\nOutput:\n"
+    } else {
+        "Script failed\nWall time 2.4 seconds\nOutput:\n"
+    };
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": [
+                    {"type": "input_text", "text": header},
+                    {"type": "input_text", "text": format!("{output}\n")},
+                ],
+            }
+        })
+    )
+}
+
+/// The other live exec result shape, written when the result is chunked or truncated: the
+/// item text is itself a JSON object carrying `exit_code` and the command output.
+fn chunked_command_output(call_id: &str, exit_code: i32, output: &str) -> String {
     let result = serde_json::json!({
         "chunk_id": "test",
         "wall_time_seconds": 1.4,
@@ -205,6 +234,240 @@ fn scanner_ignores_pr_from_failed_matching_gh_command() {
 
     append(&path, &gh_pr_create_call("call_failed_create"));
     append(&path, &command_output("call_failed_create", 1, failed_url));
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert!(scanner.refs_for(&path, &mut budget).is_empty());
+}
+
+// The regression that emptied every codex PR badge on this box: the scanner only read the
+// chunked JSON result shape, while a real `gh pr create` records its URL in a plain-text
+// result item under a `Script completed` header. Both lines below are the live bytes from
+// `rollout-2026-08-10T18-57-32` (Rutherford-Soddy/case-management#436), trimmed only in the
+// command text. A scanner that requires an `exit_code` field fails here.
+#[test]
+fn scanner_reports_pr_from_the_live_plaintext_result_shape() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &custom_tool_call(
+            "call_SHlM2lhDtiywUOZ7pQZyOpOP",
+            "exec",
+            r#"const r = await tools.exec_command({"cmd":"git commit --no-verify -m \"Use mail icon\" && git push -u origin HEAD && gh pr create --base develop --title \"Use mail icon\"","workdir":"/home/theconnman/git/rutherford-soddy/case-management"});"#,
+        ),
+    );
+    append(
+        &path,
+        &format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_019fed0f-1234-7c92-ad51-0597c67aa2c7",
+                    "call_id": "call_SHlM2lhDtiywUOZ7pQZyOpOP",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 3.4 seconds\nOutput:\n"},
+                        {"type": "input_text", "text": " 4 files changed, 8 insertions(+), 8 deletions(-)\n[task/report-feedback-icon 1a2b3c4] Use mail icon\nhttps://github.com/Rutherford-Soddy/case-management/pull/436\n"},
+                    ],
+                }
+            })
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert_eq!(
+        hrefs(&scanner.refs_for(&path, &mut budget)),
+        vec!["https://github.com/Rutherford-Soddy/case-management/pull/436".to_string()]
+    );
+}
+
+// The chunked result shape is the other half of live traffic: a truncated result nests the
+// command output inside a JSON object with `exit_code`. Both shapes must badge, and a
+// nonzero exit code must not.
+#[test]
+fn scanner_reads_the_chunked_result_shape_and_its_exit_code() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(&path, &gh_pr_create_call("call_chunked_ok"));
+    append(
+        &path,
+        &chunked_command_output("call_chunked_ok", 0, "https://github.com/o/r/pull/12"),
+    );
+    append(&path, &gh_pr_create_call("call_chunked_failed"));
+    append(
+        &path,
+        &chunked_command_output("call_chunked_failed", 1, "https://github.com/o/r/pull/13"),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert_eq!(
+        hrefs(&scanner.refs_for(&path, &mut budget)),
+        vec!["https://github.com/o/r/pull/12".to_string()]
+    );
+}
+
+// A `gh pr create` that outlives its call returns a shell session id and empty output, and
+// the URL lands in a later call polling that session. Both lines are the live shape from
+// `rollout-2026-08-05T21-23-29`, which opened two PRs this way and badged neither.
+#[test]
+fn scanner_follows_a_pr_create_that_outlived_its_call() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let still_running = |call_id: &str, session_id: u64| {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 1.2 seconds\nOutput:\n"},
+                        {"type": "input_text", "text": serde_json::json!({
+                            "chunk_id": "0ee3f9",
+                            "wall_time_seconds": 1.0,
+                            "session_id": session_id,
+                            "original_token_count": 0,
+                            "output": "",
+                        }).to_string()},
+                    ],
+                }
+            })
+        )
+    };
+
+    append(&path, &gh_pr_create_call("call_async_create"));
+    append(&path, &still_running("call_async_create", 42987));
+    append(
+        &path,
+        &custom_tool_call(
+            "call_poll",
+            "exec",
+            r#"const r=await tools.write_stdin({session_id:42987,chars:"",yield_time_ms:1000,max_output_tokens:2000}); text(r);"#,
+        ),
+    );
+    append(
+        &path,
+        &command_output(
+            "call_poll",
+            0,
+            "https://github.com/TheConnMan/agent-runner/pull/10",
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert_eq!(
+        hrefs(&scanner.refs_for(&path, &mut budget)),
+        vec!["https://github.com/TheConnMan/agent-runner/pull/10".to_string()]
+    );
+}
+
+/// A GitHub connector PR creation, as the rollout records it: the model-visible tool result
+/// is only `Action completed.`, so the URL lives on the event's structured result.
+fn connector_pr_create(tool: &str, is_error: bool, url: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "exec-f02dcd28-2e28-4448-a0a6-ea72f1b9e145",
+                "invocation": {
+                    "server": "codex_apps",
+                    "tool": tool,
+                    "arguments": {"repository_full_name": "Rutherford-Soddy/case-management"},
+                },
+                "app_name": "GitHub",
+                "action_name": "create_pull_request",
+                "result": {"Ok": {
+                    "content": [{"type": "text", "text": "Action completed."}],
+                    "structuredContent": {
+                        "url": url,
+                        "number": 437,
+                        "state": "open",
+                        "isError": is_error,
+                    },
+                }},
+            }
+        })
+    )
+}
+
+// The second creation channel, and the one that opened Rutherford-Soddy/case-management#437:
+// the thread called the GitHub connector instead of `gh`, so there is no `gh pr create` exec
+// to pair. A scanner that reads only `response_item` lines badges nothing here.
+#[test]
+fn scanner_reports_pr_opened_through_the_github_connector() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &connector_pr_create(
+            "github.create_pull_request",
+            false,
+            "https://github.com/Rutherford-Soddy/case-management/pull/437",
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert_eq!(
+        hrefs(&scanner.refs_for(&path, &mut budget)),
+        vec!["https://github.com/Rutherford-Soddy/case-management/pull/437".to_string()]
+    );
+}
+
+// Reading a PR through the connector is not opening one, and a failed creation opened
+// nothing. Both must stay unbadged, or the provenance rule is back to badging mentions.
+#[test]
+fn scanner_ignores_connector_calls_that_did_not_open_a_pr() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &connector_pr_create(
+            "github.get_pull_request",
+            false,
+            "https://github.com/o/r/pull/41",
+        ),
+    );
+    append(
+        &path,
+        &connector_pr_create(
+            "github.create_pull_request",
+            true,
+            "https://github.com/o/r/pull/42",
+        ),
+    );
+
+    let mut scanner = PrScanner::new();
+    let mut budget = SCAN_BUDGET_BYTES;
+    assert!(scanner.refs_for(&path, &mut budget).is_empty());
+}
+
+// The followed shell session must not turn every later poll into a PR source: once the URL
+// has been read, a poll of an unrelated session is just tool output again.
+#[test]
+fn scanner_ignores_a_poll_of_an_unrelated_shell_session() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    append(
+        &path,
+        &custom_tool_call(
+            "call_other_poll",
+            "exec",
+            r#"const r=await tools.write_stdin({session_id:777,chars:"",yield_time_ms:1000}); text(r);"#,
+        ),
+    );
+    append(
+        &path,
+        &command_output("call_other_poll", 0, "https://github.com/o/r/pull/99"),
+    );
 
     let mut scanner = PrScanner::new();
     let mut budget = SCAN_BUDGET_BYTES;
