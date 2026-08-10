@@ -72,19 +72,141 @@ fn push_capped(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) 
     }
 }
 
-/// Scan one complete rollout line. A PR is attributed to the session only when an `exec`
-/// call that creates a PR is paired with its successful command result. Rollout prose and
-/// unrelated tool output may contain arbitrary PR links and are deliberately ignored.
-fn scan_response_item(line: &str, entry: &mut Entry) {
+/// What one `exec` result says: whether the command failed, and the command's own output.
+///
+/// Codex writes an exec result in two shapes, both live on this box. The common one is plain
+/// text content items, a `Script completed` / `Script failed` header followed by the raw
+/// command output (`gh pr create` prints just the PR URL). The other appears when the result
+/// is chunked or truncated: the item text is itself a JSON object carrying `exit_code` and
+/// `output`. Reading only the JSON shape badges nothing at all, because the creation results
+/// this box actually records are plain text.
+struct ExecResult {
+    failed: bool,
+    command_output: Vec<String>,
+    /// Shell session ids the result reports. A command that outlives its call returns one of
+    /// these with empty output, and the rest of its output (the PR URL) arrives under a later
+    /// call that polls the same id.
+    shell_sessions: Vec<u64>,
+}
+
+impl ExecResult {
+    fn parse(payload: &serde_json::Map<String, Value>) -> Option<ExecResult> {
+        let output = payload.get("output")?;
+        // `output` is an array of content items, or, less often, a bare string.
+        let texts: Vec<&str> = match output {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect(),
+            Value::String(text) => vec![text.as_str()],
+            _ => return None,
+        };
+
+        let mut result = ExecResult {
+            failed: false,
+            command_output: Vec::new(),
+            shell_sessions: Vec::new(),
+        };
+        for text in texts {
+            match serde_json::from_str::<Value>(text) {
+                Ok(Value::Object(chunk)) => {
+                    if chunk
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|code| code != 0)
+                    {
+                        result.failed = true;
+                    }
+                    if let Some(session_id) = chunk.get("session_id").and_then(Value::as_u64) {
+                        result.shell_sessions.push(session_id);
+                    }
+                    if let Some(command_output) = chunk.get("output").and_then(Value::as_str) {
+                        result.command_output.push(command_output.to_owned());
+                    }
+                }
+                _ => {
+                    if text.starts_with("Script failed") {
+                        result.failed = true;
+                    }
+                    result.command_output.push(text.to_owned());
+                }
+            }
+        }
+        Some(result)
+    }
+}
+
+/// Whether `input` polls one of the shell sessions in `sessions`, i.e. carries
+/// `session_id: <id>` in any of the spacing and quoting the tool call JS uses.
+fn polls_shell_session(input: &str, sessions: &HashSet<u64>) -> bool {
+    if sessions.is_empty() {
+        return false;
+    }
+    input.match_indices("session_id").any(|(at, key)| {
+        let rest = input[at + key.len()..]
+            .trim_start_matches(['"', '\'', ' ', ':'])
+            .as_bytes();
+        let digits: String = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .map(|byte| *byte as char)
+            .collect();
+        digits.parse::<u64>().is_ok_and(|id| sessions.contains(&id))
+    })
+}
+
+/// Scan a `mcp_tool_call_end` event for a PR opened through the GitHub connector, the other
+/// way a thread creates one: `tools.mcp__codex_apps__github_create_pull_request`. The tool
+/// result the model sees is only `Action completed.`, so the URL is read off the event's own
+/// structured result, which is as strong a provenance signal as a `gh pr create` exit code.
+fn scan_connector_pr_create(payload: &serde_json::Map<String, Value>, entry: &mut Entry) {
+    let tool = payload
+        .get("invocation")
+        .and_then(|invocation| invocation.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !tool.ends_with("create_pull_request") {
+        return;
+    }
+    let Some(content) = payload
+        .get("result")
+        .and_then(|result| result.get("Ok"))
+        .and_then(|ok| ok.get("structuredContent"))
+    else {
+        return;
+    };
+    if content.get("isError").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let Some(url) = content.get("url").and_then(Value::as_str) else {
+        return;
+    };
+    scan_pr_keys(url, |owner, repo, number| {
+        push_capped(&mut entry.refs, owner, repo, number)
+    });
+}
+
+/// Scan one complete rollout line. A PR is attributed to the session only when the thread
+/// itself opened it: an `exec` call creating one paired with its successful result, or a
+/// successful GitHub connector creation. Rollout prose and unrelated tool output may contain
+/// arbitrary PR links and are deliberately ignored.
+fn scan_rollout_line(line: &str, entry: &mut Entry) {
     let Ok(item) = serde_json::from_str::<Value>(line) else {
         return;
     };
-    if item.get("type").and_then(Value::as_str) != Some("response_item") {
-        return;
-    }
+    let kind = item.get("type").and_then(Value::as_str);
     let Some(payload) = item.get("payload").and_then(Value::as_object) else {
         return;
     };
+    if kind == Some("event_msg") {
+        if payload.get("type").and_then(Value::as_str) == Some("mcp_tool_call_end") {
+            scan_connector_pr_create(payload, entry);
+        }
+        return;
+    }
+    if kind != Some("response_item") {
+        return;
+    }
 
     match payload.get("type").and_then(Value::as_str) {
         Some("custom_tool_call") => {
@@ -97,7 +219,9 @@ fn scan_response_item(line: &str, entry: &mut Entry) {
             let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
                 return;
             };
-            if input.contains("gh pr create") {
+            if input.contains("gh pr create")
+                || polls_shell_session(input, &entry.pending_pr_shells)
+            {
                 entry.pending_pr_creates.insert(call_id.to_owned());
             }
         }
@@ -108,25 +232,26 @@ fn scan_response_item(line: &str, entry: &mut Entry) {
             if !entry.pending_pr_creates.remove(call_id) {
                 return;
             }
-            let Some(output) = payload.get("output").and_then(Value::as_array) else {
+            let Some(result) = ExecResult::parse(payload) else {
                 return;
             };
-            for item in output {
-                let Some(text) = item.get("text").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Ok(result) = serde_json::from_str::<Value>(text) else {
-                    continue;
-                };
-                if result.get("exit_code").and_then(Value::as_i64) != Some(0) {
-                    continue;
-                }
-                let Some(command_output) = result.get("output").and_then(Value::as_str) else {
-                    continue;
-                };
-                scan_pr_keys(command_output, |owner, repo, number| {
+            if result.failed {
+                return;
+            }
+            let before = entry.refs.len();
+            for text in &result.command_output {
+                scan_pr_keys(text, |owner, repo, number| {
                     push_capped(&mut entry.refs, owner, repo, number)
                 });
+            }
+            // A `gh pr create` that outlived its call returned a shell session and no URL yet.
+            // Follow that session so the poll carrying the URL is read as part of the creation.
+            if entry.refs.len() == before {
+                entry.pending_pr_shells.extend(result.shell_sessions);
+            } else {
+                for session in result.shell_sessions {
+                    entry.pending_pr_shells.remove(&session);
+                }
             }
         }
         _ => {}
@@ -147,6 +272,9 @@ struct Entry {
     /// `gh pr create` exec calls whose matching result has not arrived yet. This must persist
     /// across ticks because a call and its output commonly land in separate appended chunks.
     pending_pr_creates: HashSet<String>,
+    /// Shell sessions running a `gh pr create` that has not printed its URL yet. A later call
+    /// polling one of these is treated as the same creation.
+    pending_pr_shells: HashSet<u64>,
 }
 
 /// Incremental per-rollout PR-ref scanner. Held by the codex backend across ticks.
@@ -193,7 +321,7 @@ impl PrScanner {
                 if let Some(last_newline) = buf.iter().rposition(|byte| *byte == b'\n') {
                     let text = String::from_utf8_lossy(&buf[..=last_newline]);
                     for line in text.lines() {
-                        scan_response_item(line, &mut entry);
+                        scan_rollout_line(line, &mut entry);
                     }
                     entry.offset += last_newline as u64 + 1;
                 }
