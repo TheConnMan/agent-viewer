@@ -48,6 +48,8 @@ Codex maintains a global session registry. Read it and its name index read only.
 - `source` is a **serialized enum, not a flat string**. Observed values: `cli`, `exec`,
   `vscode`, and JSON blobs like `{"subagent":"review"}` or nested `thread_spawn` objects.
   Parse defensively: match `cli`/`exec`/`vscode` prefixes; anything else → treat as subagent.
+  Only those serialized subagent sources are Codex companions hidden by default; ordinary
+  `exec` rows remain visible in the default unfiltered view.
 - `archived=1` rows are the hidden set; their `rollout_path` points into
   `~/.codex/archived_sessions/` (active rows point into `~/.codex/sessions/`).
 - Grouping key = `cwd`. Optionally fold `cwd` up to the nearest `.git` root so worktrees
