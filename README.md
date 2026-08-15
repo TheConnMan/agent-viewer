@@ -93,8 +93,11 @@ A single session can surface from more than one source (e.g. a registry row and 
 rollout file). The secondary copies are marked **companions** and hidden by default so
 the list shows one row per session. One-shot runs started by a script rather than by you
 are companions too, because they are steps inside somebody else's job and not fleet members
-you would ever attach to: Codex `exec` and subagent threads (the review passes an
-`/implement` run fires off, for example). Archived sessions are hidden
+you would ever attach to: Codex `exec` and bare or malformed subagent rows (the review passes an
+`/implement` run fires off, for example). A valid nested `subagent.thread_spawn` row with a
+nonempty `parent_thread_id` remains visible by default so its activity can be followed, but it
+is still marked as a subagent for safety. Process-hosted ThreadSpawn rows do not advertise stop,
+while daemon-hosted ThreadSpawn rows retain the daemon's safe turn interrupt. Archived sessions are hidden
 too, and so are sessions whose working directory no longer exists on disk (e.g. deleted
 `/tmp` scratch dirs). Press `Ctrl+A` to reveal all of them; the footer shows how many rows are
 currently hidden, and `Ctrl+F` searches the hidden rows too. Sessions you spawn from the
@@ -219,9 +222,10 @@ its SQLite title still shows the prompt.
   retaining it for later attach.
   A Codex session hosted by the app-server daemon is stopped by interrupting its current turn,
   never by signalling a process: the daemon runs every session it hosts, so a signal would take
-  all of them down with it. A Codex subagent row advertises no stop at all and reports
-  `codex does not support stop`, because the only pid on that row is its parent's and
-  signalling it would take the parent and every sibling down with it.
+  all of them down with it. A process-hosted Codex subagent row advertises no stop and reports
+  `codex does not support stop`, because the only pid on that row is its parent's and signalling it
+  would take the parent and every sibling down with it. A daemon-hosted ThreadSpawn subagent keeps
+  the daemon's safe turn interrupt.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).

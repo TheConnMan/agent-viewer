@@ -21,12 +21,29 @@ fn parse_subagent_string() {
 
 #[test]
 fn parse_subagent_thread_spawn() {
-    // Verbatim shape from the live DB: nested thread_spawn, label = agent_nickname.
+    // A nested spawn belongs to a subagent for safety, but its parent link makes it a
+    // primary row in the default view.
     let raw = r#"{"subagent":{"thread_spawn":{"parent_thread_id":"019f4dda","depth":1,"agent_path":null,"agent_nickname":"Aristotle","agent_role":"worker"}}}"#;
     assert_eq!(
         Source::parse(raw),
-        Source::Subagent("Aristotle".to_string())
+        Source::ThreadSpawn {
+            nickname: "Aristotle".to_string(),
+            parent_thread_id: "019f4dda".to_string(),
+        }
     );
+    assert!(
+        !Source::parse(raw).is_companion(),
+        "a spawned agent with a real parent thread must be visible"
+    );
+}
+
+#[test]
+fn malformed_thread_spawn_stays_a_companion() {
+    let empty_parent = r#"{"subagent":{"thread_spawn":{"parent_thread_id":""}}}"#;
+    let non_string_parent = r#"{"subagent":{"thread_spawn":{"parent_thread_id":7}}}"#;
+
+    assert!(Source::parse(empty_parent).is_companion());
+    assert!(Source::parse(non_string_parent).is_companion());
 }
 
 #[test]
@@ -46,7 +63,7 @@ fn parse_garbage_never_panics() {
 
 #[test]
 fn companion_flags_by_source() {
-    // Cli / VsCode are shown; Exec and any Subagent are companions (hidden by default).
+    // Cli / VsCode are shown; Exec and bare subagents are companions.
     assert!(!Source::Cli.is_companion());
     assert!(!Source::VsCode.is_companion());
     assert!(Source::Exec.is_companion());

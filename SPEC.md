@@ -48,6 +48,11 @@ Codex maintains a global session registry. Read it and its name index read only.
 - `source` is a **serialized enum, not a flat string**. Observed values: `cli`, `exec`,
   `vscode`, and JSON blobs like `{"subagent":"review"}` or nested `thread_spawn` objects.
   Parse defensively: match `cli`/`exec`/`vscode` prefixes; anything else → treat as subagent.
+- Companion visibility is distinct from subagent identity. `exec` and `Subagent` rows (bare,
+  unlinked, or malformed subagent JSON) are companions and hidden by default. A valid nested
+  `subagent.thread_spawn` with a nonempty `parent_thread_id` is visible by default, but remains
+  a subagent row for safety. Process-hosted ThreadSpawn rows do not advertise stop; daemon-hosted
+  ThreadSpawn rows retain the daemon's safe turn interrupt.
 - `archived=1` rows are the hidden set; their `rollout_path` points into
   `~/.codex/archived_sessions/` (active rows point into `~/.codex/sessions/`).
 - Grouping key = `cwd`. Optionally fold `cwd` up to the nearest `.git` root so worktrees
@@ -273,19 +278,21 @@ row takes a different rule set entirely, because its fd carries no liveness info
 "Codex attach/resume". `archived=1` is the hidden set and is orthogonal, applying on top of any
 of these.
 
-**Stop is gated on the same scan, and subagent rows are withheld.** `stop_route` is a pure
-function: a daemon-hosted row routes to `turn/interrupt`, a subagent row returns `Unsupported`,
-and everything else signals its pid or, with no pid, is `Unsupported` too. Subagent-ness is the
+**Stop is gated on the same scan, and process-hosted subagent rows are withheld.** `stop_route` is a
+pure function: a daemon-hosted row, including a daemon-hosted ThreadSpawn subagent, routes to
+`turn/interrupt`; a process-hosted subagent row returns `Unsupported`; and everything else signals
+its pid or, with no pid, is `Unsupported` too. Subagent-ness is the
 `subagent` field the listing records from the parsed `source` enum, never `companion`. It was
 `companion && origin != Exec` and that was wrong: `companion` is presentational and
 `mark_dead_dirs` sets it on every session whose cwd has been deleted, so an ordinary cli or
 vscode session in a removed worktree was reclassified as a subagent and lost its stop action.
-The subagent case is the same hazard as the daemon one, one level
-down: a `codex exec` parent holds the rollout fd of every subagent thread it spawned (measured
-live 2026-07-27, pid 2910115 held two), so the fd scan stamps the PARENT's pid onto the
-subagent rows. Signalling from there SIGTERMs the parent's whole process group to stop one
-child, and there is no separate process to signal instead, so the row advertises no stop at all
-and the footer reads `codex does not support stop`.
+The process-hosted subagent case is the same hazard as the daemon one, one level down: a
+`codex exec` parent holds the rollout fd of every subagent thread it spawned (measured live
+2026-07-27, pid 2910115 held two), so the fd scan stamps the PARENT's pid onto the subagent rows.
+Signalling from there SIGTERMs the parent's whole process group to stop one child, and there is no
+separate process to signal instead, so the row advertises no stop at all and the footer reads
+`codex does not support stop`. A daemon-hosted ThreadSpawn subagent is still a subagent row, but
+its stop safely uses `turn/interrupt` through the daemon.
 
 On macOS and Windows, `/proc` file descriptor evidence is unavailable. A `task_complete` tail
 proves `Done`; every other tail is `Unknown`, never inferred as live, idle, or errored. Actions
