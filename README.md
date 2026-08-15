@@ -91,12 +91,11 @@ a session you just spawned blooms once when its row first appears.
 
 A single session can surface from more than one source (e.g. a registry row and a
 rollout file). The secondary copies are marked **companions** and hidden by default so
-the list shows one row per session. One-shot runs started by a script rather than by you
-are companions too, because they are steps inside somebody else's job and not fleet members
-you would ever attach to: Codex `exec` and subagent threads (the review passes an
-`/implement` run fires off, for example). Archived sessions are hidden
-too, and so are sessions whose working directory no longer exists on disk (e.g. deleted
-`/tmp` scratch dirs). Press `Ctrl+A` to reveal all of them; the footer shows how many rows are
+the list shows one row per session. For Codex, only rows whose serialized source is a
+subagent are companions; ordinary Codex `exec` rows remain visible in the default
+unfiltered view. Archived sessions are hidden too, and so are sessions whose working
+directory no longer exists on disk (e.g. deleted `/tmp` scratch dirs). Press `Ctrl+A` to
+reveal all of them; the footer shows how many rows are
 currently hidden, and `Ctrl+F` searches the hidden rows too. Sessions you spawn from the
 viewer are pinned, so they always show even if another source would have marked them a
 companion.
