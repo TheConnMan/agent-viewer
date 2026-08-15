@@ -41,9 +41,10 @@ impl Source {
         Source::Subagent("subagent".into())
     }
 
-    /// Companion filter. Only subagents are hidden.
+    /// Companion filter (verified on the live registry 2026-07-11: cli 25 +
+    /// vscode 320 shown; exec 1671 + subagent 876 hidden). Exec | Subagent(_) -> true.
     /// thread_source/has_user_event are UNRELIABLE — do not use them.
     pub fn is_companion(&self) -> bool {
-        matches!(self, Source::Subagent(_))
+        matches!(self, Source::Exec | Source::Subagent(_))
     }
 }
