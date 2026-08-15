@@ -512,7 +512,7 @@ impl Backend for CodexBackend {
             // The parsed `source` enum is the ONLY authority on subagent-ness. `companion` is
             // a presentation flag other passes (mark_dead_dirs) also set, so stop routing
             // reads this instead.
-            let subagent = thread.source.is_subagent();
+            let subagent = matches!(thread.source, source::Source::Subagent(_));
             let origin = if matches!(thread.source, source::Source::Exec) {
                 SessionOrigin::Exec
             } else {

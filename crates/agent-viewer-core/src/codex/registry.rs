@@ -115,12 +115,13 @@ impl Registry {
             .query_map([], |row| {
                 let raw_source = row.get::<_, String>(4)?;
                 let source = Source::parse(&raw_source);
-                let parent_thread_id = match &source {
-                    Source::ThreadSpawn {
-                        parent_thread_id, ..
-                    } => Some(parent_thread_id.clone()),
-                    _ => None,
-                };
+                // Only a subagent row can carry a spawn parent: every other `source` is one of
+                // the flat `cli`/`exec`/`vscode` strings, which `Source::parse` matches before
+                // it ever reaches JSON. Gating here keeps the JSON parse to once per row
+                // instead of once in each of these two fields.
+                let parent_thread_id = matches!(source, Source::Subagent(_))
+                    .then(|| spawn_parent_thread_id(&raw_source))
+                    .flatten();
                 Ok(Thread {
                     id: row.get(0)?,
                     rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
@@ -162,6 +163,18 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(models)
     }
+}
+
+fn spawn_parent_thread_id(raw_source: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw_source)
+        .ok()?
+        .get("subagent")?
+        .get("thread_spawn")?
+        .get("parent_thread_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_string)
 }
 
 fn read_thread_names(path: &std::path::Path) -> HashMap<String, String> {

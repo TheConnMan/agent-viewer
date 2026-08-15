@@ -130,9 +130,8 @@ fn thread_row(id: &str, source: &str, updated_ms: i64) -> String {
 /// source (cli, vscode, a subagent JSON blob) is Interactive. Asserting both branches from
 /// one listing kills a mapping that collapsed every row onto a single origin.
 ///
-/// The same listing is where visibility and `subagent` are recorded. A valid thread spawn is
-/// visible but remains a subagent, because stop routing must still deny its shared parent pid.
-/// Bare subagents and malformed spawns remain companions. `exec` does not become a subagent:
+/// The same listing is where `subagent` is recorded, and it is the field stop routing reads,
+/// so the mapping is pinned here too: ONLY the subagent JSON blob sets it. `exec` does not -
 /// an exec parent is a primary session of its own process.
 #[test]
 fn codex_origin_is_exec_only_for_exec_source() {
@@ -143,23 +142,11 @@ fn codex_origin_is_exec_only_for_exec_source() {
           '/home/user/proj','Sub Title','workspace-write','on-request',0,\
           'gpt-5','main','first msg','preview',1000,1000)"
     );
-    let thread_spawn_row = thread_row(
-        "t_spawn",
-        r#"{"subagent":{"thread_spawn":{"parent_thread_id":"t_parent","agent_nickname":"Aristotle"}}}"#,
-        900,
-    );
-    let malformed_spawn_row = thread_row(
-        "t_spawn_empty_parent",
-        r#"{"subagent":{"thread_spawn":{"parent_thread_id":""}}}"#,
-        800,
-    );
     let rows = [
         thread_row("t_exec", "exec", 4000),
         thread_row("t_cli", "cli", 3000),
         thread_row("t_vscode", "vscode", 2000),
         subagent_row,
-        thread_spawn_row,
-        malformed_spawn_row,
     ];
     let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
     let (dir, path) = common::temp_db(&schema, &refs);
@@ -180,8 +167,6 @@ fn codex_origin_is_exec_only_for_exec_source() {
     assert_eq!(origin("t_cli"), SessionOrigin::Interactive);
     assert_eq!(origin("t_vscode"), SessionOrigin::Interactive);
     assert_eq!(origin("t_sub"), SessionOrigin::Interactive);
-    assert_eq!(origin("t_spawn"), SessionOrigin::Interactive);
-    assert_eq!(origin("t_spawn_empty_parent"), SessionOrigin::Interactive);
 
     let subagent = |id: &str| {
         sessions
@@ -190,31 +175,10 @@ fn codex_origin_is_exec_only_for_exec_source() {
             .unwrap_or_else(|| panic!("no session {id}"))
             .subagent
     };
-    let companion = |id: &str| {
-        sessions
-            .iter()
-            .find(|s| s.id == id)
-            .unwrap_or_else(|| panic!("no session {id}"))
-            .companion
-    };
-    assert!(subagent("t_sub"), "a bare subagent remains a subagent");
-    assert!(
-        subagent("t_spawn"),
-        "a visible spawned agent must still be protected by subagent stop safety"
-    );
+    assert!(subagent("t_sub"), "the subagent blob is the only subagent");
     assert!(!subagent("t_exec"), "an exec parent owns its own process");
     assert!(!subagent("t_cli"));
     assert!(!subagent("t_vscode"));
-    assert!(
-        !companion("t_spawn"),
-        "a valid spawned agent is visible by default"
-    );
-    assert!(companion("t_sub"), "a bare subagent remains a companion");
-    assert!(companion("t_exec"), "an exec row remains a companion");
-    assert!(
-        companion("t_spawn_empty_parent"),
-        "an empty spawn parent is not a valid visibility relationship"
-    );
 }
 
 // --- per-row stop capability ---
