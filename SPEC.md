@@ -976,7 +976,7 @@ the `hold` rule applies there too.
 
 ### Themes, sprites, and the age ramp
 
-Eleven built-in themes, selected through the composer's `/theme` command, which previews a
+Twelve built-in themes, selected through the composer's `/theme` command, which previews a
 candidate against the whole screen on `↑`/`↓`, commits on `Enter`, and reverts on `Esc`. The
 choice persists in the viewer DB. User themes are `*.theme` files under
 `~/.config/agent-viewer/themes`, one `key=#rrggbb` per line with `#` comments; a malformed line
