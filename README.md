@@ -387,8 +387,9 @@ selection. Any other key returns you to the list.
 
 ## Themes
 
-Eleven themes ship: `analog amber` (the default), `terminal match`, `paper light`, `mono 16`,
-`aubergine`, `hoth`, `catppuccin mocha`, `tokyo night`, `gruvbox dark`, `rose pine`, and `nord`.
+Twelve themes ship: `analog amber` (the default), `terminal match`, `paper light`, `mono 16`,
+`aubergine`, `hoth`, `catppuccin mocha`, `tokyo night`, `gruvbox dark`, `rose pine`, `nord`, and
+`dracula`.
 Type `/theme` in the composer to open the picker; `↑`/`↓` preview each one against the whole
 screen, `Enter` commits, `Esc` reverts. The choice is persisted, so the next launch opens on it.
 Marks and motion travel with the theme: `terminal match` builds itself from your terminal's own
