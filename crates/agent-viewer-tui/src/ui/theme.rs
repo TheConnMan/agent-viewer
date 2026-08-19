@@ -218,6 +218,7 @@ pub fn builtins(glyph_marks: bool) -> Vec<Theme> {
         gruvbox(glyph_marks),
         rosepine(glyph_marks),
         nord(glyph_marks),
+        dracula(glyph_marks),
     ]
 }
 
@@ -555,6 +556,37 @@ fn nord(glyph_marks: bool) -> Theme {
         oc: rgb(0xa3, 0xbe, 0x8c),
         pulse_start: rgb(0x5e, 0x81, 0x90),
         pulse_end: rgb(0x88, 0xc0, 0xd0),
+        mark_set: mark_set(glyph_marks),
+        animation: true,
+        source_path: None,
+        modified: None,
+    }
+}
+
+fn dracula(glyph_marks: bool) -> Theme {
+    Theme {
+        id: "dracula-classic".into(),
+        name: "dracula".into(),
+        tag: "classic".into(),
+        bg: rgb(0x28, 0x2a, 0x36),
+        surface: rgb(0x44, 0x47, 0x5a),
+        border: rgb(0x62, 0x72, 0xa4),
+        text: rgb(0xf8, 0xf8, 0xf2),
+        muted: rgb(0x62, 0x72, 0xa4),
+        faint: rgb(0x62, 0x72, 0xa4),
+        accent: rgb(0xbd, 0x93, 0xf9),
+        selbg: rgb(0x44, 0x47, 0x5a),
+        selfg: rgb(0xf8, 0xf8, 0xf2),
+        ok: rgb(0x50, 0xfa, 0x7b),
+        warn: rgb(0xf1, 0xfa, 0x8c),
+        attn: rgb(0xff, 0x79, 0xc6),
+        err: rgb(0xff, 0x55, 0x55),
+        merged: rgb(0xbd, 0x93, 0xf9),
+        cc: rgb(0xff, 0xb8, 0x6c),
+        cx: rgb(0x8b, 0xe9, 0xfd),
+        oc: rgb(0x50, 0xfa, 0x7b),
+        pulse_start: rgb(0x8b, 0xe9, 0xfd),
+        pulse_end: rgb(0xbd, 0x93, 0xf9),
         mark_set: mark_set(glyph_marks),
         animation: true,
         source_path: None,

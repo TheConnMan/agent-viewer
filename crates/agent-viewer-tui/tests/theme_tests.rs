@@ -8,7 +8,7 @@ use std::time::Duration;
 fn builtins_resolve_distinct_core_tokens() {
     let (themes, notices) = ThemeState::load(false, None, std::path::Path::new("/missing"));
     assert!(notices.is_empty());
-    assert_eq!(themes.themes().len(), 11);
+    assert_eq!(themes.themes().len(), 12);
 
     let accents = themes
         .themes()
@@ -26,9 +26,29 @@ fn builtins_resolve_distinct_core_tokens() {
         .map(|theme| theme.warn)
         .collect::<HashSet<Color>>();
 
-    assert_eq!(accents.len(), 11);
-    assert_eq!(backgrounds.len(), 11);
-    assert_eq!(warnings.len(), 11);
+    assert_eq!(accents.len(), 12);
+    assert_eq!(backgrounds.len(), 12);
+    assert_eq!(warnings.len(), 12);
+}
+
+#[test]
+fn builtin_catalog_includes_dracula_with_its_canonical_palette() {
+    let (themes, notices) = ThemeState::load(false, None, std::path::Path::new("/missing"));
+    assert!(notices.is_empty());
+    let dracula = themes
+        .themes()
+        .iter()
+        .find(|theme| theme.id == "dracula-classic")
+        .expect("Dracula builtin theme");
+
+    assert_eq!(dracula.bg, Color::Rgb(0x28, 0x2a, 0x36));
+    assert_eq!(dracula.text, Color::Rgb(0xf8, 0xf8, 0xf2));
+    assert_eq!(dracula.selbg, Color::Rgb(0x44, 0x47, 0x5a));
+    assert_eq!(dracula.accent, Color::Rgb(0xbd, 0x93, 0xf9));
+    assert_eq!(dracula.ok, Color::Rgb(0x50, 0xfa, 0x7b));
+    assert_eq!(dracula.warn, Color::Rgb(0xf1, 0xfa, 0x8c));
+    assert_eq!(dracula.err, Color::Rgb(0xff, 0x55, 0x55));
+    assert_eq!(dracula.attn, Color::Rgb(0xff, 0x79, 0xc6));
 }
 
 #[test]
