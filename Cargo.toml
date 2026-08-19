@@ -11,3 +11,15 @@ rust-version = "1.95"
 
 [patch.crates-io]
 vt100 = { path = "vendor/vt100" }
+
+# Dev builds default to full DWARF, which dominates the target dir. A section
+# dump of a comparable test binary measured .text at 3.5MB against roughly
+# 175MB of .debug_* sections, so about 97% of each artifact was debug info.
+# Cargo never garbage collects a target dir, so that accumulates across every
+# branch and feature hash until the disk fills.
+#
+# line-tables-only keeps file and line numbers in panics and backtraces. It
+# drops type and variable DWARF, so build the one target you are stepping
+# through with CARGO_PROFILE_DEV_DEBUG=2 when a debugger needs locals.
+[profile.dev]
+debug = "line-tables-only"
