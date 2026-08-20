@@ -652,8 +652,9 @@ paths.
 ## Phone companion
 
 The Android companion has a session list, a triage inbox, a new session composer, and a
-session detail screen. Session detail shows recent turns as a read only tail. The four shipped
-themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
+session detail screen. Session detail includes a read only recent tail, and Jump In opens a live
+terminal. Leaving the screen closes only the attach client, and sessions remain resumable. The
+four shipped themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
 
 Start the local HTTP server:
 

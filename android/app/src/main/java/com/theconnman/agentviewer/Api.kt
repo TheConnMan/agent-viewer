@@ -165,6 +165,53 @@ data class Capabilities(
     val stop: Boolean = false,
 )
 
+@Serializable
+data class TerminalScreen(
+    val type: String,
+    val seq: Long,
+    val rows: Int,
+    val cols: Int,
+    @SerialName("cursor_row") val cursorRow: Int,
+    @SerialName("cursor_col") val cursorCol: Int,
+    val lines: List<String>,
+    val running: Boolean,
+)
+
+@Serializable
+sealed interface TerminalCommand {
+    @Serializable
+    @SerialName("input")
+    data class Input(val text: String) : TerminalCommand
+
+    @Serializable
+    @SerialName("resize")
+    data class Resize(val rows: Int, val cols: Int) : TerminalCommand
+
+    @Serializable
+    @SerialName("close")
+    data object Close : TerminalCommand
+}
+
+internal fun terminalWebSocketUrl(
+    baseUrl: String,
+    sessionId: String,
+    backend: BackendKind,
+): String {
+    val socketBase = when {
+        baseUrl.startsWith("https://") -> "wss://${baseUrl.removePrefix("https://")}"
+        baseUrl.startsWith("http://") -> "ws://${baseUrl.removePrefix("http://")}"
+        else -> throw IllegalArgumentException("API base URL must use HTTP or HTTPS")
+    }.trimEnd('/')
+    val backendName = when (backend) {
+        BackendKind.CODEX -> "Codex"
+        BackendKind.CLAUDE -> "Claude"
+    }
+    return "$socketBase/sessions/${encodePathPart(sessionId)}/terminal?backend=$backendName"
+}
+
+private fun encodePathPart(value: String): String =
+    URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
 @Serializable(with = TailEventSerializer::class)
 sealed interface TailEvent {
     data class Agent(val text: String) : TailEvent
@@ -257,13 +304,13 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
     suspend fun sessions(): List<Session> = decode(get("/sessions"))
 
     suspend fun tail(sessionId: String, count: Int = 12): List<TailEvent> =
-        decode(get("/sessions/${pathPart(sessionId)}/tail?n=$count"))
+        decode(get("/sessions/${encodePathPart(sessionId)}/tail?n=$count"))
 
     suspend fun capabilities(sessionId: String): Capabilities =
-        decode(get("/sessions/${pathPart(sessionId)}/caps"))
+        decode(get("/sessions/${encodePathPart(sessionId)}/caps"))
 
     suspend fun pulse(sessionId: String): List<Long> =
-        decode(get("/sessions/${pathPart(sessionId)}/pulse"))
+        decode(get("/sessions/${encodePathPart(sessionId)}/pulse"))
 
     suspend fun models(): Map<ComposerProvider, List<String>> {
         val response: ModelsResponse = decode(get("/models"))
@@ -279,18 +326,18 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
     }
 
     suspend fun stop(sessionId: String) {
-        request("POST", "/sessions/${pathPart(sessionId)}/stop", "{}")
+        request("POST", "/sessions/${encodePathPart(sessionId)}/stop", "{}")
     }
 
     suspend fun hide(sessionId: String, hidden: Boolean) {
         val action = if (hidden) "unhide" else "hide"
-        request("POST", "/sessions/${pathPart(sessionId)}/$action", "{}")
+        request("POST", "/sessions/${encodePathPart(sessionId)}/$action", "{}")
     }
 
     suspend fun rename(sessionId: String, name: String) {
         request(
             "PATCH",
-            "/sessions/${pathPart(sessionId)}",
+            "/sessions/${encodePathPart(sessionId)}",
             ApiJson.json.encodeToString(RenameRequest.serializer(), RenameRequest(name)),
         )
     }
@@ -326,6 +373,4 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
                 connection.disconnect()
             }
         }
-
-    private fun pathPart(value: String): String = URLEncoder.encode(value, "UTF-8")
 }

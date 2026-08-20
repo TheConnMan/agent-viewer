@@ -20,6 +20,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
 
 class ApiContractTest {
     @Test
@@ -200,16 +202,184 @@ class ApiContractTest {
         )
     }
 
+    @Test
+    fun `session row helpers omit hold titles without hiding longer titles`() {
+        val visibleHold = session("visibleHold", Status.Working, title = "Hold")
+        val visibleMixedHold = session("visibleMixedHold", Status.Working, title = "hOlD")
+        val visibleLongerTitle = session("visibleLongerTitle", Status.Working, title = "hold task")
+        val hiddenHold = session("hiddenHold", Status.Done, hidden = true, title = "Hold")
+        val hiddenMixedHold = session("hiddenMixedHold", Status.Done, hidden = true, title = "hOlD")
+        val hiddenLongerTitle = session("hiddenLongerTitle", Status.Done, hidden = true, title = "hold task")
+        val triageHold = session("triageHold", Status.NeedsInput(null), title = "Hold")
+        val triageMixedHold = session("triageMixedHold", Status.NeedsInput(null), title = "hOlD")
+        val triageLongerTitle = session("triageLongerTitle", Status.NeedsInput(null), title = "hold task")
+        val sessions = listOf(
+            visibleHold,
+            visibleMixedHold,
+            visibleLongerTitle,
+            hiddenHold,
+            hiddenMixedHold,
+            hiddenLongerTitle,
+            triageHold,
+            triageMixedHold,
+            triageLongerTitle,
+        )
+
+        assertEquals(
+            listOf("visibleLongerTitle", "triageLongerTitle"),
+            normalSessionRows(sessions).map(Session::id),
+        )
+        assertEquals(
+            listOf("hiddenLongerTitle"),
+            hiddenSessionRows(sessions).map(Session::id),
+        )
+        assertEquals(
+            listOf("triageLongerTitle"),
+            triageSessionRows(sessions).map(Session::id),
+        )
+    }
+
+    @Test
+    fun `tail bottom index selects the sentinel after the newest event and handles an empty tail`() {
+        val tail = listOf(
+            TailEvent.User("First"),
+            TailEvent.Tool("Bash", "pwd"),
+            TailEvent.Agent("Newest"),
+        )
+
+        assertEquals(3, tailBottomIndex(tail))
+        assertNull(tailBottomIndex(emptyList()))
+    }
+
+    @Test
+    fun `terminal websocket URL uses a secure encoded session path`() {
+        assertEquals(
+            "wss://remote-dev.tail26e2ce.ts.net:8443/sessions/thread%2Fwith%20space%3F%23/terminal?backend=Codex",
+            terminalWebSocketUrl(
+                ApiConfig.DEFAULT_BASE_URL,
+                "thread/with space?#",
+                BackendKind.CODEX,
+            ),
+        )
+        assertEquals(
+            "ws://127.0.0.1:8477/sessions/local%20session/terminal?backend=Claude",
+            terminalWebSocketUrl(
+                "http://127.0.0.1:8477/",
+                "local session",
+                BackendKind.CLAUDE,
+            ),
+        )
+    }
+
+    @Test
+    fun `terminal screen message decodes the complete screen contract`() {
+        val screen = ApiJson.json.decodeFromString<TerminalScreen>(
+            """
+            {
+              "type": "screen",
+              "seq": 42,
+              "rows": 24,
+              "cols": 80,
+              "cursor_row": 23,
+              "cursor_col": 7,
+              "lines": ["first line", "waiting for input"],
+              "running": true
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals("screen", screen.type)
+        assertEquals(42, screen.seq)
+        assertEquals(24, screen.rows)
+        assertEquals(80, screen.cols)
+        assertEquals(23, screen.cursorRow)
+        assertEquals(7, screen.cursorCol)
+        assertEquals(listOf("first line", "waiting for input"), screen.lines)
+        assertTrue(screen.running)
+    }
+
+    @Test
+    fun `terminal commands serialize Unicode input and resize dimensions`() {
+        val input = ApiJson.json.parseToJsonElement(
+            ApiJson.json.encodeToString<TerminalCommand>(TerminalCommand.Input("Review café 漢字")),
+        ).jsonObject
+        val resize = ApiJson.json.parseToJsonElement(
+            ApiJson.json.encodeToString<TerminalCommand>(TerminalCommand.Resize(rows = 32, cols = 56)),
+        ).jsonObject
+
+        assertEquals(JsonPrimitive("input"), input["type"])
+        assertEquals(JsonPrimitive("Review café 漢字"), input["text"])
+        assertEquals(JsonPrimitive("resize"), resize["type"])
+        assertEquals(JsonPrimitive(32), resize["rows"])
+        assertEquals(JsonPrimitive(56), resize["cols"])
+    }
+
+    @Test
+    fun `terminal close command serializes an explicit close action`() {
+        val close = ApiJson.json.parseToJsonElement(
+            ApiJson.json.encodeToString<TerminalCommand>(TerminalCommand.Close),
+        ).jsonObject
+
+        assertEquals(JsonPrimitive("close"), close["type"])
+        assertEquals(setOf("type"), close.keys)
+    }
+
+    @Test
+    fun `terminal line input respects the server byte limit and preserves Unicode`() {
+        val unicodeDraft = "café 漢字"
+
+        assertEquals(
+            TerminalCommand.Input("$unicodeDraft\r"),
+            terminalLineCommand(unicodeDraft),
+        )
+        assertEquals(
+            TerminalCommand.Input("${"a".repeat(4_095)}\r"),
+            terminalLineCommand("a".repeat(4_095)),
+        )
+        assertNull(terminalLineCommand("a".repeat(4_096)))
+        assertNull(terminalLineCommand("漢".repeat(1_365) + "a"))
+        assertNull(terminalLineCommand(""))
+    }
+
+    @Test
+    fun `terminal rendering preserves source text and keeps cursor coordinates separate`() {
+        val sourceLines = listOf("café 漢字", "second line")
+        val render = terminalRenderFrame(
+            TerminalScreen(
+                type = "screen",
+                seq = 7,
+                rows = 24,
+                cols = 80,
+                cursorRow = 0,
+                cursorCol = 6,
+                lines = sourceLines,
+                running = true,
+            ),
+        )
+
+        assertEquals(sourceLines.joinToString("\n"), render.text)
+        assertEquals(0, render.cursorRow)
+        assertEquals(6, render.cursorCol)
+    }
+
+    @Test
+    fun `only the dedicated close action sends a terminal close command`() {
+        assertNull(terminalExitCommand(TerminalExit.BACK))
+        assertNull(terminalExitCommand(TerminalExit.DISPOSE))
+        assertEquals(TerminalCommand.Close, terminalExitCommand(TerminalExit.CLOSE))
+    }
+
     private fun session(
         id: String,
         status: Status,
         hidden: Boolean = false,
         companion: Boolean = false,
+        title: String = id,
     ) = Session(
         backend = BackendKind.CODEX,
         id = id,
         origin = SessionOrigin.BACKGROUND,
-        title = id,
+        title = title,
         cwd = "/tmp/project",
         status = status,
         createdAtMs = 1_000,

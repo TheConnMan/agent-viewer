@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -137,15 +138,17 @@ private enum class BottomTab { SESSIONS, TRIAGE, NEW }
 private enum class SessionFilter { ALL, PROJECT, STATE, HIDDEN }
 
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
-    sessions.filter { !it.hidden && !it.companion }
+    sessions.filter { !it.hidden && !it.companion && !it.title.equals("Hold", ignoreCase = true) }
 
 internal fun hiddenSessionRows(sessions: List<Session>): List<Session> =
-    sessions.filter { it.hidden || it.companion }
+    sessions.filter { (it.hidden || it.companion) && !it.title.equals("Hold", ignoreCase = true) }
 
 internal fun triageSessionRows(sessions: List<Session>): List<Session> =
     normalSessionRows(sessions)
         .filter { it.status is Status.NeedsInput }
         .sortedBy { it.updatedAtMs }
+
+internal fun tailBottomIndex(tail: List<TailEvent>): Int? = tail.size.takeIf { tail.isNotEmpty() }
 
 internal class SessionSubmitter(
     private val create: suspend (NewSessionRequest) -> Unit,
@@ -182,6 +185,7 @@ fun AgentViewerApp() {
     var tab by rememberSaveable { mutableStateOf(BottomTab.SESSIONS) }
     var selectedBackend by rememberSaveable { mutableStateOf<BackendKind?>(null) }
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var terminalOpen by rememberSaveable { mutableStateOf(false) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var loadError by remember { mutableStateOf<String?>(null) }
     val api = remember { ApiClient() }
@@ -229,17 +233,27 @@ fun AgentViewerApp() {
             contentColor = colors.text,
         ) {
             selectedSession?.let { session ->
-                SessionDetailScreen(
-                    session = session,
-                    api = api,
-                    colors = colors,
-                    foreground = foreground,
-                    onBack = {
-                        selectedBackend = null
-                        selectedSessionId = null
-                    },
-                    onMutated = refresh,
-                )
+                if (terminalOpen) {
+                    TerminalConsole(
+                        session = session,
+                        colors = colors,
+                        foreground = foreground,
+                        onBack = { terminalOpen = false },
+                    )
+                } else {
+                    SessionDetailScreen(
+                        session = session,
+                        api = api,
+                        colors = colors,
+                        foreground = foreground,
+                        onBack = {
+                            selectedBackend = null
+                            selectedSessionId = null
+                        },
+                        onJumpIn = { terminalOpen = true },
+                        onMutated = refresh,
+                    )
+                }
             } ?: Column(modifier = Modifier.fillMaxSize()) {
                 Box(modifier = Modifier.weight(1f)) {
                     when (tab) {
@@ -249,6 +263,7 @@ fun AgentViewerApp() {
                             colors = colors,
                             onTheme = { appTheme = nextTheme(appTheme) },
                             onSelected = {
+                                terminalOpen = false
                                 selectedBackend = it.backend
                                 selectedSessionId = it.id
                             },
@@ -259,6 +274,7 @@ fun AgentViewerApp() {
                             api = api,
                             colors = colors,
                             onSelected = {
+                                terminalOpen = false
                                 selectedBackend = it.backend
                                 selectedSessionId = it.id
                             },
@@ -974,6 +990,7 @@ private fun SessionDetailScreen(
     colors: ViewerColors,
     foreground: Boolean,
     onBack: () -> Unit,
+    onJumpIn: () -> Unit,
     onMutated: () -> Unit,
 ) {
     var capabilities by remember(session.id) { mutableStateOf<Capabilities?>(null) }
@@ -982,6 +999,7 @@ private fun SessionDetailScreen(
     var actionError by remember(session.id) { mutableStateOf<String?>(null) }
     var editingName by remember(session.id) { mutableStateOf(false) }
     var name by remember(session.id) { mutableStateOf(session.title) }
+    val tailListState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(session.id) {
         runCatching { api.capabilities(session.id) }.onSuccess { capabilities = it }
@@ -998,6 +1016,9 @@ private fun SessionDetailScreen(
             delay(2_000)
         }
     }
+    LaunchedEffect(tail) {
+        tailBottomIndex(tail)?.let { tailListState.scrollToItem(it) }
+    }
     Column(modifier = Modifier.fillMaxSize()) {
         DetailHeader(session, colors, onBack)
         Row(
@@ -1013,7 +1034,9 @@ private fun SessionDetailScreen(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            JumpInButton(colors, Modifier.weight(1f)) { }
+            if (capabilities?.attach == true) {
+                JumpInButton(colors, Modifier.weight(1f), onJumpIn)
+            }
             if (capabilities?.stop == true) {
                 IconControl(colors.err, "stop", Modifier.size(48.dp), {
                     scope.launch {
@@ -1105,10 +1128,12 @@ private fun SessionDetailScreen(
         }
         LazyColumn(
             modifier = Modifier.weight(1f),
+            state = tailListState,
             verticalArrangement = Arrangement.spacedBy(11.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 18.dp, vertical = 8.dp),
         ) {
             items(tail) { event -> TailRow(event, colors) }
+            if (tail.isNotEmpty()) item(key = "tail bottom") { Spacer(Modifier.height(1.dp)) }
             if (tail.isEmpty()) item { EmptyState(tailError ?: "no recent turns", colors) }
         }
     }

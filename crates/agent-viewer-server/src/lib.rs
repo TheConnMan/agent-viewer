@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use agent_viewer_core::backend::all_backends;
@@ -13,17 +13,139 @@ use agent_viewer_core::{
 };
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Json, Path as AxumPath, Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::error::CapacityError;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SPAWN_ABANDON_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_TAIL_EVENTS: usize = 12;
 const PULSE_WINDOW: Duration = Duration::from_secs(60 * 60);
+const ANDROID_ORIGIN: &str = "https://appassets.androidplatform.net";
+const TERMINAL_ROWS: u16 = 24;
+const TERMINAL_COLS: u16 = 80;
+const TERMINAL_MIN_ROWS: u64 = 4;
+const TERMINAL_MAX_ROWS: u64 = 200;
+const TERMINAL_MIN_COLS: u64 = 10;
+const TERMINAL_MAX_COLS: u64 = 300;
+const TERMINAL_INPUT_BYTES: usize = 4_096;
+const TERMINAL_MESSAGE_BYTES: usize = TERMINAL_INPUT_BYTES * 6 + 512;
+const TERMINAL_COMMAND_CAPACITY: usize = 32;
+const TERMINAL_LIMIT: usize = 4;
+const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TERMINAL_RESIZE_SETTLE: Duration = Duration::from_millis(1_100);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TerminalKey {
+    backend: BackendKind,
+    id: String,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalOwner {
+    generation: u64,
+}
+
+#[derive(Default)]
+struct TerminalHubState {
+    owners: HashMap<TerminalKey, TerminalOwner>,
+    reservations: HashMap<TerminalKey, u64>,
+    next_generation: u64,
+}
+
+#[derive(Clone, Default)]
+struct TerminalHub {
+    inner: Arc<Mutex<TerminalHubState>>,
+}
+
+#[derive(Clone)]
+struct TerminalLease {
+    key: TerminalKey,
+    generation: u64,
+    commands: mpsc::Sender<TerminalCommand>,
+    screen: watch::Receiver<TerminalScreen>,
+}
+
+struct TerminalReservation {
+    hub: TerminalHub,
+    key: TerminalKey,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for TerminalReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hub.cancel_reservation(&self.key, self.generation);
+        }
+    }
+}
+
+enum TerminalCommand {
+    Input {
+        bytes: Vec<u8>,
+        result: oneshot::Sender<Result<(), String>>,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+        result: oneshot::Sender<Result<(), String>>,
+    },
+    Close {
+        complete: oneshot::Sender<()>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TerminalScreen {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u64,
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    lines: Vec<String>,
+    running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalScreenState {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    lines: Vec<String>,
+    running: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalError<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    error: &'a str,
+    message: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalQuery {
+    backend: BackendKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum TerminalClientMessage {
+    Input { text: String },
+    Resize { rows: u64, cols: u64 },
+    Close,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct SessionView {
@@ -65,11 +187,104 @@ impl BackendPool {
     }
 }
 
+impl TerminalHub {
+    fn reserve(&self, key: TerminalKey) -> ApiResult<TerminalReservation> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| ApiError::internal("terminal hub lock failed"))?;
+        if state.owners.contains_key(&key) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "terminal is already connected",
+            ));
+        }
+        if state.reservations.contains_key(&key) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "terminal is already connecting",
+            ));
+        }
+        if state.owners.len() + state.reservations.len() >= TERMINAL_LIMIT {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "terminal capacity reached",
+            ));
+        }
+        state.next_generation = state.next_generation.wrapping_add(1).max(1);
+        let generation = state.next_generation;
+        state.reservations.insert(key.clone(), generation);
+        drop(state);
+        Ok(TerminalReservation {
+            hub: self.clone(),
+            key,
+            generation,
+            armed: true,
+        })
+    }
+
+    fn finish_reservation(
+        &self,
+        reservation: &mut TerminalReservation,
+        commands: mpsc::Sender<TerminalCommand>,
+        screen: watch::Receiver<TerminalScreen>,
+    ) -> ApiResult<TerminalLease> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| ApiError::internal("terminal hub lock failed"))?;
+        if state.reservations.get(&reservation.key) != Some(&reservation.generation) {
+            return Err(ApiError::internal("terminal reservation was lost"));
+        }
+        state.reservations.remove(&reservation.key);
+        state.owners.insert(
+            reservation.key.clone(),
+            TerminalOwner {
+                generation: reservation.generation,
+            },
+        );
+        reservation.armed = false;
+        Ok(TerminalLease {
+            key: reservation.key.clone(),
+            generation: reservation.generation,
+            commands,
+            screen,
+        })
+    }
+
+    fn cancel_reservation(&self, key: &TerminalKey, generation: u64) {
+        if let Ok(mut state) = self.inner.lock()
+            && state.reservations.get(key) == Some(&generation)
+        {
+            state.reservations.remove(key);
+        }
+    }
+
+    fn downgrade(&self) -> Weak<Mutex<TerminalHubState>> {
+        Arc::downgrade(&self.inner)
+    }
+}
+
+fn remove_terminal_owner(hub: &Weak<Mutex<TerminalHubState>>, key: &TerminalKey, generation: u64) {
+    let Some(hub) = hub.upgrade() else {
+        return;
+    };
+    if let Ok(mut state) = hub.lock()
+        && state
+            .owners
+            .get(key)
+            .is_some_and(|owner| owner.generation == generation)
+    {
+        state.owners.remove(key);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     snapshot: Arc<RwLock<Vec<SessionView>>>,
     backends: BackendPool,
     router_available: bool,
+    terminals: TerminalHub,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +382,7 @@ pub fn router() -> Router {
         snapshot,
         backends: BackendPool::new(all_backends()),
         router_available: agent_viewer_core::router::available(),
+        terminals: TerminalHub::default(),
     })
 }
 
@@ -182,6 +398,7 @@ pub fn router_with_backends(mut backends: Vec<Box<dyn Backend>>) -> Router {
         snapshot,
         backends: BackendPool::new(backends),
         router_available: false,
+        terminals: TerminalHub::default(),
     })
 }
 
@@ -191,6 +408,7 @@ fn build_router(state: AppState) -> Router {
         .route("/sessions/{id}/tail", get(session_tail))
         .route("/sessions/{id}/caps", get(session_capabilities))
         .route("/sessions/{id}/pulse", get(session_pulse))
+        .route("/sessions/{id}/terminal", get(session_terminal))
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/hide", post(hide_session))
         .route("/sessions/{id}/unhide", post(unhide_session))
@@ -352,6 +570,439 @@ async fn session_pulse(
     })
     .await?;
     Ok(Json(activity))
+}
+
+async fn session_terminal(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    path: Result<AxumPath<String>, PathRejection>,
+    query: Result<Query<TerminalQuery>, QueryRejection>,
+) -> ApiResult<Response> {
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        != Some(ANDROID_ORIGIN)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "terminal origin is not allowed",
+        ));
+    }
+    let id = path_value(path)?;
+    let Query(query) = query.map_err(|_| ApiError::bad_request("invalid terminal query"))?;
+    let session = snapshot_session_for_backend(&state, &id, query.backend)?;
+    let key = TerminalKey {
+        backend: query.backend,
+        id,
+    };
+    let reservation = state.terminals.reserve(key)?;
+    let lease = create_terminal_owner(&state, session, reservation).await?;
+
+    let failed_hub = state.terminals.clone();
+    let failed_lease = lease.clone();
+    let socket_hub = state.terminals.clone();
+    Ok(ws
+        .max_message_size(TERMINAL_MESSAGE_BYTES)
+        .max_frame_size(TERMINAL_MESSAGE_BYTES)
+        .on_failed_upgrade(move |_| {
+            tokio::spawn(close_terminal_owner(failed_hub, failed_lease));
+        })
+        .on_upgrade(move |socket| terminal_socket(socket, socket_hub, lease)))
+}
+
+async fn create_terminal_owner(
+    state: &AppState,
+    session: Session,
+    mut reservation: TerminalReservation,
+) -> ApiResult<TerminalLease> {
+    let kind = reservation.key.backend;
+    let command = with_backend(state.backends.clone(), kind, move |backend| {
+        if !backend.capabilities_for(&session).attach {
+            return Err(ApiError::unsupported(format!(
+                "{} does not support attach",
+                kind.name()
+            )));
+        }
+        backend
+            .attach_command(&session)
+            .map_err(|refusal| ApiError::unsupported(refusal.to_string()))
+    })
+    .await?;
+    let spec = agent_viewer_core::pty::spec_from_command(&command, TERMINAL_ROWS, TERMINAL_COLS);
+    let initial = terminal_screen(blank_terminal_state(), 0);
+    let (screen_tx, screen_rx) = watch::channel(initial);
+    let (command_tx, command_rx) = mpsc::channel(TERMINAL_COMMAND_CAPACITY);
+    let (startup_tx, startup_rx) = oneshot::channel();
+    let (activate_tx, activate_rx) = oneshot::channel();
+    spawn_terminal_owner_thread(
+        spec,
+        command_rx,
+        screen_tx,
+        startup_tx,
+        activate_rx,
+        (
+            state.terminals.downgrade(),
+            reservation.key.clone(),
+            reservation.generation,
+        ),
+    )?;
+    startup_rx
+        .await
+        .map_err(|_| ApiError::internal("terminal attach worker failed"))?
+        .map_err(|error| ApiError::internal(format!("terminal attach failed: {error}")))?;
+    let lease = state
+        .terminals
+        .finish_reservation(&mut reservation, command_tx, screen_rx)?;
+    if activate_tx.send(()).is_err() {
+        remove_terminal_owner(&state.terminals.downgrade(), &lease.key, lease.generation);
+        return Err(ApiError::internal("terminal attach worker stopped"));
+    }
+    Ok(lease)
+}
+
+fn spawn_terminal_owner_thread(
+    spec: agent_viewer_core::pty::PtySpec,
+    mut commands: mpsc::Receiver<TerminalCommand>,
+    screen: watch::Sender<TerminalScreen>,
+    startup: oneshot::Sender<Result<(), String>>,
+    activate: oneshot::Receiver<()>,
+    owner: (Weak<Mutex<TerminalHubState>>, TerminalKey, u64),
+) -> ApiResult<()> {
+    let (hub, key, generation) = owner;
+    std::thread::Builder::new()
+        .name(format!("agent_viewer_terminal_{}", key.id))
+        .spawn(move || {
+            let mut pty = match agent_viewer_core::pty::PtySession::spawn(spec) {
+                Ok(pty) => pty,
+                Err(error) => {
+                    let _ = startup.send(Err(bounded_terminal_error(&error.to_string())));
+                    return;
+                }
+            };
+            let mut last_state = terminal_screen_state(&pty, true);
+            screen.send_replace(terminal_screen(last_state.clone(), 0));
+            if startup.send(Ok(())).is_err() || activate.blocking_recv().is_err() {
+                pty.kill();
+                return;
+            }
+            let mut sequence = 0_u64;
+            loop {
+                match commands.try_recv() {
+                    Ok(TerminalCommand::Input { bytes, result }) => {
+                        let outcome = pty
+                            .write_input(&bytes)
+                            .map_err(|error| bounded_terminal_error(&error.to_string()));
+                        let _ = result.send(outcome);
+                    }
+                    Ok(TerminalCommand::Resize { rows, cols, result }) => {
+                        let previous_text = terminal_visible_text(&last_state.lines);
+                        let outcome = pty
+                            .resize(rows, cols)
+                            .map_err(|error| bounded_terminal_error(&error.to_string()));
+                        if outcome.is_ok() {
+                            let deadline = std::time::Instant::now() + TERMINAL_RESIZE_SETTLE;
+                            loop {
+                                std::thread::sleep(TERMINAL_POLL_INTERVAL);
+                                let next_state = terminal_screen_state(&pty, true);
+                                let changed_text =
+                                    terminal_visible_text(&next_state.lines) != previous_text;
+                                if changed_text || std::time::Instant::now() >= deadline {
+                                    publish_terminal_state(
+                                        next_state,
+                                        &screen,
+                                        &mut last_state,
+                                        &mut sequence,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = result.send(outcome);
+                    }
+                    Ok(TerminalCommand::Close { complete }) => {
+                        pty.kill();
+                        remove_terminal_owner(&hub, &key, generation);
+                        let _ = complete.send(());
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        pty.kill();
+                        remove_terminal_owner(&hub, &key, generation);
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                }
+
+                let running = !pty.is_exited();
+                if !running {
+                    pty.kill();
+                }
+                publish_terminal_screen(&pty, running, &screen, &mut last_state, &mut sequence);
+                if !running {
+                    remove_terminal_owner(&hub, &key, generation);
+                    break;
+                }
+                std::thread::sleep(TERMINAL_POLL_INTERVAL);
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| ApiError::internal(format!("terminal owner thread failed: {error}")))
+}
+
+fn blank_terminal_state() -> TerminalScreenState {
+    TerminalScreenState {
+        rows: TERMINAL_ROWS,
+        cols: TERMINAL_COLS,
+        cursor_row: 0,
+        cursor_col: 0,
+        lines: vec![String::new(); usize::from(TERMINAL_ROWS)],
+        running: true,
+    }
+}
+
+fn terminal_screen_state(
+    pty: &agent_viewer_core::pty::PtySession,
+    running: bool,
+) -> TerminalScreenState {
+    pty.with_screen(|screen| {
+        let (rows, cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        TerminalScreenState {
+            rows,
+            cols,
+            cursor_row,
+            cursor_col,
+            lines: screen.rows(0, cols).collect(),
+            running,
+        }
+    })
+}
+
+fn terminal_screen(state: TerminalScreenState, seq: u64) -> TerminalScreen {
+    TerminalScreen {
+        kind: "screen",
+        seq,
+        rows: state.rows,
+        cols: state.cols,
+        cursor_row: state.cursor_row,
+        cursor_col: state.cursor_col,
+        lines: state.lines,
+        running: state.running,
+    }
+}
+
+fn publish_terminal_screen(
+    pty: &agent_viewer_core::pty::PtySession,
+    running: bool,
+    screen: &watch::Sender<TerminalScreen>,
+    last_state: &mut TerminalScreenState,
+    sequence: &mut u64,
+) {
+    let next_state = terminal_screen_state(pty, running);
+    publish_terminal_state(next_state, screen, last_state, sequence);
+}
+
+fn publish_terminal_state(
+    next_state: TerminalScreenState,
+    screen: &watch::Sender<TerminalScreen>,
+    last_state: &mut TerminalScreenState,
+    sequence: &mut u64,
+) {
+    if *last_state == next_state {
+        return;
+    }
+    *sequence = sequence.wrapping_add(1);
+    *last_state = next_state.clone();
+    screen.send_replace(terminal_screen(next_state, *sequence));
+}
+
+fn terminal_visible_text(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, mut lease: TerminalLease) {
+    let initial = lease.screen.borrow_and_update().clone();
+    if send_terminal_screen(&mut socket, &initial).await.is_ok() {
+        loop {
+            tokio::select! {
+                changed = lease.screen.changed() => {
+                    if changed.is_err() {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    let screen = lease.screen.borrow().clone();
+                    if send_terminal_screen(&mut socket, &screen).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = socket.recv() => {
+                    match incoming {
+                        Some(Ok(Message::Text(text))) => {
+                            if handle_terminal_client_message(&mut socket, &lease, text.as_str()).await {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Binary(_))) => {
+                            if send_terminal_error(&mut socket, "terminal commands must be JSON text").await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Ping(bytes))) => {
+                            if socket.send(Message::Pong(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(error)) => {
+                            if websocket_message_too_large(error) {
+                                let _ = socket.send(Message::Close(Some(CloseFrame {
+                                    code: close_code::SIZE,
+                                    reason: "terminal message is too large".into(),
+                                }))).await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_terminal_owner(hub, lease).await;
+}
+
+fn websocket_message_too_large(error: axum::Error) -> bool {
+    error
+        .into_inner()
+        .downcast_ref::<WebSocketError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                WebSocketError::Capacity(CapacityError::MessageTooLong { .. })
+            )
+        })
+}
+
+async fn close_terminal_owner(hub: TerminalHub, lease: TerminalLease) {
+    let (complete_tx, complete_rx) = oneshot::channel();
+    if lease
+        .commands
+        .send(TerminalCommand::Close {
+            complete: complete_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = complete_rx.await;
+    }
+    remove_terminal_owner(&hub.downgrade(), &lease.key, lease.generation);
+}
+
+async fn handle_terminal_client_message(
+    socket: &mut WebSocket,
+    lease: &TerminalLease,
+    text: &str,
+) -> bool {
+    if text.len() > TERMINAL_MESSAGE_BYTES {
+        return send_terminal_error(socket, "terminal command is too large")
+            .await
+            .is_err();
+    }
+    let command = match serde_json::from_str::<TerminalClientMessage>(text) {
+        Ok(command) => command,
+        Err(_) => {
+            return send_terminal_error(socket, "invalid terminal command")
+                .await
+                .is_err();
+        }
+    };
+    match command {
+        TerminalClientMessage::Input { text } => {
+            if text.len() > TERMINAL_INPUT_BYTES {
+                return send_terminal_error(socket, "terminal input is too large")
+                    .await
+                    .is_err();
+            }
+            let (result_tx, result_rx) = oneshot::channel();
+            if lease
+                .commands
+                .send(TerminalCommand::Input {
+                    bytes: text.into_bytes(),
+                    result: result_tx,
+                })
+                .await
+                .is_err()
+            {
+                return send_terminal_error(socket, "terminal is no longer running")
+                    .await
+                    .is_err();
+            }
+            if let Ok(Err(error)) = result_rx.await {
+                return send_terminal_error(socket, &error).await.is_err();
+            }
+        }
+        TerminalClientMessage::Resize { rows, cols } => {
+            if !(TERMINAL_MIN_ROWS..=TERMINAL_MAX_ROWS).contains(&rows)
+                || !(TERMINAL_MIN_COLS..=TERMINAL_MAX_COLS).contains(&cols)
+            {
+                return send_terminal_error(socket, "terminal dimensions are out of range")
+                    .await
+                    .is_err();
+            }
+            let (result_tx, result_rx) = oneshot::channel();
+            if lease
+                .commands
+                .send(TerminalCommand::Resize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    result: result_tx,
+                })
+                .await
+                .is_err()
+            {
+                return send_terminal_error(socket, "terminal is no longer running")
+                    .await
+                    .is_err();
+            }
+            if let Ok(Err(error)) = result_rx.await {
+                return send_terminal_error(socket, &error).await.is_err();
+            }
+        }
+        TerminalClientMessage::Close => {
+            let _ = socket.send(Message::Close(None)).await;
+            return true;
+        }
+    }
+    false
+}
+
+async fn send_terminal_screen(
+    socket: &mut WebSocket,
+    screen: &TerminalScreen,
+) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(screen).expect("terminal screen serialization cannot fail");
+    socket.send(Message::Text(text.into())).await
+}
+
+async fn send_terminal_error(socket: &mut WebSocket, error: &str) -> Result<(), axum::Error> {
+    let error = bounded_terminal_error(error);
+    let frame = TerminalError {
+        kind: "error",
+        error: &error,
+        message: &error,
+    };
+    let text = serde_json::to_string(&frame).expect("terminal error serialization cannot fail");
+    socket.send(Message::Text(text.into())).await
+}
+
+fn bounded_terminal_error(error: &str) -> String {
+    error.chars().take(256).collect()
 }
 
 async fn stop_session(
@@ -568,6 +1219,22 @@ fn snapshot_session(state: &AppState, id: &str) -> ApiResult<Session> {
     snapshot
         .iter()
         .find(|view| view.session.id == id)
+        .map(|view| view.session.clone())
+        .ok_or_else(ApiError::not_found)
+}
+
+fn snapshot_session_for_backend(
+    state: &AppState,
+    id: &str,
+    backend: BackendKind,
+) -> ApiResult<Session> {
+    let snapshot = match state.snapshot.read() {
+        Ok(snapshot) => snapshot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    snapshot
+        .iter()
+        .find(|view| view.session.id == id && view.session.backend == backend)
         .map(|view| view.session.clone())
         .ok_or_else(ApiError::not_found)
 }
