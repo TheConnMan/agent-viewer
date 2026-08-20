@@ -165,9 +165,8 @@ fn tail_events_and_capabilities_have_json_contracts() {
 #[tokio::test]
 async fn router_exposes_authenticated_backend_contracts() {
     let (project_root, cwd) = project_fixture();
-    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::new(
-        session(cwd),
-    ))]);
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::new(session(cwd)))]);
 
     let response = app
         .clone()
@@ -201,11 +200,7 @@ async fn router_exposes_authenticated_backend_contracts() {
 
     let response = app
         .clone()
-        .oneshot(request(
-            Method::GET,
-            "/sessions/session-1/tail?n=2",
-            true,
-        ))
+        .oneshot(request(Method::GET, "/sessions/session-1/tail?n=2", true))
         .await
         .expect("tail response");
     assert_eq!(response.status(), StatusCode::OK);
@@ -219,11 +214,7 @@ async fn router_exposes_authenticated_backend_contracts() {
 
     let response = app
         .clone()
-        .oneshot(request(
-            Method::GET,
-            "/sessions/session-1/caps",
-            true,
-        ))
+        .oneshot(request(Method::GET, "/sessions/session-1/caps", true))
         .await
         .expect("capabilities response");
     assert_eq!(response.status(), StatusCode::OK);
@@ -240,11 +231,7 @@ async fn router_exposes_authenticated_backend_contracts() {
     );
 
     let response = app
-        .oneshot(request(
-            Method::POST,
-            "/sessions/session-1/stop",
-            true,
-        ))
+        .oneshot(request(Method::POST, "/sessions/session-1/stop", true))
         .await
         .expect("stop response");
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
