@@ -301,6 +301,7 @@ fn backend_from_str(s: &str) -> Option<BackendKind> {
     match s {
         "codex" => Some(BackendKind::Codex),
         "claude" => Some(BackendKind::Claude),
+        "agent-runner" => Some(BackendKind::AgentRunner),
         _ => None,
     }
 }

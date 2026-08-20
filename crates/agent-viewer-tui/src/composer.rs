@@ -6,6 +6,8 @@ use agent_viewer_core::BackendKind;
 use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
 
+use crate::mutations::ReleaseHandle;
+
 /// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
 /// the task text plus the installed target backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,14 +450,28 @@ impl Composer {
 
 /// Tracks typed-but-unsubmitted input while attached, so a Left arrow detaches only when
 /// the input line is empty (otherwise Left is forwarded to the child as cursor movement).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct DetachTracker {
     pending: u32,
+    release: Option<(std::process::Command, ReleaseHandle)>,
 }
 
 impl DetachTracker {
     pub fn new() -> DetachTracker {
-        DetachTracker { pending: 0 }
+        DetachTracker {
+            pending: 0,
+            release: None,
+        }
+    }
+
+    pub fn with_release(
+        release: Option<std::process::Command>,
+        release_handle: ReleaseHandle,
+    ) -> DetachTracker {
+        DetachTracker {
+            pending: 0,
+            release: release.map(|command| (command, release_handle)),
+        }
     }
 
     pub fn on_char(&mut self) {
@@ -475,6 +491,14 @@ impl DetachTracker {
     /// Left detaches only when there is no pending input.
     pub fn detach_on_left(&self) -> bool {
         self.pending == 0
+    }
+}
+
+impl Drop for DetachTracker {
+    fn drop(&mut self) {
+        if let Some((release, handle)) = self.release.take() {
+            handle.release(release);
+        }
     }
 }
 

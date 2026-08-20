@@ -160,6 +160,7 @@ fn scan_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<
             v
         }
         BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
+        BackendKind::AgentRunner => Vec::new(),
     };
     cmds.sort();
     cmds.dedup();
@@ -515,6 +516,24 @@ pub(crate) fn attach_selected(ui: &mut Ui) -> bool {
 pub(crate) fn submit_attach(ui: &mut Ui, request: TargetRequest) -> bool {
     let id = request.id().to_string();
     let key: Key = (request.backend(), id.clone());
+    if request.backend() == BackendKind::AgentRunner {
+        let retained_is_live = ui
+            .attached
+            .get_mut(&key)
+            .is_some_and(|pty| !pty.is_exited());
+        if retained_is_live {
+            ui.focused_session = ui.app.session_for(&key).cloned();
+            ui.focused = Some(key);
+            if !matches!(ui.mode, Mode::Triage(_)) {
+                ui.mode = Mode::Attached;
+            }
+            set_mouse_capture(ui, true);
+            return false;
+        }
+        if ui.attached.contains_key(&key) {
+            ui.remove_pty(&key);
+        }
+    }
     // Triage hosts its child in the modal's panel rather than the whole screen, so a plan
     // resolved for the queue must be able to tell that apart when it lands.
     let triage = matches!(ui.mode, Mode::Triage(_));
@@ -547,9 +566,14 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     plan: AttachPlan,
 ) -> io::Result<bool> {
-    let AttachPlan { session, command } = plan;
+    let (session, command, release) = plan.into_parts();
+    let replace_retained = session.backend == BackendKind::AgentRunner && release.is_some();
+    let tracker = DetachTracker::with_release(release, ui.attaches.release_handle());
     let key: Key = (session.backend, session.id.clone());
-    let capture_on_attach = matches!(session.backend, BackendKind::Codex | BackendKind::Claude);
+    let capture_on_attach = matches!(
+        session.backend,
+        BackendKind::Codex | BackendKind::Claude | BackendKind::AgentRunner
+    );
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -571,24 +595,32 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
         .terminal_palette()
         .or(ui.terminal_palette);
 
+    let retained_exited = ui.attached.get_mut(&key).is_some_and(PtySession::is_exited);
+    if replace_retained || retained_exited {
+        ui.remove_pty(&key);
+    }
+
     if let Some(pty) = ui.attached.get_mut(&key) {
         // The wall already holds a connection to this session and the user is zooming into
         // that tile: reuse the live PTY, resized to the full content area. This is the only
         // way a PTY exists here, since leaving a session otherwise closes it.
         pty.set_palette(palette);
         let _ = pty.resize(rows, cols);
-        ui.detach_trackers.entry(key.clone()).or_default();
+        ui.detach_trackers.entry(key.clone()).or_insert(tracker);
     } else {
         let mut spec = spec_from_command(&command, rows, cols);
         spec.palette = palette;
-        if session.backend == BackendKind::Codex {
+        if matches!(
+            session.backend,
+            BackendKind::Codex | BackendKind::AgentRunner
+        ) {
             spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
         }
         match PtySession::spawn(spec) {
             Ok(pty) => {
                 ui.attached.insert(key.clone(), pty);
                 // Fresh Left-gate: a brand-new PTY starts with an empty input line.
-                ui.detach_trackers.insert(key.clone(), DetachTracker::new());
+                ui.detach_trackers.insert(key.clone(), tracker);
             }
             Err(e) => {
                 ui.set_notice(format!("attach failed: {e}"));
@@ -623,6 +655,14 @@ pub(crate) fn spawn_from_composer(
     // Defense-in-depth: never spawn the /model meta-command as a task (Enter routing already
     // avoids this, but keep the spawn path safe).
     if ui.composer.is_model_command() {
+        return false;
+    }
+    if ui
+        .app
+        .selected()
+        .is_some_and(|session| session.backend == BackendKind::AgentRunner)
+    {
+        ui.set_notice("Agent Runner runs are available through native attach only".to_string());
         return false;
     }
     let Some(target) = ui.app.spawn_target() else {
@@ -729,7 +769,9 @@ fn spawn_through_router(
 
 #[cfg(test)]
 mod tests {
-    use super::{hide_request, install_attach_plan, kill_request, spawn_from_composer};
+    use super::{
+        hide_request, install_attach_plan, kill_request, spawn_from_composer, submit_attach,
+    };
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{SpawnBackend, sess, test_ui_with};
@@ -1313,6 +1355,7 @@ mod tests {
         let plan = crate::ops::AttachPlan {
             session: session.clone(),
             command,
+            release: None,
         };
 
         assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
@@ -1346,6 +1389,7 @@ mod tests {
         let initial_plan = crate::ops::AttachPlan {
             session: session.clone(),
             command: initial_command,
+            release: None,
         };
         assert!(
             install_attach_plan(&mut ui, &mut initial_terminal, initial_plan)
@@ -1366,6 +1410,7 @@ mod tests {
         let retained_plan = crate::ops::AttachPlan {
             session,
             command: retained_command,
+            release: None,
         };
 
         assert!(
@@ -1384,6 +1429,242 @@ mod tests {
             .get_mut(&key)
             .expect("retained attached pty")
             .kill();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fresh_agent_runner_lease_replaces_a_stale_retained_pty_and_tracks_the_new_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let launched = dir.path().join("launched");
+        let release_log = dir.path().join("release.log");
+        let runner = dir.path().join("agent-runner");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                release_log.display()
+            ),
+        )
+        .expect("write fake runner");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake runner executable");
+
+        let mut session = sess("runner-reattach", "", 100);
+        session.backend = BackendKind::AgentRunner;
+        let key = (BackendKind::AgentRunner, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test terminal");
+        let mut stale_command = std::process::Command::new("sh");
+        stale_command.args(["-c", "sleep 30"]);
+        assert!(
+            install_attach_plan(
+                &mut ui,
+                &mut terminal,
+                crate::ops::AttachPlan {
+                    session: session.clone(),
+                    command: stale_command,
+                    release: None,
+                },
+            )
+            .expect("install stale child")
+        );
+        let stale_pid = ui
+            .attached
+            .get(&key)
+            .and_then(agent_viewer_core::pty::PtySession::pid)
+            .expect("stale child pid");
+
+        let mut fresh_command = std::process::Command::new("sh");
+        fresh_command.args([
+            "-c",
+            &format!("printf fresh > '{}'; sleep 30", launched.display()),
+        ]);
+        let mut release = std::process::Command::new(&runner);
+        release.args(["--json", "run", "attach-release", "lease-fresh"]);
+        assert!(
+            install_attach_plan(
+                &mut ui,
+                &mut terminal,
+                crate::ops::AttachPlan {
+                    session,
+                    command: fresh_command,
+                    release: Some(release),
+                },
+            )
+            .expect("install fresh lease")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !launched.exists() {
+            assert!(Instant::now() < deadline, "fresh child did not launch");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let fresh_pid = ui
+            .attached
+            .get(&key)
+            .and_then(agent_viewer_core::pty::PtySession::pid)
+            .expect("fresh child pid");
+        assert_ne!(fresh_pid, stale_pid);
+        let stale_deadline = Instant::now() + Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{stale_pid}")).exists() {
+            assert!(
+                Instant::now() < stale_deadline,
+                "the stale child remained alive after replacement"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !release_log.exists(),
+            "the fresh lease must remain held while its child is live"
+        );
+
+        ui.attached.get_mut(&key).expect("fresh child").kill();
+        ui.remove_pty(&key);
+        let release_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(&release_log) {
+                Ok(contents) if contents == "--json run attach-release lease-fresh\n" => break,
+                Ok(contents) => panic!("unexpected lease release log: {contents:?}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        Instant::now() < release_deadline,
+                        "lease release did not complete"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("lease release log failed: {error}"),
+            }
+        }
+        drop(ui);
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("final lease release log"),
+            "--json run attach-release lease-fresh\n",
+            "the lease must be released exactly once"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn removing_agent_runner_pty_releases_once_without_blocking_and_joins_on_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let release_log = dir.path().join("release.log");
+        let release_pid = dir.path().join("release.pid");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s' \"$$\" > '{}'\nsleep 2\n",
+                release_log.display(),
+                release_pid.display()
+            ),
+        )
+        .expect("write slow release command");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make slow release command executable");
+
+        let mut session = sess("runner-slow-release", "", 100);
+        session.backend = BackendKind::AgentRunner;
+        let key = (BackendKind::AgentRunner, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("test terminal");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let mut release = std::process::Command::new(&runner);
+        release.args(["--json", "run", "attach-release", "lease-slow"]);
+        assert!(
+            install_attach_plan(
+                &mut ui,
+                &mut terminal,
+                crate::ops::AttachPlan {
+                    session,
+                    command,
+                    release: Some(release),
+                },
+            )
+            .expect("install leased child")
+        );
+
+        let remove_started = Instant::now();
+        ui.remove_pty(&key);
+        assert!(
+            remove_started.elapsed() < Duration::from_millis(250),
+            "UI removal waited for the release command"
+        );
+
+        let start_deadline = Instant::now() + Duration::from_secs(1);
+        while !release_pid.exists() {
+            assert!(
+                Instant::now() < start_deadline,
+                "background release command did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&release_pid)
+            .expect("read release pid")
+            .parse::<u32>()
+            .expect("release pid is numeric");
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+        let shutdown_started = Instant::now();
+        drop(ui);
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "release worker shutdown was not bounded"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "release worker outlived UI shutdown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("release command log"),
+            "--json run attach-release lease-slow\n",
+            "the lease must be released exactly once"
+        );
+    }
+
+    #[test]
+    fn a_live_agent_runner_pty_does_not_request_a_second_lease() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut session = sess("runner-live-lease", "", 100);
+        session.backend = BackendKind::AgentRunner;
+        let key = (BackendKind::AgentRunner, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let pty = agent_viewer_core::pty::PtySession::spawn(agent_viewer_core::pty::PtySpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: None,
+            envs: Vec::new(),
+            rows: 20,
+            cols: 80,
+            palette: None,
+            scrollback_rows: 0,
+        })
+        .expect("live native child");
+        ui.attached.insert(key.clone(), pty);
+        ui.detach_trackers
+            .insert(key.clone(), agent_viewer_tui::app::DetachTracker::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&calls);
+        ui.attach_executor = Arc::new(move |_| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Err("a second lease was requested".to_string())
+        });
+
+        assert!(
+            !submit_attach(&mut ui, TargetRequest::from(&session)),
+            "an already attached live run must reuse its current lease"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        ui.attached.get_mut(&key).expect("live child").kill();
+        ui.remove_pty(&key);
     }
 
     #[test]
@@ -1640,6 +1921,23 @@ mod async_attach_tests {
         AttachPlan {
             session: session.clone(),
             command,
+            release: None,
+        }
+    }
+
+    fn leased_sleeping_plan(
+        session: &Session,
+        runner: &std::path::Path,
+        lease_id: &str,
+    ) -> AttachPlan {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let mut release = std::process::Command::new(runner);
+        release.args(["--json", "run", "attach-release", lease_id]);
+        AttachPlan {
+            session: session.clone(),
+            command,
+            release: Some(release),
         }
     }
 
@@ -1766,6 +2064,7 @@ mod async_attach_tests {
         let plan = AttachPlan {
             session: fresh.clone(),
             command,
+            release: None,
         };
         let mut ui = test_ui_with(vec![displayed]);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
@@ -1833,6 +2132,149 @@ mod async_attach_tests {
         assert_eq!(ui.focused.as_ref(), Some(&key));
         assert!(matches!(ui.mode, Mode::Attached));
         ui.attached.get_mut(&key).expect("attached child").kill();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cancelling_after_lease_issue_but_before_pty_spawn_releases_the_lease() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let release_log = dir.path().join("release.log");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                release_log.display()
+            ),
+        )
+        .expect("write fake agent runner");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake agent runner runnable");
+
+        let mut first = sess("leased_left_behind", "", 100);
+        first.backend = BackendKind::AgentRunner;
+        let mut second = sess("moved_to", "/tmp/agentviewer_moved_to", 200);
+        second.backend = BackendKind::AgentRunner;
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        let planned = first.clone();
+        let runner_for_plan = runner.clone();
+        ui.attach_executor = Arc::new(move |_| {
+            Ok(leased_sleeping_plan(
+                &planned,
+                &runner_for_plan,
+                "lease-cancelled",
+            ))
+        });
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, first.id.clone()))
+        );
+
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, second.id.clone()))
+        );
+        land_attach(&mut ui, result);
+
+        assert!(
+            ui.attached.is_empty(),
+            "a cancelled plan must not spawn Codex"
+        );
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("lease release was invoked"),
+            "--json run attach-release lease-cancelled\n"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_agent_runner_attach_plan_releases_without_blocking_the_ui_and_joins_on_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("fake command directory");
+        let runner = dir.path().join("agent-runner");
+        let release_log = dir.path().join("release.log");
+        let release_pid = dir.path().join("release.pid");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s' \"$$\" > '{}'\nsleep 2\n",
+                release_log.display(),
+                release_pid.display()
+            ),
+        )
+        .expect("write slow release command");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+            .expect("make slow release command executable");
+
+        let mut first = sess("stale-leased-plan", "", 100);
+        first.backend = BackendKind::AgentRunner;
+        let mut second = sess("new-selection", "", 200);
+        second.backend = BackendKind::AgentRunner;
+        let mut ui = test_ui_with(vec![first.clone(), second.clone()]);
+        let planned = first.clone();
+        let runner_for_plan = runner.clone();
+        ui.attach_executor = Arc::new(move |_| {
+            Ok(leased_sleeping_plan(
+                &planned,
+                &runner_for_plan,
+                "lease-stale-plan",
+            ))
+        });
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, first.id.clone()))
+        );
+        assert!(submit_attach(&mut ui, TargetRequest::from(&first)));
+        let result = poll_attach(&mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::AgentRunner, second.id.clone()))
+        );
+
+        let landing_started = Instant::now();
+        land_attach(&mut ui, result);
+        assert!(
+            landing_started.elapsed() < Duration::from_millis(250),
+            "dropping the stale attach plan blocked the UI"
+        );
+        assert!(ui.attached.is_empty());
+        assert!(matches!(ui.mode, Mode::Normal));
+
+        let start_deadline = Instant::now() + Duration::from_secs(1);
+        while !release_pid.exists() {
+            assert!(
+                Instant::now() < start_deadline,
+                "background stale plan release did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&release_pid)
+            .expect("read stale release pid")
+            .parse::<u32>()
+            .expect("stale release pid is numeric");
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+        let shutdown_started = Instant::now();
+        drop(ui);
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "stale release worker shutdown was not bounded"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "stale release worker outlived UI shutdown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(release_log).expect("stale release command log"),
+            "--json run attach-release lease-stale-plan\n",
+            "the stale lease must be released exactly once"
+        );
     }
 
     /// The control for the error-path drop test below: a FAILED resolution that lands while

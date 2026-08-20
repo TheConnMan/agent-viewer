@@ -16,7 +16,7 @@ it falls back safely to `Agent Viewer`.
 
 ## Backends
 
-Two backends ship, and each advertises which capabilities it supports; the TUI gates
+Three backends ship, and each advertises which capabilities it supports; the TUI gates
 keys accordingly (an unsupported action is a no-op with a footer notice). Backends with
 no data or whose CLI is not installed simply list empty — they never error the view.
 
@@ -34,6 +34,14 @@ no data or whose CLI is not installed simply list empty — they never error the
   channel it has (there is no `claude rename` subcommand). It applies to background rows only:
   an interactive row has no job dir, so `Ctrl+R` there is a footer notice. No archive/hide
   (Claude has no hide concept).
+- **Agent Runner** discovers every page of retained, reviewable Kubernetes Codex runs from
+  `agent-runner --json run list`. It can only attach. The viewer requests a fresh lease with
+  `agent-runner --json run attach <run id>`, checks its local version and the controller metadata
+  for exact version 0.146.0, then runs `codex --no-alt-screen resume --remote <unix endpoint> <native thread id>`
+  in the existing embedded terminal. The controller also verifies the authenticated gateway server
+  version before returning the lease. It releases the lease when that terminal exits or the attach
+  is cancelled. It cannot spawn, stop, remove, rename, archive, tail, triage, or render a
+  transcript for an Agent Runner row.
 
 ## States
 
@@ -269,6 +277,12 @@ Codex and Claude attached transcripts scroll immediately: Codex scrolls the view
 transcript, while Claude receives the wheel in its attached terminal. Their capture behavior
 follows the `Ctrl+T` controls above.
 
+An Agent Runner row uses the same full screen terminal handoff but never uses a local transcript.
+The controller has Kubernetes access and returns a short lived local Unix endpoint only after
+authorizing the retained run. Closing the terminal releases that lease. Reopening a row first
+replaces any stale attached terminal, obtains a fresh lease, and resumes the recorded native
+thread. The viewer never receives Pod credentials, an app server capability, or direct Pod access.
+
 ### Video wall
 
 `Ctrl+W` replaces the session list with a grid of everything that is running, and gives the
@@ -381,9 +395,10 @@ not an oversight; revisiting either is a future, separately specified decision.
 
 Quitting the viewer (`Ctrl+C`) kills the attach PTYs it owns, but that does not lose any work:
 the conversations live in each backend's own store and re-attach by session ID next time.
-If a child exits while you are attached, its final screen stays visible. `Ctrl+Y` remains
-available to send that retained visible screen, and `Ctrl+T` remains available for host
-selection. Any other key returns you to the list.
+If a local Codex or Claude child exits while you are attached, its final screen stays visible.
+`Ctrl+Y` remains available to send that retained visible screen, and `Ctrl+T` remains available
+for host selection. Any other key returns you to the list. When an Agent Runner child exits,
+the viewer releases its lease, removes the retained terminal, and restores the session list.
 
 ## Themes
 

@@ -97,6 +97,7 @@ fn mark_for(backend: BackendKind, glyph: bool) -> &'static str {
     match backend {
         BackendKind::Claude => "✳",
         BackendKind::Codex => "◆",
+        BackendKind::AgentRunner => "◆",
     }
 }
 
@@ -105,6 +106,7 @@ fn backend_mark_color(backend: BackendKind, theme: &Theme) -> ratatui::style::Co
     match backend {
         BackendKind::Claude => theme.cc,
         BackendKind::Codex => theme.cx,
+        BackendKind::AgentRunner => theme.cx,
     }
 }
 

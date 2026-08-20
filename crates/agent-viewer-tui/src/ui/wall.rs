@@ -145,6 +145,9 @@ pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
         else {
             continue;
         };
+        if *backend == BackendKind::AgentRunner {
+            continue;
+        }
         if !tiled(status, *updated_at_ms, now_ms) {
             continue;
         }
