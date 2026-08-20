@@ -513,17 +513,17 @@ mod design_tests {
 
     #[test]
     fn metadata_drops_hint_before_truncating_folder_from_the_left() {
-        let wide = metadata_layout("cx", "codex", "gpt 5.3", "~/git/example-org/example-app", 76);
+        let wide = metadata_layout("cx", "codex", "gpt 5.3", "~/git/exampleco/project", 76);
         assert_eq!(wide.hint.as_deref(), Some(COMPOSER_HINT));
-        assert_eq!(wide.folder, "~/git/example-org/example-app");
+        assert_eq!(wide.folder, "~/git/exampleco/project");
 
-        let without_hint = metadata_layout("cx", "codex", "gpt 5.3", "~/git/example-org/example-app", 52);
+        let without_hint = metadata_layout("cx", "codex", "gpt 5.3", "~/git/exampleco/project", 52);
         assert_eq!(without_hint.hint, None);
-        assert_eq!(without_hint.folder, "~/git/example-org/example-app");
+        assert_eq!(without_hint.folder, "~/git/exampleco/project");
 
-        let narrow = metadata_layout("cx", "codex", "gpt 5.3", "~/git/example-org/example-app", 32);
+        let narrow = metadata_layout("cx", "codex", "gpt 5.3", "~/git/exampleco/project", 32);
         assert_eq!(narrow.hint, None);
         assert!(narrow.folder.starts_with('…'));
-        assert!(narrow.folder.ends_with("/agentos"));
+        assert!(narrow.folder.ends_with("/project"));
     }
 }

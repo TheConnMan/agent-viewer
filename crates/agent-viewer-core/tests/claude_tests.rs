@@ -941,7 +941,7 @@ fn claude_list_finds_project_transcript_without_job_transcript_path() {
 
     let project_root = config_root
         .join("projects")
-        .join("-home-example-user-git-example-org");
+        .join("-home-example-git-example-org");
     std::fs::create_dir_all(&project_root).unwrap();
     let expected = [
         (session_id, project_root.join(format!("{session_id}.jsonl"))),
