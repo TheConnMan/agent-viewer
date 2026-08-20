@@ -17,14 +17,19 @@ config surfaces, or features not requested.
 
 ## Scope
 
-- **v1 (this build): a Rust TUI** (`ratatui`) plus a `-core` library crate. The TUI is the
+**v1: a Rust TUI** (`ratatui`) plus a `-core` library crate. The TUI is the
   primary deliverable because the killer feature (one keystroke attach/resume into a session)
   is inherently terminal. Linux is the fully measured runtime platform. Native release archives
   also target macOS Intel, macOS Apple Silicon, and Windows x64; those platforms enumerate and
   render sessions but do not claim Linux process status or Codex daemon controls.
-- **Out of scope for v1:** a web/Tailscale surface. It is a natural v2 (an `axum` binary
-  sharing `-core`, deployed like the `bonus-drain`/`bg-schedule` viewers with token-guarded
-  write routes) but do NOT build it now. Leave `-core` cleanly separable so v2 can reuse it.
+
+**v2: a phone companion.** The `agent-viewer-server` axum binary shares `-core`, binds only
+to `127.0.0.1:8477`, and is exposed to the tailnet with `tailscale serve`. Every request is
+rejected unless Tailscale supplied the `Tailscale-User-Login` header. One refresh thread owns
+the listing backends and publishes a two second snapshot behind an `RwLock`, so HTTP handlers
+never list a backend per request. State changing handlers run blocking work against separate
+action backends and delegate mutations to the existing `Backend` methods. The Codex registry
+remains read only.
 
 ## Enumeration — the source of truth (requirements 2, 3-read, 4)
 
@@ -936,7 +941,7 @@ palette, model cache seed, and model probes include only providers with an insta
 
 ## Crate layout
 
-Cargo workspace, two crates plus one vendored dependency. Live-refresh the registry every ~1-2s.
+Cargo workspace, three crates plus one vendored dependency. Live-refresh the registry every ~1-2s.
 
 `agent-viewer-core` (lib), no UI, unit-tested:
 
@@ -981,6 +986,10 @@ the refresh tick; `app.rs` the row model and grouping; `keys.rs` the per-mode ke
 `shared_listing.rs` the off-thread caches; `logos.rs` the inline brand marks; `terminal_title.rs`
 the tab title. Rendering lives under `ui/`: `list.rs`, `header.rs`, `composer.rs`, `overlay.rs`,
 `palette.rs`, `wall.rs`, `triage.rs`, `tail.rs`, `theme.rs`, `sprite.rs`, `age.rs`.
+
+`agent-viewer-server` (bin plus lib): `axum` over `-core`. The library owns the authenticated
+route surface, the published session snapshot, and blocking action dispatch. The binary binds
+the loopback listener on `127.0.0.1:8477`.
 
 `vendor/vt100` is a patched fork of the published crate; see "Vendored vt100".
 

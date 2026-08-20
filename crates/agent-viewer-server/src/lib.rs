@@ -14,7 +14,7 @@ use agent_viewer_core::{
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Json, Path as AxumPath, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SPAWN_ABANDON_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_TAIL_EVENTS: usize = 12;
-const MAX_TAIL_EVENTS: usize = 100;
 const PULSE_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,11 +272,28 @@ fn apply_overlay(db: &ViewerDb, sessions: &mut [Session]) {
 }
 
 async fn require_tailscale_user(request: Request, next: Next) -> Response {
-    if request.headers().contains_key("Tailscale-User-Login") {
-        next.run(request).await
-    } else {
-        ApiError::new(StatusCode::UNAUTHORIZED, "missing Tailscale user").into_response()
+    if !request.headers().contains_key("Tailscale-User-Login") {
+        return ApiError::new(StatusCode::UNAUTHORIZED, "missing Tailscale user").into_response();
     }
+    if matches!(*request.method(), Method::POST | Method::PATCH)
+        && !request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim() == "application/json")
+            })
+    {
+        return ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+        )
+        .into_response();
+    }
+    next.run(request).await
 }
 
 async fn health() -> Json<StatusBody> {
@@ -299,7 +315,7 @@ async fn session_tail(
 ) -> ApiResult<Json<Vec<TailEvent>>> {
     let id = path_value(path)?;
     let Query(query) = query.map_err(|_| ApiError::bad_request("invalid tail query"))?;
-    let max_events = query.n.unwrap_or(DEFAULT_TAIL_EVENTS).min(MAX_TAIL_EVENTS);
+    let max_events = query.n.unwrap_or(DEFAULT_TAIL_EVENTS);
     let session = snapshot_session(&state, &id)?;
     let events = with_backend(state.backends, session.backend, move |backend| {
         backend
@@ -373,15 +389,14 @@ async fn rename_session(
     let session = snapshot_session(&state, &id)?;
     let name = name.to_string();
     with_backend(state.backends, session.backend, move |backend| {
-        let current = authoritative_session(backend, session.backend, &id)?;
-        if !backend.capabilities_for(&current).rename {
+        if !backend.capabilities_for(&session).rename {
             return Err(ApiError::unsupported(format!(
                 "{} does not support rename",
-                current.backend.name()
+                session.backend.name()
             )));
         }
         backend
-            .rename(&current, &name)
+            .rename(&session, &name)
             .map_err(|error| core_error("rename", error))
     })
     .await?;
@@ -395,28 +410,27 @@ async fn mutate_session(
 ) -> ApiResult<Json<StatusBody>> {
     let session = snapshot_session(&state, &id)?;
     with_backend(state.backends, session.backend, move |backend| {
-        let current = authoritative_session(backend, session.backend, &id)?;
-        let capabilities = backend.capabilities_for(&current);
+        let capabilities = backend.capabilities_for(&session);
         let result = match mutation {
-            MutationKind::Stop if capabilities.stop => backend.stop(&current),
-            MutationKind::Hide if capabilities.archive => backend.hide(&current.id),
-            MutationKind::Unhide if capabilities.archive => backend.unhide(&current.id),
+            MutationKind::Stop if capabilities.stop => backend.stop(&session),
+            MutationKind::Hide if capabilities.archive => backend.hide(&session.id),
+            MutationKind::Unhide if capabilities.archive => backend.unhide(&session.id),
             MutationKind::Stop => {
                 return Err(ApiError::unsupported(format!(
                     "{} does not support stop",
-                    current.backend.name()
+                    session.backend.name()
                 )));
             }
             MutationKind::Hide => {
                 return Err(ApiError::unsupported(format!(
                     "{} does not support hide",
-                    current.backend.name()
+                    session.backend.name()
                 )));
             }
             MutationKind::Unhide => {
                 return Err(ApiError::unsupported(format!(
                     "{} does not support unhide",
-                    current.backend.name()
+                    session.backend.name()
                 )));
             }
         };
@@ -555,22 +569,6 @@ fn snapshot_session(state: &AppState, id: &str) -> ApiResult<Session> {
         .iter()
         .find(|view| view.session.id == id)
         .map(|view| view.session.clone())
-        .ok_or_else(ApiError::not_found)
-}
-
-fn authoritative_session(
-    backend: &mut dyn Backend,
-    expected_kind: BackendKind,
-    id: &str,
-) -> ApiResult<Session> {
-    if backend.kind() != expected_kind {
-        return Err(ApiError::not_found());
-    }
-    backend
-        .list()
-        .map_err(|error| core_error("list", error))?
-        .into_iter()
-        .find(|session| session.backend == expected_kind && session.id == id)
         .ok_or_else(ApiError::not_found)
 }
 

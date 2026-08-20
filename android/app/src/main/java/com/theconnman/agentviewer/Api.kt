@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.descriptors.SerialDescriptor
@@ -17,25 +18,17 @@ import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonDecoder
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 object ApiConfig {
     const val DEFAULT_BASE_URL = "https://remote-dev.tail26e2ce.ts.net:8443"
 }
 
 object ApiJson {
-    val json = Json {
-        ignoreUnknownKeys = true
-        explicitNulls = false
-    }
+    val json = Json
 }
 
 @Serializable
@@ -73,32 +66,50 @@ object StatusSerializer : KSerializer<Status> {
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("Status")
 
     override fun deserialize(decoder: Decoder): Status {
-        val jsonDecoder = decoder as? JsonDecoder ?: error("Status requires JSON")
+        val jsonDecoder = decoder as? JsonDecoder
+            ?: throw SerializationException("Status requires JSON")
         return when (val element = jsonDecoder.decodeJsonElement()) {
-            is JsonPrimitive -> when (element.content) {
-                "Working" -> Status.Working
-                "Idle" -> Status.Idle
-                "Done" -> Status.Done
-                "Error" -> Status.Error
-                "Unknown" -> Status.Unknown
-                else -> Status.Unknown
+            is JsonPrimitive -> {
+                if (!element.isString) throw SerializationException("Status must be a string or externally tagged object")
+                when (element.content) {
+                    "Working" -> Status.Working
+                    "Idle" -> Status.Idle
+                    "Done" -> Status.Done
+                    "Error" -> Status.Error
+                    "Unknown" -> Status.Unknown
+                    else -> throw SerializationException("Unknown Status variant: ${element.content}")
+                }
             }
 
             is JsonObject -> {
-                val reason = element["NeedsInput"]
-                    ?.jsonObject
-                    ?.get("reason")
-                    ?.jsonPrimitive
-                    ?.contentOrNull
+                if (element.keys != setOf("NeedsInput")) {
+                    throw SerializationException("Malformed Status object")
+                }
+                val payload = element["NeedsInput"] as? JsonObject
+                    ?: throw SerializationException("NeedsInput payload must be an object")
+                if (payload.keys != setOf("reason")) {
+                    throw SerializationException("NeedsInput payload must contain only reason")
+                }
+                val reasonElement = payload.getValue("reason")
+                val reason = when (reasonElement) {
+                    kotlinx.serialization.json.JsonNull -> null
+                    is JsonPrimitive -> if (reasonElement.isString) {
+                        reasonElement.content
+                    } else {
+                        throw SerializationException("NeedsInput reason must be a string or null")
+                    }
+                    else -> throw SerializationException("NeedsInput reason must be a string or null")
+                }
                 Status.NeedsInput(reason)
             }
 
-            else -> Status.Unknown
+            else -> throw SerializationException("Malformed Status value")
         }
     }
 
     override fun serialize(encoder: Encoder, value: Status) {
-        val jsonEncoder = encoder as? JsonEncoder ?: error("Status requires JSON")
+        val jsonEncoder = encoder as? JsonEncoder
+            ?: throw SerializationException("Status requires JSON")
         val element = when (value) {
             Status.Working -> JsonPrimitive("Working")
             Status.Idle -> JsonPrimitive("Idle")
@@ -107,7 +118,7 @@ object StatusSerializer : KSerializer<Status> {
             Status.Unknown -> JsonPrimitive("Unknown")
             is Status.NeedsInput -> buildJsonObject {
                 put("NeedsInput", buildJsonObject {
-                    value.reason?.let { put("reason", JsonPrimitive(it)) }
+                    put("reason", value.reason?.let(::JsonPrimitive) ?: kotlinx.serialization.json.JsonNull)
                 })
             }
         }
@@ -165,19 +176,39 @@ object TailEventSerializer : KSerializer<TailEvent> {
     override val descriptor: SerialDescriptor = buildClassSerialDescriptor("TailEvent")
 
     override fun deserialize(decoder: Decoder): TailEvent {
-        val jsonDecoder = decoder as? JsonDecoder ?: error("TailEvent requires JSON")
-        val objectValue = jsonDecoder.decodeJsonElement().jsonObject
-        objectValue["Agent"]?.jsonPrimitive?.contentOrNull?.let(TailEvent::Agent)?.let { return it }
-        objectValue["User"]?.jsonPrimitive?.contentOrNull?.let(TailEvent::User)?.let { return it }
-        val tool = objectValue["Tool"]?.jsonObject
-        return TailEvent.Tool(
-            name = tool?.get("name")?.jsonPrimitive?.contentOrNull.orEmpty(),
-            detail = tool?.get("detail")?.jsonPrimitive?.contentOrNull.orEmpty(),
-        )
+        val jsonDecoder = decoder as? JsonDecoder
+            ?: throw SerializationException("TailEvent requires JSON")
+        val objectValue = jsonDecoder.decodeJsonElement() as? JsonObject
+            ?: throw SerializationException("TailEvent must be an externally tagged object")
+        if (objectValue.size != 1) throw SerializationException("TailEvent must contain exactly one variant")
+        return when (val variant = objectValue.keys.single()) {
+            "Agent", "User" -> {
+                val text = objectValue.getValue(variant) as? JsonPrimitive
+                    ?: throw SerializationException("$variant payload must be a string")
+                if (!text.isString) throw SerializationException("$variant payload must be a string")
+                if (variant == "Agent") TailEvent.Agent(text.content) else TailEvent.User(text.content)
+            }
+            "Tool" -> {
+                val tool = objectValue.getValue("Tool") as? JsonObject
+                    ?: throw SerializationException("Tool payload must be an object")
+                if (tool.keys != setOf("name", "detail")) {
+                    throw SerializationException("Tool payload must contain name and detail")
+                }
+                fun stringField(name: String): String {
+                    val value = tool.getValue(name) as? JsonPrimitive
+                        ?: throw SerializationException("Tool $name must be a string")
+                    if (!value.isString) throw SerializationException("Tool $name must be a string")
+                    return value.content
+                }
+                TailEvent.Tool(name = stringField("name"), detail = stringField("detail"))
+            }
+            else -> throw SerializationException("Unknown TailEvent variant: $variant")
+        }
     }
 
     override fun serialize(encoder: Encoder, value: TailEvent) {
-        val jsonEncoder = encoder as? JsonEncoder ?: error("TailEvent requires JSON")
+        val jsonEncoder = encoder as? JsonEncoder
+            ?: throw SerializationException("TailEvent requires JSON")
         val element = when (value) {
             is TailEvent.Agent -> buildJsonObject { put("Agent", JsonPrimitive(value.text)) }
             is TailEvent.User -> buildJsonObject { put("User", JsonPrimitive(value.text)) }
@@ -215,6 +246,13 @@ data class NewSessionRequest(
 @Serializable
 private data class RenameRequest(val name: String)
 
+@Serializable
+private data class ModelsResponse(
+    @SerialName("Codex") val codex: List<String>,
+    @SerialName("Claude") val claude: List<String>,
+    val auto: List<String> = emptyList(),
+)
+
 class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
     suspend fun sessions(): List<Session> = decode(get("/sessions"))
 
@@ -228,18 +266,11 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
         decode(get("/sessions/${pathPart(sessionId)}/pulse"))
 
     suspend fun models(): Map<ComposerProvider, List<String>> {
-        val response = ApiJson.json.parseToJsonElement(get("/models")).jsonObject
-        fun values(key: String): List<String> = response[key]
-            ?.jsonArray
-            ?.mapNotNull { it.jsonPrimitive.contentOrNull }
-            .orEmpty()
-        val codex = values("Codex")
-        val claude = values("Claude")
-        val auto = if (codex.isNotEmpty() || claude.isNotEmpty()) listOf("auto") else emptyList()
+        val response: ModelsResponse = decode(get("/models"))
         return mapOf(
-            ComposerProvider.AUTO to auto,
-            ComposerProvider.CLAUDE to claude,
-            ComposerProvider.CODEX to codex,
+            ComposerProvider.AUTO to response.auto,
+            ComposerProvider.CLAUDE to response.claude,
+            ComposerProvider.CODEX to response.codex,
         )
     }
 
@@ -248,12 +279,12 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
     }
 
     suspend fun stop(sessionId: String) {
-        request("POST", "/sessions/${pathPart(sessionId)}/stop")
+        request("POST", "/sessions/${pathPart(sessionId)}/stop", "{}")
     }
 
     suspend fun hide(sessionId: String, hidden: Boolean) {
         val action = if (hidden) "unhide" else "hide"
-        request("POST", "/sessions/${pathPart(sessionId)}/$action")
+        request("POST", "/sessions/${pathPart(sessionId)}/$action", "{}")
     }
 
     suspend fun rename(sessionId: String, name: String) {

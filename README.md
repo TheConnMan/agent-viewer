@@ -649,6 +649,35 @@ no ops with the existing footer notice. `agent-viewer --version` and `agent-view
 the version before terminal, filesystem, or backend startup, making them safe release smoke
 paths.
 
+## Phone companion
+
+The Android companion has a session list, a triage inbox, a new session composer, and a
+session detail screen. Session detail shows recent turns as a read only tail. The four shipped
+themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
+
+Start the local HTTP server:
+
+```
+cargo run -p agent-viewer-server
+```
+
+Publish that API on tailnet HTTPS port 8443:
+
+```
+tailscale serve --bg --https=8443 http://127.0.0.1:8477
+```
+
+Build the debug APK with the generated debug keystore:
+
+```
+cd android
+./gradlew assembleDebug
+```
+
+The editable API base URL is `ApiConfig.DEFAULT_BASE_URL` in
+`android/app/src/main/java/com/theconnman/agentviewer/Api.kt`. It defaults to
+`https://remote-dev.tail26e2ce.ts.net:8443`.
+
 ## Test
 
 ```
