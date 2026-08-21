@@ -76,14 +76,8 @@ pub enum GroupingMode {
     State,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortOrder {
-    #[default]
-    Recency,
-    Title,
-}
-
-pub const DEFAULT_RETENTION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Age after which a resolved spawn pin whose session is gone is pruned.
+const PRUNE_RETENTION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A backend's stored model catalog and the epoch-ms it was fetched at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,7 +714,7 @@ impl ViewerDb {
     /// is, so a long-running spawned session never loses its always-visible status.
     /// (Unresolved rows are handled by the caller's abandonment rule.)
     pub fn prune_resolved_missing(&self, live: &HashSet<(BackendKind, String)>) -> Result<()> {
-        let cutoff = crate::spawn::now_ms() - 7 * 24 * 60 * 60 * 1000;
+        let cutoff = crate::spawn::now_ms() - PRUNE_RETENTION_WINDOW_MS;
         let mut stmt = self.conn.prepare(
             "SELECT id, backend, session_id FROM spawned \
              WHERE session_id IS NOT NULL AND spawned_at_ms < ?1",
@@ -885,22 +879,6 @@ impl ViewerDb {
         self.set_setting("grouping_mode", value)
     }
 
-    pub fn sort_order(&self) -> Result<SortOrder> {
-        Ok(match self.setting("sort_order")?.as_deref() {
-            Some("title") => SortOrder::Title,
-            Some("recency") | None => SortOrder::Recency,
-            Some(_) => SortOrder::default(),
-        })
-    }
-
-    pub fn set_sort_order(&self, order: SortOrder) -> Result<()> {
-        let value = match order {
-            SortOrder::Recency => "recency",
-            SortOrder::Title => "title",
-        };
-        self.set_setting("sort_order", value)
-    }
-
     /// The header mascot, stored by name. The viewer owns the set of valid names; an unknown one
     /// simply falls back to its default, so a downgrade cannot wedge the header.
     pub fn header_sprite(&self) -> Result<Option<String>> {
@@ -919,17 +897,6 @@ impl ViewerDb {
 
     pub fn set_age_ramp(&self, enabled: bool) -> Result<()> {
         self.set_setting("age_ramp", if enabled { "1" } else { "0" })
-    }
-
-    pub fn retention_window_ms(&self) -> Result<i64> {
-        Ok(self
-            .setting("retention_window_ms")?
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_RETENTION_WINDOW_MS))
-    }
-
-    pub fn set_retention_window_ms(&self, ms: i64) -> Result<()> {
-        self.set_setting("retention_window_ms", &ms.to_string())
     }
 
     /// Store a backend's discovered model catalog, stamped with the time it was fetched.

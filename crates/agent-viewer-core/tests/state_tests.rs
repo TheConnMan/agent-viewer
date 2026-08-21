@@ -2,8 +2,8 @@
 
 use agent_viewer_core::backend::{BackendKind, Session, SessionOrigin, Status};
 use agent_viewer_core::state::{
-    DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
-    apply_viewer_state, match_spawn, match_spawn_between,
+    GroupingMode, SpawnRecord, ViewerDb, ViewerState, apply_viewer_state, match_spawn,
+    match_spawn_between,
 };
 use agent_viewer_core::{
     ListingCacheClaim, ListingCacheRead, ListingCacheScope, ListingCacheSnapshot,
@@ -944,31 +944,6 @@ fn viewer_db_grouping_mode_defaults_and_roundtrips() {
 }
 
 #[test]
-fn viewer_db_sort_order_defaults_and_roundtrips() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    assert_eq!(db.sort_order().expect("default sort"), SortOrder::Recency);
-
-    db.set_sort_order(SortOrder::Title).expect("set sort");
-    assert_eq!(db.sort_order().expect("read sort"), SortOrder::Title);
-
-    drop(db);
-    let db = ViewerDb::open(&path).expect("reopen viewer db");
-    assert_eq!(
-        db.sort_order().expect("read persisted sort"),
-        SortOrder::Title
-    );
-
-    db.set_sort_order(SortOrder::Recency)
-        .expect("overwrite sort");
-    assert_eq!(
-        db.sort_order().expect("read overwritten sort"),
-        SortOrder::Recency
-    );
-}
-
-#[test]
 fn viewer_db_age_ramp_defaults_off_and_roundtrips() {
     let (_dir, path) = temp_db_path();
     let db = ViewerDb::open(&path).expect("open viewer db");
@@ -987,39 +962,6 @@ fn viewer_db_age_ramp_defaults_off_and_roundtrips() {
 
     db.set_age_ramp(false).expect("disable age ramp");
     assert!(!db.age_ramp().expect("read disabled age ramp"));
-}
-
-#[test]
-fn viewer_db_retention_window_defaults_and_roundtrips() {
-    let (_dir, path) = temp_db_path();
-    let db = ViewerDb::open(&path).expect("open viewer db");
-
-    assert_eq!(
-        db.retention_window_ms().expect("default retention"),
-        DEFAULT_RETENTION_WINDOW_MS
-    );
-
-    db.set_retention_window_ms(86_400_000)
-        .expect("set retention");
-    assert_eq!(
-        db.retention_window_ms().expect("read retention"),
-        86_400_000
-    );
-
-    drop(db);
-    let db = ViewerDb::open(&path).expect("reopen viewer db");
-    assert_eq!(
-        db.retention_window_ms().expect("read persisted retention"),
-        86_400_000
-    );
-
-    db.set_retention_window_ms(172_800_000)
-        .expect("overwrite retention");
-    assert_eq!(
-        db.retention_window_ms()
-            .expect("read overwritten retention"),
-        172_800_000
-    );
 }
 
 // Model-catalog cache: a backend's discovered model ids survive a viewer restart, so the
