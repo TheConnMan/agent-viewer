@@ -629,6 +629,9 @@ Measured on this box, `codex debug models` takes seconds on a cold run; Claude's
   `fetched_at_ms`), seeded into the cache at startup so the picker is populated from the first
   keystroke on every run after the first. The TTL is a day and lives in the TUI, not the DB;
   a stale list still serves the picker while its refresh runs behind it.
+- **The composer overlays automatic selection, not the catalog.** Raw backend catalogs and the
+  persistent cache remain provider supplied. When routing is available, the composer prepends
+  one `auto` choice for each concrete provider; it never stores that choice in the cache.
 - **A failed probe is not cached.** `available_models()` always seeds the backend's default
   first, so a one-entry result means discovery failed; it is dropped rather than written,
   which would otherwise pin an empty picker for the whole TTL.
@@ -710,10 +713,15 @@ Two carve-outs, both deliberate:
   does not offer (`codex exec`, no daemon), so honouring it means not routing. Routing anyway
   would silently ignore an env var the operator set deliberately.
 
-`--model` carries the composer's selection on a pinned route only: the router refuses it without
-an explicit `--provider`, so an Auto route must never send one. Codex's `default` model is the
-composer's no-model state and reaches the router as no flag, leaving that resolution where it
-already was. Effort is never sent on either path, because the composer has no effort control.
+`--model` carries an explicit composer's selection on a pinned route only: the router refuses it
+without an explicit `--provider`, so a provider Auto route must never send one. When routing is
+available, concrete Claude and Codex each begin at visible model `auto`. That pins the provider
+without classification but omits `--model`, so Agent Router uses its configured unscored model
+for that provider. `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` is the Codex exception: its automatic
+model selection bypasses Agent Router and `codex exec` resolves the model directly. The Codex
+`default` catalog value is omitted from the routed picker because it also omits the flag. Effort is never
+sent on either path, because the composer has no effort control; the backend resolves the
+effective effort.
 
 **A pinned route that came back on the other provider is an error, not a relabelled spawn.**
 Every downstream identity — which listing to fence, which preexisting-id set to exclude, which
@@ -730,16 +738,19 @@ palette, model cache seed, and model probes include only providers with an insta
   otherwise its exact returned job name, then bounded cwd and invocation-interval matching while
   excluding that provider's preexisting ids).
 - **The binary is probed once at startup** with a PATH lookup (`router::available()`), matching
-  the backends-appear-when-present posture: no router means no `auto` entry, which is not an
-  error state. The same flag (`Composer::router_available`) is what decides whether a spawn on a
-  concrete backend routes or calls that backend directly, so both paths agree on one probe
+  the backends-appear-when-present posture: no router means no automatic choices, which is not
+  an error state. The same flag (`Composer::router_available`) is what decides whether a spawn
+  on a concrete backend routes or calls that backend directly, so both paths agree on one probe
   rather than re-resolving PATH per keystroke.
 - **When the router is present, Auto is the composer's STARTING selection**
   (`Composer::default_to_auto`, called once at startup after the availability probe): routed
   spawns are the default posture, and one `Tab` reaches the concrete backends. Without the
   router the composer starts on the first installed concrete backend.
-- **On Auto no model is passed.** The router owns model and reasoning-effort selection there, so
-  the picker offers a single `auto` entry and the CLI is invoked without `--model`.
+- **Provider Auto passes no model.** The router chooses provider, model, and reasoning effort;
+  the picker offers its single `auto` entry and the CLI is invoked without `--model`.
+- **Concrete provider `auto` passes no model.** Each pinned provider shows `auto` first when
+  routing is available. The CLI sends that provider but no `--model`, leaving the router's
+  configured unscored provider model and the backend's effective-effort resolution in force.
 - **Every router failure is a footer error with nothing spawned** — non-zero exit (carrying its
   stderr), timeout, unreadable JSON, a provider name the viewer does not know, or a pinned
   provider the router did not honour. There is deliberately no fallback to a hardcoded provider,
@@ -1046,9 +1057,11 @@ pane and a usable list cannot both fit. Closing an already-open pane is never re
 The palette is the discoverability surface for everything without a chord of its own, and the
 only way to reach some actions from the wall. It carries the action list (each with its chord,
 and unavailable actions shown as unavailable rather than hidden), the header sprites, every
-visible session as a jump target, every discovered model per backend, and the slash commands for
-the composer's current backend. Session entries use the same visible-row model as the list, so
-the `hold` rule applies there too.
+visible session as a jump target, every discovered model per backend, and when routing is
+available one concrete `auto` choice per backend. The same choice is reachable with `/model` and
+`Shift+Tab`. It pins that backend while leaving model and effort automatic. The slash commands
+remain those of the composer's current backend. Session entries use the same visible-row model as
+the list, so the `hold` rule applies there too.
 
 ### Themes, sprites, and the age ramp
 

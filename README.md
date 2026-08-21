@@ -104,8 +104,8 @@ companion.
 ## Inline spawn composer
 
 The list view carries a persistent composer in a rounded box between the list and the
-footer. Its metadata row shows the backend, the selected model when it is not the default,
-and the target folder. The task input is below it, uses the full width, and wraps as it grows.
+footer. Its metadata row shows the backend, selected model, and target folder. The task input
+is below it, uses the full width, and wraps as it grows.
 Just start typing to describe a task. A bracketed multiline paste remains one draft with its
 line breaks preserved. `Tab` cycles the target agent among only the providers whose CLIs are
 installed on `PATH`. When `agent-router` is installed, `auto` joins the cycle and becomes the
@@ -113,12 +113,16 @@ starting selection;
 `Shift+Tab` cycles that agent's model; and `Enter` explicitly submits the draft and spawns it
 detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
-daemon if none is running and never stops one. The models are discovered from each agent's
-CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`),
-default first. Discovery runs in the background and is cached
+daemon if none is running and never stops one, unless `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` selects
+the direct `codex exec` path. The models are discovered from each agent's
+CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`).
+When routing is available, each concrete provider prepends `auto`; otherwise its catalog starts
+with the provider default. Discovery runs in the background and is cached
 for a day, so the picker is populated from the first keystroke rather than waiting on a probe
-that takes seconds; a catalog that has never been discovered shows just the agent's default
-until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists. The
+that takes seconds; an undiscovered routed Claude catalog shows `auto` plus its default, while
+an undiscovered routed Codex catalog shows `auto` alone because its redundant default is hidden.
+Without routing, either catalog shows just its default until its first probe lands.
+`Shift+Tab` cycles the Claude/Codex lists. The
 target directory is the selected row's project root (by-project view) or its exact cwd
 (by-state view). Bare letters, numbers, and slash always type into the composer, including when
 it is empty; once you have typed anything, every printable key (and space) is task text, and
@@ -130,9 +134,9 @@ rows that existed before submission.
 ### agent-router
 
 Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
-project whenever its CLI is on your `PATH` — **every** spawn, not only the `auto` one. The
-router names the job and records the decision, so a job started from the viewer is tracked the
-same way as one dispatched from anywhere else.
+project whenever its CLI is on your `PATH`, except when `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`
+selects direct Codex execution. The router names the job and records the decision, so a routed
+job started from the viewer is tracked the same way as one dispatched from anywhere else.
 
 With the router installed the composer STARTS on a third `auto` entry (one `Tab` reaches the
 concrete agents, and the entry sits last in the cycle). It has a single `auto` model, because
@@ -143,23 +147,31 @@ the task, weighs the weekly usage headroom of each subscription, and dispatches 
 footer then shows the decision (for example
 `auto: codex gpt-5.6-luna effort low job 0199… (codex weekly 3%, claude 47%)`).
 
-Picking a concrete agent chooses the provider, not a way around the router: the run becomes
-`agent-router run --json --dir <target> --provider claude --model 'opus[1m]' -- "<task>"`, the
-router honours that override without classifying anything, and the job still gets its derived
-name and decision-log row. The footer reads as an ordinary spawn
-(`spawned on claude opus[1m] job Fix The Parser (codex weekly 3%, claude 47%)`). Codex's
-`default` model sends no `--model` at all, leaving that choice to the router as before.
+Picking a concrete agent chooses the provider, not a way around the router. Its default `auto`
+model runs `agent-router run --json --dir <target> --provider claude -- "<task>"`: the provider
+is pinned without classification, while Agent Router uses its configured unscored model for that
+provider and the backend resolves the effective effort. Choosing an explicit model instead adds, for example,
+`--model 'opus[1m]'`; the router honours that override without classifying anything. Either
+pinned form still gets the derived name and decision-log row. The footer reads as an ordinary
+spawn (`spawned on claude opus[1m] job Fix The Parser (codex weekly 3%, claude 47%)`).
+
+`AGENT_VIEWER_CODEX_EXEC_SPAWN=1` is a spawn scoped Codex carveout: every Codex spawn bypasses
+Agent Router, whether its visible model is automatic or explicit. Direct `codex exec` resolves
+the automatic default itself and receives explicit model picks directly. These spawns do not get
+router naming or a router decision log.
 
 Either way the new session appears and is selected through the dispatching agent's normal
-listing. Without the binary installed the `auto` entry never appears, the composer starts on
+listing. Without the binary installed no automatic entries appear, the composer starts on
 Claude, and spawns call the agent's own CLI directly exactly as they used to. A router that
 fails (non-zero exit, timeout, unreadable output, or a pinned provider it did not honour) is a
 footer error with nothing spawned — never a fallback to a guessed provider, and never a silent
 retry straight at the agent.
 
 Type `/model` (optionally `/model <filter>`) to open a filterable picker of every available
-model for the target agent, floating above the box. `↑`/`↓` move the highlight, `Tab` or
-`Enter` picks the model (and clears the composer), `Esc` closes it.
+model for the target agent, floating above the box. With routing available, `auto` is first for
+each concrete provider and pins that provider while leaving model and effort automatic.
+`Shift+Tab` and `Ctrl+K` expose the same concrete `auto` choice. `↑`/`↓` move the highlight,
+`Tab` or `Enter` picks the model (and clears the composer), `Esc` closes it.
 
 **Spawned sessions run unsandboxed.** Codex jobs are started with
 `--dangerously-bypass-approvals-and-sandbox` on the exec path, and with the same posture
@@ -190,8 +202,8 @@ its SQLite title still shows the prompt.
 - `↑`/`↓` — move selection.
 - `→` — attach the selected session in an embedded terminal.
 - `Enter` — spawn the composed task, or (empty composer) attach the selected session.
-- `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's discovered models
-  (Claude and Codex).
+- `Tab` / `Shift+Tab` — cycle the composer's target agent / that agent's models. With routing,
+  each concrete provider starts at `auto`.
 - `/model` — open a filterable picker of every available model for the target agent
   (`↑`/`↓` highlight, `Tab`/`Enter` pick, `Esc` close).
 - `Space` / `Enter` — collapse or expand a group when a group header is selected (the collapse
@@ -200,7 +212,8 @@ its SQLite title still shows the prompt.
   commits and persists it, `Esc` reverts to the one you started on.
 - `Ctrl+K` — command palette. It carries every action in this list (each with its chord, and
   unavailable ones shown as such), plus the header sprites, every visible session to jump to,
-  every discovered model for each backend, and the slash commands for the composer's backend.
+  every discovered model and routed `auto` choice for each backend, and the slash commands for
+  the composer's backend.
 - `Ctrl+B` — toggle the tail pane, the last 12 turns of the selected session beside the list.
   It needs at least 100 columns; below that opening it is a footer notice naming the width.
 - `Ctrl+W` — video wall (see below). `Ctrl+O` zooms the focused tile to the full attach view.
@@ -417,7 +430,8 @@ There is no config file. The viewer reads:
   tags when the inline logo marks are unavailable.
 - `AV_SPRITE=<name>` opens on that header sprite for one run.
 - `AGENT_VIEWER_CODEX_EXEC_SPAWN=1` spawns Codex sessions with `codex exec` instead of the
-  app-server daemon. Those sessions can never be attached to, which is why it is opt-in.
+  app-server daemon. Those sessions can never be attached to, and `codex exec` resolves an
+  automatic model directly rather than through Agent Router, which is why it is opt-in.
 - `CODEX_HOME` is where the Codex registry and rollouts live. Defaults to `~/.codex`.
 - `CLAUDE_CONFIG_DIR` is where Claude's `jobs/` and `sessions/` live. Defaults to `~/.claude`.
 - `~/.config/agent-viewer/themes/*.theme` holds your own themes, as described above.

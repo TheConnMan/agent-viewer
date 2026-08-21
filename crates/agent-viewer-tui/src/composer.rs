@@ -172,11 +172,19 @@ impl Composer {
         self.models_key
     }
 
-    /// Install the discovered model list (default-first) for `backend`, selecting index 0.
+    /// Install the discovered model list for `backend`, selecting index 0. When routing is
+    /// available, one automatic choice is overlaid ahead of the raw provider catalog.
     /// The one exception is a re-install for the SAME backend that still offers the current
     /// selection: discovery lands asynchronously, and a catalog arriving mid-compose must not
     /// silently rewrite a model the user deliberately picked.
-    pub fn set_models(&mut self, models: Vec<String>, backend: BackendKind) {
+    pub fn set_models(&mut self, mut models: Vec<String>, backend: BackendKind) {
+        if self.auto_available {
+            models.retain(|model| {
+                model != AUTO_MODEL
+                    && !(backend == BackendKind::Codex && model == backend.default_model())
+            });
+            models.insert(0, AUTO_MODEL.to_string());
+        }
         let keeps_selection = self.models_key == Some(backend) && models.contains(&self.model);
         if !keeps_selection {
             self.model = models
@@ -263,6 +271,15 @@ impl Composer {
     pub fn select_backend(&mut self, backend: BackendKind) {
         self.auto = false;
         self.backend = backend;
+    }
+
+    /// Select a model only when it belongs to the installed catalog.
+    pub fn select_model(&mut self, model: &str) -> bool {
+        if !self.models.iter().any(|candidate| candidate == model) {
+            return false;
+        }
+        self.model = model.to_string();
+        true
     }
 
     /// Shift+Tab: advance to the next discovered model after the current one, wrapping. A
@@ -605,6 +622,114 @@ mod tests {
         assert_eq!(composer.model(), "auto");
         composer.push_str("/model");
         assert_eq!(composer.model_suggestions(), vec!["auto".to_string()]);
+    }
+
+    #[test]
+    fn concrete_providers_default_to_auto_and_cycle_through_their_catalog() {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let mut composer = Composer::new();
+            composer.set_auto_available(true);
+            composer.select_backend(backend);
+            let explicit = if backend == BackendKind::Codex {
+                "gpt".to_string()
+            } else {
+                backend.default_model().to_string()
+            };
+            let models = if backend == BackendKind::Codex {
+                vec![backend.default_model().to_string(), explicit.clone()]
+            } else {
+                vec![explicit.clone()]
+            };
+
+            composer.set_models(models, backend);
+
+            assert!(!composer.is_auto());
+            assert_eq!(composer.backend(), backend);
+            assert_eq!(composer.model(), AUTO_MODEL);
+            composer.cycle_model();
+            assert_eq!(composer.model(), explicit);
+            composer.cycle_model();
+            assert_eq!(composer.model(), AUTO_MODEL);
+        }
+    }
+
+    #[test]
+    fn concrete_provider_catalogs_stay_unchanged_without_the_router() {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let mut composer = Composer::new();
+            composer.select_backend(backend);
+            let explicit = backend.default_model().to_string();
+
+            composer.set_models(vec![explicit.clone()], backend);
+
+            assert_eq!(composer.model(), explicit);
+            composer.cycle_model();
+            assert_eq!(composer.model(), explicit);
+        }
+    }
+
+    #[test]
+    fn an_explicit_model_survives_a_same_provider_catalog_refresh() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        let explicit = BackendKind::Claude.default_model().to_string();
+        composer.set_models(
+            vec![explicit.clone(), "sonnet".to_string()],
+            BackendKind::Claude,
+        );
+        composer.cycle_model();
+        assert_eq!(composer.model(), explicit);
+
+        composer.set_models(
+            vec![explicit.clone(), "sonnet".to_string(), "haiku".to_string()],
+            BackendKind::Claude,
+        );
+
+        assert_eq!(composer.model(), explicit);
+    }
+
+    #[test]
+    fn a_routed_codex_catalog_has_auto_without_redundant_default() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        composer.select_backend(BackendKind::Codex);
+        composer.set_models(
+            vec![
+                AUTO_MODEL.to_string(),
+                BackendKind::Codex.default_model().to_string(),
+                "gpt".to_string(),
+                AUTO_MODEL.to_string(),
+            ],
+            BackendKind::Codex,
+        );
+        composer.push_str("/model");
+
+        assert_eq!(
+            composer.model_suggestions(),
+            vec![AUTO_MODEL.to_string(), "gpt".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_routerless_codex_catalog_retains_default() {
+        let mut composer = Composer::new();
+        composer.select_backend(BackendKind::Codex);
+        composer.set_models(
+            vec![
+                BackendKind::Codex.default_model().to_string(),
+                "gpt".to_string(),
+            ],
+            BackendKind::Codex,
+        );
+        composer.push_str("/model");
+
+        assert_eq!(
+            composer.model_suggestions(),
+            vec![
+                BackendKind::Codex.default_model().to_string(),
+                "gpt".to_string(),
+            ]
+        );
     }
 
     /// Auto has no provider until the router answers, so the backend's own slash commands must
