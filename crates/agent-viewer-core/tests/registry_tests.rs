@@ -410,3 +410,45 @@ fn list_follows_a_state_db_rollover_without_a_restart() {
         "a session created in state_2 must appear without a restart, got {after:?}"
     );
 }
+
+#[test]
+fn list_strips_esc_and_bidi_from_title_and_summary() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("state_1.sqlite");
+    let conn = rusqlite::Connection::open(&path).expect("open state db");
+    conn.execute_batch(&schema).expect("run schema DDL");
+    let hostile = common::hostile_display_text();
+    conn.execute(
+        "INSERT INTO threads \
+         (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, \
+          sandbox_policy, approval_mode, preview, created_at_ms, updated_at_ms) \
+         VALUES (?1, ?2, 1, 1, 'cli', 'openai', '/home/user/proj', ?3, \
+                 'workspace-write', 'on-request', ?4, 1000, 2000)",
+        rusqlite::params!["t_hostile", "/tmp/hostile.jsonl", hostile, hostile],
+    )
+    .expect("insert hostile thread");
+    conn.close().expect("close writer connection");
+
+    let mut backend = CodexBackend::new(dir.path().to_path_buf());
+    let sessions = backend.list().expect("list hostile preview");
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    let expected = common::sanitized_display_text();
+    assert_eq!(session.title, expected);
+    assert_eq!(session.summary, expected);
+    assert!(
+        !session.summary.contains('\u{1b}')
+            && !session.summary.contains('\u{202e}')
+            && !session.summary.contains('\u{200b}'),
+        "stored summary retained a control or bidi character: {:?}",
+        session.summary
+    );
+    assert!(
+        !session.title.contains('\u{1b}')
+            && !session.title.contains('\u{202e}')
+            && !session.title.contains('\u{200b}'),
+        "stored title retained a control or bidi character: {:?}",
+        session.title
+    );
+}

@@ -62,6 +62,17 @@ pub fn copy_fixture_to_temp(name: &str) -> (TempDir, PathBuf) {
     (dir, dest)
 }
 
+/// Display text carrying ESC, CSI leftovers, an RLO bidi override, and ZWSP.
+/// A sanitizer that is the union of the TUI title set and Grok's C0/C1+bidi set
+/// must drop the controls and keep the printable remainder.
+pub fn hostile_display_text() -> &'static str {
+    "safe\u{1b}[31m \u{202e}bidi\u{200b}zwsp"
+}
+
+pub fn sanitized_display_text() -> &'static str {
+    "safe[31m bidizwsp"
+}
+
 /// Read and parse a JSON fixture relative to the fixtures directory.
 pub fn fixture_json(rel: &str) -> serde_json::Value {
     let path = fixture_path(rel);

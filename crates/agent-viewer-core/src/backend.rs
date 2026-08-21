@@ -258,7 +258,7 @@ pub struct Session {
 
 /// One entry of a session's recent transcript, oldest first.
 ///
-/// Prose keeps its original text (the caller wraps it); a tool event is the tool's own name
+/// Prose is display-sanitized (the caller wraps it); a tool event is the tool's own name
 /// plus the one argument worth showing, already squashed onto a single line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailEvent {
@@ -301,6 +301,7 @@ pub(crate) fn tool_detail(input: &serde_json::Value) -> String {
             ),
             _ => continue,
         };
+        let text = sanitize_display_text(&text);
         if !text.is_empty() {
             return text;
         }
@@ -312,6 +313,47 @@ pub(crate) fn tool_detail(input: &serde_json::Value) -> String {
 /// one tool line instead of silently eating the rest of the pane.
 pub(crate) fn squash(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Drop C0/C1 controls, bidi overrides, and other format characters that can spoof a
+/// list row or leak into the parent terminal.
+///
+/// The character set is the union of the TUI title sanitizer and Grok's C0/C1+bidi
+/// filter. Matching characters are dropped, not mapped to space: existing title tests
+/// pin concatenation of `\n`/`\r`. Grok's `is_terminal_safe` identity rejection is a
+/// separate check and is not relaxed into this strip.
+pub fn sanitize_display_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| is_display_safe(*character))
+        .collect()
+}
+
+fn is_display_safe(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
 }
 
 /// `Send` so the TUI can move the listing backends onto a dedicated refresh thread
@@ -524,5 +566,23 @@ mod tests {
             }
         }
         assert_eq!(Dummy.available_models(), vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_display_text_drops_controls_bidi_and_format_chars() {
+        assert_eq!(
+            sanitize_display_text("safe\u{1b}[31m \u{202e}bidi\u{200b}zwsp"),
+            "safe[31m bidizwsp"
+        );
+        assert_eq!(
+            sanitize_display_text("line\ncarriage\rdelete\u{7f} c1\u{80}\u{9b}31m"),
+            "linecarriagedelete c131m"
+        );
+        let clean = "Café 東京 🦀 Deploy";
+        assert_eq!(sanitize_display_text(clean), clean);
+        assert_eq!(
+            sanitize_display_text("Grok leader peer is not owned by the current user"),
+            "Grok leader peer is not owned by the current user"
+        );
     }
 }

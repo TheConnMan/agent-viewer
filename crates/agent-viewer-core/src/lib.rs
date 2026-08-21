@@ -13,7 +13,7 @@ pub mod state;
 
 pub use backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session, SessionOrigin,
-    SpawnResult, Status, TailEvent,
+    SpawnResult, Status, TailEvent, sanitize_display_text,
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use grok::{GrokBackend, GrokDiagnostics, GrokLifecycle};

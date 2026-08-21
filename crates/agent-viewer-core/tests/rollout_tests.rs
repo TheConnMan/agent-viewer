@@ -227,6 +227,98 @@ fn transcript_excludes_empty_text_items() {
 }
 
 #[test]
+fn transcript_strips_esc_and_bidi_from_user_agent_and_tool_events() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("hostile.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let hostile = common::hostile_display_text();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": hostile}]
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": hostile}]
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": hostile,
+                "arguments": serde_json::json!({"cmd": hostile}).to_string()
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": hostile
+            }
+        })
+    )
+    .unwrap();
+    drop(f);
+
+    let items = read_transcript_tail(&path).expect("read transcript");
+    let expected = common::sanitized_display_text();
+    assert_eq!(
+        items,
+        vec![
+            TailEvent::User(expected.to_string()),
+            TailEvent::Agent(expected.to_string()),
+            TailEvent::Tool {
+                name: expected.to_string(),
+                detail: expected.to_string(),
+            },
+            TailEvent::Tool {
+                name: "apply_patch".to_string(),
+                detail: expected.to_string(),
+            },
+        ]
+    );
+    for item in &items {
+        let text = match item {
+            TailEvent::User(text) | TailEvent::Agent(text) => text.as_str(),
+            TailEvent::Tool { name, detail } => {
+                assert!(!name.contains('\u{1b}') && !name.contains('\u{202e}'));
+                detail.as_str()
+            }
+        };
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}') && !text.contains('\u{200b}'),
+            "TailEvent retained a control or bidi character: {item:?}"
+        );
+    }
+}
+
+#[test]
 fn codex_turn_activity_normalizes_filters_and_tolerates_bad_timestamps() {
     let (_dir, path) = common::copy_fixture_to_temp("rollout_complete.jsonl");
     let mut file = std::fs::OpenOptions::new()

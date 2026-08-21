@@ -997,26 +997,11 @@ fn open_at_no_symlinks(
 }
 
 fn sanitize_terminal_text(text: &str) -> String {
-    text.chars()
-        .filter_map(|character| {
-            let unsafe_character = matches!(
-                character,
-                '\u{0000}'..='\u{001f}'
-                    | '\u{007f}'..='\u{009f}'
-                    | '\u{061c}'
-                    | '\u{200e}'..='\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            );
-            if unsafe_character {
-                character.is_whitespace().then_some(' ')
-            } else {
-                Some(character)
-            }
-        })
-        .collect()
+    crate::backend::sanitize_display_text(text)
 }
 
+/// Identity rejection for Grok ids/cwds/models. Not a strip: a hit drops the row
+/// rather than rewriting it.
 fn is_terminal_safe(text: &str) -> bool {
     !text.chars().any(|character| {
         matches!(
@@ -1161,14 +1146,14 @@ fn read_grok_tail(path: &Path, max_events: usize) -> Result<Vec<TailEvent>> {
                         .join("\n"),
                     _ => String::new(),
                 };
-                let text = crate::backend::squash(&sanitize_terminal_text(&text));
+                let text = sanitize_terminal_text(&crate::backend::squash(&text));
                 if !text.is_empty() {
                     events.push(TailEvent::User(text));
                 }
             }
             Some("assistant") => {
                 if let Some(text) = value.get("content").and_then(Value::as_str) {
-                    let text = crate::backend::squash(&sanitize_terminal_text(text));
+                    let text = sanitize_terminal_text(&crate::backend::squash(text));
                     if !text.is_empty() {
                         events.push(TailEvent::Agent(text));
                     }

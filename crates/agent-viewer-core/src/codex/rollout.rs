@@ -238,7 +238,9 @@ pub fn read_transcript_tail(path: &std::path::Path) -> Result<Vec<TailEvent>> {
             crate::json_str(payload, "type"),
             Some("function_call") | Some("custom_tool_call")
         ) {
-            let Some(name) = crate::json_str(payload, "name").filter(|name| !name.is_empty())
+            let Some(name) = crate::json_str(payload, "name")
+                .map(crate::backend::sanitize_display_text)
+                .filter(|name| !name.is_empty())
             else {
                 continue;
             };
@@ -247,12 +249,13 @@ pub fn read_transcript_tail(path: &std::path::Path) -> Result<Vec<TailEvent>> {
             let detail = crate::json_str(payload, "arguments")
                 .and_then(|arguments| serde_json::from_str::<serde_json::Value>(arguments).ok())
                 .map(|arguments| crate::backend::tool_detail(&arguments))
-                .or_else(|| crate::json_str(payload, "input").map(crate::backend::squash))
+                .or_else(|| {
+                    crate::json_str(payload, "input").map(|input| {
+                        crate::backend::sanitize_display_text(&crate::backend::squash(input))
+                    })
+                })
                 .unwrap_or_default();
-            items.push(TailEvent::Tool {
-                name: name.to_string(),
-                detail,
-            });
+            items.push(TailEvent::Tool { name, detail });
             continue;
         }
         // `developer` and `system` messages are harness scaffolding, not conversation: the
@@ -280,11 +283,14 @@ pub fn read_transcript_tail(path: &std::path::Path) -> Result<Vec<TailEvent>> {
         // Tool-only response_items extract to "" — skip them so the pane never shows a
         // blank role-only line.
         if !text.is_empty() && !is_environment_preamble(&text, items.len()) {
-            items.push(if role == "user" {
-                TailEvent::User(text)
-            } else {
-                TailEvent::Agent(text)
-            });
+            let text = crate::backend::sanitize_display_text(&text);
+            if !text.is_empty() {
+                items.push(if role == "user" {
+                    TailEvent::User(text)
+                } else {
+                    TailEvent::Agent(text)
+                });
+            }
         }
     }
     Ok(items)

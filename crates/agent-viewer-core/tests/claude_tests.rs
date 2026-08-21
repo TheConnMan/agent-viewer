@@ -423,6 +423,41 @@ fn parse_job_state_working_uses_detail_and_empty_default() {
     assert_eq!(empty.transcript_path, None);
 }
 
+#[test]
+fn parse_job_state_strips_esc_and_bidi_from_summary() {
+    let hostile = common::hostile_display_text();
+    let blocked = serde_json::json!({
+        "state": "blocked",
+        "needs": hostile,
+        "detail": "unused",
+    })
+    .to_string();
+    let blocked_detail = parse_job_state(&blocked);
+    assert_eq!(blocked_detail.summary, common::sanitized_display_text());
+    assert!(
+        !blocked_detail.summary.contains('\u{1b}')
+            && !blocked_detail.summary.contains('\u{202e}')
+            && !blocked_detail.summary.contains('\u{200b}'),
+        "blocked summary retained a control or bidi character: {:?}",
+        blocked_detail.summary
+    );
+
+    let working = serde_json::json!({
+        "state": "working",
+        "detail": hostile,
+    })
+    .to_string();
+    let working_detail = parse_job_state(&working);
+    assert_eq!(working_detail.summary, common::sanitized_display_text());
+    assert!(
+        !working_detail.summary.contains('\u{1b}')
+            && !working_detail.summary.contains('\u{202e}')
+            && !working_detail.summary.contains('\u{200b}'),
+        "working summary retained a control or bidi character: {:?}",
+        working_detail.summary
+    );
+}
+
 /// Write an executable stub `claude` and do not return until it can actually be exec'd.
 ///
 /// Writing an executable and immediately spawning it races against every other thread in this
@@ -645,6 +680,69 @@ fn read_claude_transcript_keeps_prose_written_before_a_tool_call_ahead_of_it() {
             },
         ]
     );
+}
+
+#[test]
+fn read_claude_transcript_strips_esc_and_bidi_from_user_agent_and_tool_events() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("hostile.jsonl");
+    let mut f = std::fs::File::create(&path).unwrap();
+    let hostile = common::hostile_display_text();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": hostile}
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": hostile},
+                    {
+                        "type": "tool_use",
+                        "name": hostile,
+                        "input": {"command": hostile}
+                    }
+                ]
+            }
+        })
+    )
+    .unwrap();
+    drop(f);
+
+    let items = read_claude_transcript(&path, 100).expect("read transcript");
+    let expected = common::sanitized_display_text();
+    assert_eq!(
+        items,
+        vec![
+            TailEvent::User(expected.to_string()),
+            TailEvent::Agent(expected.to_string()),
+            TailEvent::Tool {
+                name: expected.to_string(),
+                detail: expected.to_string(),
+            },
+        ]
+    );
+    for item in &items {
+        let text = match item {
+            TailEvent::User(text) | TailEvent::Agent(text) => text.as_str(),
+            TailEvent::Tool { name, detail } => {
+                assert!(!name.contains('\u{1b}') && !name.contains('\u{202e}'));
+                detail.as_str()
+            }
+        };
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}') && !text.contains('\u{200b}'),
+            "TailEvent retained a control or bidi character: {item:?}"
+        );
+    }
 }
 
 #[test]

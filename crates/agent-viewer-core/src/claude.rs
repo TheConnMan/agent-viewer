@@ -623,7 +623,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             id: session_id.to_string(),
             short_id,
             origin,
-            title: name.to_string(),
+            title: crate::backend::sanitize_display_text(name),
             cwd: std::path::PathBuf::from(cwd),
             git_branch: None,
             status,
@@ -745,9 +745,9 @@ pub fn parse_job_state(text: &str) -> JobDetail {
     let summary = if crate::json_str(&value, "state") == Some("blocked")
         && let Some(needs) = needs
     {
-        needs.to_string()
+        crate::backend::sanitize_display_text(needs)
     } else if let Some(detail) = crate::json_str(&value, "detail") {
-        detail.to_string()
+        crate::backend::sanitize_display_text(detail)
     } else {
         String::new()
     };
@@ -1035,18 +1035,22 @@ pub fn read_claude_transcript(
             _ => continue,
         };
         let prose = |text: String| {
-            if is_user {
+            let text = crate::backend::sanitize_display_text(&text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(if is_user {
                 TailEvent::User(text)
             } else {
                 TailEvent::Agent(text)
-            }
+            })
         };
         let content = value.get("message").and_then(|m| m.get("content"));
         match content {
             // message.content is either a plain string...
             Some(serde_json::Value::String(text)) => {
-                if !text.is_empty() {
-                    events.push(prose(text.clone()));
+                if let Some(event) = prose(text.clone()) {
+                    events.push(event);
                 }
             }
             // ...or a list of blocks: type=="text" is prose, type=="tool_use" is a tool
@@ -1061,32 +1065,32 @@ pub fn read_claude_transcript(
                             }
                         }
                         Some("tool_use") => {
-                            let Some(name) =
-                                crate::json_str(block, "name").filter(|name| !name.is_empty())
+                            let Some(name) = crate::json_str(block, "name")
+                                .map(crate::backend::sanitize_display_text)
+                                .filter(|name| !name.is_empty())
                             else {
                                 continue;
                             };
                             // Flush the prose written before this call so the pane reads in
                             // the order the agent produced it.
-                            if !text.is_empty() {
-                                events.push(prose(std::mem::take(&mut text)));
+                            if !text.is_empty()
+                                && let Some(event) = prose(std::mem::take(&mut text))
+                            {
+                                events.push(event);
                             }
                             let detail = block
                                 .get("input")
                                 .map(crate::backend::tool_detail)
                                 .unwrap_or_default();
-                            events.push(TailEvent::Tool {
-                                name: name.to_string(),
-                                detail,
-                            });
+                            events.push(TailEvent::Tool { name, detail });
                         }
                         _ => {}
                     }
                 }
                 // A message whose content is only thinking/tool_result blocks extracts to
                 // "" — skip it so the pane never shows a blank role-only line.
-                if !text.is_empty() {
-                    events.push(prose(text));
+                if let Some(event) = prose(text) {
+                    events.push(event);
                 }
             }
             _ => continue,
