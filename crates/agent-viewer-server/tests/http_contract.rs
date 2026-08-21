@@ -1136,6 +1136,47 @@ async fn claude_terminal_becomes_ready_only_after_startup_markers_clear() {
 }
 
 #[tokio::test]
+async fn claude_terminal_becomes_ready_when_startup_and_prompt_share_one_pty_read() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.15; printf 'Attaching\\r\\n\\033[2J\\033[H❯\\r\\n'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+
+    let prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines
+                .iter()
+                .any(|line| line.as_str().is_some_and(|line| line.trim() == "❯"))
+        })
+    })
+    .await;
+    assert_eq!(prompt["ready"], false);
+
+    timeout(Duration::from_millis(1_500), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await
+    .expect("stable Claude composer becomes ready without an observed startup snapshot");
+}
+
+#[tokio::test]
 async fn terminal_submit_is_rejected_until_the_native_terminal_is_ready() {
     let calls = Arc::new(FakeCalls::default());
     let script = "sleep 2; printf 'Resuming session\\r\\n'; sleep 30";
@@ -1260,6 +1301,14 @@ async fn claude_nonblank_precomposer_banner_stays_unready_and_rejects_submit() {
     assert_eq!(
         banner["ready"], false,
         "arbitrary Claude banner must fail closed"
+    );
+    let unexpected_ready = timeout(Duration::from_millis(750), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(
+        unexpected_ready.is_err(),
+        "arbitrary Claude banner must remain unready after the settle window"
     );
 
     socket
