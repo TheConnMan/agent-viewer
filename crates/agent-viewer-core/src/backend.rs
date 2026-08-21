@@ -2,6 +2,7 @@
 pub enum BackendKind {
     Codex,
     Claude,
+    Grok,
 }
 
 /// A nonsecret namespace for one concrete backend listing source.
@@ -107,11 +108,12 @@ pub struct SpawnResult {
 }
 
 impl BackendKind {
-    /// "codex" | "claude"
+    /// "codex" | "claude" | "grok"
     pub fn name(self) -> &'static str {
         match self {
             BackendKind::Codex => "codex",
             BackendKind::Claude => "claude",
+            BackendKind::Grok => "grok",
         }
     }
     /// The model label a spawn uses when the user has picked nothing: the leading entry of
@@ -122,6 +124,7 @@ impl BackendKind {
         match self {
             BackendKind::Codex => "default",
             BackendKind::Claude => "opus[1m]",
+            BackendKind::Grok => "default",
         }
     }
     /// "[cx]" | "[cc]"  (row + composer prefix)
@@ -129,6 +132,7 @@ impl BackendKind {
         match self {
             BackendKind::Codex => "[cx]",
             BackendKind::Claude => "[cc]",
+            BackendKind::Grok => "[gx]",
         }
     }
 }
@@ -414,6 +418,17 @@ pub(crate) fn dedup_preserve(v: Vec<String>) -> Vec<String> {
 }
 
 /// The fixed v1 roster. No config surface.
+#[cfg(target_os = "linux")]
+pub fn all_backends() -> Vec<Box<dyn Backend>> {
+    vec![
+        Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
+        Box::new(crate::claude::ClaudeBackend::new()),
+        Box::new(crate::grok::GrokBackend::new()),
+    ]
+}
+
+/// The fixed v1 roster. No config surface.
+#[cfg(not(target_os = "linux"))]
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
@@ -445,6 +460,28 @@ mod tests {
             "b".to_string(),
         ]);
         assert_eq!(got, vec!["default", "a", "b", "c"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_backend_roster_includes_grok() {
+        let names: Vec<_> = all_backends()
+            .into_iter()
+            .map(|backend| backend.kind().name())
+            .collect();
+
+        assert_eq!(names, vec!["codex", "claude", "grok"]);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn non_linux_backend_roster_excludes_grok() {
+        let names: Vec<_> = all_backends()
+            .into_iter()
+            .map(|backend| backend.kind().name())
+            .collect();
+
+        assert_eq!(names, vec!["codex", "claude"]);
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod claude;
 pub mod codex;
 pub mod error;
+pub mod grok;
 pub mod group;
 pub mod platform;
 pub mod pr_status;
@@ -15,6 +16,7 @@ pub use backend::{
     SpawnResult, Status, TailEvent,
 };
 pub use error::{AttachRefusal, Error, Result};
+pub use grok::{GrokBackend, GrokDiagnostics, GrokLifecycle};
 pub use pr_status::PrBadgeColor;
 pub use state::{
     ListingCacheClaim, ListingCacheLease, ListingCacheRead, ListingCacheSnapshot,

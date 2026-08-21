@@ -1,6 +1,6 @@
 # agent-viewer — build spec
 
-Terminal viewer for OpenAI Codex and Claude Code sessions, in the spirit of Claude Code's
+Terminal viewer for OpenAI Codex, Claude Code, and Grok sessions, in the spirit of Claude Code's
 `claude agents`.
 This spec is the contract. Every fact below was verified on this box (Codex 0.144.1,
 Rust 1.95.0) during research; where a fact needs live re-verification during the build it
@@ -68,10 +68,85 @@ wait for the lease holder and then read its snapshot rather than independently l
 This cache is display only. Attach, mutations, and session derived spawn directories always
 relist their authoritative source.
 
+## Grok storage and lifecycle contract
+
+The Grok backend is supported only on Linux. Its official lifecycle transport uses Unix domain
+sockets and Linux peer credential ownership checks, so other platforms neither enumerate Grok
+nor advertise its lifecycle capabilities. Grok lifecycle requires Linux kernel 5.6 or newer
+because secure durable traversal uses `openat2`, with no insecure fallback.
+
+The Grok contract was verified against official Grok Build source commit
+`19d42e35c07a9c9244f03f6df0c4c353f970d4f9`. The storage facts come from
+`xai-grok-home/src/lib.rs`, `xai-grok-config/src/paths.rs`, and the JSONL session storage under
+`xai-grok-shell/src/session/storage`. The leader and lifecycle facts come from the leader
+protocol, roster, session setup, ACP agent, and session administration extension modules at
+that commit. Extension methods are official xAI surfaces at this revision, but they do not
+carry an ACP stability guarantee.
+
+Grok home is a nonempty `GROK_HOME` value verbatim, otherwise `~/.grok`. Durable sessions live
+under its `sessions` child in a working directory bucket and then a session identity directory.
+Agent Viewer reads `summary.json` for identity, title, working directory, timestamps, and
+summary, reads `chat_history.jsonl` for the bounded transcript tail, and reads `updates.jsonl`
+for durable turn status. It never writes a durable Grok file. Missing files, torn final JSONL
+records, malformed objects, directories that vanish during refresh, and unknown fields are
+skipped without failing the other rows.
+
+Durable storage is history, not live authority, but an unambiguous final turn event supplies a
+terminal result. A `turn_completed` event with `end_turn` or `cancelled` maps to `Done`.
+`rate_limit`, `error`, `refusal`, `max_tokens`, or `max_turn_requests` maps to `Error`. A later
+`user_message_chunk`, a torn suffix, malformed evidence, or conflicting evidence maps to
+`Unknown`. When a reachable leader reports the same identity, its resident roster fields
+replace stale durable title, working directory, summary, and timestamp. Active roster activity
+wins for status. Idle or dormant roster activity preserves an unambiguous durable terminal
+result; otherwise supported roster activity maps to working, needs input, idle, done, or error,
+and unknown evidence maps to `Unknown`.
+
+Leader discovery examines the official `leader*.lock` and `leader*.sock` entries below Grok
+home, connects only to a discovered socket, registers as a client, and probes leader identity
+before sending ACP. Each frame is a four byte big endian length followed by JSON. A declared or
+outgoing body above the official 64 MiB ceiling is rejected before allocation or write. ACP is
+carried in the leader frame payload after registration, with request identity correlation while
+unrelated notifications are ignored.
+
+One leader serves multiple clients and tracks multiple sessions. A leader hosted row therefore
+has `pid: None`; resident roster state records shared hosting, never row process ownership.
+Agent Viewer may start the official leader only for a lifecycle request when none is reachable.
+It starts the leader from a stable directory and never stops or restarts it. Stop sends
+`session/cancel` with only the selected opaque session identity and never signals the leader.
+If no leader endpoint exists, or every discovered endpoint is definitively missing or refuses
+the connection, cancel succeeds idempotently because the session is already stopped. Reachable
+ownership ambiguity and substantive connection, protocol, or security failures remain errors.
+When a reachable owner exists, it always receives `session/cancel` for the selected identity.
+
+Spawn registers with `yolo_mode` set to true, initializes ACP, calls `session/new` with the
+selected working directory and optional official default model capability, preserves the
+returned `sessionId` exactly, and submits the prompt to that identity. It returns only after the
+exact identity reports `Working` in the resident roster. The official leader continues the turn
+after Agent Viewer disconnects. Rename uses `_x.ai/session/rename`; delete uses
+`_x.ai/session/delete`; model discovery uses `_x.ai/models/list`. A model discovery failure
+returns the built in `default` model. Grok exposes no archive or unarchive operation, so those
+capabilities remain false. Attach is exactly `grok --resume <session id>` with the child working
+directory set to the selected row's working directory.
+
+The official `grok` binary on `PATH` and an authenticated Grok runtime are lifecycle
+prerequisites. Agent Viewer creates no Grok configuration and copies no instruction, skill, MCP,
+or secret material. Grok's own discovery must expose the existing project instructions, at least
+one shared skill, one stdio MCP server, and one HTTP MCP server before the configuration gate can
+pass.
+
+Completion requires authenticated live proof of registration, two distinct session identities,
+resident roster transitions, transcript tailing, selected session cancellation while its sibling
+remains live, rename, delete, resume, terminal completion, exact cleanup, and the full
+configuration smoke. Deterministic protocol coverage does not replace those live gates.
+Authenticated paid execution has proved detached prompt acceptance, `Working` followed by
+`Done` after disconnect, and a persisted response. The configuration gate remains blocked
+because current official inspection exposes no MCP servers. Project instructions, one shared
+skill, one stdio MCP server, and one HTTP MCP server remain required.
+
 ## Removed backends
 
-opencode support was removed before 1.0 by owner decision: the viewer ships as Codex plus
-Claude Code, and a cleaner integration can be built later. The managed-server design
+opencode support was removed before 1.0 by owner decision: the viewer ships as Codex, Claude
+Code, and Grok, and a cleaner opencode integration can be built later. The managed-server design
 (credential pinning, the same-stream authorization rule, and the measured Linux
 `TCP_DEFER_ACCEPT` evidence behind it) lives in git history at commit `30ed871`, the last one
 carrying the "Enumeration and runtime: opencode" section.
@@ -615,7 +690,8 @@ that process. Only spawn may start; attach and stop probe. See "Codex attach/res
 Every backend advertises its spawnable models through `available_models()` (default first).
 Codex discovers them by shelling out, and that shell-out is slow enough to shape the design.
 Measured on this box, `codex debug models` takes seconds on a cold run; Claude's list is a
-`~/.claude.json` read and effectively free.
+`~/.claude.json` read and effectively free. Grok asks the reachable official leader for its
+model list and safely retains its built in `default` entry when that request is unavailable.
 
 - **The probe never runs on the render thread.** The composer's key path reads memory only.
   `ModelCache` (TUI) spawns discovery on a worker thread, results drain non-blocking via
@@ -688,7 +764,8 @@ name override is involved, so the list can never disagree with `claude agents`.
 
 ## Routed spawn — `agent-router`, and why it is not a backend
 
-Every ordinary task or text command goes through the `agent-router` CLI when it is installed,
+Every ordinary task or text command for Auto, Codex, or Claude goes through the `agent-router`
+CLI when it is installed,
 parsed into a `RouterOutcome` by `core/router.rs`. Two shapes of the same call:
 
 - **Auto** (the composer's fourth selector entry):
@@ -705,7 +782,7 @@ writes the decision-log row that makes a viewer-started job visible to `agent-ro
 `agent-router status` alongside every other dispatch. The backend that runs the job is the one
 the user picked either way, so nothing about the choice is taken from them.
 
-Three carve-outs, all deliberate:
+Four carve-outs, all deliberate:
 
 - **No router on `PATH`** — spawns call the backend's own CLI exactly as before. The router is
   an enhancement, not a dependency.
@@ -715,6 +792,11 @@ Three carve-outs, all deliberate:
 - **A structured Codex skill:** the discovered skill path is sent directly through the Codex
   app server. This bypasses router naming and the decision log because the router has no
   structured skill invocation.
+- **Phase 1 Grok:** Agent Router does not yet accept a Grok provider, so a composer pinned to
+  Grok calls `GrokBackend::spawn`, which delegates to the public `GrokLifecycle`, even when the
+  router binary is installed. Auto and pinned Codex or Claude keep their existing routes. Phase 2
+  removes only this carveout after Agent Router consumes the public lifecycle and returns exact
+  Grok session identity through its normal outcome contract.
 
 `--model` carries an explicit composer's selection on a pinned route only: the router refuses it
 without an explicit `--provider`, so a provider Auto route must never send one. When routing is
@@ -782,9 +864,13 @@ Cargo workspace, two crates plus one vendored dependency. Live-refresh the regis
   `attach_route`, `stop_route`).
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
   trust bootstrap, and spawn/attach/stop/remove/rename.
-- `router.rs` is the `agent-router` shell-out used for ordinary tasks and text commands when the
-  binary is installed, on Auto and on a pinned provider alike. Deliberately not a `Backend`: it
-  enumerates nothing and owns no sessions.
+- `grok.rs` is the Grok backend and the reusable public `GrokLifecycle`: read only durable
+  discovery, bounded transcript tails, leader registration and framing, roster precedence,
+  lifecycle requests, diagnostics, model fallback, and exact official attach construction.
+- `router.rs` is the `agent-router` shell out used for ordinary tasks and text commands by Auto
+  and by pinned Codex or Claude when
+  the binary is installed. It deliberately is not a `Backend`: it enumerates nothing and owns
+  no sessions. Pinned Grok temporarily uses `GrokLifecycle` directly until Router Phase 2.
 - `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
   badge color.
 - `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the

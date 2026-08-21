@@ -257,6 +257,7 @@ fn probe_local_commands(key: &CommandCacheKey) -> Vec<CommandEntry> {
             .into_iter()
             .map(CommandEntry::codex_prompt)
             .collect::<Vec<_>>(),
+        BackendKind::Grok => Vec::new(),
     }
 }
 

@@ -5,6 +5,9 @@ use agent_viewer_core::state::{
     DEFAULT_RETENTION_WINDOW_MS, GroupingMode, SortOrder, SpawnRecord, ViewerDb, ViewerState,
     apply_viewer_state, match_spawn, match_spawn_between,
 };
+use agent_viewer_core::{
+    ListingCacheClaim, ListingCacheRead, ListingCacheScope, ListingCacheSnapshot,
+};
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -163,6 +166,81 @@ fn viewer_db_spawn_roundtrip() {
             .get(&(BackendKind::Codex, "session-xyz".to_string())),
         Some(&4242)
     );
+}
+
+#[test]
+fn viewer_db_grok_spawn_identity_round_trip() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    let cwd = PathBuf::from("/home/user/grok-project");
+    let rowid = db
+        .record_spawn(BackendKind::Grok, &cwd, 42_424, 1_787_289_306_007)
+        .expect("record Grok spawn");
+
+    let stored = db
+        .unresolved_spawns()
+        .expect("read unresolved Grok spawn")
+        .into_iter()
+        .find(|record| record.rowid == rowid)
+        .expect("Grok spawn record");
+    assert_eq!(stored.backend, BackendKind::Grok);
+    assert_eq!(stored.cwd, cwd);
+
+    db.resolve_spawn(rowid, "grok-session-exact")
+        .expect("resolve exact Grok identity");
+    drop(db);
+    let reopened = ViewerDb::open(&path).expect("reopen viewer db");
+    let state = reopened.viewer_state().expect("read Grok viewer state");
+    assert!(
+        state
+            .pinned
+            .contains(&(BackendKind::Grok, "grok-session-exact".to_string()))
+    );
+    assert_eq!(
+        state
+            .spawn_pids
+            .get(&(BackendKind::Grok, "grok-session-exact".to_string())),
+        Some(&42_424)
+    );
+}
+
+#[test]
+fn viewer_db_grok_listing_snapshot_round_trip_preserves_backend_and_status() {
+    let (_dir, path) = temp_db_path();
+    let db = ViewerDb::open(&path).expect("open viewer db");
+    let scope = ListingCacheScope::new(BackendKind::Grok, "official-grok-home")
+        .expect("Grok listing scope");
+    let lease = match db
+        .claim_listing_refresh(Some(&scope), None, 10_000, 2_000, 5_000)
+        .expect("claim Grok listing")
+    {
+        ListingCacheClaim::Claimed(lease) => lease,
+        other => panic!("expected Grok listing lease, got {other:?}"),
+    };
+    let original = sess(
+        BackendKind::Grok,
+        "grok-snapshot-session",
+        "/home/user/grok-project",
+        9_000,
+        Status::Unknown,
+    );
+    db.publish_listing(
+        &lease,
+        ListingCacheSnapshot::from_sessions(vec![original.clone()]).expect("encode Grok listing"),
+        10_000,
+    )
+    .expect("publish Grok listing");
+
+    drop(db);
+    let reopened = ViewerDb::open(&path).expect("reopen viewer db");
+    let snapshot = match reopened
+        .read_listing_snapshot(&scope, 10_001)
+        .expect("read Grok listing")
+    {
+        ListingCacheRead::Fresh(snapshot) => snapshot,
+        other => panic!("expected fresh Grok listing, got {other:?}"),
+    };
+    assert_eq!(snapshot.into_sessions(), vec![original]);
 }
 
 #[test]

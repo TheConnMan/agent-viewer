@@ -8,7 +8,7 @@ use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_tui::app::{DetachTracker, KillStage};
+use agent_viewer_tui::app::{DetachTracker, KillStage, SpawnRoute};
 use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal, TriageState, triage_queue};
@@ -608,7 +608,10 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
 ) -> io::Result<bool> {
     let AttachPlan { session, command } = plan;
     let key: Key = (session.backend, session.id.clone());
-    let capture_on_attach = matches!(session.backend, BackendKind::Codex | BackendKind::Claude);
+    let capture_on_attach = matches!(
+        session.backend,
+        BackendKind::Codex | BackendKind::Claude | BackendKind::Grok
+    );
     let size = terminal
         .size()
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -663,7 +666,7 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     if !triage {
         ui.mode = Mode::Attached;
     }
-    // Codex and Claude scroll immediately.
+    // Every concrete backend scrolls immediately.
     set_mouse_capture(ui, capture_on_attach);
     Ok(true)
 }
@@ -737,6 +740,10 @@ pub(crate) fn spawn_from_composer(
         refresher.force();
         return true;
     }
+    let route = ui.composer.spawn_route(
+        ui.composer.backend() == BackendKind::Codex
+            && agent_viewer_core::codex::exec_spawn_opt_in(),
+    );
     if ui.composer.is_auto() {
         let provider = selected_command.as_ref().and_then(CommandEntry::owner);
         return spawn_through_router(refresher, ui, target, provider, None);
@@ -761,12 +768,7 @@ pub(crate) fn spawn_from_composer(
     // job name and a row in the router's decision log. The direct backend call below is the
     // fallback for a box with no router installed.
     //
-    // The codex exec opt-in is the one carve-out. It selects a spawn path (`codex exec`, no
-    // daemon) that the router does not offer, so routing would silently ignore an env var the
-    // operator set deliberately.
-    let exec_pinned =
-        backend_kind == BackendKind::Codex && agent_viewer_core::codex::exec_spawn_opt_in();
-    if ui.composer.router_available() && !exec_pinned {
+    if route == SpawnRoute::Router {
         return spawn_through_router(refresher, ui, target, Some(backend_kind), model);
     }
     let notice = match model.as_deref() {

@@ -159,10 +159,12 @@ pub fn wall_sessions(app: &App, now_ms: i64) -> Vec<(BackendKind, String)> {
                     let left_backend = match left_backend {
                         BackendKind::Codex => 0,
                         BackendKind::Claude => 1,
+                        BackendKind::Grok => 2,
                     };
                     let right_backend = match right_backend {
                         BackendKind::Codex => 0,
                         BackendKind::Claude => 1,
+                        BackendKind::Grok => 2,
                     };
                     left_backend.cmp(&right_backend)
                 })

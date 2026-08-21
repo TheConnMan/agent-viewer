@@ -14,6 +14,7 @@ use ratatui_image::protocol::Protocol;
 /// time so there is no runtime asset path to resolve.
 const CLAUDE_SVG: &str = include_str!("../assets/logos/claude.svg");
 const CODEX_SVG: &str = include_str!("../assets/logos/codex.svg");
+const GROK_SVG: &str = include_str!("../assets/logos/grok.svg");
 /// The Auto spawn entry is not a backend, so it carries a neutral robot mark instead of a brand.
 const AUTO_SVG: &str = include_str!("../assets/logos/auto.svg");
 
@@ -27,9 +28,11 @@ const RASTER_PX: u32 = 64;
 pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
+    grok: Protocol,
     auto: Protocol,
     composer_claude: Option<Protocol>,
     composer_codex: Option<Protocol>,
+    composer_grok: Option<Protocol>,
     composer_auto: Option<Protocol>,
 }
 
@@ -52,13 +55,16 @@ impl LogoMarks {
     fn from_picker(picker: &Picker) -> anyhow::Result<LogoMarks> {
         let (claude, composer_claude) = build_protocols(picker, CLAUDE_SVG)?;
         let (codex, composer_codex) = build_protocols(picker, CODEX_SVG)?;
+        let (grok, composer_grok) = build_protocols(picker, GROK_SVG)?;
         let (auto, composer_auto) = build_protocols(picker, AUTO_SVG)?;
         Ok(LogoMarks {
             claude,
             codex,
+            grok,
             auto,
             composer_claude,
             composer_codex,
+            composer_grok,
             composer_auto,
         })
     }
@@ -68,6 +74,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => &self.claude,
             BackendKind::Codex => &self.codex,
+            BackendKind::Grok => &self.grok,
         }
     }
 
@@ -77,6 +84,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => self.composer_claude.as_ref().unwrap_or(&self.claude),
             BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
+            BackendKind::Grok => self.composer_grok.as_ref().unwrap_or(&self.grok),
         }
     }
 
@@ -165,9 +173,45 @@ mod tests {
     use super::{LogoMarks, build_composer_canvas};
     use agent_viewer_core::BackendKind;
     use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Size;
+    use ratatui::style::Color;
+    use ratatui_image::Image;
     use ratatui_image::picker::{Picker, ProtocolType};
+    use ratatui_image::protocol::Protocol;
     use ratatui_image::{FontSize, Resize};
+
+    fn rendered_cells(protocol: &Protocol) -> Vec<(String, Color, Color)> {
+        let size = protocol.size();
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Image::new(protocol), frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.fg, cell.bg))
+            .collect()
+    }
+
+    #[test]
+    fn halfblocks_picker_maps_grok_to_its_deterministic_image_mark() {
+        let picker = Picker::halfblocks();
+        let first = LogoMarks::from_picker(&picker).unwrap();
+        let second = LogoMarks::from_picker(&picker).unwrap();
+
+        let grok = rendered_cells(first.image(BackendKind::Grok));
+        assert_eq!(grok, rendered_cells(second.image(BackendKind::Grok)));
+        assert_ne!(grok, rendered_cells(first.image(BackendKind::Codex)));
+        assert_ne!(grok, rendered_cells(first.image(BackendKind::Claude)));
+        assert_eq!(
+            grok,
+            rendered_cells(first.composer_image(BackendKind::Grok))
+        );
+    }
 
     #[test]
     fn graphics_composer_image_uses_its_own_three_cell_canvas() {

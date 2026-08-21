@@ -49,7 +49,7 @@ pub use wall::{WallState, WallTile, WallView};
 pub type Pulses = HashMap<(BackendKind, String), i64>;
 
 /// Startup-read (once, never per-frame): when true, list rows + composer use the brand
-/// glyphs (✳/◆) instead of the DEFAULT textual `[cc]`/`[cx]` tags — an opt-in for
+/// glyphs (✳/◆/X) instead of the DEFAULT textual `[cc]`/`[cx]`/`[gx]` tags — an opt-in for
 /// terminals whose font renders them. Set from `AGENT_VIEWER_GLYPH_MARKS=1`.
 static GLYPH_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -97,6 +97,7 @@ fn mark_for(backend: BackendKind, glyph: bool) -> &'static str {
     match backend {
         BackendKind::Claude => "✳",
         BackendKind::Codex => "◆",
+        BackendKind::Grok => "X",
     }
 }
 
@@ -105,6 +106,7 @@ fn backend_mark_color(backend: BackendKind, theme: &Theme) -> ratatui::style::Co
     match backend {
         BackendKind::Claude => theme.cc,
         BackendKind::Codex => theme.cx,
+        BackendKind::Grok => theme.text,
     }
 }
 
