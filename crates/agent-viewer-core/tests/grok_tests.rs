@@ -2638,214 +2638,45 @@ mod protocol {
         );
     }
     #[test]
-    fn started_leader_process_is_detached_and_reaped() {
+    fn lifecycle_requires_the_persistent_leader_and_never_starts_one() {
         use std::os::unix::fs::PermissionsExt;
 
-        if !Path::new("/proc/self/stat").is_file() {
-            return;
-        }
         let home = tempfile::tempdir().expect("temporary Grok home");
-        let replacement_home = tempfile::tempdir().expect("replacement leader home");
-        let replacement = ScriptedLeader::start(replacement_home.path(), false);
+        write_durable_grok_session(home.path(), "session-durable", &[]);
         let binary = home.path().join("fake-grok");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$GROK_HOME/start-pid\"\ncp /proc/$$/stat \"$GROK_HOME/start-stat\"\nln '{}' \"$GROK_HOME/leader.sock\"\nprintf '%s' \"$$\" > \"$GROK_HOME/leader.lock\"\n",
-            replacement.socket.display()
-        );
-        fs::write(&binary, script).expect("fake official Grok binary");
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-            .expect("executable fake Grok binary");
-
-        GrokLifecycle::new(&binary, home.path())
-            .spawn(
-                Path::new("/home/user/project"),
-                "start detached leader",
-                None,
-            )
-            .expect("spawn through newly started leader");
-        let session_id = |stat: &str| {
-            stat.rsplit_once(") ")
-                .and_then(|(_, fields)| fields.split_whitespace().nth(3))
-                .and_then(|value| value.parse::<u32>().ok())
-                .expect("Linux process session identity")
-        };
-        let parent_session =
-            session_id(&fs::read_to_string("/proc/self/stat").expect("test process status"));
-        let child_session = session_id(
-            &fs::read_to_string(home.path().join("start-stat")).expect("started leader status"),
-        );
-        let child_pid = fs::read_to_string(home.path().join("start-pid"))
-            .expect("started leader pid")
-            .parse::<u32>()
-            .expect("numeric started leader pid");
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while Path::new(&format!("/proc/{child_pid}")).exists()
-            && std::time::Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let detached = child_session != parent_session;
-        let reaped = !Path::new(&format!("/proc/{child_pid}")).exists();
-        assert!(
-            detached && reaped,
-            "started leader must be detached and reaped: detached={detached}, reaped={reaped}"
-        );
-    }
-
-    #[test]
-    fn start_resolves_relative_grok_home_before_setting_child_cwd() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let process_cwd = std::env::current_dir().expect("current test directory");
-        let home = tempfile::Builder::new()
-            .prefix(".grok-start-relative-")
-            .tempdir_in(&process_cwd)
-            .expect("relative Grok home below current directory");
-        fs::create_dir(home.path().join("safe")).expect("safe relative component");
-        let absolute_home = fs::canonicalize(home.path()).expect("absolute Grok home target");
-        let relative_home = PathBuf::from(
-            home.path()
-                .file_name()
-                .expect("relative Grok home file name"),
-        )
-        .join("safe")
-        .join("..");
-        let replacement_home = tempfile::tempdir().expect("replacement leader home");
-        let replacement = ScriptedLeader::start(replacement_home.path(), false);
-        let binary = absolute_home.join("fake-grok");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s' \"$GROK_HOME\" > '{}/start-home'\nprintf '%s' \"$PWD\" > '{}/start-cwd'\nln '{}' '{}/leader.sock'\nprintf '%s' \"$$\" > '{}/leader.lock'\n",
-            absolute_home.display(),
-            absolute_home.display(),
-            replacement.socket.display(),
-            absolute_home.display(),
-            absolute_home.display()
-        );
-        fs::write(&binary, script).expect("fake official Grok binary");
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-            .expect("executable fake Grok binary");
-
-        let result = GrokLifecycle::new(&binary, &relative_home)
-            .spawn(
-                Path::new("/home/user/project"),
-                "resolve relative Grok home",
-                None,
-            )
-            .expect("spawn through a leader started from a relative Grok home");
-        assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
-        assert_eq!(
-            fs::read_to_string(absolute_home.join("start-home")).expect("captured child Grok home"),
-            absolute_home.display().to_string(),
-            "child GROK_HOME must be resolved before child cwd changes"
-        );
-        assert_eq!(
-            fs::read_to_string(absolute_home.join("start-cwd")).expect("captured child cwd"),
-            absolute_home.display().to_string(),
-            "the leader child must start from the resolved Grok home"
-        );
-        assert_eq!(
-            std::env::current_dir().expect("current test directory after spawn"),
-            process_cwd
-        );
-        assert!(
-            replacement
-                .captured()
-                .iter()
-                .any(|frame| frame.body["type"] == "register"),
-            "lifecycle must discover the replacement at the original absolute target"
-        );
-    }
-
-    #[test]
-    fn start_operation_recovers_from_stale_connection_refused_via_configured_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = tempfile::tempdir().expect("temporary Grok home");
-        let stale_socket = home.path().join("leader.sock");
-        let stale_listener = UnixListener::bind(&stale_socket).expect("stale leader socket");
-        drop(stale_listener);
         fs::write(
-            home.path().join("leader.lock"),
-            std::process::id().to_string(),
+            &binary,
+            "#!/bin/sh\nprintf invoked > \"$(dirname \"$0\")/invoked\"\n",
         )
-        .expect("stale leader lock");
-
-        let replacement_home = tempfile::tempdir().expect("replacement leader home");
-        let replacement = ScriptedLeader::start(replacement_home.path(), false);
-        let binary = home.path().join("fake-grok");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GROK_HOME/start-argv\"\nprintf '%s' \"$PWD\" > \"$GROK_HOME/start-cwd\"\nprintf '%s' \"$$\" > \"$GROK_HOME/start-pid\"\nif [ -r /proc/$$/stat ]; then cp /proc/$$/stat \"$GROK_HOME/start-stat\"; fi\nln '{}' \"$GROK_HOME/leader-replacement.sock\"\nprintf '%s' \"$$\" > \"$GROK_HOME/leader-replacement.lock\"\n",
-            replacement.socket.display()
-        );
-        fs::write(&binary, script).expect("fake official Grok binary");
+        .expect("fake official Grok binary");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
             .expect("executable fake Grok binary");
 
         let lifecycle = GrokLifecycle::new(&binary, home.path());
-        let result = lifecycle
-            .spawn(
-                Path::new("/home/user/project"),
-                "recover stale leader",
-                None,
-            )
-            .expect("a start operation must recover from a stale refused leader socket");
-        assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
-        assert!(home.path().join("start-argv").is_file());
-        assert_eq!(
-            fs::read_to_string(home.path().join("start-argv")).expect("started leader argv"),
-            "agent\nleader\n--no-exit-on-disconnect\n--relay-on-demand\n"
-        );
-        assert_eq!(
-            fs::read_to_string(home.path().join("start-cwd")).expect("started leader cwd"),
-            home.path().display().to_string()
-        );
-        assert!(
-            stale_socket.exists(),
-            "recovery must not delete shared runtime state"
-        );
-        assert!(
-            replacement
-                .captured()
-                .iter()
-                .any(|frame| frame.body["type"] == "register"),
-            "the replacement official leader must accept the lifecycle connection"
-        );
-
-        if Path::new("/proc/self/stat").is_file() {
-            let session_id = |stat: &str| {
-                stat.rsplit_once(") ")
-                    .and_then(|(_, fields)| fields.split_whitespace().nth(3))
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .expect("Linux process session identity")
-            };
-            let parent_session =
-                session_id(&fs::read_to_string("/proc/self/stat").expect("test process status"));
-            let child_session = session_id(
-                &fs::read_to_string(home.path().join("start-stat")).expect("started leader status"),
-            );
-            let child_pid = fs::read_to_string(home.path().join("start-pid"))
-                .expect("started leader pid")
-                .parse::<u32>()
-                .expect("numeric started leader pid");
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while Path::new(&format!("/proc/{child_pid}")).exists()
-                && std::time::Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            let detached = child_session != parent_session;
-            let reaped = !Path::new(&format!("/proc/{child_pid}")).exists();
+        let errors = [
+            lifecycle
+                .spawn(
+                    Path::new("/home/user/project"),
+                    "require persistent leader",
+                    None,
+                )
+                .expect_err("missing persistent leader must refuse spawn"),
+            lifecycle
+                .rename("session-durable", "Persistent title")
+                .expect_err("missing persistent leader must refuse rename"),
+            lifecycle
+                .delete("session-durable")
+                .expect_err("missing persistent leader must refuse delete"),
+        ];
+        for error in errors {
             assert!(
-                detached && reaped,
-                "started leader must be detached and reaped: detached={detached}, reaped={reaped}"
+                error.to_string().contains("grok-agent-leader.service"),
+                "missing leader error must name the persistent service: {error}"
             );
         }
-
-        let diagnostics = lifecycle
-            .diagnostics()
-            .expect("replacement leader diagnostics");
-        assert!(diagnostics.registered);
-        assert!(diagnostics.leader_count >= 2);
-        assert!(!diagnostics.methods.is_empty());
+        assert!(
+            !home.path().join("invoked").exists(),
+            "Agent Viewer must never start or replace the persistent leader"
+        );
     }
 }

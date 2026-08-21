@@ -120,7 +120,7 @@ impl GrokLifecycle {
                     "Grok model identity contains unsafe characters".into(),
                 ));
             }
-            let mut client = self.connect_or_start(model)?;
+            let mut client = self.connect_required(model)?;
             let response =
                 client.request("session/new", json!({"cwd": cwd_text, "mcpServers": []}))?;
             let session_id = response
@@ -229,7 +229,7 @@ impl GrokLifecycle {
         require_session_id(session_id)?;
         #[cfg(target_os = "linux")]
         {
-            let mut client = self.connect_or_start(None)?;
+            let mut client = self.connect_required(None)?;
             let response = client.ext_request(
                 "x.ai/session/rename",
                 json!({"sessionId": session_id, "title": title}),
@@ -251,7 +251,7 @@ impl GrokLifecycle {
         #[cfg(target_os = "linux")]
         {
             let cwd = durable_session_cwd(&self.home, session_id)?;
-            let mut client = self.connect_or_start(None)?;
+            let mut client = self.connect_required(None)?;
             let response = client.ext_request(
                 "x.ai/session/delete",
                 json!({"sessionId": session_id, "cwd": cwd}),
@@ -346,55 +346,14 @@ impl GrokLifecycle {
     }
 
     #[cfg(target_os = "linux")]
-    fn connect_or_start(&self, model: Option<&str>) -> Result<LeaderClient> {
-        let mut last_error = match self.connect_existing(model, true) {
-            Ok((_, mut clients)) if !clients.is_empty() => return Ok(clients.remove(0)),
-            Err(error) => Some(error),
-            Ok(_) => None,
-        };
-        self.start_leader()?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match self.connect_existing(model, true) {
-                Ok((_, mut clients)) if !clients.is_empty() => return Ok(clients.remove(0)),
-                Err(error) => last_error = Some(error),
-                _ => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(last_error.unwrap_or_else(|| {
-                    Error::Command("official Grok leader did not become reachable".into())
-                }));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+    fn connect_required(&self, model: Option<&str>) -> Result<LeaderClient> {
+        match self.connect_existing(model, true) {
+            Ok((_, mut clients)) if !clients.is_empty() => Ok(clients.remove(0)),
+            Err(error) if !is_definitively_unreachable_error(&error) => Err(error),
+            Ok(_) | Err(_) => Err(Error::Command(
+                "persistent Grok leader is not reachable; start grok-agent-leader.service".into(),
+            )),
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn start_leader(&self) -> Result<()> {
-        if !binary_available(&self.binary) {
-            return Err(Error::Command(
-                "official grok binary is unavailable".to_string(),
-            ));
-        }
-        let resolved_home = lexical_absolute_path(&self.home)?;
-        let stable_cwd = if resolved_home.is_dir() {
-            resolved_home.as_path()
-        } else {
-            resolved_home
-                .parent()
-                .filter(|parent| parent.is_dir())
-                .unwrap_or_else(|| Path::new("/"))
-        };
-        let mut command = std::process::Command::new(&self.binary);
-        command
-            .arg("agent")
-            .arg("leader")
-            .arg("--no-exit-on-disconnect")
-            .arg("--relay-on-demand")
-            .env("GROK_HOME", &resolved_home)
-            .current_dir(stable_cwd);
-        crate::spawn::spawn_detached_silent(command)?;
-        Ok(())
     }
 }
 

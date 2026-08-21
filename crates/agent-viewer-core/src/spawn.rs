@@ -240,38 +240,6 @@ pub fn spawn_detached(mut cmd: std::process::Command, log_path: &std::path::Path
     Ok(reap_detached(cmd.spawn()?))
 }
 
-/// Spawn a detached child with all standard streams disconnected and reap it asynchronously.
-pub(crate) fn spawn_detached_silent(mut cmd: std::process::Command) -> Result<u32> {
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-
-        // SAFETY: setsid() is async-signal-safe and the only work done in the child between
-        // fork and exec.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    Ok(reap_detached(cmd.spawn()?))
-}
-
 /// Create (or reopen) a spawn log, readable only by its owner on unix.
 ///
 /// These logs are the backend's raw stdout/stderr: the task prompt, file contents it printed,

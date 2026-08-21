@@ -47,6 +47,8 @@ or unarchive capability. Durable `updates.jsonl` records identify unambiguous co
 failed turns. Live active roster state wins; idle or dormant roster state preserves an
 unambiguous durable terminal result. Ambiguous or later activity remains unknown. A shared
 leader never becomes row process ownership, and Agent Viewer never stops or restarts it.
+Grok lifecycle actions require the persistent `grok-agent-leader.service` described under
+Install; Agent Viewer reports an actionable error instead of starting a competing leader.
 
 Grok requires the official `grok` binary on `PATH` and an authenticated Grok runtime. Agent
 Viewer writes no Grok configuration. The official runtime remains responsible for discovering
@@ -519,6 +521,28 @@ cargo install --git https://github.com/TheConnMan/agent-viewer agent-viewer-tui
 
 A source build uses the repository's vendored vt100 patch, so it pulls the whole repo rather
 than the published crate.
+
+### Persistent Grok leader (Linux)
+
+Grok background turns need one user-owned process that outlives every submitting client. The
+reference unit lives at
+`crates/agent-viewer-core/systemd/grok-agent-leader.service`. It assumes the official `grok`
+binary is `~/.local/bin/grok` and uses the default `~/.grok` home; edit `ExecStart` or
+`Environment=GROK_HOME=...` in the installed copy when either path differs.
+
+```bash
+install -Dm644 crates/agent-viewer-core/systemd/grok-agent-leader.service \
+  ~/.config/systemd/user/grok-agent-leader.service
+systemctl --user daemon-reload
+systemctl --user enable --now grok-agent-leader.service
+systemctl --user status grok-agent-leader.service
+```
+
+Inspect the persistent owner with `grok leader list`, and inspect service failures with
+`journalctl --user -u grok-agent-leader.service`. The unit restarts the official leader after a
+crash or Grok-managed update. Agent Viewer only connects to it: submission returns after the
+exact session becomes resident and working, while the leader continues the turn. Opening that
+row uses `grok --leader --resume` and therefore cannot replace the service.
 
 ## Run
 
