@@ -283,7 +283,8 @@ class ApiContractTest {
               "cursor_row": 23,
               "cursor_col": 7,
               "lines": ["first line", "waiting for input"],
-              "running": true
+              "running": true,
+              "ready": true
             }
             """.trimIndent(),
         )
@@ -296,6 +297,7 @@ class ApiContractTest {
         assertEquals(7, screen.cursorCol)
         assertEquals(listOf("first line", "waiting for input"), screen.lines)
         assertTrue(screen.running)
+        assertTrue(screen.ready)
     }
 
     @Test
@@ -315,6 +317,247 @@ class ApiContractTest {
     }
 
     @Test
+    fun `terminal submit separates line text from enter and carries a delivery id`() {
+        val deliveryId = 5_000_000_000L
+        val submit = ApiJson.json.parseToJsonElement(
+            ApiJson.json.encodeToString<TerminalCommand>(
+                TerminalCommand.Submit(id = deliveryId, text = "Review café 漢字"),
+            ),
+        ).jsonObject
+
+        assertEquals(JsonPrimitive("submit"), submit["type"])
+        assertEquals(JsonPrimitive(deliveryId), submit["id"])
+        assertEquals(JsonPrimitive("Review café 漢字"), submit["text"])
+        assertEquals(setOf("type", "id", "text"), submit.keys)
+    }
+
+    @Test
+    fun `terminal acknowledgement clears only its matching pending draft`() {
+        val deliveryId = 5_000_000_000L
+        val queued = TerminalInputState(draft = "keep this message").enqueued(deliveryId)
+        val unrelatedAck = terminalInputAfterServerFrame(
+            queued,
+            """{"type":"ack","id":4999999999}""",
+        )
+        val matchingAck = terminalInputAfterServerFrame(
+            queued,
+            """{"type":"ack","id":$deliveryId}""",
+        )
+        val failed = queued.failed()
+        val ack = ApiJson.json.decodeFromString<TerminalAck>(
+            """{"type":"ack","id":$deliveryId}""",
+        )
+
+        assertEquals("keep this message", queued.draft)
+        assertEquals(deliveryId, queued.pendingId)
+        assertEquals(queued, unrelatedAck)
+        assertEquals("", matchingAck.draft)
+        assertNull(matchingAck.pendingId)
+        assertEquals("keep this message", failed.draft)
+        assertNull(failed.pendingId)
+        assertEquals("ack", ack.type)
+        assertEquals(deliveryId, ack.id)
+    }
+
+    @Test
+    fun `terminal malformed and unknown frames preserve the draft for retry`() {
+        val queued = TerminalInputState(draft = "retry this message").enqueued(5_000_000_000L)
+
+        listOf(
+            """{"type":"ack","id":"not a number"}""",
+            """{"type":"future-frame"}""",
+            "not json",
+        ).forEach { frame ->
+            val retryable = terminalInputAfterServerFrame(queued, frame)
+            assertEquals("retry this message", retryable.draft)
+            assertNull(retryable.pendingId)
+        }
+    }
+
+    @Test
+    fun `terminal composed send requires a connected stable ready screen and no pending delivery`() {
+        val ready = TerminalScreen(
+            type = "screen",
+            seq = 7,
+            rows = 24,
+            cols = 80,
+            cursorRow = 23,
+            cursorCol = 2,
+            lines = listOf("› "),
+            running = true,
+            ready = true,
+        )
+
+        assertTrue(terminalSubmitEnabled("connected", ready, pendingId = null, closeRequested = false))
+        assertFalse(terminalSubmitEnabled("connecting", ready, pendingId = null, closeRequested = false))
+        assertFalse(
+            terminalSubmitEnabled("connected", ready.copy(running = false), pendingId = null, closeRequested = false),
+        )
+        assertFalse(
+            terminalSubmitEnabled("connected", ready.copy(ready = false), pendingId = null, closeRequested = false),
+        )
+        assertFalse(terminalSubmitEnabled("connected", ready, pendingId = 9L, closeRequested = false))
+        assertFalse(terminalSubmitEnabled("connected", ready, pendingId = null, closeRequested = true))
+    }
+
+    @Test
+    fun `terminal reconnect retries spontaneous endings without losing the draft`() {
+        val current = TerminalConnectionState(
+            generation = 7L,
+            inputState = TerminalInputState(draft = "retry after reconnect").enqueued(5_000_000_000L),
+            screenSequence = 42L,
+        )
+
+        listOf(TerminalSocketEnd.SPONTANEOUS_CLOSE, TerminalSocketEnd.FAILURE).forEach { ending ->
+            val decision = terminalConnectionEnded(
+                current,
+                callbackGeneration = 7L,
+                ending,
+                screenRunning = true,
+            )
+            assertTrue(decision.reconnectScheduled)
+            assertEquals("retry after reconnect", decision.inputState.draft)
+            assertNull(decision.inputState.pendingId)
+        }
+    }
+
+    @Test
+    fun `terminal reconnect ignores intentional and stale socket endings`() {
+        val current = TerminalConnectionState(
+            generation = 7L,
+            inputState = TerminalInputState(draft = "current draft").enqueued(5_000_000_000L),
+            screenSequence = 42L,
+        )
+
+        listOf(TerminalSocketEnd.INTENTIONAL_CLOSE, TerminalSocketEnd.DISPOSE).forEach { ending ->
+            val decision = terminalConnectionEnded(
+                current,
+                callbackGeneration = 7L,
+                ending,
+                screenRunning = true,
+            )
+            assertFalse(decision.reconnectScheduled)
+            assertEquals("current draft", decision.inputState.draft)
+            assertNull(decision.inputState.pendingId)
+        }
+
+        val staleFailure = terminalConnectionEnded(
+            current,
+            callbackGeneration = 6L,
+            TerminalSocketEnd.FAILURE,
+            screenRunning = true,
+        )
+        assertEquals(current, staleFailure)
+    }
+
+    @Test
+    fun `terminal close after a final ended screen does not reconnect`() {
+        val endedScreen = TerminalScreen(
+            type = "screen",
+            seq = 42L,
+            rows = 24,
+            cols = 80,
+            cursorRow = 23,
+            cursorCol = 0,
+            lines = listOf("session ended"),
+            running = false,
+            ready = false,
+        )
+        val current = TerminalConnectionState(
+            generation = 7L,
+            inputState = TerminalInputState(draft = "preserved after completion"),
+            screenSequence = 42L,
+        )
+
+        val decision = terminalConnectionEnded(
+            current,
+            callbackGeneration = 7L,
+            TerminalSocketEnd.SPONTANEOUS_CLOSE,
+            screenRunning = endedScreen.running,
+        )
+
+        assertFalse(decision.reconnectScheduled)
+        assertEquals("preserved after completion", decision.inputState.draft)
+    }
+
+    @Test
+    fun `terminal every fresh socket attempt resets screen generation and sequence`() {
+        val visibleScreen = TerminalScreen(
+            type = "screen",
+            seq = 42L,
+            rows = 24,
+            cols = 80,
+            cursorRow = 23,
+            cursorCol = 0,
+            lines = listOf("previous socket"),
+            running = true,
+            ready = true,
+        )
+        val initial = TerminalConnectionState(
+            inputState = TerminalInputState(draft = "preserved"),
+            screenSequence = 42L,
+        )
+        val firstAttempt = terminalSocketAttemptStarted(initial)
+        assertTrue(firstAttempt.clearScreen)
+        assertEquals(1L, firstAttempt.connectionState.generation)
+        assertNull(firstAttempt.connectionState.screenSequence)
+        assertTrue(
+            terminalScreenFrameIsCurrent(firstAttempt.connectionState, callbackGeneration = 1L, sequence = 0L),
+        )
+
+        val disposed = terminalConnectionEnded(
+            firstAttempt.connectionState.copy(screenSequence = visibleScreen.seq),
+            callbackGeneration = 1L,
+            TerminalSocketEnd.DISPOSE,
+            screenRunning = visibleScreen.running,
+        )
+        val foregroundResume = terminalSocketAttemptStarted(disposed)
+
+        assertTrue(foregroundResume.clearScreen)
+        assertEquals(2L, foregroundResume.connectionState.generation)
+        assertNull(foregroundResume.connectionState.screenSequence)
+        assertFalse(foregroundResume.connectionState.reconnectScheduled)
+        assertEquals("preserved", foregroundResume.connectionState.inputState.draft)
+        assertTrue(
+            terminalScreenFrameIsCurrent(
+                foregroundResume.connectionState,
+                callbackGeneration = 2L,
+                sequence = 0L,
+            ),
+        )
+        assertFalse(
+            terminalScreenFrameIsCurrent(
+                foregroundResume.connectionState,
+                callbackGeneration = 1L,
+                sequence = 43L,
+            ),
+        )
+    }
+
+    @Test
+    fun `terminal scheduled reconnect starts a fresh socket generation`() {
+        val previous = TerminalConnectionState(
+            generation = 7L,
+            inputState = TerminalInputState(draft = "preserved"),
+            screenSequence = 42L,
+            reconnectScheduled = true,
+        )
+
+        val reconnected = terminalSocketAttemptStarted(previous)
+
+        assertTrue(reconnected.clearScreen)
+        assertEquals(8L, reconnected.connectionState.generation)
+        assertNull(reconnected.connectionState.screenSequence)
+        assertFalse(reconnected.connectionState.reconnectScheduled)
+        assertTrue(
+            terminalScreenFrameIsCurrent(reconnected.connectionState, callbackGeneration = 8L, sequence = 0L),
+        )
+        assertFalse(
+            terminalScreenFrameIsCurrent(reconnected.connectionState, callbackGeneration = 7L, sequence = 43L),
+        )
+    }
+
+    @Test
     fun `terminal close command serializes an explicit close action`() {
         val close = ApiJson.json.parseToJsonElement(
             ApiJson.json.encodeToString<TerminalCommand>(TerminalCommand.Close),
@@ -329,16 +572,16 @@ class ApiContractTest {
         val unicodeDraft = "café 漢字"
 
         assertEquals(
-            TerminalCommand.Input("$unicodeDraft\r"),
-            terminalLineCommand(unicodeDraft),
+            TerminalCommand.Submit(id = 9L, text = unicodeDraft),
+            terminalLineCommand(9L, unicodeDraft),
         )
         assertEquals(
-            TerminalCommand.Input("${"a".repeat(4_095)}\r"),
-            terminalLineCommand("a".repeat(4_095)),
+            TerminalCommand.Submit(id = 10L, text = "a".repeat(4_096)),
+            terminalLineCommand(10L, "a".repeat(4_096)),
         )
-        assertNull(terminalLineCommand("a".repeat(4_096)))
-        assertNull(terminalLineCommand("漢".repeat(1_365) + "a"))
-        assertNull(terminalLineCommand(""))
+        assertNull(terminalLineCommand(11L, "a".repeat(4_097)))
+        assertNull(terminalLineCommand(12L, "漢".repeat(1_365) + "ab"))
+        assertNull(terminalLineCommand(13L, ""))
     }
 
     @Test
@@ -354,6 +597,7 @@ class ApiContractTest {
                 cursorCol = 6,
                 lines = sourceLines,
                 running = true,
+                ready = true,
             ),
         )
 

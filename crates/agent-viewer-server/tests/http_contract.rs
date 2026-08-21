@@ -410,6 +410,23 @@ async fn wait_for_pids(path: &Path, expected: usize) -> Vec<u32> {
     }
 }
 
+async fn wait_for_file_bytes(path: &Path) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(bytes) = std::fs::read(path)
+            && !bytes.is_empty()
+        {
+            return bytes;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected terminal evidence at {}",
+            path.display()
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn attachable_app(script: impl Into<String>, calls: Arc<FakeCalls>) -> axum::Router {
     let fixture = project_fixture();
     let mut attachable_session = session(fixture.cwd.clone());
@@ -782,6 +799,558 @@ async fn terminal_input_preserves_utf8_and_control_bytes() {
     })
     .await;
     assert!(screen["seq"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn terminal_submit_uses_bracketed_paste_and_acknowledges_the_delivery_id() {
+    let fixture = project_fixture();
+    let evidence = fixture.root.join("bracketed-submit.bin");
+    let calls = Arc::new(FakeCalls::default());
+    let script = format!(
+        "stty raw -echo; printf 'Resuming session\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H\\033[?2004h› ready\\r\\n'; python3 -c 'import sys; data=sys.stdin.buffer.read(25); open(\"{}\", \"wb\").write(data)'; sleep 30",
+        evidence.display()
+    );
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable(
+        attachable_session,
+        calls,
+        script,
+    ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 17, "text": "café 漢字" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit terminal line");
+
+    let delivered = wait_for_file_bytes(&evidence).await;
+    assert_eq!(
+        delivered,
+        b"\x1b[200~caf\xc3\xa9 \xe6\xbc\xa2\xe5\xad\x97\x1b[201~\r"
+    );
+    let ack = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "ack" || value["type"] == "error"
+    })
+    .await;
+    assert_eq!(
+        ack["type"], "ack",
+        "successful PTY write must be acknowledged without screen echo"
+    );
+    assert_eq!(ack["id"], 17);
+}
+
+#[tokio::test]
+async fn terminal_submit_without_bracketed_paste_delays_enter_past_burst_detection() {
+    let fixture = project_fixture();
+    let evidence = fixture.root.join("plain-submit.txt");
+    let calls = Arc::new(FakeCalls::default());
+    let script = format!(
+        "stty raw -echo; printf 'Resuming session\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H› ready\\r\\n'; python3 -c 'import sys,time; data=sys.stdin.buffer.read(2); started=time.monotonic(); tail=sys.stdin.buffer.read(1); open(\"{}\", \"w\").write(data.hex()+\":\"+tail.hex()+\":\"+str(time.monotonic()-started))'; sleep 30",
+        evidence.display()
+    );
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable(
+        attachable_session,
+        calls,
+        script,
+    ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 23, "text": "go" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit terminal line");
+
+    let result =
+        String::from_utf8(wait_for_file_bytes(&evidence).await).expect("captured raw submission");
+    let elapsed = result
+        .rsplit_once(':')
+        .and_then(|(_, elapsed)| elapsed.parse::<f64>().ok())
+        .expect("submission delay");
+    assert!(
+        elapsed >= 0.12,
+        "enter arrived inside the native paste burst window: {elapsed}"
+    );
+
+    let ack = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "ack" || value["type"] == "error"
+    })
+    .await;
+    assert_eq!(
+        ack["type"], "ack",
+        "successful PTY write must be acknowledged without screen echo"
+    );
+    assert_eq!(ack["id"], 23);
+}
+
+#[tokio::test]
+async fn terminal_submit_write_failure_returns_an_error_without_acknowledging() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "printf 'Resuming session\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H› ready\\r\\n'; sleep 0.75; exec </dev/null >/dev/null 2>&1; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+    sleep(Duration::from_millis(100)).await;
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 29, "text": "do not acknowledge" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit after PTY closed");
+
+    let failure = next_terminal_json(&mut socket).await;
+    assert_eq!(
+        failure["type"], "error",
+        "failed PTY write must report an error before any other response"
+    );
+    let ack = timeout(Duration::from_millis(250), async {
+        loop {
+            let value = next_terminal_json(&mut socket).await;
+            if value["type"] == "ack" && value["id"] == 29 {
+                return value;
+            }
+        }
+    })
+    .await;
+    assert!(ack.is_err(), "failed PTY write must not be acknowledged");
+}
+
+#[tokio::test]
+async fn terminal_submit_rejects_control_characters_without_writing_or_acknowledging() {
+    for (case, text) in [
+        ("carriage-return", "first\rsecond"),
+        ("line-feed", "first\nsecond"),
+        ("paste-escape", "first\u{1b}[201~second"),
+        ("null", "first\0second"),
+    ] {
+        let fixture = project_fixture();
+        let evidence = fixture.root.join(format!("control-{case}.bin"));
+        let calls = Arc::new(FakeCalls::default());
+        let script = format!(
+            "stty raw -echo; printf 'Resuming session\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H\\033[?2004h› ready\\r\\n'; python3 -c 'import sys; data=sys.stdin.buffer.read(1); open(\"{}\", \"wb\").write(data)'; sleep 30",
+            evidence.display()
+        );
+        let mut attachable_session = session(fixture.cwd.clone());
+        attachable_session.daemon_hosted = true;
+        let app = agent_viewer_server::router_with_backends(vec![Box::new(
+            FakeBackend::attachable(attachable_session, calls, script),
+        )]);
+        let server = start_server(app).await;
+        let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+            .await
+            .expect("attach terminal");
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+
+        let id = match case {
+            "carriage-return" => 43,
+            "line-feed" => 44,
+            "paste-escape" => 45,
+            "null" => 46,
+            _ => unreachable!(),
+        };
+        socket
+            .send(Message::Text(
+                json!({ "type": "submit", "id": id, "text": text })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("submit control text");
+
+        let response = terminal_json_matching(&mut socket, |value| {
+            value["type"] == "error" || value["type"] == "ack"
+        })
+        .await;
+        assert_eq!(response["type"], "error", "control case {case}");
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("control")),
+            "control case {case} must be rejected before PTY delivery"
+        );
+        let ack = timeout(Duration::from_millis(250), async {
+            terminal_json_matching(&mut socket, |value| {
+                value["type"] == "ack" && value["id"] == id
+            })
+            .await
+        })
+        .await;
+        assert!(ack.is_err(), "control case {case} must not be acknowledged");
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !evidence.exists(),
+            "control case {case} reached the terminal child"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_terminal_becomes_ready_only_after_a_stable_native_prompt() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "sleep 0.15; printf 'Resuming session\\r\\n'; sleep 0.15; printf '\\033[2J\\033[H› ready\\r\\n'; sleep 0.3; printf '\\033[2J\\033[Hdirect input is disabled\\r\\n'; sleep 0.15; printf '\\033[2J\\033[H› ready\\r\\n'; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+
+    let initial = next_terminal_json(&mut socket).await;
+    assert_eq!(initial["type"], "screen");
+    assert_eq!(initial["ready"], false, "blank terminal must not be ready");
+    let resuming = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("Resuming session"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(resuming["ready"], false);
+    let first_prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.trim_start().starts_with("› "))
+            })
+        })
+    })
+    .await;
+    assert_eq!(first_prompt["ready"], false);
+    let blocked = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("direct input is disabled"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(blocked["ready"], false);
+    let stable_prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.trim_start().starts_with("› "))
+            })
+        }) && value["seq"].as_u64() > first_prompt["seq"].as_u64()
+    })
+    .await;
+    assert_eq!(stable_prompt["ready"], false);
+
+    let premature = timeout(Duration::from_millis(550), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(premature.is_err(), "Codex prompt became ready before 600ms");
+    timeout(Duration::from_secs(1), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await
+    .expect("stable Codex prompt becomes ready");
+}
+
+#[tokio::test]
+async fn claude_terminal_becomes_ready_only_after_startup_markers_clear() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.15; printf 'Waking session\\r\\n'; sleep 0.15; printf '\\033[2J\\033[HAttaching\\r\\n'; sleep 0.15; printf '\\033[2J\\033[H❯\\r\\n'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+
+    let initial = next_terminal_json(&mut socket).await;
+    assert_eq!(initial["type"], "screen");
+    assert_eq!(initial["ready"], false, "blank terminal must not be ready");
+    for marker in ["Waking session", "Attaching"] {
+        let startup = terminal_json_matching(&mut socket, |value| {
+            value["lines"].as_array().is_some_and(|lines| {
+                lines
+                    .iter()
+                    .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
+            })
+        })
+        .await;
+        assert_eq!(startup["ready"], false);
+    }
+    let prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines
+                .iter()
+                .any(|line| line.as_str().is_some_and(|line| line.trim() == "❯"))
+        })
+    })
+    .await;
+    assert_eq!(prompt["ready"], false);
+
+    let premature = timeout(Duration::from_millis(550), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(
+        premature.is_err(),
+        "Claude prompt became ready before 600ms"
+    );
+    timeout(Duration::from_secs(1), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await
+    .expect("stable Claude prompt becomes ready");
+}
+
+#[tokio::test]
+async fn terminal_submit_is_rejected_until_the_native_terminal_is_ready() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "sleep 2; printf 'Resuming session\\r\\n'; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+
+    let initial = next_terminal_json(&mut socket).await;
+    assert_eq!(initial["type"], "screen");
+    assert_ne!(initial["ready"], true, "blank terminal must not be ready");
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 31, "text": "must not be lost" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit during startup");
+
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(
+        response["type"], "error",
+        "submit before native readiness must be rejected"
+    );
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 31
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "rejected startup submit must not be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn codex_nonblank_precomposer_banner_stays_unready_and_rejects_submit() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "sleep 0.15; printf 'Codex startup banner\\r\\n'; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    let banner = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("Codex startup banner"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        banner["ready"], false,
+        "arbitrary Codex banner must fail closed"
+    );
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 37, "text": "must wait for the composer" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit before Codex composer");
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(response["type"], "error");
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 37
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "unready Codex submit must not be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn claude_nonblank_precomposer_banner_stays_unready_and_rejects_submit() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.15; printf 'Claude startup banner\\r\\n'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+    let banner = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("Claude startup banner"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        banner["ready"], false,
+        "arbitrary Claude banner must fail closed"
+    );
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 41, "text": "must wait for the composer" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit before Claude composer");
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(response["type"], "error");
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 41
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "unready Claude submit must not be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn codex_startup_words_in_transcript_do_not_revoke_latched_readiness() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "sleep 0.1; printf 'Resuming session\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H› ready\\r\\n'; sleep 0.8; printf '\\033[2J\\033[HTranscript says Resuming session completed\\r\\n'; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+
+    let transcript = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("Transcript says Resuming session"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        transcript["ready"], true,
+        "startup words after readiness must be ordinary transcript text"
+    );
+}
+
+#[tokio::test]
+async fn claude_startup_words_in_transcript_do_not_revoke_latched_readiness() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.1; printf 'Attaching\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H❯\\r\\n'; sleep 0.8; printf '\\033[2J\\033[HTranscript says Attaching completed\\r\\n'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+    terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
+
+    let transcript = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.contains("Transcript says Attaching"))
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        transcript["ready"], true,
+        "startup words after readiness must be ordinary transcript text"
+    );
 }
 
 #[tokio::test]

@@ -41,6 +41,8 @@ const TERMINAL_COMMAND_CAPACITY: usize = 32;
 const TERMINAL_LIMIT: usize = 4;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINAL_RESIZE_SETTLE: Duration = Duration::from_millis(1_100);
+const TERMINAL_PLAIN_SUBMIT_DELAY: Duration = Duration::from_millis(150);
+const TERMINAL_READY_SETTLE: Duration = Duration::from_millis(600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TerminalKey {
@@ -93,6 +95,10 @@ enum TerminalCommand {
         bytes: Vec<u8>,
         result: oneshot::Sender<Result<(), String>>,
     },
+    Submit {
+        text: String,
+        result: oneshot::Sender<Result<(), String>>,
+    },
     Resize {
         rows: u16,
         cols: u16,
@@ -114,6 +120,7 @@ struct TerminalScreen {
     cursor_col: u16,
     lines: Vec<String>,
     running: bool,
+    ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +131,67 @@ struct TerminalScreenState {
     cursor_col: u16,
     lines: Vec<String>,
     running: bool,
+    ready: bool,
+}
+
+struct TerminalReadiness {
+    backend: BackendKind,
+    saw_startup: bool,
+    candidate_since: Option<std::time::Instant>,
+    ready: bool,
+}
+
+impl TerminalReadiness {
+    fn new(backend: BackendKind) -> Self {
+        Self {
+            backend,
+            saw_startup: false,
+            candidate_since: None,
+            ready: false,
+        }
+    }
+
+    fn observe(&mut self, lines: &[String], running: bool) -> bool {
+        if !running {
+            self.candidate_since = None;
+            self.ready = false;
+            return false;
+        }
+        if self.ready {
+            return true;
+        }
+        let startup_visible = match self.backend {
+            BackendKind::Codex => lines.iter().any(|line| {
+                line.contains("Resuming session") || line.contains("direct input is disabled")
+            }),
+            BackendKind::Claude => lines
+                .iter()
+                .any(|line| line.contains("Waking session") || line.contains("Attaching")),
+        };
+        if startup_visible {
+            self.saw_startup = true;
+            self.candidate_since = None;
+            self.ready = false;
+            return false;
+        }
+        if !self.saw_startup {
+            return false;
+        }
+        let prompt_visible = match self.backend {
+            BackendKind::Codex => lines.iter().any(|line| line.trim_start().starts_with("› ")),
+            BackendKind::Claude => lines.iter().any(|line| line.trim() == "❯"),
+        };
+        if !prompt_visible {
+            self.candidate_since = None;
+            self.ready = false;
+            return false;
+        }
+        let since = self
+            .candidate_since
+            .get_or_insert_with(std::time::Instant::now);
+        self.ready = since.elapsed() >= TERMINAL_READY_SETTLE;
+        self.ready
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +200,13 @@ struct TerminalError<'a> {
     kind: &'static str,
     error: &'a str,
     message: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalAck {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +218,7 @@ struct TerminalQuery {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum TerminalClientMessage {
     Input { text: String },
+    Submit { id: u64, text: String },
     Resize { rows: u64, cols: u64 },
     Close,
 }
@@ -680,7 +756,8 @@ fn spawn_terminal_owner_thread(
                     return;
                 }
             };
-            let mut last_state = terminal_screen_state(&pty, true);
+            let mut readiness = TerminalReadiness::new(key.backend);
+            let mut last_state = terminal_screen_state(&pty, true, &mut readiness);
             screen.send_replace(terminal_screen(last_state.clone(), 0));
             if startup.send(Ok(())).is_err() || activate.blocking_recv().is_err() {
                 pty.kill();
@@ -695,6 +772,35 @@ fn spawn_terminal_owner_thread(
                             .map_err(|error| bounded_terminal_error(&error.to_string()));
                         let _ = result.send(outcome);
                     }
+                    Ok(TerminalCommand::Submit { text, result }) => {
+                        let before_submit = terminal_screen_state(&pty, true, &mut readiness);
+                        let outcome = if !before_submit.ready {
+                            Err("terminal is not ready for input".to_owned())
+                        } else if !terminal_accepts_input(&pty) {
+                            Err("terminal input is no longer connected".to_owned())
+                        } else {
+                            let bracketed_paste =
+                                pty.with_screen(|screen| screen.bracketed_paste());
+                            let write_outcome = if bracketed_paste {
+                                pty.write_input(b"\x1b[200~")
+                                    .and_then(|()| pty.write_input(text.as_bytes()))
+                                    .and_then(|()| pty.write_input(b"\x1b[201~"))
+                                    .and_then(|()| pty.write_input(b"\r"))
+                            } else {
+                                pty.write_input(text.as_bytes()).and_then(|()| {
+                                    std::thread::sleep(TERMINAL_PLAIN_SUBMIT_DELAY);
+                                    pty.write_input(b"\r")
+                                })
+                            }
+                            .map_err(|error| bounded_terminal_error(&error.to_string()));
+                            write_outcome.and_then(|()| {
+                                terminal_accepts_input(&pty).then_some(()).ok_or_else(|| {
+                                    "terminal input is no longer connected".to_owned()
+                                })
+                            })
+                        };
+                        let _ = result.send(outcome);
+                    }
                     Ok(TerminalCommand::Resize { rows, cols, result }) => {
                         let previous_text = terminal_visible_text(&last_state.lines);
                         let outcome = pty
@@ -704,7 +810,7 @@ fn spawn_terminal_owner_thread(
                             let deadline = std::time::Instant::now() + TERMINAL_RESIZE_SETTLE;
                             loop {
                                 std::thread::sleep(TERMINAL_POLL_INTERVAL);
-                                let next_state = terminal_screen_state(&pty, true);
+                                let next_state = terminal_screen_state(&pty, true, &mut readiness);
                                 let changed_text =
                                     terminal_visible_text(&next_state.lines) != previous_text;
                                 if changed_text || std::time::Instant::now() >= deadline {
@@ -738,7 +844,14 @@ fn spawn_terminal_owner_thread(
                 if !running {
                     pty.kill();
                 }
-                publish_terminal_screen(&pty, running, &screen, &mut last_state, &mut sequence);
+                publish_terminal_screen(
+                    &pty,
+                    running,
+                    &mut readiness,
+                    &screen,
+                    &mut last_state,
+                    &mut sequence,
+                );
                 if !running {
                     remove_terminal_owner(&hub, &key, generation);
                     break;
@@ -758,23 +871,28 @@ fn blank_terminal_state() -> TerminalScreenState {
         cursor_col: 0,
         lines: vec![String::new(); usize::from(TERMINAL_ROWS)],
         running: true,
+        ready: false,
     }
 }
 
 fn terminal_screen_state(
     pty: &agent_viewer_core::pty::PtySession,
     running: bool,
+    readiness: &mut TerminalReadiness,
 ) -> TerminalScreenState {
     pty.with_screen(|screen| {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
+        let lines = screen.rows(0, cols).collect::<Vec<_>>();
+        let ready = readiness.observe(&lines, running);
         TerminalScreenState {
             rows,
             cols,
             cursor_row,
             cursor_col,
-            lines: screen.rows(0, cols).collect(),
+            lines,
             running,
+            ready,
         }
     })
 }
@@ -789,17 +907,19 @@ fn terminal_screen(state: TerminalScreenState, seq: u64) -> TerminalScreen {
         cursor_col: state.cursor_col,
         lines: state.lines,
         running: state.running,
+        ready: state.ready,
     }
 }
 
 fn publish_terminal_screen(
     pty: &agent_viewer_core::pty::PtySession,
     running: bool,
+    readiness: &mut TerminalReadiness,
     screen: &watch::Sender<TerminalScreen>,
     last_state: &mut TerminalScreenState,
     sequence: &mut u64,
 ) {
-    let next_state = terminal_screen_state(pty, running);
+    let next_state = terminal_screen_state(pty, running, readiness);
     publish_terminal_state(next_state, screen, last_state, sequence);
 }
 
@@ -826,6 +946,21 @@ fn terminal_visible_text(lines: &[String]) -> String {
         .join("\n")
 }
 
+fn terminal_accepts_input(pty: &agent_viewer_core::pty::PtySession) -> bool {
+    let Some(pid) = pty.pid() else {
+        return false;
+    };
+    std::fs::read_link(format!("/proc/{pid}/fd/0"))
+        .is_ok_and(|target| target.starts_with("/dev/pts/"))
+}
+
+fn terminal_submit_has_control(text: &str) -> bool {
+    text.contains("\x1b[201~")
+        || text
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+}
+
 async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, mut lease: TerminalLease) {
     let initial = lease.screen.borrow_and_update().clone();
     if send_terminal_screen(&mut socket, &initial).await.is_ok() {
@@ -833,6 +968,10 @@ async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, mut lease: Ter
             tokio::select! {
                 changed = lease.screen.changed() => {
                     if changed.is_err() {
+                        let screen = lease.screen.borrow().clone();
+                        if !screen.running {
+                            let _ = send_terminal_screen(&mut socket, &screen).await;
+                        }
                         let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
@@ -844,7 +983,7 @@ async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, mut lease: Ter
                 incoming = socket.recv() => {
                     match incoming {
                         Some(Ok(Message::Text(text))) => {
-                            if handle_terminal_client_message(&mut socket, &lease, text.as_str()).await {
+                            if handle_terminal_client_message(&mut socket, &mut lease, text.as_str()).await {
                                 break;
                             }
                         }
@@ -906,7 +1045,7 @@ async fn close_terminal_owner(hub: TerminalHub, lease: TerminalLease) {
 
 async fn handle_terminal_client_message(
     socket: &mut WebSocket,
-    lease: &TerminalLease,
+    lease: &mut TerminalLease,
     text: &str,
 ) -> bool {
     if text.len() > TERMINAL_MESSAGE_BYTES {
@@ -945,6 +1084,53 @@ async fn handle_terminal_client_message(
             }
             if let Ok(Err(error)) = result_rx.await {
                 return send_terminal_error(socket, &error).await.is_err();
+            }
+        }
+        TerminalClientMessage::Submit { id, text } => {
+            if text.len() > TERMINAL_INPUT_BYTES {
+                return send_terminal_error(socket, "terminal input is too large")
+                    .await
+                    .is_err();
+            }
+            if terminal_submit_has_control(&text) {
+                return send_terminal_error(socket, "terminal input contains control characters")
+                    .await
+                    .is_err();
+            }
+            let (result_tx, result_rx) = oneshot::channel();
+            if lease
+                .commands
+                .send(TerminalCommand::Submit {
+                    text,
+                    result: result_tx,
+                })
+                .await
+                .is_err()
+            {
+                return send_terminal_error(socket, "terminal is no longer running")
+                    .await
+                    .is_err();
+            }
+            match result_rx.await {
+                Ok(Ok(())) => {
+                    if lease.screen.has_changed().is_ok_and(|changed| changed) {
+                        let screen = lease.screen.borrow_and_update().clone();
+                        if send_terminal_screen(socket, &screen).await.is_err() {
+                            return true;
+                        }
+                    }
+                    if send_terminal_ack(socket, id).await.is_err() {
+                        return true;
+                    }
+                }
+                Ok(Err(error)) => {
+                    return send_terminal_error(socket, &error).await.is_err();
+                }
+                Err(_) => {
+                    return send_terminal_error(socket, "terminal is no longer running")
+                        .await
+                        .is_err();
+                }
             }
         }
         TerminalClientMessage::Resize { rows, cols } => {
@@ -998,6 +1184,12 @@ async fn send_terminal_error(socket: &mut WebSocket, error: &str) -> Result<(), 
         message: &error,
     };
     let text = serde_json::to_string(&frame).expect("terminal error serialization cannot fail");
+    socket.send(Message::Text(text.into())).await
+}
+
+async fn send_terminal_ack(socket: &mut WebSocket, id: u64) -> Result<(), axum::Error> {
+    let frame = TerminalAck { kind: "ack", id };
+    let text = serde_json::to_string(&frame).expect("terminal ack serialization cannot fail");
     socket.send(Message::Text(text.into())).await
 }
 
