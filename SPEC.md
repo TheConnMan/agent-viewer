@@ -685,8 +685,8 @@ name override is involved, so the list can never disagree with `claude agents`.
 
 ## Routed spawn — `agent-router`, and why it is not a backend
 
-Every spawn goes through the `agent-router` CLI when it is installed, parsed into a
-`RouterOutcome` by `core/router.rs`. Two shapes of the same call:
+Every ordinary task or text command goes through the `agent-router` CLI when it is installed,
+parsed into a `RouterOutcome` by `core/router.rs`. Two shapes of the same call:
 
 - **Auto** (the composer's fourth selector entry):
   `agent-router run --json --dir <target> --provider auto -- "<task>"`. The router classifies
@@ -702,13 +702,16 @@ writes the decision-log row that makes a viewer-started job visible to `agent-ro
 `agent-router status` alongside every other dispatch. The backend that runs the job is the one
 the user picked either way, so nothing about the choice is taken from them.
 
-Two carve-outs, both deliberate:
+Three carve-outs, all deliberate:
 
 - **No router on `PATH`** — spawns call the backend's own CLI exactly as before. The router is
   an enhancement, not a dependency.
 - **`AGENT_VIEWER_CODEX_EXEC_SPAWN=1`** — the codex exec opt-in selects a spawn path the router
   does not offer (`codex exec`, no daemon), so honouring it means not routing. Routing anyway
   would silently ignore an env var the operator set deliberately.
+- **A structured Codex skill:** the discovered skill path is sent directly through the Codex
+  app server. This bypasses router naming and the decision log because the router has no
+  structured skill invocation.
 
 `--model` carries the composer's selection on a pinned route only: the router refuses it without
 an explicit `--provider`, so an Auto route must never send one. Codex's `default` model is the
@@ -768,9 +771,9 @@ Cargo workspace, two crates plus one vendored dependency. Live-refresh the regis
   `attach_route`, `stop_route`).
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
   trust bootstrap, and spawn/attach/stop/remove/rename.
-- `router.rs` is the `agent-router` shell-out every spawn goes through when the binary is
-  installed, on Auto and on a pinned provider alike. Deliberately not a `Backend`: it enumerates
-  nothing and owns no sessions.
+- `router.rs` is the `agent-router` shell-out used for ordinary tasks and text commands when the
+  binary is installed, on Auto and on a pinned provider alike. Deliberately not a `Backend`: it
+  enumerates nothing and owns no sessions.
 - `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
   badge color.
 - `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the
@@ -1046,9 +1049,19 @@ pane and a usable list cannot both fit. Closing an already-open pane is never re
 The palette is the discoverability surface for everything without a chord of its own, and the
 only way to reach some actions from the wall. It carries the action list (each with its chord,
 and unavailable actions shown as unavailable rather than hidden), the header sprites, every
-visible session as a jump target, every discovered model per backend, and the slash commands for
-the composer's current backend. Session entries use the same visible-row model as the list, so
-the `hold` rule applies there too.
+visible session as a jump target, every discovered model per backend, and the composer's command
+catalogs. Slash opens viewer commands, Claude skills, and Codex prompts. With Codex selected,
+matching discovered Codex skills also appear in slash completion. Accepting one inserts its
+native `$name ` form while retaining the structured skill path for invocation. Dollar opens the
+separate native direct Codex skill catalog, discovered for the target directory through the Codex
+app server only on Linux. Auto owns their union while keeping slash and dollar catalogs separate, and
+a concrete provider filters the union to entries it can invoke. Each entry retains its owner and
+kind, so duplicate labels show both and accepting one pins that exact entry. Same named
+structured skills also show the shortest scope that distinguishes their paths. A target catalog
+refresh clears a pin unless the exact entry, including a structured skill path, remains installed.
+Structured Codex skills invoke that path directly through the Codex app server, bypassing
+`agent-router` naming and decision logging. Session entries use the same visible row model as the
+list, so the `hold` rule applies there too.
 
 ### Themes, sprites, and the age ramp
 

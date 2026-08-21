@@ -2,11 +2,13 @@
 //! `MutationRunner` worker thread with all data owned (Send).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::codex::app_server::CodexSkill;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::router::RouterOutcome;
 use agent_viewer_core::spawn::now_ms;
@@ -40,6 +42,10 @@ pub(crate) enum Mutation {
         target: SpawnTarget,
         task: String,
         model: Option<String>,
+        /// Present only for a discovered Codex app server skill. The worker dispatches this
+        /// through the structured skill API rather than the Backend text spawn.
+        codex_skill: Option<CodexSkill>,
+        codex_skill_directory: Option<PathBuf>,
         spawned_at_ms: i64,
         preexisting_ids: HashSet<String>,
         notice: String,
@@ -104,8 +110,33 @@ impl Mutation {
             target,
             task,
             model,
+            codex_skill: None,
+            codex_skill_directory: None,
             spawned_at_ms,
             preexisting_ids: app.session_ids_for_backend(backend),
+            notice,
+        }
+    }
+
+    pub(crate) fn spawn_codex_skill(
+        app: &App,
+        target: SpawnTarget,
+        task: String,
+        model: Option<String>,
+        skill: CodexSkill,
+        spawned_at_ms: i64,
+        notice: String,
+    ) -> Self {
+        let selected_directory = target.displayed_directory().to_path_buf();
+        Self::Spawn {
+            backend: BackendKind::Codex,
+            target,
+            task,
+            model,
+            codex_skill: Some(skill),
+            codex_skill_directory: Some(selected_directory),
+            spawned_at_ms,
+            preexisting_ids: app.session_ids_for_backend(BackendKind::Codex),
             notice,
         }
     }
@@ -272,10 +303,31 @@ fn run_spawn_at_directory(
     mutation: &Mutation,
     directory: std::path::PathBuf,
 ) -> Result<MutationOutcome, String> {
+    run_spawn_at_directory_with_skill_spawner(
+        backend,
+        db,
+        mutation,
+        directory,
+        agent_viewer_core::codex::spawn_skill,
+    )
+}
+
+fn run_spawn_at_directory_with_skill_spawner<F>(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+    directory: std::path::PathBuf,
+    spawn_codex_skill: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&Path, &str, Option<&str>, &CodexSkill) -> agent_viewer_core::Result<SpawnResult>,
+{
     let Mutation::Spawn {
         backend: backend_kind,
         task,
         model,
+        codex_skill,
+        codex_skill_directory,
         spawned_at_ms,
         notice,
         ..
@@ -283,7 +335,14 @@ fn run_spawn_at_directory(
     else {
         unreachable!();
     };
-    let result = match backend.spawn(&directory, task, model.as_deref(), None) {
+    if codex_skill.is_some() && codex_skill_directory.as_ref() != Some(&directory) {
+        return Err("target directory changed before codex skill invocation".to_string());
+    }
+    let spawned = match codex_skill {
+        Some(skill) => spawn_codex_skill(&directory, task, model.as_deref(), skill),
+        None => backend.spawn(&directory, task, model.as_deref(), None),
+    };
+    let result = match spawned {
         Ok(spawned) => {
             if let Some(pid) = spawned.pid
                 && let Some(db) = db
@@ -310,6 +369,23 @@ fn run_spawn_with_backend(
     db: Option<&ViewerDb>,
     mutation: &Mutation,
 ) -> Result<MutationOutcome, String> {
+    run_spawn_with_backend_and_skill_spawner(
+        backend,
+        db,
+        mutation,
+        agent_viewer_core::codex::spawn_skill,
+    )
+}
+
+fn run_spawn_with_backend_and_skill_spawner<F>(
+    backend: &mut dyn Backend,
+    db: Option<&ViewerDb>,
+    mutation: &Mutation,
+    spawn_codex_skill: F,
+) -> Result<MutationOutcome, String>
+where
+    F: FnOnce(&Path, &str, Option<&str>, &CodexSkill) -> agent_viewer_core::Result<SpawnResult>,
+{
     let Mutation::Spawn { target, .. } = mutation else {
         unreachable!();
     };
@@ -323,7 +399,7 @@ fn run_spawn_with_backend(
         }
         SpawnTarget::ExplicitDirectory(directory) => directory.clone(),
     };
-    run_spawn_at_directory(backend, db, mutation, directory)
+    run_spawn_at_directory_with_skill_spawner(backend, db, mutation, directory, spawn_codex_skill)
 }
 
 /// The directory a spawn target resolves to, for a spawn path with no backend of its own.
@@ -513,17 +589,19 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
 mod tests {
     use super::{
         Mutation, RouterOutcome, run_remove, run_spawn_routed, run_spawn_with_backend,
-        spawn_selection_from_mutation,
+        run_spawn_with_backend_and_skill_spawner, spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::claude::ClaudeBackend;
     use agent_viewer_core::spawn::now_ms;
     use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
+    use agent_viewer_tui::mutations::MutationRunner;
     use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::channel;
     use std::time::Duration;
 
     /// A routed row with no job id is matched by `match_spawn`'s cwd + creation-time rule, and
@@ -839,6 +917,8 @@ mod tests {
             target,
             task: "new task".to_string(),
             model: None,
+            codex_skill: None,
+            codex_skill_directory: None,
             spawned_at_ms: 42,
             preexisting_ids: ["displayed_other_session".to_string()]
                 .into_iter()
@@ -937,6 +1017,125 @@ mod tests {
             vec![directory.clone()]
         );
         assert_eq!(outcome.spawned.expect("spawn selection").cwd, directory);
+    }
+
+    #[test]
+    fn structured_skill_refuses_a_fresh_directory_different_from_selection() {
+        let displayed = session_at("target", "/displayed/stale");
+        let fresh = session_at("target", "/authority/fresh");
+        let target = SpawnTarget::Session {
+            request: TargetRequest::from(&displayed),
+            mode: SpawnDirectoryMode::WorkingDirectory,
+            displayed_directory: displayed.cwd.clone(),
+        };
+        let mutation = Mutation::Spawn {
+            backend: BackendKind::Codex,
+            target,
+            task: "$openai-docs reply".to_string(),
+            model: None,
+            codex_skill: Some(agent_viewer_core::codex::app_server::CodexSkill {
+                name: "openai-docs".to_string(),
+                path: PathBuf::from("/home/user/.codex/skills/openai-docs/SKILL.md"),
+            }),
+            codex_skill_directory: Some(displayed.cwd),
+            spawned_at_ms: 42,
+            preexisting_ids: HashSet::new(),
+            notice: "spawned on codex skill".to_string(),
+        };
+        let mut backend = RecordingSpawnBackend::with_sessions(vec![fresh]);
+        let structured_calls = std::cell::Cell::new(0);
+
+        let result = run_spawn_with_backend_and_skill_spawner(
+            &mut backend,
+            None,
+            &mutation,
+            |_, _, _, _| {
+                structured_calls.set(structured_calls.get() + 1);
+                Ok(SpawnResult {
+                    pid: None,
+                    session_id: Some("unexpected".to_string()),
+                })
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err("target directory changed before codex skill invocation".to_string())
+        );
+        assert_eq!(backend.list_calls, 1);
+        assert_eq!(structured_calls.get(), 0);
+        assert!(backend.spawn_directories.into_inner().is_empty());
+    }
+
+    #[test]
+    fn structured_codex_skill_reaches_turn_start_on_the_mutation_worker() {
+        let skill = agent_viewer_core::codex::app_server::CodexSkill {
+            name: "review".to_string(),
+            path: PathBuf::from("/home/user/.codex/skills/review/SKILL.md"),
+        };
+        let mutation = Mutation::Spawn {
+            backend: BackendKind::Codex,
+            target: SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/structured-skill")),
+            task: "$review inspect the boundary".to_string(),
+            model: Some("gpt-test".to_string()),
+            codex_skill: Some(skill),
+            codex_skill_directory: Some(PathBuf::from("/tmp/structured-skill")),
+            spawned_at_ms: 42,
+            preexisting_ids: HashSet::new(),
+            notice: "spawned on codex skill".to_string(),
+        };
+        let (request_tx, request_rx) = channel();
+        let mut runner = MutationRunner::new();
+
+        assert!(runner.submit("structured-skill".to_string(), move || {
+            let mut backend = RecordingSpawnBackend::with_sessions(Vec::new());
+            run_spawn_with_backend_and_skill_spawner(
+                &mut backend,
+                None,
+                &mutation,
+                |directory, task, model, selected_skill| {
+                    assert_eq!(directory, Path::new("/tmp/structured-skill"));
+                    assert_eq!(model, Some("gpt-test"));
+                    let request = agent_viewer_core::codex::app_server::turn_start_request(
+                        3,
+                        "thread-structured",
+                        task,
+                        None,
+                        Some(selected_skill),
+                    );
+                    request_tx.send(request).expect("capture turn request");
+                    Ok(SpawnResult {
+                        pid: None,
+                        session_id: Some("thread-structured".to_string()),
+                    })
+                },
+            )
+        }));
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("structured turn request reaches the worker boundary");
+        assert!(request.contains(r#""method":"turn/start""#));
+        assert!(request.contains(
+            r#"{"name":"review","path":"/home/user/.codex/skills/review/SKILL.md","type":"skill"}"#
+        ));
+        assert!(request.contains(r#"{"text":"inspect the boundary","type":"text"}"#));
+
+        let start = std::time::Instant::now();
+        let outcome = loop {
+            if let Some(outcome) = runner.poll() {
+                break outcome.expect("structured skill spawn succeeds");
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            outcome
+                .spawned
+                .and_then(|selection| selection.session_id)
+                .as_deref(),
+            Some("thread-structured")
+        );
     }
 
     /// A live process whose `/proc/<pid>/comm` starts with "claude", which is the only shape

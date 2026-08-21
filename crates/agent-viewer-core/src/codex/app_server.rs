@@ -32,6 +32,14 @@ pub struct Daemon {
     pub socket_path: PathBuf,
 }
 
+/// One enabled Codex skill returned by `skills/list` for a requested working directory.
+/// `path` is retained because `turn/start` requires it alongside the skill name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSkill {
+    pub name: String,
+    pub path: PathBuf,
+}
+
 /// The WebSocket handshake target. The control socket is a Unix socket that upgrades to
 /// RFC6455 at `/rpc`; the host is meaningless over a Unix socket but the HTTP request needs
 /// one. No compression is offered: the daemon rejects a client advertising
@@ -135,14 +143,49 @@ pub fn thread_start_request(id: i64, cwd: &Path, model: Option<&str>) -> String 
     request(id, "thread/start", params)
 }
 
-/// PURE builder: `turn/start` carrying the task as one text UserInput.
+/// PURE builder: `skills/list` for the target working directory.
+pub fn skills_list_request(id: i64, cwd: &Path) -> String {
+    request(
+        id,
+        "skills/list",
+        serde_json::json!({
+            "cwds": [cwd.to_string_lossy()],
+            "forceReload": false,
+        }),
+    )
+}
+
+/// PURE builder: `turn/start` carrying an ordinary task as one text UserInput, or a selected
+/// Codex skill as its structured UserInput followed by the task text.
 ///
 /// `effort` None omits the key entirely so codex resolves its own reasoning effort; a null
 /// would be an explicit value rather than a default.
-pub fn turn_start_request(id: i64, thread_id: &str, task: &str, effort: Option<&str>) -> String {
+pub fn turn_start_request(
+    id: i64,
+    thread_id: &str,
+    task: &str,
+    effort: Option<&str>,
+    skill: Option<&CodexSkill>,
+) -> String {
+    let input = match skill {
+        None => vec![serde_json::json!({ "type": "text", "text": task })],
+        Some(skill) => {
+            let mut input = vec![serde_json::json!({
+                "type": "skill",
+                "name": skill.name,
+                "path": skill.path.to_string_lossy(),
+            })];
+            let insertion = format!("${} ", skill.name);
+            let remaining = task.strip_prefix(&insertion).unwrap_or(task);
+            if !remaining.is_empty() {
+                input.push(serde_json::json!({ "type": "text", "text": remaining }));
+            }
+            input
+        }
+    };
     let mut params = serde_json::json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": task }],
+        "input": input,
     });
     if let (Some(effort), Some(params)) = (effort, params.as_object_mut()) {
         params.insert("effort".to_string(), serde_json::json!(effort));
@@ -191,6 +234,50 @@ pub fn parse_thread_id(line: &str, expect_id: i64) -> Option<String> {
         .pointer("/result/thread/id")
         .and_then(|id| id.as_str())
         .map(str::to_string)
+}
+
+/// PURE: enabled skills from this request's result entry for `cwd`. Entries for other working
+/// directories, disabled skills, malformed metadata, notifications, and unrelated responses
+/// are ignored. Never panics.
+pub fn parse_skills_list(line: &str, expect_id: i64, cwd: &Path) -> Vec<CodexSkill> {
+    let Some(value) = response_for(line, expect_id) else {
+        return Vec::new();
+    };
+    let Some(data) = value
+        .pointer("/result/data")
+        .and_then(|data| data.as_array())
+    else {
+        return Vec::new();
+    };
+    let expected_cwd = cwd.to_string_lossy();
+    let mut discovered = Vec::new();
+    for entry in data {
+        if crate::json_str(entry, "cwd") != Some(expected_cwd.as_ref()) {
+            continue;
+        }
+        let Some(skills) = entry.get("skills").and_then(|skills| skills.as_array()) else {
+            return Vec::new();
+        };
+        for skill in skills {
+            if skill.get("enabled").and_then(|enabled| enabled.as_bool()) != Some(true) {
+                continue;
+            }
+            let (Some(name), Some(path)) = (
+                crate::json_str(skill, "name"),
+                crate::json_str(skill, "path"),
+            ) else {
+                continue;
+            };
+            if name.is_empty() || path.is_empty() {
+                continue;
+            }
+            discovered.push(CodexSkill {
+                name: name.to_string(),
+                path: PathBuf::from(path),
+            });
+        }
+    }
+    discovered
 }
 
 /// PURE: the id of the one turn still in progress in a `thread/read` response, or None when
@@ -336,6 +423,21 @@ fn lost_response(method: &str, error: &Error) -> Error {
     ))
 }
 
+/// IMPURE: list the enabled skills the daemon resolves for `cwd`.
+#[cfg(target_os = "linux")]
+pub(super) fn list_skills(daemon: &Daemon, cwd: &Path) -> Result<Vec<CodexSkill>> {
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let mut client = Client::connect(daemon, deadline)?;
+    let line = client.request(2, &skills_list_request(2, cwd), deadline)?;
+    Ok(parse_skills_list(&line, 2, cwd))
+}
+
+/// Portable Codex builds have no measured app-server transport for skill discovery.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn list_skills(_daemon: &Daemon, _cwd: &Path) -> Result<Vec<CodexSkill>> {
+    Err(Error::Unsupported("codex"))
+}
+
 /// IMPURE: start a thread on `daemon` and kick off its first turn. The turn keeps running after
 /// this client disconnects (verified live: the rollout grew 3778 bytes post-disconnect and the
 /// turn ran to completion), so a spawn is exactly connect, start, turn, disconnect.
@@ -346,6 +448,7 @@ pub fn try_spawn_thread(
     task: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    skill: Option<&CodexSkill>,
 ) -> SpawnAttempt {
     let deadline = Instant::now() + RPC_TIMEOUT;
     let mut client = match Client::connect(daemon, deadline) {
@@ -368,7 +471,7 @@ pub fn try_spawn_thread(
     // for the response confirms the turn was accepted without waiting for it to finish.
     match client.request(
         3,
-        &turn_start_request(3, &thread_id, task, effort),
+        &turn_start_request(3, &thread_id, task, effort, skill),
         deadline,
     ) {
         Ok(_) => SpawnAttempt::Started(thread_id),
@@ -384,6 +487,7 @@ pub fn try_spawn_thread(
     _task: &str,
     _model: Option<&str>,
     _effort: Option<&str>,
+    _skill: Option<&CodexSkill>,
 ) -> SpawnAttempt {
     SpawnAttempt::NotCreated(Error::Unsupported("codex"))
 }
@@ -396,7 +500,7 @@ pub fn spawn_thread(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<String> {
-    match try_spawn_thread(daemon, cwd, task, model, effort) {
+    match try_spawn_thread(daemon, cwd, task, model, effort, None) {
         SpawnAttempt::Started(thread_id) => Ok(thread_id),
         SpawnAttempt::TurnFailed { thread_id, error } => Err(Error::Command(format!(
             "app-server started thread {thread_id} but its first turn failed: {error}"

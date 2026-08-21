@@ -7,8 +7,9 @@ use std::io;
 use std::path::PathBuf;
 
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
-use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
+use agent_viewer_tui::app::{Row, Section};
 use agent_viewer_tui::attach::key_to_bytes;
+use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState,
@@ -20,8 +21,8 @@ use crate::actions::{
     activate_selected, apply_rename, attach_selected, back_triage_item, close_triage,
     ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected, kill_request,
     kill_selected, move_wall_selection, open_filter, open_rename, open_rename_request, open_reply,
-    open_triage, scroll_wall_tile, send_reply, skip_triage_item, spawn_from_composer,
-    submit_attach, toggle_group_if_header, toggle_wall,
+    open_triage, request_completions, scroll_wall_tile, send_reply, skip_triage_item,
+    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -699,10 +700,9 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     ui: &mut Ui,
     _terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<bool> {
-    // Refresh the slash-command list up front (keyed on backend+target, so a no-op unless
-    // they changed) BEFORE anything reads `suggestions_active` — otherwise a Ctrl+S regroup
-    // or a background snapshot that moved the selected session/target could leave `suggesting`
-    // (and a subsequent Tab accept) reading commands scanned for the PREVIOUS target.
+    // Refresh the installed scope before anything reads `suggestions_active`. Discovery itself
+    // requires command text, so moving through target directories with an empty composer reads
+    // memory only and cannot start a probe.
     ensure_completions(ui);
     ensure_models(ui);
 
@@ -816,10 +816,8 @@ fn handle_compose_key(
         }
         return;
     }
-    // Same up-front refresh the list does, and for the same reason: nothing may read
-    // `suggestions_active` against commands scanned for a target that has since moved. Below
-    // the ctrl branch because none of those chords reads either, and the rescan costs a
-    // `spawn_target()` and a `PathBuf` every time one is pressed over the grid.
+    // Same scope refresh the list does, and for the same reason: nothing may read
+    // `suggestions_active` against commands scanned for a target that has since moved.
     ensure_completions(ui);
     ensure_models(ui);
     if !handle_composer_popup_key(key.code, ui) {
@@ -922,6 +920,7 @@ fn sync_composer_popups(ui: &mut Ui) {
 }
 
 fn open_palette(backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    request_completions(ui);
     let items = palette_items(backends, ui);
     // Every ACTION row is built for the row selected right now, so that identity is captured
     // with them: a refresh landing while the palette is up can clamp the selection onto a
@@ -1020,30 +1019,36 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
         }));
     }
 
-    let spawn_target = ui.app.spawn_target();
-    let command_backend = (!ui.composer.is_auto()).then(|| ui.composer.backend());
-    items.extend(
-        palette_commands(
-            command_backend,
-            spawn_target
-                .as_ref()
-                .map(|target| target.displayed_directory()),
-        )
-        .into_iter()
+    items.extend(command_palette_items(ui.composer.commands()));
+    items
+}
+
+fn command_palette_items(commands: &[CommandEntry]) -> Vec<PaletteItem> {
+    commands
+        .iter()
+        .cloned()
         .map(|command| {
+            let name = command.display().to_string();
+            let detail = command.detail(commands);
             PaletteItem::new(
                 PaletteGroup::Commands,
-                "/",
-                format!("/{command}"),
-                format!("{} slash command", ui.composer.provider_name()),
+                name.chars().next().unwrap_or('/').to_string(),
+                name,
+                detail,
                 None,
                 true,
                 None,
                 PaletteTarget::Command(command),
             )
-        }),
-    );
-    items
+        })
+        .collect()
+}
+
+pub(crate) fn refresh_palette_commands(ui: &mut Ui) {
+    let commands = command_palette_items(ui.composer.commands());
+    if let Mode::Palette(palette) = &mut ui.mode {
+        palette.replace_commands(commands);
+    }
 }
 
 fn palette_action_items(
@@ -1255,29 +1260,6 @@ fn status_word(status: &Status) -> &'static str {
         Status::Error => "error",
         Status::Unknown => "unknown",
     }
-}
-
-/// The palette's slash commands: the viewer's own `/model` and `/theme` always, plus the
-/// backend's scanned commands. `backend` is None under Auto, where the provider is unknown until
-/// the router answers, so no backend-specific command is offered (matching the typed `/` popup).
-fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Path>) -> Vec<String> {
-    let home = agent_viewer_core::home_dir();
-    let mut commands = match backend {
-        Some(BackendKind::Claude) => {
-            let mut commands = subdir_names(&home.join(".claude/skills"));
-            if let Some(target) = target {
-                commands.extend(subdir_names(&target.join(".claude/skills")));
-            }
-            commands
-        }
-        Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
-        None => Vec::new(),
-    };
-    commands.extend(["model".to_string(), "theme".to_string()]);
-    commands.retain(|command| !matches!(command.as_str(), "wall" | "tail"));
-    commands.sort();
-    commands.dedup();
-    commands
 }
 
 fn backend_of(backends: &[Box<dyn Backend>], kind: BackendKind) -> Option<&dyn Backend> {
@@ -1498,9 +1480,9 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
         }
         PaletteTarget::Sprite(sprite) => set_sprite(ui, sprite),
         PaletteTarget::Command(command) => {
-            ui.composer.clear();
-            ui.composer.push_str(&format!("/{command} "));
-            if command == "theme" {
+            let opens_theme = command.owner().is_none() && command.name() == "theme";
+            ui.composer.select_command(command);
+            if opens_theme {
                 ui.themes.open_picker();
             }
             ensure_completions(ui);
@@ -1757,12 +1739,13 @@ pub(crate) mod tests {
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
         handle_attached_key, handle_key, handle_mouse, handle_mouse_event, handle_palette_key,
         handle_paste, handle_rename_key, handle_triage_key, is_quit_chord, open_filter,
-        open_palette, palette_items, set_mouse_capture, wall_input_target,
+        open_palette, palette_items, request_completions, set_mouse_capture, wall_input_target,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
+    use agent_viewer_tui::composer::CommandEntry;
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
     use agent_viewer_tui::ui::TriageState;
     use agent_viewer_tui::ui::{AttachView, Draw, Mode, PaletteAction, PaletteTarget, Pulses};
@@ -3388,7 +3371,7 @@ pub(crate) mod tests {
         pick_palette_target(
             &mut ui,
             "/theme",
-            &PaletteTarget::Command("theme".to_string()),
+            &PaletteTarget::Command(CommandEntry::viewer("theme")),
         );
 
         assert!(
@@ -4279,6 +4262,179 @@ pub(crate) mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(model_backends, HashSet::from([BackendKind::Codex]));
+    }
+
+    #[test]
+    fn auto_palette_uses_the_same_owned_command_union_as_typed_completion() {
+        let claude = CommandEntry::claude_skill("review");
+        let prompt = CommandEntry::codex_prompt("review");
+        let skill = CommandEntry::codex_skill(
+            "diagnose",
+            PathBuf::from("/tmp/agentviewer_palette_skill/SKILL.md"),
+        );
+        let first_review = CommandEntry::codex_skill(
+            "inspect",
+            PathBuf::from("/projects/first/.codex/skills/inspect/SKILL.md"),
+        );
+        let second_review = CommandEntry::codex_skill(
+            "inspect",
+            PathBuf::from("/projects/second/.codex/skills/inspect/SKILL.md"),
+        );
+        let theme = CommandEntry::viewer("theme");
+        let commands = vec![
+            claude.clone(),
+            prompt.clone(),
+            skill.clone(),
+            first_review.clone(),
+            second_review.clone(),
+            theme.clone(),
+        ];
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_auto_available(true);
+        ui.composer.default_to_auto();
+        ui.composer
+            .set_commands(commands, (BackendKind::Claude, None));
+        ui.composer.push_str("/re");
+
+        let popup = ui.composer.suggestions();
+        assert_eq!(popup, vec![&claude, &prompt]);
+
+        let items = palette_items(&[], &ui);
+        let command_rows = items
+            .iter()
+            .filter(|item| matches!(&item.target, PaletteTarget::Command(_)))
+            .collect::<Vec<_>>();
+        for expected in [
+            &claude,
+            &prompt,
+            &skill,
+            &first_review,
+            &second_review,
+            &theme,
+        ] {
+            assert!(
+                command_rows.iter().any(
+                    |item| matches!(&item.target, PaletteTarget::Command(entry) if entry == expected)
+                ),
+                "palette is missing {expected:?}"
+            );
+        }
+
+        let claude_row = command_rows
+            .iter()
+            .find(|item| item.target == PaletteTarget::Command(claude.clone()))
+            .expect("Claude skill row");
+        assert_eq!(claude_row.name, "/review");
+        assert!(claude_row.detail.to_lowercase().contains("claude"));
+        assert!(claude_row.detail.to_lowercase().contains("skill"));
+
+        let prompt_row = command_rows
+            .iter()
+            .find(|item| item.target == PaletteTarget::Command(prompt.clone()))
+            .expect("Codex prompt row");
+        assert_eq!(prompt_row.name, "/review");
+        assert!(prompt_row.detail.to_lowercase().contains("codex"));
+        assert!(prompt_row.detail.to_lowercase().contains("prompt"));
+
+        let skill_row = command_rows
+            .iter()
+            .find(|item| item.target == PaletteTarget::Command(skill.clone()))
+            .expect("Codex skill row");
+        assert_eq!(skill_row.name, "$diagnose");
+        assert_eq!(skill_row.detail, "codex skill");
+
+        let first_row = command_rows
+            .iter()
+            .find(|item| item.target == PaletteTarget::Command(first_review.clone()))
+            .expect("first Codex skill row");
+        assert_eq!(first_row.name, "$inspect");
+        assert_eq!(first_row.detail, "codex skill  scope …/first");
+
+        let second_row = command_rows
+            .iter()
+            .find(|item| item.target == PaletteTarget::Command(second_review.clone()))
+            .expect("second Codex skill row");
+        assert_eq!(second_row.name, "$inspect");
+        assert_eq!(second_row.detail, "codex skill  scope …/second");
+    }
+
+    #[test]
+    fn landed_command_catalog_updates_an_already_open_palette() {
+        let directory = tempfile::tempdir().expect("command target");
+        std::fs::create_dir_all(directory.path().join(".claude/skills/theme-check"))
+            .expect("project skill");
+        let cwd = directory.path().to_string_lossy().into_owned();
+        let mut ui = test_ui_with(vec![sess("target", &cwd, 100)]);
+        open_palette_with_query(&mut ui, "theme");
+        let viewer_theme = PaletteTarget::Command(CommandEntry::viewer("theme"));
+        let landed_skill = PaletteTarget::Command(CommandEntry::claude_skill("theme-check"));
+        highlight_palette_target(&mut ui, &viewer_theme);
+
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("palette closed before discovery landed");
+        };
+        assert_eq!(palette.query(), "theme");
+        assert_eq!(
+            palette.highlighted().map(|item| &item.target),
+            Some(&viewer_theme)
+        );
+        assert!(palette.results().all(|item| item.target != landed_skill));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            crate::actions::install_commands(&mut ui);
+            let landed = match &ui.mode {
+                Mode::Palette(palette) => palette.results().any(|item| item.target == landed_skill),
+                _ => panic!("palette closed while discovery landed"),
+            };
+            if landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "project skill did not land in the open palette"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let Mode::Palette(palette) = &ui.mode else {
+            panic!("palette closed after discovery landed");
+        };
+        assert_eq!(palette.query(), "theme");
+        assert_eq!(
+            palette.highlighted().map(|item| &item.target),
+            Some(&viewer_theme),
+            "refresh must preserve the highlighted item identity"
+        );
+    }
+
+    #[test]
+    fn palette_selection_inserts_the_literal_and_pins_only_owned_commands() {
+        let skill = CommandEntry::codex_skill(
+            "diagnose",
+            PathBuf::from("/tmp/agentviewer_palette_pick/SKILL.md"),
+        );
+        let theme = CommandEntry::viewer("theme");
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_auto_available(true);
+        ui.composer.default_to_auto();
+        ui.composer.set_commands(
+            vec![skill.clone(), theme.clone()],
+            (BackendKind::Claude, None),
+        );
+
+        pick_palette_target(&mut ui, "diagnose", &PaletteTarget::Command(skill.clone()));
+
+        assert_eq!(ui.composer.text(), "$diagnose ");
+        assert_eq!(ui.composer.pinned_command(), Some(&skill));
+        assert!(ui.composer.is_auto());
+
+        ui.mode = Mode::Normal;
+        pick_palette_target(&mut ui, "theme", &PaletteTarget::Command(theme.clone()));
+
+        assert_eq!(ui.composer.text(), "/theme ");
+        assert_eq!(ui.composer.pinned_command(), None);
+        assert!(ui.composer.is_auto());
     }
 
     #[test]
@@ -5863,6 +6019,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn target_navigation_needs_explicit_demand_before_command_discovery() {
+        let sessions = vec![
+            sess("a", "/tmp/agentviewer-demand-a", 200),
+            sess("b", "/tmp/agentviewer-demand-b", 100),
+        ];
+        let mut ui = test_ui_with(sessions.clone());
+
+        assert_eq!(ensure_completions(&mut ui), 0);
+        ui.app.move_selection(1);
+        assert_eq!(ensure_completions(&mut ui), 0);
+
+        ui.composer.push_char('/');
+        assert_eq!(ensure_completions(&mut ui), 1);
+        assert_eq!(ensure_completions(&mut ui), 0);
+
+        let mut palette_ui = test_ui_with(sessions);
+        assert_eq!(request_completions(&mut palette_ui), 1);
+    }
+
+    #[test]
     fn ctrl_c_quits_when_no_child_is_taking_our_keys() {
         let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(is_quit_chord(ctrl_c, true, false));
@@ -6072,7 +6248,12 @@ pub(crate) mod tests {
         for character in "/th".chars() {
             press_normal_key(&mut ui, &backends, character, KeyModifiers::NONE);
         }
-        assert!(ui.composer.suggestions().contains(&"theme"));
+        assert!(
+            ui.composer
+                .suggestions()
+                .iter()
+                .any(|entry| *entry == &CommandEntry::viewer("theme"))
+        );
 
         press_normal_code(&mut ui, &backends, KeyCode::Tab, KeyModifiers::NONE);
 

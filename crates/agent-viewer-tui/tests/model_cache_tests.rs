@@ -3,7 +3,10 @@
 //! non-blocking via `poll()`.
 
 use agent_viewer_core::backend::BackendKind;
+use agent_viewer_core::codex::app_server::parse_skills_list;
+use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -102,6 +105,32 @@ fn a_probe_result_lands_through_poll() {
         cache.models(BackendKind::Codex),
         Some(["default".to_string(), "gpt-5.6-sol".to_string()].as_slice())
     );
+}
+
+#[test]
+fn parsed_codex_skills_land_in_the_visible_command_catalog() {
+    let mut cache = ModelCache::default();
+    let cwd = PathBuf::from("/home/user/git/proj");
+    let key = (BackendKind::Codex, Some(cwd.clone()));
+    let response = r#"{"jsonrpc":"2.0","id":12,"result":{"data":[{"cwd":"/home/user/git/proj","errors":[],"skills":[{"enabled":true,"name":"project_check","path":"/home/user/git/proj/.agents/skills/project_check/SKILL.md"}]}]}}"#.to_string();
+
+    assert!(
+        cache.request_commands_with_codex_discovery(key.clone(), move |target| {
+            parse_skills_list(&response, 12, target)
+        })
+    );
+
+    let start = Instant::now();
+    while cache.commands(&key).is_none() && start.elapsed() < Duration::from_secs(2) {
+        cache.poll_commands();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let commands = cache.commands(&key).expect("command discovery lands");
+    assert!(commands.contains(&CommandEntry::codex_skill(
+        "project_check",
+        cwd.join(".agents/skills/project_check/SKILL.md"),
+    )));
 }
 
 #[test]

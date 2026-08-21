@@ -562,11 +562,11 @@ fn draw_composer_popups(frame: &mut Frame, d: &Draw, theme: &Theme, anchor: Rect
             anchor,
         );
     } else {
-        overlay::draw_suggestions(
+        overlay::draw_command_suggestions(
             frame,
             &d.composer.suggestions(),
+            d.composer.commands(),
             d.composer.suggestion_highlight(),
-            "/",
             theme,
             anchor,
         );
@@ -922,6 +922,7 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composer::CommandEntry;
     use std::time::{Duration, Instant};
 
     fn attached_test_session() -> Session {
@@ -1797,7 +1798,10 @@ mod tests {
         assert_eq!(overlay::popup_area(&composer, &themes, below), None);
         // A bare "/" matches every installed command, so the popup shows one row per command.
         composer.set_commands(
-            vec!["review".to_string(), "security-review".to_string()],
+            vec![
+                CommandEntry::claude_skill("review"),
+                CommandEntry::claude_skill("security-review"),
+            ],
             (BackendKind::Claude, None),
         );
         composer.push_char('/');
@@ -2283,14 +2287,15 @@ mod tests {
     #[test]
     fn the_completion_popup_renders_over_the_wall_while_composing() {
         let mut composer = Composer::new();
+        let implement = CommandEntry::claude_skill("implement");
         composer.set_commands(
-            vec!["implement".to_string()],
+            vec![implement.clone()],
             (composer.backend(), Some(std::path::PathBuf::from("/tmp"))),
         );
         for character in "/imp".chars() {
             composer.push_char(character);
         }
-        assert_eq!(composer.suggestions(), vec!["implement"]);
+        assert_eq!(composer.suggestions(), vec![&implement]);
 
         let (composing, _) = wall_frame(&Mode::Compose, &composer);
         assert!(
@@ -2303,6 +2308,55 @@ mod tests {
             !grid.contains("implement"),
             "the popup must stay hidden while the tiles own the keyboard"
         );
+    }
+
+    #[test]
+    fn typed_completion_popup_labels_duplicate_owner_and_kind() {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        composer.default_to_auto();
+        composer.set_commands(
+            vec![
+                CommandEntry::claude_skill("review"),
+                CommandEntry::codex_prompt("review"),
+                CommandEntry::codex_skill(
+                    "inspect",
+                    std::path::PathBuf::from("/projects/first/.codex/skills/inspect/SKILL.md"),
+                ),
+                CommandEntry::codex_skill(
+                    "inspect",
+                    std::path::PathBuf::from("/projects/second/.codex/skills/inspect/SKILL.md"),
+                ),
+                CommandEntry::codex_skill(
+                    "diagnose",
+                    std::path::PathBuf::from("/projects/only/.codex/skills/diagnose/SKILL.md"),
+                ),
+            ],
+            (BackendKind::Claude, Some(std::path::PathBuf::from("/tmp"))),
+        );
+        composer.push_str("/re");
+
+        let (rendered, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(
+            rendered.contains("/review  claude skill"),
+            "the Claude owned row lost its visible owner or kind"
+        );
+        assert!(
+            rendered.contains("/review  codex prompt"),
+            "the Codex owned row lost its visible owner or kind"
+        );
+
+        composer.clear();
+        composer.push_str("$in");
+        let (rendered, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(rendered.contains("$inspect  codex skill  scope …/first"));
+        assert!(rendered.contains("$inspect  codex skill  scope …/second"));
+
+        composer.clear();
+        composer.push_str("$di");
+        let (rendered, _) = wall_frame(&Mode::Compose, &composer);
+        assert!(rendered.contains("$diagnose  codex skill"));
+        assert!(!rendered.contains("scope …/only"));
     }
 
     /// The grid's chord list is wrong while the composer holds the keyboard: Shift+arrows and
