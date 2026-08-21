@@ -442,7 +442,8 @@ fn claude_live_rename_round_trips_through_the_agents_listing() {
     let state_path = agent_viewer_core::claude::job_state_path_in(
         &agent_viewer_core::claude::default_jobs_root(),
         &short,
-    );
+    )
+    .expect("listed short id is a single path component");
     let snapshot = std::fs::read(&state_path).expect("state.json readable");
     let snapshot_mode = std::os::unix::fs::PermissionsExt::mode(
         &std::fs::metadata(&state_path)

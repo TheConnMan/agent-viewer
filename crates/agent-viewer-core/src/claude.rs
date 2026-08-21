@@ -1,7 +1,7 @@
 use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status};
 use crate::error::{AttachRefusal, Error, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -44,7 +44,7 @@ impl ClaudeBackend {
 
     /// `<jobs_root>/<short_id>/state.json` - claude's own store of record for a bg job's
     /// name, summary, transcript path, and respawn contract.
-    fn job_state_path(&self, short_id: &str) -> PathBuf {
+    fn job_state_path(&self, short_id: &str) -> Result<PathBuf> {
         job_state_path_in(&self.jobs_root, short_id)
     }
 
@@ -86,10 +86,8 @@ impl ClaudeBackend {
         else {
             return Err(Error::Unsupported(self.kind().name()));
         };
-        crate::spawn::run_checked(&mut claude_rm_command(
-            std::path::Path::new(&self.binary),
-            short_id,
-        ))
+        let short_id = require_job_short_id(short_id)?;
+        crate::spawn::run_checked(&mut claude_rm_command(Path::new(&self.binary), short_id))
     }
 }
 
@@ -182,7 +180,7 @@ pub fn capabilities_for_session_on_platform(
     let has_short_id = session
         .short_id
         .as_deref()
-        .is_some_and(|short_id| !short_id.is_empty());
+        .is_some_and(is_safe_job_short_id);
     capabilities.rename &= has_short_id;
     capabilities.delete = has_short_id
         && (platform == crate::platform::Platform::Linux
@@ -217,23 +215,23 @@ impl Backend for ClaudeBackend {
         let mut sessions = parse_agents_json(&stdout)?;
         for session in &mut sessions {
             // Fill summary/updated_at_ms/rollout_path from the jobs state.json.
-            if let Some(short_id) = session.short_id.as_deref() {
-                let path = job_state_path_in(&self.jobs_root, short_id);
-                if let Some((mtime, detail)) = self.cached_job_detail(&path) {
-                    session.summary = detail.summary;
-                    session.rollout_path = detail.transcript_path;
-                    session.pr_refs = detail.prs;
-                    // `claude agents --json` echoes the stale `working` label verbatim, so the
-                    // demotion has to happen here, against the state.json the agents output
-                    // does not publish `tempo` from. Idle is still a LIVE state: the row keeps
-                    // its stop/attach capabilities, it just leaves the working group. A job
-                    // parked on a running shell is NOT demoted; `parse_job_state` owns that.
-                    if detail.idle_despite_working && matches!(session.status, Status::Working) {
-                        session.status = Status::Idle;
-                    }
-                    if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                        session.updated_at_ms = since.as_millis() as i64;
-                    }
+            if let Some(short_id) = session.short_id.as_deref()
+                && let Ok(path) = job_state_path_in(&self.jobs_root, short_id)
+                && let Some((mtime, detail)) = self.cached_job_detail(&path)
+            {
+                session.summary = detail.summary;
+                session.rollout_path = detail.transcript_path;
+                session.pr_refs = detail.prs;
+                // `claude agents --json` echoes the stale `working` label verbatim, so the
+                // demotion has to happen here, against the state.json the agents output
+                // does not publish `tempo` from. Idle is still a LIVE state: the row keeps
+                // its stop/attach capabilities, it just leaves the working group. A job
+                // parked on a running shell is NOT demoted; `parse_job_state` owns that.
+                if detail.idle_despite_working && matches!(session.status, Status::Working) {
+                    session.status = Status::Idle;
+                }
+                if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    session.updated_at_ms = since.as_millis() as i64;
                 }
             }
             if session.rollout_path.is_none() {
@@ -347,7 +345,7 @@ impl Backend for ClaudeBackend {
         else {
             return Err(Error::Unsupported(BackendKind::Claude.name()));
         };
-        let path = self.job_state_path(short_id);
+        let path = self.job_state_path(short_id)?;
         // Read-modify-write, never a blind overwrite: state.json carries the job's respawn
         // contract, and a missing file means the job is gone (Err, so the TUI reports it).
         let existing = std::fs::read_to_string(&path)?;
@@ -371,10 +369,8 @@ impl Backend for ClaudeBackend {
         else {
             return Err(Error::Unsupported(self.kind().name()));
         };
-        crate::spawn::run_checked(&mut claude_stop_command(
-            std::path::Path::new(&self.binary),
-            short_id,
-        ))
+        let short_id = require_job_short_id(short_id)?;
+        crate::spawn::run_checked(&mut claude_stop_command(Path::new(&self.binary), short_id))
     }
     fn attach_command(
         &self,
@@ -387,7 +383,7 @@ impl Backend for ClaudeBackend {
         // short id (a rare jobs entry missing its "id" key) falls back to `claude -r <full id>`,
         // pinned to its cwd when that dir still exists.
         match session.short_id.as_deref() {
-            Some(short_id) if !short_id.is_empty() => {
+            Some(short_id) if is_safe_job_short_id(short_id) => {
                 cmd.arg("attach").arg(short_id);
             }
             _ => {
@@ -584,8 +580,10 @@ pub fn mark_sdk_companions(
 /// The agents output does not publish `tempo`, so a `working` here may still be demoted to
 /// `Idle` by `list()` from the job's state.json (see `parse_job_state`).
 /// The SHORT id (entry "id") the caller needs for the jobs path is folded into
-/// `Session.short_id`. Entries missing sessionId/cwd/name are SKIPPED. Non-array top
-/// level -> Err(Json).
+/// `Session.short_id` only when it is a single path component; empty, `.`, `..`,
+/// separators, and multi-component values become None so they cannot be stored or
+/// joined under the jobs root. Entries missing sessionId/cwd/name are SKIPPED.
+/// Non-array top level -> Err(Json).
 pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
     // Non-array top level surfaces as Err(Json) via the From conversion.
     let entries: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())?;
@@ -602,7 +600,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             continue;
         };
         let short_id = crate::json_str(&entry, "id")
-            .filter(|short_id| !short_id.is_empty())
+            .filter(|short_id| is_safe_job_short_id(short_id))
             .map(str::to_string);
         let started_at = entry.get("startedAt").and_then(|v| v.as_i64()).unwrap_or(0);
         let origin = if crate::json_str(&entry, "kind") == Some("background") {
@@ -833,9 +831,38 @@ pub fn jobs_root_from(config_dir: Option<&str>, home: &std::path::Path) -> PathB
     }
 }
 
-/// <jobs_root>/<short_id>/state.json
-pub fn job_state_path_in(jobs_root: &std::path::Path, short_id: &str) -> PathBuf {
-    jobs_root.join(short_id).join("state.json")
+/// True when `short_id` is a single path component that can be joined under the jobs root.
+/// Empty, `.`, `..`, anything with a path separator, and anything Path would split into
+/// more than one component are refused so a hostile `claude agents` listing cannot walk
+/// out of `~/.claude/jobs`.
+pub fn is_safe_job_short_id(short_id: &str) -> bool {
+    if short_id.is_empty() || short_id == "." || short_id == ".." {
+        return false;
+    }
+    if short_id.contains('/') || short_id.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(short_id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => name == std::ffi::OsStr::new(short_id),
+        _ => false,
+    }
+}
+
+fn require_job_short_id(short_id: &str) -> Result<&str> {
+    if is_safe_job_short_id(short_id) {
+        Ok(short_id)
+    } else {
+        Err(Error::Command(
+            "Claude job identity is not a single path component".into(),
+        ))
+    }
+}
+
+/// <jobs_root>/<short_id>/state.json. Refuses a short_id that is not a single path component.
+pub fn job_state_path_in(jobs_root: &Path, short_id: &str) -> Result<PathBuf> {
+    require_job_short_id(short_id)?;
+    Ok(jobs_root.join(short_id).join("state.json"))
 }
 
 fn canonical_transcript_path(

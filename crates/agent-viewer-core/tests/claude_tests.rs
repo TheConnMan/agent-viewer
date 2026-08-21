@@ -2,9 +2,9 @@ mod common;
 
 use agent_viewer_core::backend::{Backend, BackendKind, PrRef, SessionOrigin, Status};
 use agent_viewer_core::claude::{
-    ClaudeBackend, SessionRegistryEntry, agents_json, is_sdk_entrypoint, mark_sdk_companions,
-    parse_agents_json, parse_claude_json_models, parse_job_state, parse_session_registry,
-    read_claude_transcript, sessions_root_from,
+    ClaudeBackend, SessionRegistryEntry, agents_json, is_sdk_entrypoint, job_state_path_in,
+    mark_sdk_companions, parse_agents_json, parse_claude_json_models, parse_job_state,
+    parse_session_registry, read_claude_transcript, sessions_root_from,
 };
 use agent_viewer_core::{Session, TailEvent};
 use common::rfc3339_at;
@@ -284,6 +284,92 @@ fn claude_parse_rejects_non_array_top_level() {
     // Documented contract: a non-array top level is Err(Json), not silently empty.
     assert!(parse_agents_json("{\"sessions\": []}").is_err());
     assert!(parse_agents_json("not json").is_err());
+}
+
+#[test]
+fn parse_agents_json_drops_a_hostile_short_id() {
+    // A hostile `claude agents --json` listing must not be stored as a short_id that later
+    // joins under ~/.claude/jobs. The row itself still lists (same as a missing id); only
+    // the identity is dropped, so rename/remove/stop stay capability-gated off.
+    let json = r#"[
+      {"id": "../escape",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711000000,
+       "sessionId": "escp0001-5555-4133-a473-d3d004454cdd",
+       "name": "Hostile Short Id",
+       "state": "idle"},
+      {"id": ".",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711001000,
+       "sessionId": "dot00001-5555-4133-a473-d3d004454cdd",
+       "name": "Dot Short Id",
+       "state": "idle"},
+      {"id": "..",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711002000,
+       "sessionId": "dotdot01-5555-4133-a473-d3d004454cdd",
+       "name": "Dotdot Short Id",
+       "state": "idle"},
+      {"id": "foo/bar",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711003000,
+       "sessionId": "slash001-5555-4133-a473-d3d004454cdd",
+       "name": "Slash Short Id",
+       "state": "idle"},
+      {"id": "foo\\bar",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711004000,
+       "sessionId": "bslash01-5555-4133-a473-d3d004454cdd",
+       "name": "Backslash Short Id",
+       "state": "idle"},
+      {"id": "safe0001",
+       "cwd": "/home/user/proj",
+       "startedAt": 1783711010000,
+       "sessionId": "safe0001-6666-4133-a473-d3d004454cee",
+       "name": "Safe Short Id",
+       "state": "idle"}
+    ]"#;
+    let parsed = parse_agents_json(json).expect("parse agents json");
+    assert_eq!(
+        parsed.len(),
+        6,
+        "hostile rows stay listed; only the short_id is dropped"
+    );
+    for title in [
+        "Hostile Short Id",
+        "Dot Short Id",
+        "Dotdot Short Id",
+        "Slash Short Id",
+        "Backslash Short Id",
+    ] {
+        assert_eq!(
+            by_title(&parsed, title).short_id,
+            None,
+            "{title} must not store an unsafe short_id"
+        );
+    }
+    assert_eq!(
+        by_title(&parsed, "Safe Short Id").short_id.as_deref(),
+        Some("safe0001")
+    );
+}
+
+#[test]
+fn job_state_path_in_rejects_unsafe_short_ids() {
+    let root = std::path::Path::new("/tmp/jobs");
+    for short_id in ["", ".", "..", "../escape", "foo/bar", "foo\\bar", "/abs"] {
+        let err = job_state_path_in(root, short_id).expect_err("unsafe short_id must not join");
+        assert!(
+            matches!(err, agent_viewer_core::Error::Command(_)),
+            "{short_id:?} expected Command, got {err:?}"
+        );
+        assert!(
+            !err.to_string().is_empty(),
+            "{short_id:?} must name the rejection"
+        );
+    }
+    let path = job_state_path_in(root, "ab12").expect("safe id joins");
+    assert_eq!(path, root.join("ab12").join("state.json"));
 }
 
 #[test]
@@ -1065,11 +1151,11 @@ fn claude_stop_capability_requires_nonterminal_status_and_short_id() {
             "{platform:?} must use the native cli for a daemon hosted row"
         );
 
-        for short_id in [None, Some("")] {
+        for short_id in [None, Some(""), Some("../escape")] {
             let missing_id = session_with_short_id(short_id);
             assert!(
                 !capabilities_for_session_on_platform(platform, &missing_id).stop,
-                "{platform:?} must not stop a row without a short id"
+                "{platform:?} must not stop a row without a valid short id ({short_id:?})"
             );
         }
 
@@ -1120,6 +1206,58 @@ fn claude_delete_capability_is_per_row_and_requires_a_short_id() {
         !backend
             .capabilities_for(&session_with_short_id(Some("")))
             .delete
+    );
+    assert!(
+        !backend
+            .capabilities_for(&session_with_short_id(Some("../escape")))
+            .delete,
+        "a traversing short_id names no job dir either"
+    );
+}
+
+#[test]
+fn claude_stop_rejects_a_traversing_short_id_before_cli() {
+    let directory = tempfile::TempDir::new().expect("create fake cli directory");
+    let binary = directory.path().join("claude");
+    let args_path = directory.path().join("claude.args");
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\n",
+    );
+    // write_stub_claude runs the stub once to wait out ETXTBSY, which creates the args
+    // file; drop it so a later existence check is only about stop itself.
+    let _ = std::fs::remove_file(&args_path);
+
+    let mut session = session_with_short_id(Some("../escape"));
+    session.status = Status::Idle;
+    let backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
+
+    Backend::stop(&backend, &session).expect_err("traversing short_id must not reach claude stop");
+    assert!(
+        !args_path.exists(),
+        "claude stop must not be invoked with a traversing short_id"
+    );
+}
+
+#[test]
+fn claude_remove_rejects_a_traversing_short_id_before_cli() {
+    let directory = tempfile::TempDir::new().expect("create fake cli directory");
+    let binary = directory.path().join("claude");
+    let args_path = directory.path().join("claude.args");
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\n",
+    );
+    let _ = std::fs::remove_file(&args_path);
+
+    let mut session = session_with_short_id(Some("../escape"));
+    session.status = Status::Done;
+    let backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
+
+    Backend::remove(&backend, &session).expect_err("traversing short_id must not reach claude rm");
+    assert!(
+        !args_path.exists(),
+        "claude rm must not be invoked with a traversing short_id"
     );
 }
 

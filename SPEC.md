@@ -734,6 +734,12 @@ carries `respawnFlags`, `intent`, and the transcript path, and dropping them wou
 job's respawn contract. The jobs root is `$CLAUDE_CONFIG_DIR/jobs` when that is set, else
 `~/.claude/jobs`, matching what `claude agents` lists.
 
+**Short id is a single path component.** `parse_agents_json` and every jobs-path or CLI builder
+(`rename`, `remove`, `stop`, `attach`) refuse a short id that is empty, `.`, `..`, contains a
+path separator, or is not a single path component. A hostile `claude agents` listing cannot be
+stored as a short id or joined under the jobs root. The state.json write channel itself is
+unchanged: Claude still has no rename subcommand.
+
 **The temp file is created 0600, not chmod'd afterwards.** Claude writes state.json 0600 while
 the jobs dir is group/other traversable, so a temp left at the umask default would publish that
 job's intent, output, respawn flags, and transcript path — and widening only after the write

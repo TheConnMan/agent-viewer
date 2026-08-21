@@ -157,12 +157,12 @@ fn portable_claude_delete_requires_a_finished_row_with_valid_short_id() {
             );
         }
 
-        for short_id in [None, Some("")] {
+        for short_id in [None, Some(""), Some("../escape")] {
             let missing_id =
                 claude_session(short_id, PathBuf::from("/some/proj"), None, Status::Done);
             assert!(
                 !claude_capabilities_for_session_on_platform(platform, &missing_id).delete,
-                "{platform:?} must not delete a finished row without a valid short id"
+                "{platform:?} must not delete a finished row without a valid short id ({short_id:?})"
             );
         }
     }
@@ -273,4 +273,33 @@ fn claude_attach_empty_short_id_falls_back_and_leaves_cwd_unset() {
     // A deleted cwd must not be set, or spawning the resume command would fail.
     assert_eq!(cmd.get_current_dir(), None);
     assert_eq!(env_set(&cmd, "CLAUDE_AGENTS_SELECT"), None);
+}
+
+#[test]
+fn claude_attach_traversing_short_id_falls_back_instead_of_passing_it() {
+    // The attach builder must not put `../escape` on `claude attach`. Falling back to
+    // `-r <full id>` is the same path as a missing short id: the hostile component never
+    // becomes an argv.
+    let session = claude_session(
+        Some("../escape"),
+        PathBuf::from("/nonexistent/deleted-claude-dir"),
+        None,
+        Status::Done,
+    );
+    let backend = ClaudeBackend::new();
+    let cmd = backend
+        .attach_command(&session)
+        .expect("claude supports attach");
+
+    assert_eq!(
+        args_of(&cmd),
+        vec![OsStr::new("-r"), OsStr::new("sess-uuid-1234")]
+    );
+    assert!(
+        args_of(&cmd)
+            .iter()
+            .all(|arg| *arg != OsStr::new("../escape")),
+        "attach must not pass a traversing short_id through"
+    );
+    assert_eq!(cmd.get_current_dir(), None);
 }

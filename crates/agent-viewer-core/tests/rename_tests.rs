@@ -84,6 +84,12 @@ fn claude_advertises_rename_only_for_rows_with_a_job_dir() {
         !backend.capabilities_for(&claude_session(Some(""))).rename,
         "an empty short id names no job dir either"
     );
+    assert!(
+        !backend
+            .capabilities_for(&claude_session(Some("../escape")))
+            .rename,
+        "a traversing short id names no job dir either"
+    );
 }
 
 #[test]
@@ -142,6 +148,43 @@ fn claude_rename_is_unsupported_without_a_short_id() {
         Error::Unsupported(name) => assert_eq!(name, "claude"),
         other => panic!("expected Unsupported(\"claude\"), got {other:?}"),
     }
+}
+
+#[test]
+fn claude_rename_rejects_a_traversing_short_id_and_does_not_write_outside_jobs_root() {
+    // The write channel is still state.json (Claude has no rename subcommand), but the
+    // short_id is an untrusted listing field and must not be Path::join'd as-is.
+    let parent = tempfile::tempdir().expect("tempdir");
+    let jobs_root = parent.path().join("jobs");
+    std::fs::create_dir(&jobs_root).expect("jobs root");
+    let outside_dir = parent.path().join("escape");
+    std::fs::create_dir(&outside_dir).expect("outside dir");
+    let outside_state = outside_dir.join("state.json");
+    std::fs::write(&outside_state, r#"{"name":"untouched"}"#).expect("outside state");
+
+    let backend = ClaudeBackend::with_binary_and_jobs_root("claude", jobs_root.clone());
+    let err = backend
+        .rename(&claude_session(Some("../escape")), "pwned")
+        .expect_err("a traversing short_id must not write");
+    assert!(
+        matches!(err, Error::Command(_)),
+        "expected Command, got {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&outside_state).expect("outside state readable"),
+        r#"{"name":"untouched"}"#,
+        "rename must not follow ../ out of the jobs root"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&jobs_root)
+        .expect("jobs root readable")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "jobs root must stay empty: {leftovers:?}"
+    );
 }
 
 #[test]
