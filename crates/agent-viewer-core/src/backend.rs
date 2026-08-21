@@ -418,11 +418,21 @@ pub(crate) fn dedup_preserve(v: Vec<String>) -> Vec<String> {
 }
 
 /// The fixed v1 roster. No config surface.
+#[cfg(target_os = "linux")]
 pub fn all_backends() -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
         Box::new(crate::claude::ClaudeBackend::new()),
         Box::new(crate::grok::GrokBackend::new()),
+    ]
+}
+
+/// The fixed v1 roster. No config surface.
+#[cfg(not(target_os = "linux"))]
+pub fn all_backends() -> Vec<Box<dyn Backend>> {
+    vec![
+        Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
+        Box::new(crate::claude::ClaudeBackend::new()),
     ]
 }
 
@@ -450,6 +460,28 @@ mod tests {
             "b".to_string(),
         ]);
         assert_eq!(got, vec!["default", "a", "b", "c"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_backend_roster_includes_grok() {
+        let names: Vec<_> = all_backends()
+            .into_iter()
+            .map(|backend| backend.kind().name())
+            .collect();
+
+        assert_eq!(names, vec!["codex", "claude", "grok"]);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn non_linux_backend_roster_excludes_grok() {
+        let names: Vec<_> = all_backends()
+            .into_iter()
+            .map(|backend| backend.kind().name())
+            .collect();
+
+        assert_eq!(names, vec!["codex", "claude"]);
     }
 
     #[test]

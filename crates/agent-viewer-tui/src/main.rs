@@ -63,7 +63,11 @@ const ACTIVITY_LOOKAHEAD: usize = 8;
 const TAIL_REFRESH_MS: i64 = 2_000;
 
 fn available_spawn_backends(platform: Platform, path: Option<&OsStr>) -> Vec<BackendKind> {
-    [BackendKind::Claude, BackendKind::Codex, BackendKind::Grok]
+    #[cfg(target_os = "linux")]
+    let candidates = [BackendKind::Claude, BackendKind::Codex, BackendKind::Grok];
+    #[cfg(not(target_os = "linux"))]
+    let candidates = [BackendKind::Claude, BackendKind::Codex];
+    candidates
         .into_iter()
         .filter(|backend| {
             agent_viewer_core::router::find_on_path(platform, backend.name(), path).is_some()

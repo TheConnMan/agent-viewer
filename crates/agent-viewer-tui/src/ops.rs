@@ -514,13 +514,13 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mutation, RouterOutcome, run_remove, run_spawn_routed, run_spawn_with_backend,
-        spawn_selection_from_mutation,
+        Mutation, RouterOutcome, fresh_backend, run_remove, run_spawn_routed,
+        run_spawn_with_backend, spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
     use agent_viewer_core::claude::ClaudeBackend;
     use agent_viewer_core::spawn::now_ms;
-    use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, ViewerDb};
+    use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, TailEvent, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
     use std::cell::RefCell;
@@ -705,6 +705,41 @@ mod tests {
             pr_refs: Vec::new(),
             daemon_hosted: false,
         }
+    }
+
+    #[test]
+    fn fresh_grok_backend_wires_actions_attach_and_tail() {
+        let backend = fresh_backend(BackendKind::Grok);
+        let mut grok = session(BackendKind::Grok, "session-durable", false);
+        grok.status = Status::Unknown;
+        grok.rollout_path = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../agent-viewer-core/tests/fixtures/grok/home/sessions/\
+                 project-fixture-0123456789abcdef/session-durable/chat_history.jsonl",
+        ));
+
+        assert_eq!(backend.kind(), BackendKind::Grok);
+        let capabilities = backend.capabilities_for(&grok);
+        assert!(capabilities.attach);
+        assert!(capabilities.stop);
+        assert!(capabilities.rename);
+        assert!(capabilities.delete);
+        assert!(!capabilities.archive);
+
+        let command = backend
+            .attach_command(&grok)
+            .expect("Grok attach command is available");
+        assert_eq!(command.get_program(), "grok");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["--resume", "session-durable"]
+        );
+        assert_eq!(
+            backend.tail(&grok, 2).expect("Grok tail is available"),
+            vec![
+                TailEvent::User("latest request with context".to_string()),
+                TailEvent::Agent("latest answer".to_string()),
+            ]
+        );
     }
 
     fn spawn_mutation_with_hidden_session() -> Mutation {

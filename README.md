@@ -2,7 +2,7 @@
 
 A terminal viewer for coding-agent sessions, modeled on Claude Code's `claude agents`
 view. These CLIs have no built-in "see all my sessions" console; this fills that gap
-across Codex and Claude Code. It reads each agent's own local session store, shows every session in a
+across Codex, Claude Code, and Grok. It reads each agent's own local session store, shows every session in a
 single live list, and lets you attach to one in an embedded terminal without leaving the
 viewer.
 
@@ -16,7 +16,8 @@ it falls back safely to `Agent Viewer`.
 
 ## Backends
 
-Two backends ship, and each advertises which capabilities it supports; the TUI gates
+Up to three backends ship. Codex and Claude are available across supported platforms, while
+Grok is available only on Linux. Each advertises which capabilities it supports; the TUI gates
 keys accordingly (an unsupported action is a no-op with a footer notice). Backends with
 no data or whose CLI is not installed simply list empty — they never error the view.
 
@@ -34,6 +35,22 @@ no data or whose CLI is not installed simply list empty — they never error the
   channel it has (there is no `claude rename` subcommand). It applies to background rows only:
   an interactive row has no job dir, so `Ctrl+R` there is a footer notice. No archive/hide
   (Claude has no hide concept).
+
+**Grok** is supported only on Linux because its official lifecycle transport uses Unix domain
+sockets and Linux peer credential ownership checks. Grok lifecycle requires Linux kernel 5.6
+or newer because secure durable traversal uses `openat2`, with no insecure fallback. It reads the official Grok session store without writing it. When an official shared
+leader is reachable, its roster supplies live status and its ACP lifecycle supplies spawn,
+selected session cancel, rename, delete, and model discovery. Attach runs
+`grok --resume <session id>` from the selected session's working directory. Grok has no archive
+or unarchive capability. Durable records alone never fabricate terminal state, so a row remains
+unknown until the leader supplies authoritative activity. A shared leader never becomes row
+process ownership, and Agent Viewer never stops or restarts it.
+
+Grok requires the official `grok` binary on `PATH` and an authenticated Grok runtime. Agent
+Viewer writes no Grok configuration. The official runtime remains responsible for discovering
+the existing project instructions, shared skills, and MCP servers. The authenticated live
+configuration proof for one shared skill, one stdio MCP server, and one HTTP MCP server is a
+required completion gate.
 
 ## States
 
@@ -56,7 +73,7 @@ the title. On a terminal that answers the graphics probe the mark is the backend
 brand logo; the viewer always attempts this at startup, so it is what you get on kitty, iTerm2,
 Sixel, and half-block terminals alike. When the probe fails (a terminal with no graphics
 support, or no tty at all) the mark falls back to the textual tag in the backend's color,
-`[cc]` Claude (terracotta) and `[cx]` Codex (teal). Titles share a visible column sized to the widest title, capped at 40 terminal
+`[cc]` Claude (terracotta), `[cx]` Codex (teal), and `[gx]` Grok. Titles share a visible column sized to the widest title, capped at 40 terminal
 columns. The state as a word in the state's color (`Working`, `Needs input`, `Idle`, `Done`,
 `Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
 summary and any pull request badge. Elapsed time alone sits flush right. Sessions with
@@ -74,7 +91,7 @@ from its own recursive subagent subtree, so a parent remains visibly active whil
 work. A child row shows only its own subtree.
 
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
-`✳` Claude, `◆` Codex (only if your terminal font renders them). This applies to the fallback
+`✳` Claude, `◆` Codex, and `X` Grok (only if your terminal font renders them). This applies to the fallback
 only; when the logo probe succeeds the inline images win over both text modes.
 
 The default list groups alphabetic project directories and orders each project's sessions oldest first by creation time. `Ctrl+S` regroups by state in this fixed order: needs input, working, idle, done, with error folding into done and unknown folding into idle. Each section's sessions are oldest first by creation time. A session whose whole title is
@@ -114,11 +131,12 @@ starting selection;
 detached with that model. A Codex spawn goes into the shared
 `codex app-server` daemon so the new session can be joined live later; the viewer starts that
 daemon if none is running and never stops one. The models are discovered from each agent's
-CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`),
+CLI or catalog (Codex: `codex debug models`; Claude: the models in your `~/.claude.json`;
+Grok: the official leader model list with the built in default as a safe fallback),
 default first. Discovery runs in the background and is cached
 for a day, so the picker is populated from the first keystroke rather than waiting on a probe
 that takes seconds; a catalog that has never been discovered shows just the agent's default
-until its first probe lands. `Shift+Tab` cycles the Claude/Codex lists. The
+until its first probe lands. `Shift+Tab` cycles the available backend lists. The
 target directory is the selected row's project root (by-project view) or its exact cwd
 (by-state view). Bare letters, numbers, and slash always type into the composer, including when
 it is empty; once you have typed anything, every printable key (and space) is task text, and
@@ -130,11 +148,13 @@ rows that existed before submission.
 ### agent-router
 
 Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
-project whenever its CLI is on your `PATH` — **every** spawn, not only the `auto` one. The
-router names the job and records the decision, so a job started from the viewer is tracked the
-same way as one dispatched from anywhere else.
+project whenever its CLI is on your `PATH` for Auto, Codex, and Claude. The router names those
+jobs and records their decisions, so a routed job started from the viewer is tracked the same
+way as one dispatched from anywhere else. Until Agent Router gains Grok in its next integration
+phase, a composer pinned to Grok calls the official Grok lifecycle directly and therefore has
+no Router decision record.
 
-With the router installed the composer STARTS on a third `auto` entry (one `Tab` reaches the
+With the router installed the composer STARTS on an `auto` entry (one `Tab` reaches the
 concrete agents, and the entry sits last in the cycle). It has a single `auto` model, because
 the router chooses the provider, model, and reasoning effort itself, scaled to the task's
 classified complexity: on `Enter` the viewer runs
@@ -143,7 +163,7 @@ the task, weighs the weekly usage headroom of each subscription, and dispatches 
 footer then shows the decision (for example
 `auto: codex gpt-5.6-luna effort low job 0199… (codex weekly 3%, claude 47%)`).
 
-Picking a concrete agent chooses the provider, not a way around the router: the run becomes
+Picking Codex or Claude chooses the provider, not a way around the router: the run becomes
 `agent-router run --json --dir <target> --provider claude --model 'opus[1m]' -- "<task>"`, the
 router honours that override without classifying anything, and the job still gets its derived
 name and decision-log row. The footer reads as an ordinary spawn

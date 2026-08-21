@@ -4,6 +4,8 @@ use agent_viewer_core::{
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+static GROK_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn fixture(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/grok")
@@ -33,6 +35,170 @@ fn session(id: &str, rollout_path: Option<PathBuf>) -> Session {
     }
 }
 
+fn assert_terminal_safe(label: &str, value: &str) {
+    let unsafe_character = value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{0000}'..='\u{001f}'
+                | '\u{007f}'..='\u{009f}'
+                | '\u{061c}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+    });
+    assert!(
+        !unsafe_character,
+        "{label} exposed terminal control characters"
+    );
+}
+
+#[test]
+fn durable_display_fields_strip_terminal_and_bidi_controls() {
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_dir = home.path().join("sessions/project/session-controls");
+    std::fs::create_dir_all(&session_dir).expect("durable session directory");
+    let hostile =
+        "safe\u{1b}]8;;https://invalid.example\u{0007}link\u{1b}]8;;\u{0007}\u{0085}\u{202e}evil";
+    std::fs::write(
+        session_dir.join("summary.json"),
+        serde_json::json!({
+            "info":{"id":"session-controls","cwd":"/home/user/project"},
+            "session_summary":hostile,
+            "generated_title":hostile,
+            "last_turn_summary":hostile,
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        })
+        .to_string(),
+    )
+    .expect("hostile durable summary");
+
+    let row = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("durable listing")
+        .into_iter()
+        .find(|row| row.id == "session-controls")
+        .expect("hostile durable row remains usable");
+    assert_terminal_safe("durable title", &row.title);
+    assert_terminal_safe("durable summary", &row.summary);
+}
+
+#[test]
+fn durable_fallback_title_uses_safe_exact_identity() {
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let safe_id = "session-safe-fallback";
+    let session_dir = home.path().join("sessions/project").join(safe_id);
+    std::fs::create_dir_all(&session_dir).expect("durable session directory");
+    std::fs::write(
+        session_dir.join("summary.json"),
+        serde_json::json!({
+            "info":{"id":safe_id,"cwd":"/home/user/project"},
+            "session_summary":"\u{1b}\u{202e}",
+            "generated_title":"\u{1b}\u{202e}",
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        })
+        .to_string(),
+    )
+    .expect("control only durable titles");
+
+    let row = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("durable listing")
+        .into_iter()
+        .find(|row| row.id == safe_id)
+        .expect("safe identity row remains addressable");
+    assert_eq!(row.title, safe_id);
+}
+
+#[test]
+fn durable_listing_skips_control_bearing_identity_and_cwd() {
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let project = home.path().join("sessions/project");
+    std::fs::create_dir_all(&project).expect("durable project directory");
+    let hostile_id = "session-\u{1b}\u{202e}";
+    for (id, cwd) in [
+        (hostile_id, "/home/user/project"),
+        (
+            "session-hostile-cwd",
+            "/home/user/\u{1b}]0;owned\u{0007}\u{2066}",
+        ),
+    ] {
+        let directory = project.join(id);
+        std::fs::create_dir(&directory).expect("durable session directory");
+        std::fs::write(
+            directory.join("summary.json"),
+            serde_json::json!({
+                "info":{"id":id,"cwd":cwd},
+                "session_summary":"Unsafe identity boundary",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z",
+                "num_messages":2,
+                "current_model_id":"grok-4"
+            })
+            .to_string(),
+        )
+        .expect("hostile durable summary");
+    }
+
+    let rows = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("unsafe durable identities degrade to skipped rows");
+    assert!(
+        rows.is_empty(),
+        "control bearing session IDs and cwd values must be skipped, not altered"
+    );
+}
+
+#[test]
+fn transcript_events_strip_terminal_and_bidi_controls() {
+    let directory = tempfile::tempdir().expect("temporary transcript directory");
+    let history = directory.path().join("chat_history.jsonl");
+    let hostile = "safe\u{1b}]0;owned\u{0007}\u{009b}31m\u{202e}evil";
+    let records = [
+        serde_json::json!({"type":"user","content":[{"type":"text","text":hostile}]}),
+        serde_json::json!({
+            "type":"assistant",
+            "content":hostile,
+            "tool_calls":[{
+                "id":"tool-controls",
+                "name":hostile,
+                "arguments":serde_json::json!({"path":hostile}).to_string()
+            }]
+        }),
+    ];
+    std::fs::write(
+        &history,
+        records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("hostile transcript");
+
+    let backend = GrokBackend::new();
+    let events = backend
+        .tail(&session("session-controls", Some(history)), 10)
+        .expect("bounded hostile transcript tail");
+    assert_eq!(events.len(), 3);
+    for event in events {
+        match event {
+            TailEvent::User(text) => assert_terminal_safe("user transcript", &text),
+            TailEvent::Agent(text) => assert_terminal_safe("agent transcript", &text),
+            TailEvent::Tool { name, detail } => {
+                assert_terminal_safe("tool name", &name);
+                assert_terminal_safe("tool arguments", &detail);
+            }
+        }
+    }
+}
+
 #[test]
 fn durable_listing_skips_malformed_and_partial_records_without_losing_siblings() {
     let lifecycle = GrokLifecycle::new("missing-grok", fixture("home"));
@@ -50,6 +216,10 @@ fn durable_listing_skips_malformed_and_partial_records_without_losing_siblings()
     assert!(
         ids.contains(&"session-dormant"),
         "valid sibling was lost: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"session-hidden"),
+        "viewer hidden filtering must not suppress the core row: {ids:?}"
     );
     assert!(
         !ids.contains(&"session-malformed"),
@@ -82,6 +252,12 @@ fn durable_listing_skips_malformed_and_partial_records_without_losing_siblings()
             .as_path()
         )
     );
+    let hidden = rows
+        .iter()
+        .find(|row| row.id == "session-hidden")
+        .expect("hidden durable session");
+    assert!(hidden.hidden);
+    assert!(!hidden.subagent);
 }
 
 #[test]
@@ -101,7 +277,12 @@ fn official_chat_history_tail_ignores_a_torn_last_record() {
     let history = fixture(
         "home/sessions/project-fixture-0123456789abcdef/session-durable/chat_history.jsonl",
     );
-    let backend = GrokBackend::new();
+    let backend = {
+        let _lock = GROK_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        GrokBackend::new()
+    };
     let events = backend
         .tail(&session("session-durable", Some(history)), 3)
         .expect("Grok transcript tail");
@@ -120,8 +301,34 @@ fn official_chat_history_tail_ignores_a_torn_last_record() {
 }
 
 #[test]
-fn grok_advertises_only_implemented_official_actions_and_exact_attach_argv() {
+#[cfg(unix)]
+fn transcript_tail_rejects_a_symlink_instead_of_following_it() {
+    let directory = tempfile::tempdir().expect("temporary transcript directory");
+    let external = directory.path().join("external-history.jsonl");
+    std::fs::write(
+        &external,
+        r#"{"type":"assistant","content":"must not cross the symlink boundary"}"#,
+    )
+    .expect("external transcript");
+    let linked = directory.path().join("chat_history.jsonl");
+    std::os::unix::fs::symlink(&external, &linked).expect("transcript symlink");
+
     let backend = GrokBackend::new();
+    let result = backend.tail(&session("session-symlinked-tail", Some(linked)), 10);
+    assert!(
+        result.is_err(),
+        "a Grok transcript symlink must be rejected without reading its target"
+    );
+}
+
+#[test]
+fn grok_advertises_only_implemented_official_actions_and_exact_attach_argv() {
+    let backend = {
+        let _lock = GROK_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        GrokBackend::new()
+    };
     let capabilities = backend.capabilities();
     assert!(capabilities.spawn);
     assert!(capabilities.attach);
@@ -135,11 +342,295 @@ fn grok_advertises_only_implemented_official_actions_and_exact_attach_argv() {
         .expect("official Grok resume command");
     assert_eq!(command.get_program(), OsStr::new("grok"));
     assert_eq!(
+        command.get_current_dir(),
+        Some(Path::new("/home/user/project"))
+    );
+    assert_eq!(
         command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
         vec!["--resume".to_string(), "session-selected".to_string()]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn grok_home_uses_nonempty_override_and_empty_value_falls_back_to_home() {
+    let fallback_home = tempfile::tempdir().expect("fallback user home");
+    let fallback_grok = fallback_home.path().join(".grok");
+    std::fs::create_dir(&fallback_grok).expect("fallback Grok home");
+
+    let mut explicit_backend = {
+        let _lock = GROK_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_home = std::env::var_os("HOME");
+        let original_grok_home = std::env::var_os("GROK_HOME");
+        unsafe {
+            std::env::set_var("HOME", fallback_home.path());
+            std::env::set_var("GROK_HOME", fixture("home"));
+        }
+        let backend = GrokBackend::new();
+        unsafe {
+            if let Some(home) = original_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(grok_home) = original_grok_home {
+                std::env::set_var("GROK_HOME", grok_home);
+            } else {
+                std::env::remove_var("GROK_HOME");
+            }
+        }
+        backend
+    };
+    let explicit_rows = explicit_backend.list().expect("explicit Grok home listing");
+    assert!(
+        explicit_rows.iter().any(|row| row.id == "session-durable"),
+        "a nonempty GROK_HOME must win over an empty HOME fallback"
+    );
+
+    let fallback_session = fallback_grok.join("sessions/project/session-fallback-home");
+    std::fs::create_dir_all(&fallback_session).expect("fallback durable session directory");
+    std::fs::write(
+        fallback_session.join("summary.json"),
+        serde_json::json!({
+            "info":{"id":"session-fallback-home","cwd":"/home/user/project"},
+            "session_summary":"Fallback home row",
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        })
+        .to_string(),
+    )
+    .expect("fallback durable summary");
+    let mut fallback_backend = {
+        let _lock = GROK_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_home = std::env::var_os("HOME");
+        let original_grok_home = std::env::var_os("GROK_HOME");
+        unsafe {
+            std::env::set_var("HOME", fallback_home.path());
+            std::env::set_var("GROK_HOME", "");
+        }
+        let backend = GrokBackend::new();
+        unsafe {
+            if let Some(home) = original_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(grok_home) = original_grok_home {
+                std::env::set_var("GROK_HOME", grok_home);
+            } else {
+                std::env::remove_var("GROK_HOME");
+            }
+        }
+        backend
+    };
+    let fallback_rows = fallback_backend.list().expect("fallback Grok home listing");
+    assert!(
+        fallback_rows
+            .iter()
+            .any(|row| row.id == "session-fallback-home"),
+        "an empty GROK_HOME must resolve through HOME/.grok"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn relative_grok_home_with_parent_component_preserves_path_semantics() {
+    let process_cwd = std::env::current_dir().expect("current test directory");
+    let home = tempfile::Builder::new()
+        .prefix(".grok-relative-")
+        .tempdir_in(&process_cwd)
+        .expect("relative Grok home below current directory");
+    std::fs::create_dir(home.path().join("safe")).expect("safe relative component");
+    let session_dir = home.path().join("sessions/project/session-relative-home");
+    std::fs::create_dir_all(&session_dir).expect("durable session directory");
+    std::fs::write(
+        session_dir.join("summary.json"),
+        serde_json::json!({
+            "info":{"id":"session-relative-home","cwd":"/home/user/project"},
+            "session_summary":"Relative home row",
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        })
+        .to_string(),
+    )
+    .expect("relative durable summary");
+    let relative_home = PathBuf::from(
+        home.path()
+            .file_name()
+            .expect("relative Grok home file name"),
+    )
+    .join("safe")
+    .join("..");
+
+    let rows = GrokLifecycle::new("missing-grok", relative_home)
+        .list()
+        .expect("relative Grok home listing");
+    assert!(
+        rows.iter().any(|row| row.id == "session-relative-home"),
+        "a relative Grok home with safe parent traversal must retain normal path semantics"
+    );
+    assert_eq!(
+        std::env::current_dir().expect("current test directory after listing"),
+        process_cwd,
+        "listing a relative Grok home must not change process cwd"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn grok_listing_scope_is_present_and_tracks_home_and_binary_identity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let first_home = tempfile::tempdir().expect("first Grok home");
+    let second_home = tempfile::tempdir().expect("second Grok home");
+    let first_bin = tempfile::tempdir().expect("first binary directory");
+    let second_bin = tempfile::tempdir().expect("second binary directory");
+    for directory in [first_bin.path(), second_bin.path()] {
+        let binary = directory.join("grok");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").expect("fake Grok binary");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+    }
+
+    let scope = |home: &Path, bin: &Path| {
+        let _lock = GROK_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_home = std::env::var_os("GROK_HOME");
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("GROK_HOME", home);
+            std::env::set_var("PATH", bin);
+        }
+        let scope = GrokBackend::new()
+            .listing_scope()
+            .expect("Grok listings must advertise a concrete cache scope");
+        unsafe {
+            if let Some(value) = original_home {
+                std::env::set_var("GROK_HOME", value);
+            } else {
+                std::env::remove_var("GROK_HOME");
+            }
+            if let Some(value) = original_path {
+                std::env::set_var("PATH", value);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        scope
+    };
+
+    let first = scope(first_home.path(), first_bin.path());
+    let different_home = scope(second_home.path(), first_bin.path());
+    let different_binary = scope(first_home.path(), second_bin.path());
+    assert_eq!(first.backend(), BackendKind::Grok);
+    assert_ne!(first, different_home);
+    assert_ne!(first, different_binary);
+}
+
+#[test]
+#[cfg(unix)]
+fn durable_listing_skips_symlinked_and_oversized_summaries() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let project = home.path().join("sessions/project");
+    std::fs::create_dir_all(&project).expect("project sessions directory");
+    let summary = |id: &str, text: &str| {
+        serde_json::json!({
+            "info":{"id":id,"cwd":"/home/user/project"},
+            "session_summary":text,
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        })
+        .to_string()
+    };
+
+    let symlinked = project.join("session-symlinked");
+    std::fs::create_dir(&symlinked).expect("symlinked session directory");
+    let external = home.path().join("external-summary.json");
+    std::fs::write(&external, summary("session-symlinked", "external title"))
+        .expect("external summary");
+    symlink(&external, symlinked.join("summary.json")).expect("summary symlink");
+
+    let oversized = project.join("session-oversized");
+    std::fs::create_dir(&oversized).expect("oversized session directory");
+    let large_text = "x".repeat(64 * 1024 * 1024 + 1);
+    std::fs::write(
+        oversized.join("summary.json"),
+        summary("session-oversized", &large_text),
+    )
+    .expect("oversized valid summary");
+
+    let rows = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("durable listing degrades safely");
+    let unsafe_ids = rows
+        .iter()
+        .filter(|row| row.id == "session-symlinked" || row.id == "session-oversized")
+        .map(|row| row.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        unsafe_ids.is_empty(),
+        "unsafe durable summaries were followed or read without a cap: {unsafe_ids:?}"
+    );
+}
+
+#[test]
+fn durable_listing_has_an_aggregate_byte_budget_and_deterministic_selection() {
+    const SESSION_COUNT: usize = 80;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let project = home.path().join("sessions/project");
+    std::fs::create_dir_all(&project).expect("project sessions directory");
+    let large_summary = "x".repeat(900 * 1024);
+    for index in 0..SESSION_COUNT {
+        let id = format!("session-{index:03}");
+        let directory = project.join(&id);
+        std::fs::create_dir(&directory).expect("durable session directory");
+        let body = serde_json::json!({
+            "info":{"id":id,"cwd":"/home/user/project"},
+            "session_summary":large_summary.as_str(),
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4"
+        });
+        std::fs::write(directory.join("summary.json"), body.to_string())
+            .expect("bounded durable summary");
+    }
+
+    let listed = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("budgeted durable listing");
+    let ids = listed.into_iter().map(|row| row.id).collect::<Vec<_>>();
+    assert!(
+        !ids.is_empty(),
+        "the aggregate budget must retain useful rows"
+    );
+    assert!(
+        ids.len() < SESSION_COUNT,
+        "the aggregate budget must bound total summary bytes"
+    );
+    let expected = (0..ids.len())
+        .map(|index| format!("session-{index:03}"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids, expected,
+        "budget selection must be deterministic by durable path order"
     );
 }
 
@@ -172,12 +663,79 @@ mod protocol {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    #[derive(Default)]
+    struct LeaderBehavior {
+        oversized: bool,
+        prompt_error: bool,
+        reverse_permission: bool,
+        roster_error: bool,
+        models: Option<Value>,
+    }
+
     impl ScriptedLeader {
         fn start(home: &Path, oversized: bool) -> ScriptedLeader {
+            let roster: Value = serde_json::from_str(
+                &fs::read_to_string(fixture("roster.json")).expect("roster fixture"),
+            )
+            .expect("roster JSON");
+            Self::start_named(home, "", roster, oversized, false, false)
+        }
+
+        fn start_named(
+            home: &Path,
+            suffix: &str,
+            roster: Value,
+            oversized: bool,
+            prompt_error: bool,
+            reverse_permission: bool,
+        ) -> ScriptedLeader {
+            Self::start_config(
+                home,
+                suffix,
+                roster,
+                LeaderBehavior {
+                    oversized,
+                    prompt_error,
+                    reverse_permission,
+                    ..LeaderBehavior::default()
+                },
+            )
+        }
+
+        fn start_with_roster_error(home: &Path, suffix: &str) -> ScriptedLeader {
+            Self::start_config(
+                home,
+                suffix,
+                json!({"sessions":[]}),
+                LeaderBehavior {
+                    roster_error: true,
+                    ..LeaderBehavior::default()
+                },
+            )
+        }
+
+        fn start_with_models(home: &Path, models: Value) -> ScriptedLeader {
+            Self::start_config(
+                home,
+                "",
+                json!({"sessions":[]}),
+                LeaderBehavior {
+                    models: Some(models),
+                    ..LeaderBehavior::default()
+                },
+            )
+        }
+
+        fn start_config(
+            home: &Path,
+            suffix: &str,
+            roster: Value,
+            behavior: LeaderBehavior,
+        ) -> ScriptedLeader {
             fs::create_dir_all(home).expect("leader home");
-            let socket = home.join("leader.sock");
+            let socket = home.join(format!("leader{suffix}.sock"));
             let _ = fs::remove_file(&socket);
-            let lock = home.join("leader.lock");
+            let lock = home.join(format!("leader{suffix}.lock"));
             fs::write(&lock, std::process::id().to_string()).expect("leader lock");
             let listener = UnixListener::bind(&socket).expect("scripted leader socket");
             listener
@@ -189,25 +747,35 @@ mod protocol {
             let thread_frames = Arc::clone(&frames);
             let thread_socket = socket.clone();
             let thread_lock = lock.clone();
-            let roster: Value = serde_json::from_str(
-                &fs::read_to_string(fixture("roster.json")).expect("roster fixture"),
-            )
-            .expect("roster JSON");
-            let models: Value = serde_json::from_str(
-                &fs::read_to_string(fixture("models.json")).expect("models fixture"),
-            )
-            .expect("models JSON");
+            let LeaderBehavior {
+                oversized,
+                prompt_error,
+                reverse_permission,
+                roster_error,
+                models,
+            } = behavior;
+            let models = models.unwrap_or_else(|| {
+                serde_json::from_str(
+                    &fs::read_to_string(fixture("models.json")).expect("models fixture"),
+                )
+                .expect("models JSON")
+            });
             let thread = thread::spawn(move || {
                 while !thread_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => handle_connection(
                             stream,
-                            &thread_frames,
-                            &roster,
-                            &models,
-                            oversized,
-                            &thread_socket,
-                            &thread_lock,
+                            ConnectionScript {
+                                captured: &thread_frames,
+                                roster: &roster,
+                                models: &models,
+                                oversized,
+                                prompt_error,
+                                reverse_permission,
+                                roster_error,
+                                socket: &thread_socket,
+                                lock: &thread_lock,
+                            },
                         ),
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -296,15 +864,30 @@ mod protocol {
         stream.write_all(&bytes)
     }
 
-    fn handle_connection(
-        mut stream: UnixStream,
-        captured: &Arc<Mutex<Vec<CapturedFrame>>>,
-        roster: &Value,
-        models: &Value,
+    struct ConnectionScript<'a> {
+        captured: &'a Arc<Mutex<Vec<CapturedFrame>>>,
+        roster: &'a Value,
+        models: &'a Value,
         oversized: bool,
-        socket: &Path,
-        lock: &Path,
-    ) {
+        prompt_error: bool,
+        reverse_permission: bool,
+        roster_error: bool,
+        socket: &'a Path,
+        lock: &'a Path,
+    }
+
+    fn handle_connection(mut stream: UnixStream, script: ConnectionScript<'_>) {
+        let ConnectionScript {
+            captured,
+            roster,
+            models,
+            oversized,
+            prompt_error,
+            reverse_permission,
+            roster_error,
+            socket,
+            lock,
+        } = script;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("leader read timeout");
@@ -376,6 +959,124 @@ mod protocol {
                         continue;
                     };
                     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+                    let direct_extension_params = match method {
+                        "_x.ai/sessions/list" | "_x.ai/models/list" => {
+                            request.get("params") == Some(&json!({}))
+                        }
+                        "_x.ai/session/rename" => {
+                            request.get("params")
+                                == Some(&json!({
+                                    "sessionId":"session-selected",
+                                    "title":"A precise title"
+                                }))
+                        }
+                        "_x.ai/session/delete" => {
+                            matches!(
+                                request.get("params"),
+                                Some(params)
+                                    if params == &json!({
+                                        "sessionId":"session-selected",
+                                        "cwd":"/home/user/project"
+                                    })
+                                        || params == &json!({
+                                            "sessionId":"session-rejected",
+                                            "cwd":"/home/user/rejected"
+                                        })
+                                        || params.get("sessionId")
+                                            == Some(&json!("session-delete-cwd"))
+                            )
+                        }
+                        _ => true,
+                    };
+                    if !direct_extension_params {
+                        let response = json!({
+                            "type":"acp",
+                            "payload":json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{
+                                    "code":-32602,
+                                    "message":"direct extension params required"
+                                }
+                            }).to_string()
+                        });
+                        if stream.write_all(&framed(&response)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    if method == "session/prompt" && prompt_error {
+                        let response = json!({
+                            "type":"acp",
+                            "payload":json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{
+                                    "code":-32000,
+                                    "message":"prompt rejected\u{001b}]0;owned\u{0007}\u{0085}\u{202e}evil"
+                                }
+                            }).to_string()
+                        });
+                        if stream.write_all(&framed(&response)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    if method == "session/prompt" {
+                        continue;
+                    }
+                    if method == "_x.ai/sessions/list" && roster_error {
+                        let response = json!({
+                            "type":"acp",
+                            "payload":json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{"code":-32001,"message":"roster unavailable"}
+                            }).to_string()
+                        });
+                        if stream.write_all(&framed(&response)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    if method == "_x.ai/sessions/list" && reverse_permission {
+                        let reverse = json!({
+                            "type":"acp",
+                            "payload":json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "method":"session/request_permission",
+                                "params":{
+                                    "sessionId":"session-alpha",
+                                    "toolCall":{"toolCallId":"permission-collision"},
+                                    "options":[]
+                                }
+                            }).to_string()
+                        });
+                        if stream.write_all(&framed(&reverse)).is_err() {
+                            return;
+                        }
+                        let Ok(Some((prefix, outer))) = read_frame(&mut stream) else {
+                            return;
+                        };
+                        captured.lock().expect("capture frame").push(CapturedFrame {
+                            prefix,
+                            body: outer.clone(),
+                        });
+                        let Some(payload) = outer.get("payload").and_then(Value::as_str) else {
+                            return;
+                        };
+                        let Ok(response) = serde_json::from_str::<Value>(payload) else {
+                            return;
+                        };
+                        if response.get("id") != Some(&id)
+                            || response.pointer("/result/outcome/outcome")
+                                != Some(&json!("cancelled"))
+                            || response.get("method").is_some()
+                        {
+                            return;
+                        }
+                    }
                     let result = match method {
                         "initialize" => json!({
                             "protocolVersion":1,
@@ -383,12 +1084,15 @@ mod protocol {
                             "authMethods":[]
                         }),
                         "session/new" => json!({"sessionId":"session-alpha"}),
-                        "session/prompt" => json!({"stopReason":"end_turn"}),
                         "_x.ai/sessions/list" => json!({"result":roster}),
                         "_x.ai/models/list" => json!({"result":models}),
-                        "_x.ai/session/rename" | "_x.ai/session/delete" => {
-                            json!({"result":{}})
-                        }
+                        "_x.ai/session/rename" => json!({"success":true}),
+                        "_x.ai/session/delete" => json!({
+                            "success":request
+                                .pointer("/params/sessionId")
+                                .and_then(Value::as_str)
+                                != Some("session-rejected")
+                        }),
                         _ => json!({}),
                     };
                     if send_acp_response(&mut stream, id, result).is_err() {
@@ -419,7 +1123,7 @@ mod protocol {
 
     #[test]
     fn roster_precedence_maps_dead_to_error_and_dormant_to_unknown() {
-        let (home, _leader) = leader_home();
+        let (home, leader) = leader_home();
         let rows = GrokLifecycle::new("/bin/true", home.path())
             .list()
             .expect("merged Grok listing");
@@ -458,6 +1162,15 @@ mod protocol {
             1,
             "resident roster row must replace its durable sibling"
         );
+
+        let requests = acp_requests(&leader.captured());
+        let roster = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/sessions/list")
+            .expect("official roster extension request");
+        assert_eq!(roster["params"], json!({}));
+        assert!(roster["params"].get("method").is_none());
+        assert!(roster["params"].get("params").is_none());
     }
 
     #[test]
@@ -499,11 +1212,81 @@ mod protocol {
         assert_eq!(prompt["params"]["sessionId"], "session-alpha");
         assert_eq!(prompt["params"]["prompt"][0]["type"], "text");
         assert_eq!(prompt["params"]["prompt"][0]["text"], "implement framing");
+        let prompt_index = requests
+            .iter()
+            .position(|request| request["method"] == "session/prompt")
+            .expect("prompt request position");
+        let roster_index = requests
+            .iter()
+            .position(|request| request["method"] == "_x.ai/sessions/list")
+            .expect("post prompt roster request");
+        assert!(prompt_index < roster_index);
+    }
+
+    #[test]
+    fn spawn_cancels_colliding_reverse_permission_and_still_correlates_roster() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[{
+                "sessionId":"session-alpha",
+                "title":"Spawned",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+            false,
+            false,
+            true,
+        );
+
+        let result = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(
+                Path::new("/home/user/project"),
+                "permission collision",
+                None,
+            )
+            .expect("spawn must survive a colliding reverse permission request");
+        assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
+
+        let responses = acp_requests(&leader.captured())
+            .into_iter()
+            .filter(|message| message.get("method").is_none() && message.get("result").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["result"]["outcome"]["outcome"], "cancelled");
     }
 
     #[test]
     fn cancel_is_scoped_to_the_selected_session() {
-        let (home, leader) = leader_home();
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[
+                {
+                    "sessionId":"session-selected",
+                    "title":"Selected",
+                    "cwd":"/home/user/project",
+                    "activity":"working",
+                    "resident":true,
+                    "lastChangeUnixMs":1787289000000_i64
+                },
+                {
+                    "sessionId":"session-sibling",
+                    "title":"Sibling",
+                    "cwd":"/home/user/project",
+                    "activity":"working",
+                    "resident":true,
+                    "lastChangeUnixMs":1787289000000_i64
+                }
+            ]}),
+            false,
+            false,
+            false,
+        );
         GrokLifecycle::new("/bin/true", home.path())
             .cancel("session-selected")
             .expect("session cancel");
@@ -517,6 +1300,209 @@ mod protocol {
         assert_eq!(cancels[0]["params"]["sessionId"], "session-selected");
         let wire = serde_json::to_string(&cancels).unwrap();
         assert!(!wire.contains("session-sibling"));
+    }
+
+    #[test]
+    fn cancel_is_sent_only_to_the_leader_that_owns_the_selected_session() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let first = ScriptedLeader::start_named(
+            home.path(),
+            "-a",
+            json!({"sessions":[{
+                "sessionId":"session-sibling",
+                "title":"Sibling",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+        let owner = ScriptedLeader::start_named(
+            home.path(),
+            "-b",
+            json!({"sessions":[{
+                "sessionId":"session-selected",
+                "title":"Selected",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        GrokLifecycle::new("/bin/true", home.path())
+            .cancel("session-selected")
+            .expect("owner scoped cancel");
+
+        let first_cancels = acp_requests(&first.captured())
+            .into_iter()
+            .filter(|request| request["method"] == "session/cancel")
+            .count();
+        let owner_cancels = acp_requests(&owner.captured())
+            .into_iter()
+            .filter(|request| request["method"] == "session/cancel")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_cancels, 0,
+            "a nonowner leader must not receive cancel"
+        );
+        assert_eq!(owner_cancels.len(), 1);
+        assert_eq!(owner_cancels[0]["params"]["sessionId"], "session-selected");
+    }
+
+    #[test]
+    fn cancel_skips_a_failing_first_leader_and_reaches_the_later_owner() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let failing = ScriptedLeader::start_with_roster_error(home.path(), "-a");
+        let owner = ScriptedLeader::start_named(
+            home.path(),
+            "-b",
+            json!({"sessions":[{
+                "sessionId":"session-selected",
+                "title":"Selected",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        GrokLifecycle::new("/bin/true", home.path())
+            .cancel("session-selected")
+            .expect("later healthy owner must receive cancel");
+        let failing_requests = acp_requests(&failing.captured());
+        assert!(
+            failing_requests
+                .iter()
+                .any(|request| request["method"] == "initialize"),
+            "first leader must initialize successfully before its roster failure"
+        );
+        assert!(
+            failing_requests
+                .iter()
+                .any(|request| request["method"] == "_x.ai/sessions/list"),
+            "first leader must fail during cancel ownership lookup"
+        );
+        assert!(
+            !failing_requests
+                .iter()
+                .any(|request| request["method"] == "session/cancel"),
+            "the failing nonowner must not receive cancel"
+        );
+        let cancels = acp_requests(&owner.captured())
+            .into_iter()
+            .filter(|request| request["method"] == "session/cancel")
+            .collect::<Vec<_>>();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0]["params"]["sessionId"], "session-selected");
+    }
+
+    #[test]
+    fn conflicting_roster_activity_is_unknown_independent_of_leader_suffix_order() {
+        let resolve = |first_activity: &str, second_activity: &str| {
+            let home = tempfile::tempdir().expect("temporary Grok home");
+            let roster = |activity: &str| {
+                json!({"sessions":[{
+                    "sessionId":"session-conflict",
+                    "title":"Conflicting session",
+                    "cwd":"/home/user/project",
+                    "activity":activity,
+                    "resident":true,
+                    "lastChangeUnixMs":1787289000000_i64
+                }]})
+            };
+            let _first = ScriptedLeader::start_named(
+                home.path(),
+                "-a",
+                roster(first_activity),
+                false,
+                false,
+                false,
+            );
+            let _second = ScriptedLeader::start_named(
+                home.path(),
+                "-b",
+                roster(second_activity),
+                false,
+                false,
+                false,
+            );
+            GrokLifecycle::new("/bin/true", home.path())
+                .list()
+                .expect("merged roster")
+                .into_iter()
+                .find(|row| row.id == "session-conflict")
+                .expect("conflicting roster row")
+                .status
+        };
+
+        let working_then_idle = resolve("working", "idle");
+        let idle_then_working = resolve("idle", "working");
+        assert_eq!(
+            [working_then_idle, idle_then_working],
+            [Status::Unknown, Status::Unknown]
+        );
+    }
+
+    #[test]
+    fn prompt_json_rpc_failure_is_surfaced_without_creating_a_second_session() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[]}),
+            false,
+            true,
+            false,
+        );
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(Path::new("/home/user/project"), "rejected prompt", None)
+            .expect_err("the official prompt JSON RPC error must surface");
+        assert!(
+            error.to_string().contains("prompt rejected"),
+            "prompt failure must retain the official error, got {error:?}"
+        );
+        let requests = acp_requests(&leader.captured());
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "session/new")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "session/prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn leader_error_text_strips_terminal_and_bidi_controls() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[]}),
+            false,
+            true,
+            false,
+        );
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(Path::new("/home/user/project"), "rejected prompt", None)
+            .expect_err("hostile official leader error must surface safely");
+        assert_terminal_safe("leader error", &error.to_string());
     }
 
     #[test]
@@ -536,8 +1522,24 @@ mod protocol {
     }
 
     #[test]
-    fn rename_delete_and_models_use_the_official_extension_envelopes() {
-        let (home, leader) = leader_home();
+    fn rename_and_delete_require_raw_success_and_direct_extension_params() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let session_dir = home.path().join("sessions/project/session-selected");
+        fs::create_dir_all(&session_dir).expect("durable session directory");
+        fs::write(
+            session_dir.join("summary.json"),
+            serde_json::json!({
+                "info":{"id":"session-selected","cwd":"/home/user/project"},
+                "session_summary":"Selected durable session",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z",
+                "num_messages":2,
+                "current_model_id":"grok-4"
+            })
+            .to_string(),
+        )
+        .expect("durable selected summary");
+        let leader = ScriptedLeader::start(home.path(), false);
         let lifecycle = GrokLifecycle::new("/bin/true", home.path());
         lifecycle
             .rename("session-selected", "A precise title")
@@ -545,6 +1547,114 @@ mod protocol {
         lifecycle
             .delete("session-selected")
             .expect("official delete");
+
+        let requests = acp_requests(&leader.captured());
+        let rename = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/session/rename")
+            .unwrap();
+        assert_eq!(
+            rename["params"],
+            json!({"sessionId":"session-selected", "title":"A precise title"})
+        );
+        assert!(rename["params"].get("method").is_none());
+        assert!(rename["params"].get("params").is_none());
+        let delete = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/session/delete")
+            .unwrap();
+        assert_eq!(
+            delete["params"],
+            json!({"sessionId":"session-selected", "cwd":"/home/user/project"})
+        );
+        assert!(delete["params"].get("method").is_none());
+        assert!(delete["params"].get("params").is_none());
+    }
+
+    #[test]
+    fn delete_uses_durable_cwd_in_official_direct_extension_params() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let session_dir = home.path().join("sessions/project/session-delete-cwd");
+        fs::create_dir_all(&session_dir).expect("durable session directory");
+        fs::write(
+            session_dir.join("summary.json"),
+            serde_json::json!({
+                "info":{
+                    "id":"session-delete-cwd",
+                    "cwd":"/home/theconnman/git/curietech/agentos"
+                },
+                "session_summary":"Disposable delete target",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z",
+                "num_messages":2,
+                "current_model_id":"grok-4"
+            })
+            .to_string(),
+        )
+        .expect("durable delete summary");
+        let leader = ScriptedLeader::start(home.path(), false);
+
+        GrokLifecycle::new("/bin/true", home.path())
+            .delete("session-delete-cwd")
+            .expect("official delete request");
+
+        let requests = acp_requests(&leader.captured());
+        let delete = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/session/delete")
+            .expect("official delete extension request");
+        assert_eq!(
+            delete["params"],
+            json!({
+                "sessionId":"session-delete-cwd",
+                "cwd":"/home/theconnman/git/curietech/agentos"
+            })
+        );
+        assert!(delete["params"].get("method").is_none());
+        assert!(delete["params"].get("params").is_none());
+    }
+
+    #[test]
+    fn raw_unsuccessful_mutation_response_is_rejected_as_a_failure() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let session_dir = home.path().join("sessions/project/session-rejected");
+        fs::create_dir_all(&session_dir).expect("durable session directory");
+        fs::write(
+            session_dir.join("summary.json"),
+            serde_json::json!({
+                "info":{"id":"session-rejected","cwd":"/home/user/rejected"},
+                "session_summary":"Rejected durable session",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z",
+                "num_messages":2,
+                "current_model_id":"grok-4"
+            })
+            .to_string(),
+        )
+        .expect("durable rejected summary");
+        let leader = ScriptedLeader::start(home.path(), false);
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .delete("session-rejected")
+            .expect_err("raw success false must reject the mutation");
+        let requests = acp_requests(&leader.captured());
+        let delete = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/session/delete")
+            .expect("official delete extension request");
+        assert_eq!(
+            delete["params"],
+            json!({"sessionId":"session-rejected", "cwd":"/home/user/rejected"})
+        );
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("fail"),
+            "an unsuccessful official mutation must report failure, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn models_use_official_direct_extension_params() {
+        let (home, leader) = leader_home();
+        let lifecycle = GrokLifecycle::new("/bin/true", home.path());
         assert_eq!(
             lifecycle.models().expect("official model discovery"),
             vec![
@@ -555,28 +1665,107 @@ mod protocol {
         );
 
         let requests = acp_requests(&leader.captured());
-        for (wire_method, logical_method) in [
-            ("_x.ai/session/rename", "x.ai/session/rename"),
-            ("_x.ai/session/delete", "x.ai/session/delete"),
-            ("_x.ai/models/list", "x.ai/models/list"),
-        ] {
-            let request = requests
-                .iter()
-                .find(|request| request["method"] == wire_method)
-                .unwrap_or_else(|| panic!("missing {wire_method}"));
-            assert_eq!(request["params"]["method"], logical_method);
+        let models = requests
+            .iter()
+            .find(|request| request["method"] == "_x.ai/models/list")
+            .expect("official model extension request");
+        assert_eq!(models["params"], json!({}));
+        assert!(models["params"].get("method").is_none());
+        assert!(models["params"].get("params").is_none());
+    }
+
+    #[test]
+    fn model_discovery_skips_control_bearing_ids_instead_of_altering_them() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let _leader = ScriptedLeader::start_with_models(
+            home.path(),
+            json!({
+                "currentModelId":"grok-current-\u{1b}\u{202e}",
+                "availableModels":[
+                    {"modelId":"grok-safe","name":"Safe"},
+                    {"modelId":"grok-hostile-\u{009b}\u{2066}","name":"Hostile"}
+                ]
+            }),
+        );
+
+        assert_eq!(
+            GrokLifecycle::new("/bin/true", home.path())
+                .models()
+                .expect("safe official model discovery"),
+            vec!["default".to_string(), "grok-safe".to_string()]
+        );
+    }
+
+    #[test]
+    fn hostile_caller_ids_are_rejected_with_terminal_safe_mutation_errors() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        fs::create_dir(home.path().join("sessions")).expect("empty durable sessions root");
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[]}),
+            false,
+            false,
+            false,
+        );
+        let lifecycle = GrokLifecycle::new("/bin/true", home.path());
+        let hostile_id = "session-\u{1b}]0;owned\u{0007}\u{202e}";
+        let errors = [
+            lifecycle.cancel(hostile_id),
+            lifecycle.rename(hostile_id, "safe title"),
+            lifecycle.delete(hostile_id),
+        ];
+        for result in errors {
+            let error = result.expect_err("control bearing mutation identity must be rejected");
+            assert_terminal_safe("mutation error", &error.to_string());
         }
-        let rename = requests
-            .iter()
-            .find(|request| request["method"] == "_x.ai/session/rename")
-            .unwrap();
-        assert_eq!(rename["params"]["params"]["sessionId"], "session-selected");
-        assert_eq!(rename["params"]["params"]["title"], "A precise title");
-        let delete = requests
-            .iter()
-            .find(|request| request["method"] == "_x.ai/session/delete")
-            .unwrap();
-        assert_eq!(delete["params"]["params"]["sessionId"], "session-selected");
+    }
+
+    #[test]
+    fn symlinked_sessions_root_is_not_read_or_used_for_delete() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let external = tempfile::tempdir().expect("external sessions root");
+        let session_dir = external.path().join("project/session-symlink-root");
+        fs::create_dir_all(&session_dir).expect("external durable session directory");
+        fs::write(
+            session_dir.join("summary.json"),
+            serde_json::json!({
+                "info":{
+                    "id":"session-symlink-root",
+                    "cwd":"/home/user/external"
+                },
+                "session_summary":"External durable row",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z",
+                "num_messages":2,
+                "current_model_id":"grok-4"
+            })
+            .to_string(),
+        )
+        .expect("external durable summary");
+        std::os::unix::fs::symlink(external.path(), home.path().join("sessions"))
+            .expect("symlinked sessions root");
+        let leader = ScriptedLeader::start(home.path(), false);
+        let lifecycle = GrokLifecycle::new("/bin/true", home.path());
+
+        let rows = lifecycle.list().expect("safe durable listing");
+        let deletion = lifecycle.delete("session-symlink-root");
+        let delete_requests = acp_requests(&leader.captured())
+            .into_iter()
+            .filter(|request| request["method"] == "_x.ai/session/delete")
+            .count();
+        assert!(
+            !rows.iter().any(|row| row.id == "session-symlink-root"),
+            "a symlinked sessions root must not expose durable records"
+        );
+        assert!(
+            deletion.is_err(),
+            "delete must reject a record reached through a symlinked sessions root"
+        );
+        assert_eq!(
+            delete_requests, 0,
+            "unsafe durable storage must be rejected before an extension request"
+        );
     }
 
     #[test]
@@ -594,6 +1783,57 @@ mod protocol {
     }
 
     #[test]
+    fn symlinked_leader_socket_is_not_discovered_or_connected() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let external_home = tempfile::tempdir().expect("external leader home");
+        let _external = ScriptedLeader::start(external_home.path(), false);
+        std::os::unix::fs::symlink(
+            external_home.path().join("leader.sock"),
+            home.path().join("leader.sock"),
+        )
+        .expect("symlinked leader socket");
+        std::os::unix::fs::symlink(
+            external_home.path().join("leader.lock"),
+            home.path().join("leader.lock"),
+        )
+        .expect("symlinked leader lock");
+
+        let diagnostics = GrokLifecycle::new("/bin/true", home.path())
+            .diagnostics()
+            .expect("unsafe candidate degrades to unavailable");
+        assert_eq!(diagnostics.leader_count, 0);
+        assert!(!diagnostics.registered);
+        assert!(diagnostics.methods.is_empty());
+    }
+
+    #[test]
+    fn malformed_leader_registration_degrades_to_unregistered_diagnostics() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let socket = home.path().join("leader.sock");
+        fs::write(
+            home.path().join("leader.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("leader lock");
+        let listener = UnixListener::bind(&socket).expect("malformed leader socket");
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("diagnostic connection");
+            let _ = read_frame(&mut stream).expect("registration request");
+            stream
+                .write_all(&framed(&json!({"type":"unexpected"})))
+                .expect("malformed registration response");
+        });
+
+        let diagnostics = GrokLifecycle::new("/bin/true", home.path())
+            .diagnostics()
+            .expect("malformed leader must not fail diagnostics");
+        thread.join().expect("malformed leader thread");
+        assert_eq!(diagnostics.leader_count, 1);
+        assert!(!diagnostics.registered);
+        assert!(diagnostics.methods.is_empty());
+    }
+
+    #[test]
     fn model_discovery_failure_degrades_to_only_the_backend_default() {
         let home = tempfile::tempdir().expect("empty Grok home");
         assert_eq!(
@@ -602,5 +1842,216 @@ mod protocol {
                 .expect("best effort model fallback"),
             vec!["default".to_string()]
         );
+    }
+    #[test]
+    fn started_leader_process_is_detached_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !Path::new("/proc/self/stat").is_file() {
+            return;
+        }
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let replacement_home = tempfile::tempdir().expect("replacement leader home");
+        let replacement = ScriptedLeader::start(replacement_home.path(), false);
+        let binary = home.path().join("fake-grok");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$GROK_HOME/start-pid\"\ncp /proc/$$/stat \"$GROK_HOME/start-stat\"\nln '{}' \"$GROK_HOME/leader.sock\"\nprintf '%s' \"$$\" > \"$GROK_HOME/leader.lock\"\n",
+            replacement.socket.display()
+        );
+        fs::write(&binary, script).expect("fake official Grok binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+
+        GrokLifecycle::new(&binary, home.path())
+            .spawn(
+                Path::new("/home/user/project"),
+                "start detached leader",
+                None,
+            )
+            .expect("spawn through newly started leader");
+        let session_id = |stat: &str| {
+            stat.rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(3))
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("Linux process session identity")
+        };
+        let parent_session =
+            session_id(&fs::read_to_string("/proc/self/stat").expect("test process status"));
+        let child_session = session_id(
+            &fs::read_to_string(home.path().join("start-stat")).expect("started leader status"),
+        );
+        let child_pid = fs::read_to_string(home.path().join("start-pid"))
+            .expect("started leader pid")
+            .parse::<u32>()
+            .expect("numeric started leader pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while Path::new(&format!("/proc/{child_pid}")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let detached = child_session != parent_session;
+        let reaped = !Path::new(&format!("/proc/{child_pid}")).exists();
+        assert!(
+            detached && reaped,
+            "started leader must be detached and reaped: detached={detached}, reaped={reaped}"
+        );
+    }
+
+    #[test]
+    fn start_resolves_relative_grok_home_before_setting_child_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let process_cwd = std::env::current_dir().expect("current test directory");
+        let home = tempfile::Builder::new()
+            .prefix(".grok-start-relative-")
+            .tempdir_in(&process_cwd)
+            .expect("relative Grok home below current directory");
+        fs::create_dir(home.path().join("safe")).expect("safe relative component");
+        let absolute_home = fs::canonicalize(home.path()).expect("absolute Grok home target");
+        let relative_home = PathBuf::from(
+            home.path()
+                .file_name()
+                .expect("relative Grok home file name"),
+        )
+        .join("safe")
+        .join("..");
+        let replacement_home = tempfile::tempdir().expect("replacement leader home");
+        let replacement = ScriptedLeader::start(replacement_home.path(), false);
+        let binary = absolute_home.join("fake-grok");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$GROK_HOME\" > '{}/start-home'\nprintf '%s' \"$PWD\" > '{}/start-cwd'\nln '{}' '{}/leader.sock'\nprintf '%s' \"$$\" > '{}/leader.lock'\n",
+            absolute_home.display(),
+            absolute_home.display(),
+            replacement.socket.display(),
+            absolute_home.display(),
+            absolute_home.display()
+        );
+        fs::write(&binary, script).expect("fake official Grok binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+
+        let result = GrokLifecycle::new(&binary, &relative_home)
+            .spawn(
+                Path::new("/home/user/project"),
+                "resolve relative Grok home",
+                None,
+            )
+            .expect("spawn through a leader started from a relative Grok home");
+        assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
+        assert_eq!(
+            fs::read_to_string(absolute_home.join("start-home")).expect("captured child Grok home"),
+            absolute_home.display().to_string(),
+            "child GROK_HOME must be resolved before child cwd changes"
+        );
+        assert_eq!(
+            fs::read_to_string(absolute_home.join("start-cwd")).expect("captured child cwd"),
+            absolute_home.display().to_string(),
+            "the leader child must start from the resolved Grok home"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("current test directory after spawn"),
+            process_cwd
+        );
+        assert!(
+            replacement
+                .captured()
+                .iter()
+                .any(|frame| frame.body["type"] == "register"),
+            "lifecycle must discover the replacement at the original absolute target"
+        );
+    }
+
+    #[test]
+    fn start_operation_recovers_from_stale_connection_refused_via_configured_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let stale_socket = home.path().join("leader.sock");
+        let stale_listener = UnixListener::bind(&stale_socket).expect("stale leader socket");
+        drop(stale_listener);
+        fs::write(
+            home.path().join("leader.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("stale leader lock");
+
+        let replacement_home = tempfile::tempdir().expect("replacement leader home");
+        let replacement = ScriptedLeader::start(replacement_home.path(), false);
+        let binary = home.path().join("fake-grok");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GROK_HOME/start-argv\"\nprintf '%s' \"$PWD\" > \"$GROK_HOME/start-cwd\"\nprintf '%s' \"$$\" > \"$GROK_HOME/start-pid\"\nif [ -r /proc/$$/stat ]; then cp /proc/$$/stat \"$GROK_HOME/start-stat\"; fi\nln '{}' \"$GROK_HOME/leader-replacement.sock\"\nprintf '%s' \"$$\" > \"$GROK_HOME/leader-replacement.lock\"\n",
+            replacement.socket.display()
+        );
+        fs::write(&binary, script).expect("fake official Grok binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+
+        let lifecycle = GrokLifecycle::new(&binary, home.path());
+        let result = lifecycle
+            .spawn(
+                Path::new("/home/user/project"),
+                "recover stale leader",
+                None,
+            )
+            .expect("a start operation must recover from a stale refused leader socket");
+        assert_eq!(result.session_id.as_deref(), Some("session-alpha"));
+        assert!(home.path().join("start-argv").is_file());
+        assert_eq!(
+            fs::read_to_string(home.path().join("start-argv")).expect("started leader argv"),
+            "agent\nleader\n--no-exit-on-disconnect\n--relay-on-demand\n"
+        );
+        assert_eq!(
+            fs::read_to_string(home.path().join("start-cwd")).expect("started leader cwd"),
+            home.path().display().to_string()
+        );
+        assert!(
+            stale_socket.exists(),
+            "recovery must not delete shared runtime state"
+        );
+        assert!(
+            replacement
+                .captured()
+                .iter()
+                .any(|frame| frame.body["type"] == "register"),
+            "the replacement official leader must accept the lifecycle connection"
+        );
+
+        if Path::new("/proc/self/stat").is_file() {
+            let session_id = |stat: &str| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_whitespace().nth(3))
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .expect("Linux process session identity")
+            };
+            let parent_session =
+                session_id(&fs::read_to_string("/proc/self/stat").expect("test process status"));
+            let child_session = session_id(
+                &fs::read_to_string(home.path().join("start-stat")).expect("started leader status"),
+            );
+            let child_pid = fs::read_to_string(home.path().join("start-pid"))
+                .expect("started leader pid")
+                .parse::<u32>()
+                .expect("numeric started leader pid");
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while Path::new(&format!("/proc/{child_pid}")).exists()
+                && std::time::Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let detached = child_session != parent_session;
+            let reaped = !Path::new(&format!("/proc/{child_pid}")).exists();
+            assert!(
+                detached && reaped,
+                "started leader must be detached and reaped: detached={detached}, reaped={reaped}"
+            );
+        }
+
+        let diagnostics = lifecycle
+            .diagnostics()
+            .expect("replacement leader diagnostics");
+        assert!(diagnostics.registered);
+        assert!(diagnostics.leader_count >= 2);
+        assert!(!diagnostics.methods.is_empty());
     }
 }

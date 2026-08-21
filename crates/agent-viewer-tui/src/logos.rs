@@ -173,9 +173,45 @@ mod tests {
     use super::{LogoMarks, build_composer_canvas};
     use agent_viewer_core::BackendKind;
     use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Size;
+    use ratatui::style::Color;
+    use ratatui_image::Image;
     use ratatui_image::picker::{Picker, ProtocolType};
+    use ratatui_image::protocol::Protocol;
     use ratatui_image::{FontSize, Resize};
+
+    fn rendered_cells(protocol: &Protocol) -> Vec<(String, Color, Color)> {
+        let size = protocol.size();
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Image::new(protocol), frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.fg, cell.bg))
+            .collect()
+    }
+
+    #[test]
+    fn halfblocks_picker_maps_grok_to_its_deterministic_image_mark() {
+        let picker = Picker::halfblocks();
+        let first = LogoMarks::from_picker(&picker).unwrap();
+        let second = LogoMarks::from_picker(&picker).unwrap();
+
+        let grok = rendered_cells(first.image(BackendKind::Grok));
+        assert_eq!(grok, rendered_cells(second.image(BackendKind::Grok)));
+        assert_ne!(grok, rendered_cells(first.image(BackendKind::Codex)));
+        assert_ne!(grok, rendered_cells(first.image(BackendKind::Claude)));
+        assert_eq!(
+            grok,
+            rendered_cells(first.composer_image(BackendKind::Grok))
+        );
+    }
 
     #[test]
     fn graphics_composer_image_uses_its_own_three_cell_canvas() {
