@@ -178,12 +178,28 @@ fn spawn_parent_thread_id(raw_source: &str) -> Option<String> {
 }
 
 fn read_thread_names(path: &std::path::Path) -> HashMap<String, String> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return HashMap::new();
     };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return HashMap::new();
+    };
+    if len > crate::SESSION_INDEX_MAX_BYTES {
+        return HashMap::new();
+    }
+    use std::io::Read as _;
+    let mut reader = std::io::BufReader::new(file.take(crate::SESSION_INDEX_MAX_BYTES));
     let mut names = HashMap::new();
-    for line in contents.lines() {
-        let Some(value) = crate::parse_json_line(line) else {
+    let mut line = Vec::new();
+    loop {
+        match crate::read_capped_line(&mut reader, &mut line, crate::JSONL_LINE_MAX_BYTES) {
+            Ok(crate::CappedLine::Eof) => break,
+            Ok(crate::CappedLine::Skipped) => continue,
+            Ok(crate::CappedLine::Complete) => {}
+            Err(_) => return HashMap::new(),
+        }
+        let line = String::from_utf8_lossy(&line);
+        let Some(value) = crate::parse_json_line(&line) else {
             continue;
         };
         let Some(id) = crate::json_str(&value, "id") else {

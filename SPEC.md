@@ -55,8 +55,10 @@ Codex maintains a global session registry. Read it and its name index read only.
 
 `~/.codex/session_index.jsonl` overlays the SQLite title on every list refresh. Read it read
 only. For each id, the latest valid entry with a nonempty name wins. Use the SQLite title when
-the index is missing, unreadable, malformed, invalid, or has no matching entry. The index never
-supplies rows, status, or any field other than the name.
+the index is missing, unreadable, malformed, invalid, oversize (`SESSION_INDEX_MAX_BYTES`,
+8 MiB), or has no matching entry. Individual lines over `JSONL_LINE_MAX_BYTES` (512 KiB) are
+skipped; the rest of the file is still applied. The index never supplies rows, status, or any
+field other than the name.
 
 ## Shared listing cache
 
@@ -958,6 +960,11 @@ to display twelve events. The window is deliberately far wider than the 64 KiB t
 classifier works over, because a single transcript line can be an `apply_patch` call carrying a
 whole diff: a window that landed inside one such line would find no complete line at all and
 show an empty pane.
+
+Activity timestamps still walk the whole transcript (the ribbon needs turns outside that
+512 KiB tail), but each JSONL line is capped at `JSONL_LINE_MAX_BYTES` (the same 512 KiB).
+An oversize or newline-free blob is skipped, not allocated as one `Vec`. The walk then
+continues so later timestamps still land on the ribbon.
 
 ### Registry rollover
 

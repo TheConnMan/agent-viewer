@@ -955,6 +955,44 @@ fn claude_turn_activity_reads_full_history_and_tool_use() {
     );
 }
 
+/// A 2 MiB newline-free blob used to OOM `read_until`. The ribbon still walks the whole
+/// file, so a valid timestamp after the blob must survive; only the oversize line is skipped.
+#[test]
+fn claude_turn_activity_skips_an_oversize_line_and_keeps_neighbors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("oversize.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let early = now - 40;
+    let later = now - 10;
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"before blob"}}]}}}}"#,
+        rfc3339_at(early)
+    )
+    .unwrap();
+    file.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    writeln!(file).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"after blob"}}]}}}}"#,
+        rfc3339_at(later)
+    )
+    .unwrap();
+    drop(file);
+
+    let backend = ClaudeBackend::with_binary("/unused/claude");
+    assert_eq!(
+        backend
+            .turn_activity(&claude_session(Some(path)), Duration::from_secs(60 * 60))
+            .expect("activity around an oversize line"),
+        vec![early * 1_000, later * 1_000]
+    );
+}
+
 #[test]
 fn claude_turn_activity_includes_only_requested_subtree() {
     let dir = tempfile::TempDir::new().unwrap();

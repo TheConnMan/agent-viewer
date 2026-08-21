@@ -104,6 +104,100 @@ pub(crate) fn read_tail_window(path: &std::path::Path, window: u64) -> Result<St
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Largest JSONL line the activity ribbon and session-index overlay will keep.
+///
+/// Same ceiling as the tail window: a legitimate `apply_patch` line can carry a whole diff,
+/// but a newline-free multi-megabyte blob (or one giant line) must not become a single
+/// `Vec`/`String` on the refresh or activity worker.
+pub(crate) const JSONL_LINE_MAX_BYTES: usize = TRANSCRIPT_TAIL_BYTES as usize;
+
+/// Largest `session_index.jsonl` the name overlay will load.
+///
+/// The file is a small id→name map in normal use (thousands of short records). A hostile
+/// multi-hundred-MB stand-in is skipped whole; the SQLite title remains.
+pub(crate) const SESSION_INDEX_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Outcome of one capped JSONL line read. Oversize lines are skipped, never fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CappedLine {
+    /// `buf` holds the line, including a trailing newline when the file had one.
+    Complete,
+    /// The line exceeded the cap. `buf` is empty and the reader is at the next line or EOF.
+    Skipped,
+    /// No more bytes. `buf` is empty.
+    Eof,
+}
+
+/// Read one JSONL line into `buf`, never growing `buf` past `max`.
+///
+/// `read_until(b'\n')` has no cap, so a newline-free multi-hundred-MB file (or one giant
+/// line) becomes a single allocation. This walks with `fill_buf`/`consume` and drains an
+/// oversize remainder through the BufRead window instead of accumulating it.
+pub(crate) fn read_capped_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> Result<CappedLine> {
+    buf.clear();
+    loop {
+        let (outcome, consumed, drain) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                let outcome = if buf.is_empty() {
+                    CappedLine::Eof
+                } else {
+                    CappedLine::Complete
+                };
+                (Some(outcome), 0, false)
+            } else if let Some(index) = available.iter().position(|&byte| byte == b'\n') {
+                let take = index + 1;
+                if buf.len().saturating_add(take) > max {
+                    (Some(CappedLine::Skipped), take, false)
+                } else {
+                    buf.extend_from_slice(&available[..take]);
+                    (Some(CappedLine::Complete), take, false)
+                }
+            } else if buf.len().saturating_add(available.len()) > max {
+                (Some(CappedLine::Skipped), available.len(), true)
+            } else {
+                buf.extend_from_slice(available);
+                (None, available.len(), false)
+            }
+        };
+        reader.consume(consumed);
+        match outcome {
+            Some(CappedLine::Skipped) => {
+                if drain {
+                    skip_until_newline(reader)?;
+                }
+                buf.clear();
+                return Ok(CappedLine::Skipped);
+            }
+            Some(outcome) => return Ok(outcome),
+            None => {}
+        }
+    }
+}
+
+fn skip_until_newline(reader: &mut impl std::io::BufRead) -> Result<()> {
+    loop {
+        let (found, consumed) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(());
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(index) => (true, index + 1),
+                None => (false, available.len()),
+            }
+        };
+        reader.consume(consumed);
+        if found {
+            return Ok(());
+        }
+    }
+}
+
 /// One JSONL line -> Value: trim, then None for blank or malformed lines (all the
 /// line-oriented parsers skip those silently).
 pub(crate) fn parse_json_line(line: &str) -> Option<serde_json::Value> {
@@ -255,5 +349,144 @@ mod tail_window_tests {
         writer.join().expect("writer thread");
 
         assert!(reads > 0, "the reader never raced the writer");
+    }
+}
+
+#[cfg(test)]
+mod capped_line_tests {
+    use super::{CappedLine, read_capped_line};
+    use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn read_capped_line_returns_complete_lines_including_a_final_line_without_newline() {
+        let mut reader = Cursor::new(b"abc\ndef");
+        let mut buf = Vec::new();
+
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 16).expect("first"),
+            CappedLine::Complete
+        );
+        assert_eq!(&buf, b"abc\n");
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 16).expect("last"),
+            CappedLine::Complete
+        );
+        assert_eq!(&buf, b"def");
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 16).expect("eof"),
+            CappedLine::Eof
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn read_capped_line_keeps_a_line_at_the_cap_and_skips_one_byte_over() {
+        let exactly = {
+            let mut line = vec![b'a'; 7];
+            line.push(b'\n');
+            line
+        };
+        let mut reader = Cursor::new(exactly);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 8).expect("at cap"),
+            CappedLine::Complete
+        );
+        assert_eq!(buf.len(), 8);
+
+        let over = {
+            let mut line = vec![b'a'; 8];
+            line.push(b'\n');
+            line
+        };
+        let mut reader = Cursor::new(over);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 8).expect("over cap"),
+            CappedLine::Skipped
+        );
+        assert!(buf.is_empty());
+    }
+
+    /// THE REGRESSION. `read_until('\n')` copies a newline-free blob into one Vec. A 4 MiB
+    /// Cursor yields the whole remainder from `fill_buf`, so a capped reader that still
+    /// accumulated would hold the blob in `buf` (capacity in the megabytes). Skipping must
+    /// drain without that allocation, then keep the next line.
+    #[test]
+    fn read_capped_line_skips_a_newline_free_blob_without_holding_it() {
+        let mut blob = vec![b'x'; 4 * 1024 * 1024];
+        blob.extend_from_slice(b"\nok\n");
+        let mut reader = Cursor::new(blob);
+        let mut buf = Vec::new();
+
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).expect("skip blob"),
+            CappedLine::Skipped
+        );
+        assert!(buf.is_empty(), "the skipped blob must not remain in buf");
+        assert!(
+            buf.capacity() < 2 * 1024 * 1024,
+            "allocated the blob: capacity {}",
+            buf.capacity()
+        );
+
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).expect("neighbor"),
+            CappedLine::Complete
+        );
+        assert_eq!(&buf, b"ok\n");
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).expect("eof"),
+            CappedLine::Eof
+        );
+    }
+
+    /// BufReader yields 8 KiB windows. A 16 KiB cap copies the first window into `buf`
+    /// before the next window trips the cap; that prefix must still be dropped, and
+    /// capacity must stay on the order of the cap rather than the blob.
+    #[test]
+    fn read_capped_line_skips_a_chunked_oversize_line_without_holding_it() {
+        let mut blob = vec![b'x'; 4 * 1024 * 1024];
+        blob.extend_from_slice(b"\nok\n");
+        let mut reader = BufReader::with_capacity(8 * 1024, Cursor::new(blob));
+        let mut buf = Vec::new();
+        let max = 16 * 1024;
+
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, max).expect("skip blob"),
+            CappedLine::Skipped
+        );
+        assert!(buf.is_empty());
+        assert!(
+            buf.capacity() < 2 * 1024 * 1024,
+            "allocated the blob: capacity {}",
+            buf.capacity()
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, max).expect("neighbor"),
+            CappedLine::Complete
+        );
+        assert_eq!(&buf, b"ok\n");
+    }
+
+    #[test]
+    fn read_capped_line_skips_an_oversize_eof_blob_then_returns_eof() {
+        let blob = vec![b'x'; 4 * 1024 * 1024];
+        let mut reader = Cursor::new(blob);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).expect("skip"),
+            CappedLine::Skipped
+        );
+        assert!(buf.is_empty());
+        assert!(
+            buf.capacity() < 2 * 1024 * 1024,
+            "allocated the blob: capacity {}",
+            buf.capacity()
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).expect("eof"),
+            CappedLine::Eof
+        );
     }
 }

@@ -5,6 +5,7 @@ use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::registry::{Registry, find_state_db};
 use agent_viewer_core::codex::source::Source;
 use agent_viewer_core::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 
 const INSERT_COLS: &str = "INSERT INTO threads \
@@ -309,6 +310,78 @@ fn threads_overlay_follows_a_rewritten_session_index() {
         title(reg.threads().expect("query after the rename")),
         "Renamed",
         "a rename rewrites session_index.jsonl, and the cached overlay must not survive it"
+    );
+}
+
+/// `SESSION_INDEX_MAX_BYTES` is 8 MiB. A file past that cap is skipped whole so a
+/// hostile stand-in cannot become one `String` on the listing tick; SQLite titles remain.
+#[test]
+fn threads_overlay_skips_an_oversize_session_index() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let insert = thread_insert("fixture_thread_duplicate", "SQLite Fallback Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[insert.as_str()]);
+    let mut file = std::fs::File::create(dir.path().join("session_index.jsonl")).unwrap();
+    writeln!(
+        file,
+        r#"{{"id":"fixture_thread_duplicate","thread_name":"Should Not Apply"}}"#
+    )
+    .unwrap();
+    file.write_all(&vec![b'x'; 8 * 1024 * 1024]).unwrap();
+    drop(file);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query oversize index");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(
+        threads[0].title, "SQLite Fallback Name",
+        "an oversize session_index.jsonl must not overlay names"
+    );
+}
+
+/// A 2 MiB line is over `JSONL_LINE_MAX_BYTES` but the file is still under the 8 MiB
+/// file cap. Neighbors on either side of the blob must still overlay.
+#[test]
+fn threads_overlay_isolates_an_oversize_line_from_valid_neighbors() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let ordinary = thread_insert("fixture_thread_ordinary", "Ordinary SQLite Name", 2000);
+    let duplicate = thread_insert("fixture_thread_duplicate", "Duplicate SQLite Name", 3000);
+    let (dir, path) = common::temp_db(&schema, &[ordinary.as_str(), duplicate.as_str()]);
+    let mut file = std::fs::File::create(dir.path().join("session_index.jsonl")).unwrap();
+    writeln!(
+        file,
+        r#"{{"id":"fixture_thread_ordinary","thread_name":"Ordinary Index Name"}}"#
+    )
+    .unwrap();
+    file.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    writeln!(file).unwrap();
+    writeln!(
+        file,
+        r#"{{"id":"fixture_thread_duplicate","thread_name":"Latest Index Name"}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let threads = Registry::open(&path)
+        .expect("open read only")
+        .threads()
+        .expect("query index with oversize line");
+    let ordinary = threads
+        .iter()
+        .find(|thread| thread.id == "fixture_thread_ordinary")
+        .expect("ordinary fixture thread");
+    let duplicate = threads
+        .iter()
+        .find(|thread| thread.id == "fixture_thread_duplicate")
+        .expect("duplicate fixture thread");
+    assert_eq!(
+        ordinary.title, "Ordinary Index Name",
+        "a valid entry before the oversize line must survive"
+    );
+    assert_eq!(
+        duplicate.title, "Latest Index Name",
+        "a valid entry after the oversize line must still be read"
     );
 }
 

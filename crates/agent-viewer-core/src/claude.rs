@@ -1107,17 +1107,16 @@ fn read_claude_turn_activity(
     path: &std::path::Path,
     window: std::time::Duration,
 ) -> Result<Vec<i64>> {
-    use std::io::BufRead;
-
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     let (cutoff, now) = crate::activity_window(window);
     let mut timestamps = Vec::new();
     let mut line = Vec::new();
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
+        match crate::read_capped_line(&mut reader, &mut line, crate::JSONL_LINE_MAX_BYTES)? {
+            crate::CappedLine::Eof => break,
+            crate::CappedLine::Skipped => continue,
+            crate::CappedLine::Complete => {}
         }
         let line = String::from_utf8_lossy(&line);
         let Some(value) = crate::parse_json_line(&line) else {

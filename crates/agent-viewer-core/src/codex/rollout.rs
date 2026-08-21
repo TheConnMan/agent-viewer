@@ -1,6 +1,5 @@
 use crate::backend::TailEvent;
 use crate::error::Result;
-use std::io::BufRead;
 
 /// The last-turn outcome derived from the rollout tail (replaces v1's
 /// `has_task_complete_tail`). See section 5.2 of the v2 plan for the decision order.
@@ -307,9 +306,10 @@ pub(crate) fn read_turn_activity(
     let mut timestamps = Vec::new();
     let mut line = Vec::new();
     loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
+        match crate::read_capped_line(&mut reader, &mut line, crate::JSONL_LINE_MAX_BYTES)? {
+            crate::CappedLine::Eof => break,
+            crate::CappedLine::Skipped => continue,
+            crate::CappedLine::Complete => {}
         }
         let line = String::from_utf8_lossy(&line);
         let Some(value) = crate::parse_json_line(&line) else {

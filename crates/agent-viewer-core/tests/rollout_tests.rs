@@ -470,6 +470,44 @@ fn codex_turn_activity_reads_full_history_and_meaningful_calls() {
     );
 }
 
+/// A 2 MiB newline-free blob used to OOM `read_until`. The ribbon still walks the whole
+/// file, so a valid timestamp after the blob must survive; only the oversize line is skipped.
+#[test]
+fn codex_turn_activity_skips_an_oversize_line_and_keeps_neighbors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("oversize.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let early = now - 50;
+    let later = now - 10;
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"before blob"}}]}}}}"#,
+        rfc3339_at(early)
+    )
+    .unwrap();
+    file.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    writeln!(file).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"after blob"}}]}}}}"#,
+        rfc3339_at(later)
+    )
+    .unwrap();
+    drop(file);
+
+    let backend = CodexBackend::new(PathBuf::from("/unused"));
+    assert_eq!(
+        backend
+            .turn_activity(&codex_session(Some(path)), Duration::from_secs(60 * 60))
+            .expect("activity around an oversize line"),
+        vec![early * 1_000, later * 1_000]
+    );
+}
+
 #[test]
 fn codex_turn_activity_includes_only_requested_subtree() {
     let dir = tempfile::TempDir::new().unwrap();
