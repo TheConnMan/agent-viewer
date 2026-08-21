@@ -86,15 +86,20 @@ carry an ACP stability guarantee.
 Grok home is a nonempty `GROK_HOME` value verbatim, otherwise `~/.grok`. Durable sessions live
 under its `sessions` child in a working directory bucket and then a session identity directory.
 Agent Viewer reads `summary.json` for identity, title, working directory, timestamps, and
-summary, and reads `chat_history.jsonl` for the bounded transcript tail. It never writes a
-durable Grok file. Missing files, torn final JSONL records, malformed objects, directories that
-vanish during refresh, and unknown fields are skipped without failing the other rows.
+summary, reads `chat_history.jsonl` for the bounded transcript tail, and reads `updates.jsonl`
+for durable turn status. It never writes a durable Grok file. Missing files, torn final JSONL
+records, malformed objects, directories that vanish during refresh, and unknown fields are
+skipped without failing the other rows.
 
-Durable storage is history, not live authority. It has no authoritative overall terminal state,
-so a durable only row is `Unknown`, even when an event says a turn ended. When a reachable leader
-reports the same identity, its resident roster fields replace stale durable title, working
-directory, summary, timestamp, and status. Supported activity maps to working, needs input,
-idle, done, or error. Dormant, unknown, malformed, or conflicting evidence maps to `Unknown`.
+Durable storage is history, not live authority, but an unambiguous final turn event supplies a
+terminal result. A `turn_completed` event with `end_turn` or `cancelled` maps to `Done`.
+`rate_limit`, `error`, `refusal`, `max_tokens`, or `max_turn_requests` maps to `Error`. A later
+`user_message_chunk`, a torn suffix, malformed evidence, or conflicting evidence maps to
+`Unknown`. When a reachable leader reports the same identity, its resident roster fields
+replace stale durable title, working directory, summary, and timestamp. Active roster activity
+wins for status. Idle or dormant roster activity preserves an unambiguous durable terminal
+result; otherwise supported roster activity maps to working, needs input, idle, done, or error,
+and unknown evidence maps to `Unknown`.
 
 Leader discovery examines the official `leader*.lock` and `leader*.sock` entries below Grok
 home, connects only to a discovered socket, registers as a client, and probes leader identity
@@ -108,10 +113,16 @@ has `pid: None`; resident roster state records shared hosting, never row process
 Agent Viewer may start the official leader only for a lifecycle request when none is reachable.
 It starts the leader from a stable directory and never stops or restarts it. Stop sends
 `session/cancel` with only the selected opaque session identity and never signals the leader.
+If no leader endpoint exists, or every discovered endpoint is definitively missing or refuses
+the connection, cancel succeeds idempotently because the session is already stopped. Reachable
+ownership ambiguity and substantive connection, protocol, or security failures remain errors.
+When a reachable owner exists, it always receives `session/cancel` for the selected identity.
 
-Spawn initializes ACP, calls `session/new` with the selected working directory and optional
-official default model capability, preserves the returned `sessionId` exactly, and submits the
-prompt to that identity. Rename uses `_x.ai/session/rename`; delete uses
+Spawn registers with `yolo_mode` set to true, initializes ACP, calls `session/new` with the
+selected working directory and optional official default model capability, preserves the
+returned `sessionId` exactly, and submits the prompt to that identity. It returns only after the
+exact identity reports `Working` in the resident roster. The official leader continues the turn
+after Agent Viewer disconnects. Rename uses `_x.ai/session/rename`; delete uses
 `_x.ai/session/delete`; model discovery uses `_x.ai/models/list`. A model discovery failure
 returns the built in `default` model. Grok exposes no archive or unarchive operation, so those
 capabilities remain false. Attach is exactly `grok --resume <session id>` with the child working
@@ -127,6 +138,10 @@ Completion requires authenticated live proof of registration, two distinct sessi
 resident roster transitions, transcript tailing, selected session cancellation while its sibling
 remains live, rename, delete, resume, terminal completion, exact cleanup, and the full
 configuration smoke. Deterministic protocol coverage does not replace those live gates.
+Authenticated paid execution has proved detached prompt acceptance, `Working` followed by
+`Done` after disconnect, and a persisted response. The configuration gate remains blocked
+because current official inspection exposes no MCP servers. Project instructions, one shared
+skill, one stdio MCP server, and one HTTP MCP server remain required.
 
 ## Removed backends
 

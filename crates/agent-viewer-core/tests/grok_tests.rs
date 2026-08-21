@@ -261,7 +261,7 @@ fn durable_listing_skips_malformed_and_partial_records_without_losing_siblings()
 }
 
 #[test]
-fn durable_turn_end_does_not_fabricate_a_live_or_finished_status() {
+fn durable_chat_history_turn_end_without_official_terminal_update_remains_unknown() {
     let lifecycle = GrokLifecycle::new("missing-grok", fixture("home"));
     let rows = lifecycle.list().expect("durable listing");
     let row = rows
@@ -270,6 +270,290 @@ fn durable_turn_end_does_not_fabricate_a_live_or_finished_status() {
         .expect("durable session");
 
     assert_eq!(row.status, Status::Unknown);
+}
+
+fn write_durable_grok_session(home: &Path, session_id: &str, updates: &[String]) {
+    let session_dir = home.join("sessions/project").join(session_id);
+    std::fs::create_dir_all(&session_dir).expect("durable session directory");
+    std::fs::write(
+        session_dir.join("summary.json"),
+        serde_json::json!({
+            "info":{"id":session_id,"cwd":"/home/user/project"},
+            "session_summary":"Durable status fixture",
+            "created_at":"2026-08-20T01:02:03.004Z",
+            "updated_at":"2026-08-21T04:05:06.007Z",
+            "num_messages":2,
+            "current_model_id":"grok-4.6"
+        })
+        .to_string(),
+    )
+    .expect("durable session summary");
+    std::fs::write(session_dir.join("updates.jsonl"), updates.join("\n"))
+        .expect("durable session updates");
+}
+
+fn grok_session_update(session_id: &str, method: &str, update: serde_json::Value) -> String {
+    serde_json::json!({
+        "timestamp":1787330130,
+        "method":method,
+        "params":{"sessionId":session_id,"update":update}
+    })
+    .to_string()
+}
+
+fn grok_turn_completed(session_id: &str, prompt_id: &str, stop_reason: &str) -> String {
+    grok_session_update(
+        session_id,
+        "_x.ai/session/update",
+        serde_json::json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":prompt_id,
+            "stop_reason":stop_reason
+        }),
+    )
+}
+
+fn padded_grok_turn_completed(
+    session_id: &str,
+    prompt_id: &str,
+    stop_reason: &str,
+    encoded_len: usize,
+) -> String {
+    let mut record = serde_json::from_str::<serde_json::Value>(&grok_turn_completed(
+        session_id,
+        prompt_id,
+        stop_reason,
+    ))
+    .expect("terminal update JSON");
+    record["padding"] = serde_json::Value::String(String::new());
+    let base_len = record.to_string().len();
+    assert!(
+        base_len <= encoded_len,
+        "requested padded record is too small"
+    );
+    record["padding"] = serde_json::Value::String("x".repeat(encoded_len - base_len));
+    let encoded = record.to_string();
+    assert_eq!(encoded.len(), encoded_len);
+    encoded
+}
+
+#[test]
+fn durable_terminal_status_uses_only_unambiguous_official_turn_updates() {
+    let session_id = "session-status";
+    let terminal = |reason| grok_turn_completed(session_id, "prompt-one", reason);
+    let user_message = grok_session_update(
+        session_id,
+        "session/update",
+        serde_json::json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"continue"}
+        }),
+    );
+    let agent_message = grok_session_update(
+        session_id,
+        "session/update",
+        serde_json::json!({
+            "sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text","text":"done"}
+        }),
+    );
+    let cases = vec![
+        ("end turn", vec![terminal("end_turn")], Status::Done),
+        ("cancelled", vec![terminal("cancelled")], Status::Done),
+        ("rate limit", vec![terminal("rate_limit")], Status::Error),
+        ("error", vec![terminal("error")], Status::Error),
+        ("refusal", vec![terminal("refusal")], Status::Error),
+        ("max tokens", vec![terminal("max_tokens")], Status::Error),
+        (
+            "max turn requests",
+            vec![terminal("max_turn_requests")],
+            Status::Error,
+        ),
+        (
+            "unknown stop reason",
+            vec![terminal("future_reason")],
+            Status::Unknown,
+        ),
+        (
+            "no terminal update",
+            vec![agent_message.clone()],
+            Status::Unknown,
+        ),
+        (
+            "empty prompt identity",
+            vec![grok_turn_completed(session_id, "", "end_turn")],
+            Status::Unknown,
+        ),
+        (
+            "different session identity",
+            vec![grok_turn_completed(
+                "session-sibling",
+                "prompt-one",
+                "end_turn",
+            )],
+            Status::Unknown,
+        ),
+        (
+            "user message after terminal",
+            vec![terminal("end_turn"), user_message.clone()],
+            Status::Unknown,
+        ),
+        (
+            "later terminal after user message",
+            vec![
+                terminal("end_turn"),
+                user_message,
+                grok_turn_completed(session_id, "prompt-two", "end_turn"),
+            ],
+            Status::Done,
+        ),
+        (
+            "torn suffix after terminal",
+            vec![terminal("end_turn"), "{\"timestamp\":".to_string()],
+            Status::Unknown,
+        ),
+        (
+            "malformed earlier record followed by terminal",
+            vec!["not json".to_string(), terminal("end_turn")],
+            Status::Done,
+        ),
+        (
+            "nonuser update after terminal",
+            vec![terminal("end_turn"), agent_message],
+            Status::Done,
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (name, updates, expected) in cases {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        write_durable_grok_session(home.path(), session_id, &updates);
+        let actual = GrokLifecycle::new("missing-grok", home.path())
+            .list()
+            .expect("durable listing")
+            .into_iter()
+            .find(|row| row.id == session_id)
+            .expect("durable status row")
+            .status;
+        if actual != expected {
+            mismatches.push(format!("{name}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "durable terminal status mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn durable_status_tail_discards_a_partial_multibyte_prefix_before_a_complete_terminal_record() {
+    const STATUS_TAIL_BYTES: usize = 1024 * 1024;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-utf8-boundary";
+    write_durable_grok_session(home.path(), session_id, &[]);
+    let terminal =
+        padded_grok_turn_completed(session_id, "prompt-one", "end_turn", STATUS_TAIL_BYTES - 2);
+    let prefix = "prefix";
+    let updates = format!("{prefix}é\n{terminal}");
+    assert_eq!(
+        updates.len() - STATUS_TAIL_BYTES,
+        prefix.len() + 1,
+        "the retained tail must begin on the second byte of the multibyte character"
+    );
+    std::fs::write(
+        home.path()
+            .join("sessions/project")
+            .join(session_id)
+            .join("updates.jsonl"),
+        updates,
+    )
+    .expect("UTF8 boundary updates");
+
+    let row = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("durable listing")
+        .into_iter()
+        .find(|row| row.id == session_id)
+        .expect("UTF8 boundary status row");
+    assert_eq!(row.status, Status::Done);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn durable_status_uses_only_the_last_one_mib_per_session() {
+    const STATUS_TAIL_BYTES: usize = 1024 * 1024;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-per-tail-budget";
+    write_durable_grok_session(home.path(), session_id, &[]);
+    let terminal = grok_turn_completed(session_id, "prompt-one", "end_turn");
+    let later_unrelated = padded_grok_turn_completed(
+        "session-unrelated",
+        "prompt-two",
+        "end_turn",
+        STATUS_TAIL_BYTES,
+    );
+    std::fs::write(
+        home.path()
+            .join("sessions/project")
+            .join(session_id)
+            .join("updates.jsonl"),
+        format!("{terminal}\n{later_unrelated}\n"),
+    )
+    .expect("per session budget updates");
+
+    let row = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("durable listing")
+        .into_iter()
+        .find(|row| row.id == session_id)
+        .expect("per session budget row");
+    assert_eq!(
+        row.status,
+        Status::Unknown,
+        "terminal evidence older than the one MiB tail must not be read"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn durable_status_aggregate_budget_is_deterministic_and_leaves_later_sessions_unknown() {
+    const STATUS_TAIL_BYTES: usize = 1024 * 1024;
+    const BUDGETED_SESSIONS: usize = 32;
+    const SESSION_COUNT: usize = BUDGETED_SESSIONS + 2;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    for index in 0..SESSION_COUNT {
+        let session_id = format!("session-{index:03}");
+        let terminal =
+            padded_grok_turn_completed(&session_id, "prompt-one", "end_turn", STATUS_TAIL_BYTES);
+        write_durable_grok_session(home.path(), &session_id, &[terminal]);
+    }
+
+    let rows = GrokLifecycle::new("missing-grok", home.path())
+        .list()
+        .expect("aggregate budget listing");
+    assert_eq!(rows.len(), SESSION_COUNT);
+    for index in 0..SESSION_COUNT {
+        let session_id = format!("session-{index:03}");
+        let row = rows
+            .iter()
+            .find(|row| row.id == session_id)
+            .expect("aggregate budget row");
+        let expected = if index < BUDGETED_SESSIONS {
+            Status::Done
+        } else {
+            Status::Unknown
+        };
+        assert_eq!(
+            row.status, expected,
+            "aggregate status budget selection changed for {session_id}"
+        );
+    }
 }
 
 #[test]
@@ -667,6 +951,7 @@ mod protocol {
     struct LeaderBehavior {
         oversized: bool,
         prompt_error: bool,
+        prompt_error_after_roster: bool,
         reverse_permission: bool,
         roster_error: bool,
         models: Option<Value>,
@@ -714,6 +999,18 @@ mod protocol {
             )
         }
 
+        fn start_with_prompt_error_after_roster(home: &Path, roster: Value) -> ScriptedLeader {
+            Self::start_config(
+                home,
+                "",
+                roster,
+                LeaderBehavior {
+                    prompt_error_after_roster: true,
+                    ..LeaderBehavior::default()
+                },
+            )
+        }
+
         fn start_with_models(home: &Path, models: Value) -> ScriptedLeader {
             Self::start_config(
                 home,
@@ -750,6 +1047,7 @@ mod protocol {
             let LeaderBehavior {
                 oversized,
                 prompt_error,
+                prompt_error_after_roster,
                 reverse_permission,
                 roster_error,
                 models,
@@ -771,6 +1069,7 @@ mod protocol {
                                 models: &models,
                                 oversized,
                                 prompt_error,
+                                prompt_error_after_roster,
                                 reverse_permission,
                                 roster_error,
                                 socket: &thread_socket,
@@ -870,6 +1169,7 @@ mod protocol {
         models: &'a Value,
         oversized: bool,
         prompt_error: bool,
+        prompt_error_after_roster: bool,
         reverse_permission: bool,
         roster_error: bool,
         socket: &'a Path,
@@ -883,6 +1183,7 @@ mod protocol {
             models,
             oversized,
             prompt_error,
+            prompt_error_after_roster,
             reverse_permission,
             roster_error,
             socket,
@@ -891,6 +1192,8 @@ mod protocol {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("leader read timeout");
+        let mut deferred_prompt_id = None;
+        let mut prompt_submitted = false;
         loop {
             let Ok(Some((prefix, outer))) = read_frame(&mut stream) else {
                 return;
@@ -1022,7 +1325,12 @@ mod protocol {
                         }
                         continue;
                     }
+                    if method == "session/prompt" && prompt_error_after_roster {
+                        deferred_prompt_id = Some(id);
+                        continue;
+                    }
                     if method == "session/prompt" {
+                        prompt_submitted = true;
                         continue;
                     }
                     if method == "_x.ai/sessions/list" && roster_error {
@@ -1084,7 +1392,27 @@ mod protocol {
                             "authMethods":[]
                         }),
                         "session/new" => json!({"sessionId":"session-alpha"}),
-                        "_x.ai/sessions/list" => json!({"result":roster}),
+                        "_x.ai/sessions/list" => {
+                            let mut result = roster.clone();
+                            if prompt_submitted
+                                && let Some(sessions) =
+                                    result.get_mut("sessions").and_then(Value::as_array_mut)
+                                && !sessions.iter().any(|session| {
+                                    session.get("sessionId").and_then(Value::as_str)
+                                        == Some("session-alpha")
+                                })
+                            {
+                                sessions.push(json!({
+                                    "sessionId":"session-alpha",
+                                    "title":"Spawned",
+                                    "cwd":"/home/user/project",
+                                    "activity":"working",
+                                    "resident":true,
+                                    "lastChangeUnixMs":1787289000000_i64
+                                }));
+                            }
+                            json!({"result":result})
+                        }
                         "_x.ai/models/list" => json!({"result":models}),
                         "_x.ai/session/rename" => json!({"success":true}),
                         "_x.ai/session/delete" => json!({
@@ -1097,6 +1425,24 @@ mod protocol {
                     };
                     if send_acp_response(&mut stream, id, result).is_err() {
                         return;
+                    }
+                    if method == "_x.ai/sessions/list"
+                        && let Some(prompt_id) = deferred_prompt_id.take()
+                    {
+                        let response = json!({
+                            "type":"acp",
+                            "payload":json!({
+                                "jsonrpc":"2.0",
+                                "id":prompt_id,
+                                "error":{
+                                    "code":-32000,
+                                    "message":"detached prompt rejected after roster"
+                                }
+                            }).to_string()
+                        });
+                        if stream.write_all(&framed(&response)).is_err() {
+                            return;
+                        }
                     }
                 }
                 _ => return,
@@ -1174,6 +1520,143 @@ mod protocol {
     }
 
     #[test]
+    fn resident_roster_status_wins_over_a_durable_terminal_fallback() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        write_durable_grok_session(
+            home.path(),
+            "session-status",
+            &[grok_turn_completed(
+                "session-status",
+                "prompt-one",
+                "end_turn",
+            )],
+        );
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[{
+                "sessionId":"session-status",
+                "title":"Resident status",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787330131000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        let rows = GrokLifecycle::new("/bin/true", home.path())
+            .list()
+            .expect("merged Grok listing");
+        let matches = rows
+            .iter()
+            .filter(|row| row.id == "session-status")
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, Status::Working);
+        assert!(matches[0].daemon_hosted);
+    }
+
+    #[test]
+    fn dormant_roster_preserves_a_durable_completed_turn() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        write_durable_grok_session(
+            home.path(),
+            "session-status",
+            &[grok_turn_completed(
+                "session-status",
+                "prompt-one",
+                "end_turn",
+            )],
+        );
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[{
+                "sessionId":"session-status",
+                "title":"Completed resident session",
+                "cwd":"/home/user/project",
+                "activity":"dormant",
+                "resident":true,
+                "lastChangeUnixMs":1787330131000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        let rows = GrokLifecycle::new("/bin/true", home.path())
+            .list()
+            .expect("merged Grok listing");
+        let matches = rows
+            .iter()
+            .filter(|row| row.id == "session-status")
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, Status::Done);
+        assert!(matches[0].daemon_hosted);
+    }
+
+    #[test]
+    fn idle_roster_does_not_override_a_durable_completed_turn() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        write_durable_grok_session(
+            home.path(),
+            "session-status",
+            &[grok_turn_completed(
+                "session-status",
+                "prompt-one",
+                "end_turn",
+            )],
+        );
+        write_durable_grok_session(home.path(), "session-idle", &[]);
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[
+                {
+                    "sessionId":"session-status",
+                    "title":"Completed resident session",
+                    "cwd":"/home/user/project",
+                    "activity":"idle",
+                    "resident":true,
+                    "lastChangeUnixMs":1787330129000_i64
+                },
+                {
+                    "sessionId":"session-idle",
+                    "title":"Idle resident session",
+                    "cwd":"/home/user/project",
+                    "activity":"idle",
+                    "resident":true,
+                    "lastChangeUnixMs":1787330129000_i64
+                }
+            ]}),
+            false,
+            false,
+            false,
+        );
+
+        let rows = GrokLifecycle::new("/bin/true", home.path())
+            .list()
+            .expect("merged Grok listing");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == "session-idle")
+                .expect("idle control row")
+                .status,
+            Status::Idle
+        );
+        let completed = rows
+            .iter()
+            .find(|row| row.id == "session-status")
+            .expect("completed status row");
+        assert_eq!(completed.status, Status::Done);
+        assert!(completed.daemon_hosted);
+    }
+
+    #[test]
     fn spawn_registers_before_acp_and_preserves_identity_model_and_prompt_target() {
         let (home, leader) = leader_home();
         let result = GrokLifecycle::new("/bin/true", home.path())
@@ -1221,6 +1704,119 @@ mod protocol {
             .position(|request| request["method"] == "_x.ai/sessions/list")
             .expect("post prompt roster request");
         assert!(prompt_index < roster_index);
+    }
+
+    #[test]
+    fn detached_spawn_surfaces_prompt_error_after_nonworking_roster() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let _leader = ScriptedLeader::start_with_prompt_error_after_roster(
+            home.path(),
+            json!({"sessions":[{
+                "sessionId":"session-alpha",
+                "title":"Spawned",
+                "cwd":"/home/user/project",
+                "activity":"idle",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+        );
+
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(
+                Path::new("/home/user/project"),
+                "detached nonworking kickoff",
+                None,
+            )
+            .expect_err("a nonworking roster must not hide the following prompt error");
+
+        assert_eq!(
+            error.to_string(),
+            "command failed: Grok session/prompt request failed: detached prompt rejected after roster"
+        );
+    }
+
+    #[test]
+    fn detached_spawn_surfaces_prompt_error_after_nonmatching_roster() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let _leader = ScriptedLeader::start_with_prompt_error_after_roster(
+            home.path(),
+            json!({"sessions":[{
+                "sessionId":"session-sibling",
+                "title":"Sibling",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+        );
+
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(
+                Path::new("/home/user/project"),
+                "detached nonmatching kickoff",
+                None,
+            )
+            .expect_err("an unrelated working row must not hide the following prompt error");
+
+        assert_eq!(
+            error.to_string(),
+            "command failed: Grok session/prompt request failed: detached prompt rejected after roster"
+        );
+    }
+
+    #[test]
+    fn detached_spawn_requires_the_exact_working_session_to_be_resident() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let _leader = ScriptedLeader::start_with_prompt_error_after_roster(
+            home.path(),
+            json!({"sessions":[{
+                "sessionId":"session-alpha",
+                "title":"Spawned but detached",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":false,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+        );
+
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .spawn(
+                Path::new("/home/user/project"),
+                "detached nonresident kickoff",
+                None,
+            )
+            .expect_err("a nonresident working row must not confirm detached execution");
+
+        assert_eq!(
+            error.to_string(),
+            "command failed: Grok session/prompt request failed: detached prompt rejected after roster"
+        );
+    }
+
+    #[test]
+    fn detached_spawn_registers_yolo_mode_and_preserves_optional_default_model() {
+        let registration_for = |model: Option<&str>| {
+            let (home, leader) = leader_home();
+            GrokLifecycle::new("/bin/true", home.path())
+                .spawn(Path::new("/home/user/project"), "detached kickoff", model)
+                .expect("official Grok spawn");
+            leader
+                .captured()
+                .into_iter()
+                .find(|frame| frame.body["type"] == "register")
+                .expect("leader registration")
+                .body
+        };
+
+        let selected_model = registration_for(Some("grok-4-fast"));
+        let runtime_default = registration_for(None);
+        assert_eq!(
+            selected_model["capabilities"]["default_model"],
+            "grok-4-fast"
+        );
+        assert!(runtime_default["capabilities"]["default_model"].is_null());
+        assert_eq!(selected_model["capabilities"]["yolo_mode"], true);
+        assert_eq!(runtime_default["capabilities"]["yolo_mode"], true);
     }
 
     #[test]
@@ -1300,6 +1896,200 @@ mod protocol {
         assert_eq!(cancels[0]["params"]["sessionId"], "session-selected");
         let wire = serde_json::to_string(&cancels).unwrap();
         assert!(!wire.contains("session-sibling"));
+    }
+
+    #[test]
+    fn cancel_treats_only_refused_leader_endpoints_as_already_stopped() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let stale_socket = home.path().join("leader.sock");
+        let stale_listener = UnixListener::bind(&stale_socket).expect("stale leader socket");
+        drop(stale_listener);
+        let stale_lock = home.path().join("leader.lock");
+        fs::write(&stale_lock, std::process::id().to_string()).expect("stale leader lock");
+        let socket_inode = fs::symlink_metadata(&stale_socket)
+            .expect("stale socket metadata")
+            .ino();
+        let lock_contents = fs::read_to_string(&stale_lock).expect("stale lock contents");
+
+        let session_summary = home
+            .path()
+            .join("sessions/project/session-selected/summary.json");
+        fs::create_dir_all(session_summary.parent().expect("session directory"))
+            .expect("durable session directory");
+        fs::write(
+            &session_summary,
+            json!({
+                "info":{"id":"session-selected","cwd":"/home/user/project"},
+                "session_summary":"Stopped session",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z"
+            })
+            .to_string(),
+        )
+        .expect("durable session summary");
+
+        let binary = home.path().join("fake-grok");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf started > \"$GROK_HOME/start-marker\"\n",
+        )
+        .expect("fake Grok binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+
+        GrokLifecycle::new(&binary, home.path())
+            .cancel("session-selected")
+            .expect("refused leader endpoint means the session is already stopped");
+
+        assert!(
+            !home.path().join("start-marker").exists(),
+            "cancel must not start or restart the official leader"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&stale_socket)
+                .expect("stale socket remains")
+                .ino(),
+            socket_inode,
+            "cancel must not replace or delete shared leader runtime state"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_lock).expect("stale lock remains"),
+            lock_contents,
+            "cancel must not replace or delete shared leader runtime state"
+        );
+        assert!(
+            session_summary.is_file(),
+            "cancel must not delete the durable session"
+        );
+    }
+
+    #[test]
+    fn cancel_surfaces_a_substantive_later_registration_error_after_a_refused_candidate() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+
+        let refused_socket = home.path().join("leader-a.sock");
+        let refused_listener = UnixListener::bind(&refused_socket).expect("refused leader socket");
+        drop(refused_listener);
+        fs::write(
+            home.path().join("leader-a.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("refused leader lock");
+
+        let malformed_socket = home.path().join("leader-b.sock");
+        let malformed_listener =
+            UnixListener::bind(&malformed_socket).expect("malformed leader socket");
+        fs::write(
+            home.path().join("leader-b.lock"),
+            std::process::id().to_string(),
+        )
+        .expect("malformed leader lock");
+        let malformed_thread = thread::spawn(move || {
+            let (mut stream, _) = malformed_listener
+                .accept()
+                .expect("registration connection");
+            let registration = read_frame(&mut stream)
+                .expect("registration frame")
+                .expect("registration body");
+            assert_eq!(registration.1["type"], "register");
+            stream
+                .write_all(&framed(&json!({"type":"not_registered"})))
+                .expect("malformed registration response");
+        });
+
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .cancel("session-selected")
+            .expect_err("a malformed reachable candidate must not look already stopped");
+        malformed_thread.join().expect("malformed leader thread");
+
+        assert_eq!(
+            error.to_string(),
+            "command failed: Grok leader registration failed"
+        );
+    }
+
+    #[test]
+    fn cancel_without_discovered_leader_endpoints_is_already_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let session_summary = home
+            .path()
+            .join("sessions/project/session-selected/summary.json");
+        fs::create_dir_all(session_summary.parent().expect("session directory"))
+            .expect("durable session directory");
+        fs::write(
+            &session_summary,
+            json!({
+                "info":{"id":"session-selected","cwd":"/home/user/project"},
+                "session_summary":"Stopped session",
+                "created_at":"2026-08-20T01:02:03.004Z",
+                "updated_at":"2026-08-21T04:05:06.007Z"
+            })
+            .to_string(),
+        )
+        .expect("durable session summary");
+
+        let binary = home.path().join("fake-grok");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf started > \"$GROK_HOME/start-marker\"\n",
+        )
+        .expect("fake Grok binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("executable fake Grok binary");
+
+        GrokLifecycle::new(&binary, home.path())
+            .cancel("session-selected")
+            .expect("no discovered leader means the session is already stopped");
+
+        assert!(
+            !home.path().join("start-marker").exists(),
+            "cancel must not start or restart the official leader"
+        );
+        assert!(
+            session_summary.is_file(),
+            "cancel must not delete the durable session"
+        );
+    }
+
+    #[test]
+    fn cancel_rejects_a_selected_session_without_a_reachable_owner() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        let nonowner = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[{
+                "sessionId":"session-sibling",
+                "title":"Sibling",
+                "cwd":"/home/user/project",
+                "activity":"working",
+                "resident":true,
+                "lastChangeUnixMs":1787289000000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        let error = GrokLifecycle::new("/bin/true", home.path())
+            .cancel("session-selected")
+            .expect_err("a reachable nonowner must not make cancellation succeed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no reachable Grok leader owns session session-selected"),
+            "unexpected cancellation error: {error:?}"
+        );
+        assert!(
+            !acp_requests(&nonowner.captured())
+                .iter()
+                .any(|request| request["method"] == "session/cancel"),
+            "a reachable nonowner must not receive cancel"
+        );
     }
 
     #[test]

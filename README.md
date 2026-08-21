@@ -42,9 +42,10 @@ or newer because secure durable traversal uses `openat2`, with no insecure fallb
 leader is reachable, its roster supplies live status and its ACP lifecycle supplies spawn,
 selected session cancel, rename, delete, and model discovery. Attach runs
 `grok --resume <session id>` from the selected session's working directory. Grok has no archive
-or unarchive capability. Durable records alone never fabricate terminal state, so a row remains
-unknown until the leader supplies authoritative activity. A shared leader never becomes row
-process ownership, and Agent Viewer never stops or restarts it.
+or unarchive capability. Durable `updates.jsonl` records identify unambiguous completed and
+failed turns. Live active roster state wins; idle or dormant roster state preserves an
+unambiguous durable terminal result. Ambiguous or later activity remains unknown. A shared
+leader never becomes row process ownership, and Agent Viewer never stops or restarts it.
 
 Grok requires the official `grok` binary on `PATH` and an authenticated Grok runtime. Agent
 Viewer writes no Grok configuration. The official runtime remains responsible for discovering
@@ -144,6 +145,10 @@ it is empty; once you have typed anything, every printable key (and space) is ta
 that contains it and keeps that selection. It uses the exact returned identifier first, then the
 exact returned job name, otherwise bounded cwd and invocation-interval matching while excluding
 rows that existed before submission.
+
+A pinned Grok spawn registers with `yolo_mode` enabled, creates the official session, submits
+the prompt, and returns its exact identity only after that identity reports `Working` in the
+leader roster. The official leader continues the turn after Agent Viewer disconnects.
 
 ### agent-router
 

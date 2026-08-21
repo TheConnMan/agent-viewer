@@ -136,18 +136,35 @@ impl GrokLifecycle {
                     "prompt": [{"type": "text", "text": task}],
                 }),
             )?;
-            let roster_id = client.send_request("_x.ai/sessions/list", json!({}))?;
-            let roster = client.response(
-                roster_id,
-                "_x.ai/sessions/list",
-                Some((prompt_id, "session/prompt")),
-            )?;
-            if roster.get("error").is_some_and(|error| !error.is_null())
-                || roster.get("result").is_none()
-            {
-                return Err(Error::Command(
-                    "Grok roster did not confirm the spawned session".into(),
-                ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let roster_id = client.send_request("_x.ai/sessions/list", json!({}))?;
+                let roster = client.response(
+                    roster_id,
+                    "_x.ai/sessions/list",
+                    Some((prompt_id, "session/prompt")),
+                )?;
+                let working = roster
+                    .pointer("/result/sessions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|sessions| {
+                        sessions.iter().any(|session| {
+                            session.get("sessionId").and_then(Value::as_str)
+                                == Some(session_id.as_str())
+                                && session.get("activity").and_then(Value::as_str)
+                                    == Some("working")
+                                && session.get("resident").and_then(Value::as_bool) == Some(true)
+                        })
+                    });
+                if working {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Command(
+                        "Grok roster did not confirm the spawned session was working".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Ok(SpawnResult {
                 pid: None,
@@ -165,7 +182,14 @@ impl GrokLifecycle {
         require_session_id(session_id)?;
         #[cfg(target_os = "linux")]
         {
-            let (_, mut clients) = self.connect_existing(None, true)?;
+            let (candidate_count, mut clients) = match self.connect_existing(None, true) {
+                Ok(connected) => connected,
+                Err(error) if is_definitively_unreachable_error(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if candidate_count == 0 {
+                return Ok(());
+            }
             let mut owner = None;
             for mut client in clients.drain(..) {
                 let Ok(body) = client.ext_request("x.ai/sessions/list", json!({})) else {
@@ -285,7 +309,8 @@ impl GrokLifecycle {
         let candidates = leader_candidates(&self.home)?;
         let count = candidates.len();
         let mut clients = Vec::new();
-        let mut first_error = None;
+        let mut first_unreachable_error = None;
+        let mut first_substantive_error = None;
         for candidate in candidates {
             let connected =
                 LeaderClient::connect(&candidate.socket, model).and_then(|mut client| {
@@ -297,14 +322,25 @@ impl GrokLifecycle {
                 });
             match connected {
                 Ok(client) => clients.push(client),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+                Err(error) if is_definitively_unreachable_error(&error) => {
+                    if first_unreachable_error.is_none() {
+                        first_unreachable_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    if first_substantive_error.is_none() {
+                        first_substantive_error = Some(error);
+                    }
+                }
             }
         }
-        if clients.is_empty()
-            && let Some(error) = first_error
-        {
-            return Err(error);
+        if clients.is_empty() {
+            if let Some(error) = first_substantive_error {
+                return Err(error);
+            }
+            if let Some(error) = first_unreachable_error {
+                return Err(error);
+            }
         }
         Ok((count, clients))
     }
@@ -492,6 +528,8 @@ struct DurableSummary {
 // while preventing a corrupt record from forcing an unbounded allocation during refresh.
 const GROK_SUMMARY_MAX_BYTES: u64 = 1024 * 1024;
 const GROK_DURABLE_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const GROK_STATUS_TAIL_MAX_BYTES: u64 = 1024 * 1024;
+const GROK_DURABLE_STATUS_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
@@ -518,6 +556,7 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
     let cwd_names = sessions_directory.names()?;
     let mut sessions = Vec::new();
     let mut bytes_read = 0_u64;
+    let mut status_bytes_read = 0_u64;
     for cwd_name in cwd_names {
         let Ok(cwd_directory) = sessions_directory.open_directory(&cwd_name) else {
             continue;
@@ -604,6 +643,12 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
                         .join(&session_name)
                         .join("chat_history.jsonl")
                 });
+            let (status, status_bytes) = read_durable_status(
+                &session_directory,
+                &summary.info.id,
+                GROK_DURABLE_STATUS_MAX_BYTES.saturating_sub(status_bytes_read),
+            );
+            status_bytes_read = status_bytes_read.saturating_add(status_bytes);
             sessions.push(Session {
                 backend: BackendKind::Grok,
                 id: summary.info.id.clone(),
@@ -616,7 +661,7 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
                 },
                 cwd: PathBuf::from(summary.info.cwd),
                 git_branch: None,
-                status: Status::Unknown,
+                status,
                 created_at_ms,
                 updated_at_ms,
                 hidden,
@@ -631,6 +676,99 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
         }
     }
     Ok(sessions)
+}
+
+#[cfg(target_os = "linux")]
+fn read_durable_status(
+    session_directory: &SecureDirectory,
+    session_id: &str,
+    remaining_bytes: u64,
+) -> (Status, u64) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if remaining_bytes == 0 {
+        return (Status::Unknown, 0);
+    }
+    let Ok(mut file) = session_directory.open_regular(std::ffi::OsStr::new("updates.jsonl")) else {
+        return (Status::Unknown, 0);
+    };
+    let Ok(metadata) = file.metadata() else {
+        return (Status::Unknown, 0);
+    };
+    let file_len = metadata.len();
+    let read_len = file_len
+        .min(GROK_STATUS_TAIL_MAX_BYTES)
+        .min(remaining_bytes);
+    if read_len == 0 {
+        return (Status::Unknown, 0);
+    }
+    let offset = file_len.saturating_sub(read_len);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return (Status::Unknown, 0);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(read_len).unwrap_or_default());
+    if (&mut file).take(read_len).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != read_len
+    {
+        return (Status::Unknown, bytes.len() as u64);
+    }
+    let stable_len = file
+        .metadata()
+        .is_ok_and(|current| current.len() == file_len);
+    if !stable_len {
+        return (Status::Unknown, read_len);
+    }
+    let complete_bytes = if offset > 0 {
+        let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return (Status::Unknown, read_len);
+        };
+        &bytes[first_newline + 1..]
+    } else {
+        &bytes
+    };
+    let Ok(body) = std::str::from_utf8(complete_bytes) else {
+        return (Status::Unknown, read_len);
+    };
+
+    let mut status = Status::Unknown;
+    for line in body.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            status = Status::Unknown;
+            continue;
+        };
+        let method = record.get("method").and_then(Value::as_str);
+        if record.pointer("/params/sessionId").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        let update = record.pointer("/params/update");
+        let update_kind = update
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str);
+        if update_kind == Some("user_message_chunk")
+            && matches!(method, Some("session/update" | "_x.ai/session/update"))
+        {
+            status = Status::Unknown;
+            continue;
+        }
+        if method != Some("_x.ai/session/update") || update_kind != Some("turn_completed") {
+            continue;
+        }
+        let prompt_id = update
+            .and_then(|update| update.get("prompt_id"))
+            .and_then(Value::as_str)
+            .filter(|prompt_id| !prompt_id.trim().is_empty());
+        let stop_reason = update
+            .and_then(|update| update.get("stop_reason"))
+            .and_then(Value::as_str);
+        status = match (prompt_id, stop_reason) {
+            (Some(_), Some("end_turn" | "cancelled")) => Status::Done,
+            (
+                Some(_),
+                Some("rate_limit" | "error" | "refusal" | "max_tokens" | "max_turn_requests"),
+            ) => Status::Error,
+            _ => Status::Unknown,
+        };
+    }
+    (status, read_len)
 }
 
 #[cfg(target_os = "linux")]
@@ -974,10 +1112,10 @@ fn merge_roster(
             "dormant" => Status::Unknown,
             _ => Status::Unknown,
         };
-        let status = match roster_statuses.get(&entry.session_id) {
-            Some(previous) if previous != &status => Status::Unknown,
-            Some(previous) => previous.clone(),
-            None => status,
+        let (status, roster_conflict) = match roster_statuses.get(&entry.session_id) {
+            Some(previous) if previous != &status => (Status::Unknown, true),
+            Some(previous) => (previous.clone(), false),
+            None => (status, false),
         };
         roster_statuses.insert(entry.session_id.clone(), status.clone());
         if let Some(session) = sessions.iter_mut().find(|row| row.id == entry.session_id) {
@@ -985,7 +1123,12 @@ fn merge_roster(
                 session.title = sanitize_terminal_text(&title);
             }
             session.cwd = PathBuf::from(entry.cwd);
-            session.status = status;
+            if !matches!(entry.activity.as_str(), "dormant" | "idle")
+                || roster_conflict
+                || !matches!(session.status, Status::Done | Status::Error)
+            {
+                session.status = status;
+            }
             session.updated_at_ms = entry.last_change_unix_ms;
             if let Some(summary) = entry
                 .last_turn_summary
@@ -1217,6 +1360,18 @@ fn is_frame_cap_error(error: &Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_definitively_unreachable_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+    )
+}
+
+#[cfg(target_os = "linux")]
 struct LeaderClient {
     stream: std::os::unix::net::UnixStream,
 }
@@ -1234,7 +1389,7 @@ impl LeaderClient {
                 "type": "register",
                 "client_type": "agent-viewer",
                 "mode": "stdio",
-                "capabilities": {"default_model": model},
+                "capabilities": {"default_model": model, "yolo_mode": true},
             }),
         )?;
         let registered = read_frame(&mut stream)?;
