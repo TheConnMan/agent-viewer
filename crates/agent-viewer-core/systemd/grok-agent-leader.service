@@ -1,0 +1,17 @@
+[Unit]
+Description=Persistent Grok Agent Leader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=GROK_HOME=%h/.grok
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/grok agent leader --no-exit-on-disconnect --relay-on-demand
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

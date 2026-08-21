@@ -110,9 +110,11 @@ unrelated notifications are ignored.
 
 One leader serves multiple clients and tracks multiple sessions. A leader hosted row therefore
 has `pid: None`; resident roster state records shared hosting, never row process ownership.
-Agent Viewer may start the official leader only for a lifecycle request when none is reachable.
-It starts the leader from a stable directory and never stops or restarts it. Stop sends
-`session/cancel` with only the selected opaque session identity and never signals the leader.
+The persistent `grok-agent-leader.service` owns that process outside Agent Viewer; its reference
+unit is checked into `crates/agent-viewer-core/systemd/`. Agent Viewer never starts, stops, or
+restarts the leader. A lifecycle action that needs a leader fails with service-start guidance
+when no initialized endpoint is reachable. Stop sends `session/cancel` with only the selected
+opaque session identity and never signals the leader.
 If no leader endpoint exists, or every discovered endpoint is definitively missing or refuses
 the connection, cancel succeeds idempotently because the session is already stopped. Reachable
 ownership ambiguity and substantive connection, protocol, or security failures remain errors.
@@ -125,14 +127,15 @@ exact identity reports `Working` in the resident roster. The official leader con
 after Agent Viewer disconnects. Rename uses `_x.ai/session/rename`; delete uses
 `_x.ai/session/delete`; model discovery uses `_x.ai/models/list`. A model discovery failure
 returns the built in `default` model. Grok exposes no archive or unarchive operation, so those
-capabilities remain false. Attach is exactly `grok --resume <session id>` with the child working
-directory set to the selected row's working directory.
+capabilities remain false. Attach is exactly `grok --leader --resume <session id>` with the child
+working directory set to the selected row's working directory. The explicit hidden leader flag
+prevents the embedded pager startup path from terminating the shared leader before resume.
 
-The official `grok` binary on `PATH` and an authenticated Grok runtime are lifecycle
-prerequisites. Agent Viewer creates no Grok configuration and copies no instruction, skill, MCP,
-or secret material. Grok's own discovery must expose the existing project instructions, at least
-one shared skill, one stdio MCP server, and one HTTP MCP server before the configuration gate can
-pass.
+The official `grok` binary on `PATH`, an authenticated Grok runtime, and the persistent user
+service are lifecycle prerequisites. Agent Viewer creates no Grok configuration and copies no
+instruction, skill, MCP, or secret material. Grok's own discovery must expose the existing
+project instructions, at least one shared skill, one stdio MCP server, and one HTTP MCP server
+before the configuration gate can pass.
 
 Completion requires authenticated live proof of registration, two distinct session identities,
 resident roster transitions, transcript tailing, selected session cancellation while its sibling
