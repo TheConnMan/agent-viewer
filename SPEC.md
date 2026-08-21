@@ -125,8 +125,9 @@ exact identity reports `Working` in the resident roster. The official leader con
 after Agent Viewer disconnects. Rename uses `_x.ai/session/rename`; delete uses
 `_x.ai/session/delete`; model discovery uses `_x.ai/models/list`. A model discovery failure
 returns the built in `default` model. Grok exposes no archive or unarchive operation, so those
-capabilities remain false. Attach is exactly `grok --resume <session id>` with the child working
-directory set to the selected row's working directory.
+capabilities remain false. Attach is exactly `grok --leader --resume <session id>` with the child
+working directory set to the selected row's working directory. The explicit hidden leader flag
+prevents the embedded pager startup path from terminating the shared leader before resume.
 
 The official `grok` binary on `PATH` and an authenticated Grok runtime are lifecycle
 prerequisites. Agent Viewer creates no Grok configuration and copies no instruction, skill, MCP,

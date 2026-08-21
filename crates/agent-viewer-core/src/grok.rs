@@ -493,6 +493,7 @@ impl Backend for GrokBackend {
     ) -> std::result::Result<std::process::Command, AttachRefusal> {
         let mut command = std::process::Command::new(&self.lifecycle.binary);
         command
+            .arg("--leader")
             .arg("--resume")
             .arg(&session.id)
             .current_dir(&session.cwd);

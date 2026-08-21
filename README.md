@@ -41,7 +41,8 @@ sockets and Linux peer credential ownership checks. Grok lifecycle requires Linu
 or newer because secure durable traversal uses `openat2`, with no insecure fallback. It reads the official Grok session store without writing it. When an official shared
 leader is reachable, its roster supplies live status and its ACP lifecycle supplies spawn,
 selected session cancel, rename, delete, and model discovery. Attach runs
-`grok --resume <session id>` from the selected session's working directory. Grok has no archive
+`grok --leader --resume <session id>` from the selected session's working directory so opening
+the session joins the shared leader instead of replacing it. Grok has no archive
 or unarchive capability. Durable `updates.jsonl` records identify unambiguous completed and
 failed turns. Live active roster state wins; idle or dormant roster state preserves an
 unambiguous durable terminal result. Ambiguous or later activity remains unknown. A shared

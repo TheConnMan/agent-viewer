@@ -731,7 +731,7 @@ mod tests {
         assert_eq!(command.get_program(), "grok");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            vec!["--resume", "session-durable"]
+            vec!["--leader", "--resume", "session-durable"]
         );
         assert_eq!(
             backend.tail(&grok, 2).expect("Grok tail is available"),

@@ -634,7 +634,11 @@ fn grok_advertises_only_implemented_official_actions_and_exact_attach_argv() {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
-        vec!["--resume".to_string(), "session-selected".to_string()]
+        vec![
+            "--leader".to_string(),
+            "--resume".to_string(),
+            "session-selected".to_string(),
+        ]
     );
 }
 
