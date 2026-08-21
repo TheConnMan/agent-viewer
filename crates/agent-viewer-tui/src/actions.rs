@@ -6,6 +6,7 @@ use std::io;
 
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
+use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
@@ -187,10 +188,11 @@ pub(crate) fn ensure_completions(ui: &mut Ui) {
 /// when the composer's backend has changed (mirrors `ensure_completions`). Discovery itself
 /// never runs here: `request` hands it to a worker thread, because the CLI probe behind it
 /// takes seconds and this runs on the key path. Until a list exists the picker holds just the
-/// backend's default; `install_models` swaps the real one in when the probe lands.
+/// backend's initial choice; `install_models` swaps the real one in when the probe lands.
 pub(crate) fn ensure_models(ui: &mut Ui) {
-    // Auto has no catalog to discover: the router picks model and effort, so the picker holds
-    // one "auto" entry and no probe runs.
+    // Provider Auto has no catalog to discover because the router also chooses the provider.
+    // A concrete provider still installs its raw catalog, with any automatic choice overlaid
+    // by the composer.
     if ui.composer.is_auto() {
         ui.composer.set_auto_model();
         return;
@@ -214,8 +216,8 @@ pub(crate) fn install_models(ui: &mut Ui) {
         if let Some(db) = &ui.db {
             let _ = db.set_cached_models(backend, &models, now_ms());
         }
-        // A catalog landing while Auto is selected must not overwrite its single entry: the
-        // composer's `backend` still holds the concrete selection underneath Auto.
+        // A catalog landing while provider Auto is selected must not overwrite its single entry.
+        // Concrete automatic and explicit selections are preserved by `set_models`.
         if !ui.composer.is_auto() && ui.composer.backend() == backend {
             ui.composer.set_models(models, backend);
         }
@@ -641,11 +643,11 @@ pub(crate) fn spawn_from_composer(
         return false;
     }
     let task = ui.composer.text().to_string();
-    // "default" (codex) passes no model flag; any other value is a real model. Owned rather than
+    // Codex "default" and the shared automatic choice pass no model flag. Owned rather than
     // borrowed so the composer's borrow ends before the routed path takes `ui` mutably.
     let model = {
         let model_str = ui.composer.model();
-        (model_str != "default").then(|| model_str.to_string())
+        (model_str != "default" && model_str != AUTO_MODEL).then(|| model_str.to_string())
     };
     // A named provider still goes through the router, pinned with `--provider`: the backend that
     // runs the job is the one the user picked either way, and routing is what earns it a derived
@@ -1237,6 +1239,8 @@ mod tests {
         assert!(!ui.composer.is_auto());
         ui.composer
             .set_models(vec!["opus[1m]".to_string()], BackendKind::Claude);
+        ui.composer.cycle_model();
+        assert_eq!(ui.composer.model(), "opus[1m]");
         ui.composer.push_str("route this on claude");
 
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
@@ -1254,6 +1258,58 @@ mod tests {
                 "route this on claude".to_string(),
                 Some(BackendKind::Claude),
                 Some("opus[1m]".to_string()),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_named_backend_defaults_to_router_model() {
+        let pinned = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&pinned);
+        let mut ui = test_ui_with(vec![sess(
+            "router_target",
+            "/tmp/agentviewer_pinned_auto",
+            100,
+        )]);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            let Mutation::SpawnRouted {
+                task,
+                provider,
+                model,
+                ..
+            } = mutation
+            else {
+                panic!("a concrete automatic provider must route");
+            };
+            recorded.lock().unwrap().push((task, provider, model));
+            Ok(MutationOutcome {
+                notice: "spawned on claude".to_string(),
+                spawned: None,
+            })
+        });
+        ui.composer.set_auto_available(true);
+        ui.composer
+            .set_models(vec!["opus[1m]".to_string()], BackendKind::Claude);
+        ui.composer.push_str("route this on automatic claude");
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(SpawnBackend { spawn: true })];
+        spawn_from_composer(&backends, &inert_refresher(), &mut ui);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.mutations.poll().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "automatic provider mutation did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *pinned.lock().unwrap(),
+            vec![(
+                "route this on automatic claude".to_string(),
+                Some(BackendKind::Claude),
+                None,
             )]
         );
     }

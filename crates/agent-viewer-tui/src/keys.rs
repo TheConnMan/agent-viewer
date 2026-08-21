@@ -7,6 +7,7 @@ use std::io;
 use std::path::PathBuf;
 
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
+use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_tui::app::{Row, Section, file_stems, subdir_names};
 use agent_viewer_tui::attach::key_to_bytes;
 use agent_viewer_tui::shared_listing::TargetRequest;
@@ -996,22 +997,34 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
             .models(backend)
             .map(<[String]>::to_vec)
             .unwrap_or_else(|| vec![backend.default_model().to_string()]);
-        // Under Auto the composer's model is the "auto" placeholder, which is not a model any
-        // backend accepts, so it must not be offered as one of this backend's picks.
         if !ui.composer.is_auto()
             && backend == ui.composer.backend()
             && !models.iter().any(|model| model == ui.composer.model())
         {
             models.push(ui.composer.model().to_string());
         }
+        if ui.composer.router_available() {
+            models.retain(|model| {
+                model != AUTO_MODEL
+                    && !(backend == BackendKind::Codex && model == backend.default_model())
+            });
+        }
         models.sort();
         models.dedup();
+        if ui.composer.router_available() {
+            models.insert(0, AUTO_MODEL.to_string());
+        }
         items.extend(models.into_iter().map(|name| {
+            let detail = if name == AUTO_MODEL {
+                format!("pin {} · keep model and effort automatic", backend.name())
+            } else {
+                format!("{} · set composer model", backend.name())
+            };
             PaletteItem::new(
                 PaletteGroup::Models,
                 "◇",
                 name.clone(),
-                format!("{} · set composer model", backend.name()),
+                detail,
                 None,
                 true,
                 None,
@@ -1513,21 +1526,24 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
 }
 
 fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
-    // Selects outright rather than Tab-cycling to it: cycling stops as soon as the backend
-    // matches, which under Auto is true on entry (Auto rides on top of a real backend), so Auto
-    // would
-    // survive the pick and `ensure_models` would put the "auto" entry back.
-    ui.composer.select_backend(backend);
     let mut models = ui
         .models
         .models(backend)
         .map(<[String]>::to_vec)
         .unwrap_or_else(|| vec![backend.default_model().to_string()]);
-    if !models.contains(&name) {
+    if !ui.composer.is_auto()
+        && backend == ui.composer.backend()
+        && !models.iter().any(|model| model == ui.composer.model())
+    {
+        models.push(ui.composer.model().to_string());
+    }
+    // Palette rows outlive an asynchronous catalog refresh, so retain the target the user saw.
+    if !models.iter().any(|model| model == &name) {
         models.push(name.clone());
     }
-    ui.composer.set_models(vec![name], backend);
+    ui.composer.select_backend(backend);
     ui.composer.set_models(models, backend);
+    let _ = ui.composer.select_model(&name);
 }
 
 /// While attached: Ctrl+] always leaves; Left leaves when the input line is empty (else it
@@ -1761,6 +1777,7 @@ pub(crate) mod tests {
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
+    use agent_viewer_core::router::AUTO_MODEL;
     use agent_viewer_core::{BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
@@ -2310,6 +2327,7 @@ pub(crate) mod tests {
         // without waiting on (or spawning) the multi-second CLI probe behind discovery.
         use super::ensure_models;
         let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_auto_available(true);
         ui.models.seed(
             BackendKind::Claude,
             vec!["opus[1m]".to_string(), "sonnet-5".to_string()],
@@ -2317,14 +2335,19 @@ pub(crate) mod tests {
         );
 
         ensure_models(&mut ui);
-        for c in "/model son".chars() {
+        for c in "/model".chars() {
             ui.composer.push_char(c);
         }
 
         assert_eq!(ui.composer.models_key(), Some(BackendKind::Claude));
+        assert_eq!(ui.composer.model(), AUTO_MODEL);
         assert_eq!(
             ui.composer.model_suggestions(),
-            vec!["sonnet-5".to_string()]
+            vec![
+                AUTO_MODEL.to_string(),
+                "opus[1m]".to_string(),
+                "sonnet-5".to_string(),
+            ]
         );
     }
 
@@ -2336,6 +2359,7 @@ pub(crate) mod tests {
         use crate::actions::install_models;
         use std::time::{Duration, Instant};
         let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_auto_available(true);
         ui.models.request_with(BackendKind::Claude, || {
             vec!["opus[1m]".to_string(), "kimi-k3".to_string()]
         });
@@ -2344,7 +2368,7 @@ pub(crate) mod tests {
         for c in "/model kimi".chars() {
             ui.composer.push_char(c);
         }
-        assert_eq!(ui.composer.model(), "opus[1m]");
+        assert_eq!(ui.composer.model(), AUTO_MODEL);
         assert!(ui.composer.model_suggestions().is_empty());
 
         let start = Instant::now();
@@ -2354,6 +2378,17 @@ pub(crate) mod tests {
         }
 
         assert_eq!(ui.composer.model_suggestions(), vec!["kimi-k3".to_string()]);
+        assert_eq!(ui.composer.model(), AUTO_MODEL);
+        ui.composer.clear();
+        ui.composer.push_str("/model");
+        assert_eq!(
+            ui.composer.model_suggestions(),
+            vec![
+                AUTO_MODEL.to_string(),
+                "opus[1m]".to_string(),
+                "kimi-k3".to_string(),
+            ]
+        );
     }
 
     /// A live working session with a real PTY already in `attached` — the only shape that
@@ -4282,6 +4317,188 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn palette_auto_models_are_gated_on_router_availability() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.models
+            .seed(BackendKind::Claude, vec!["opus[1m]".to_string()], true);
+        ui.models
+            .seed(BackendKind::Codex, vec!["default".to_string()], true);
+
+        let automatic_targets = palette_items(&[], &ui)
+            .into_iter()
+            .filter_map(|item| match item.target {
+                PaletteTarget::Model { backend, name } if name == AUTO_MODEL => Some(backend),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        assert!(automatic_targets.is_empty());
+    }
+
+    #[test]
+    fn routed_codex_palette_omits_redundant_default() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_available_backends(vec![BackendKind::Codex]);
+        ui.composer.set_auto_available(true);
+        ui.models.seed(
+            BackendKind::Codex,
+            vec!["default".to_string(), "gpt".to_string()],
+            true,
+        );
+
+        let model_names = palette_items(&[], &ui)
+            .into_iter()
+            .filter_map(|item| match item.target {
+                PaletteTarget::Model {
+                    backend: BackendKind::Codex,
+                    name,
+                } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(model_names, vec![AUTO_MODEL.to_string(), "gpt".to_string()]);
+    }
+
+    #[test]
+    fn palette_offers_and_accepts_auto_for_each_concrete_provider() {
+        let mut catalog_ui = test_ui_with(Vec::new());
+        catalog_ui.composer.set_auto_available(true);
+        catalog_ui
+            .models
+            .seed(BackendKind::Claude, vec!["opus[1m]".to_string()], true);
+        catalog_ui
+            .models
+            .seed(BackendKind::Codex, vec!["default".to_string()], true);
+
+        let automatic_rows = palette_items(&[], &catalog_ui)
+            .into_iter()
+            .filter(|item| {
+                matches!(
+                    &item.target,
+                    PaletteTarget::Model { name, .. } if name == AUTO_MODEL
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(automatic_rows.len(), 2);
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let row = automatic_rows
+                .iter()
+                .find(|item| {
+                    item.target
+                        == (PaletteTarget::Model {
+                            backend,
+                            name: AUTO_MODEL.to_string(),
+                        })
+                })
+                .expect("each concrete provider has an automatic model row");
+            assert!(row.detail.contains(backend.name()));
+            assert!(row.detail.contains("keep model and effort automatic"));
+            assert!(!row.detail.contains("router choose"));
+        }
+
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            let mut ui = test_ui_with(Vec::new());
+            ui.composer.set_auto_available(true);
+            ui.composer.default_to_auto();
+            ui.models
+                .seed(BackendKind::Claude, vec!["opus[1m]".to_string()], true);
+            ui.models
+                .seed(BackendKind::Codex, vec!["default".to_string()], true);
+            ui.composer.push_str("keep this draft");
+            open_palette(&[], &mut ui);
+            let mut terminal = test_terminal();
+            for character in AUTO_MODEL.chars() {
+                handle_palette_key(
+                    key(KeyCode::Char(character), KeyModifiers::NONE),
+                    &[],
+                    &mut ui,
+                    &mut terminal,
+                )
+                .expect("type automatic model query");
+            }
+            let target = PaletteTarget::Model {
+                backend,
+                name: AUTO_MODEL.to_string(),
+            };
+            highlight_palette_target(&mut ui, &target);
+            handle_palette_key(
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                &[],
+                &mut ui,
+                &mut terminal,
+            )
+            .expect("accept automatic model");
+
+            assert!(!ui.composer.is_auto());
+            assert_eq!(ui.composer.backend(), backend);
+            assert_eq!(ui.composer.model(), AUTO_MODEL);
+            assert_eq!(ui.composer.text(), "keep this draft");
+        }
+    }
+
+    #[test]
+    fn a_palette_model_target_survives_an_async_catalog_refresh() {
+        use crate::actions::install_models;
+        use std::time::{Duration, Instant};
+
+        let mut ui = test_ui_with(Vec::new());
+        ui.models.seed(
+            BackendKind::Claude,
+            vec!["opus[1m]".to_string(), "retired".to_string()],
+            false,
+        );
+        open_palette(&[], &mut ui);
+        let target = PaletteTarget::Model {
+            backend: BackendKind::Claude,
+            name: "retired".to_string(),
+        };
+        let Mode::Palette(palette) = &mut ui.mode else {
+            panic!("expected the palette to be open");
+        };
+        palette.push_str("retired");
+        highlight_palette_target(&mut ui, &target);
+
+        ui.models.request_with(BackendKind::Claude, || {
+            vec!["opus[1m]".to_string(), "replacement".to_string()]
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            install_models(&mut ui);
+            if ui
+                .models
+                .models(BackendKind::Claude)
+                .is_some_and(|models| models.iter().any(|model| model == "replacement"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement catalog did not arrive"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !ui.models
+                .models(BackendKind::Claude)
+                .expect("refreshed catalog")
+                .iter()
+                .any(|model| model == "retired")
+        );
+
+        let mut terminal = test_terminal();
+        handle_palette_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("accept stale palette model target");
+
+        assert_eq!(ui.composer.model(), "retired");
+    }
+
+    #[test]
     fn cached_palette_action_dispatches_before_fresh_authorization() {
         let mut external = sess("external", "/tmp/agentviewer-palette-disabled", 100);
         external.backend = BackendKind::Codex;
@@ -4318,6 +4535,8 @@ pub(crate) mod tests {
     fn palette_model_pick_on_the_backend_under_auto_leaves_auto() {
         use super::{ensure_models, select_palette_model};
         let mut ui = test_ui_with(Vec::new());
+        ui.models
+            .seed(BackendKind::Codex, vec!["grok-4".to_string()], true);
         ui.composer.set_auto_available(true);
         while !ui.composer.is_auto() {
             ui.composer.cycle_backend();
