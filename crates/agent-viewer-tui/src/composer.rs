@@ -6,6 +6,190 @@ use agent_viewer_core::BackendKind;
 use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
 
+/// What an entry invokes. The owner is stored separately because viewer commands have no
+/// provider and a provider can expose more than one command kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandKind {
+    Viewer,
+    Skill,
+    Prompt,
+}
+
+impl CommandKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer command",
+            Self::Skill => "skill",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
+/// One completion shared by the inline popup and Ctrl+K palette. `insertion` is literal:
+/// accepting an entry copies it unchanged, while the retained owner prevents Auto from
+/// silently sending that text to another provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandEntry {
+    name: String,
+    insertion: String,
+    owner: Option<BackendKind>,
+    kind: CommandKind,
+    codex_skill_path: Option<PathBuf>,
+}
+
+impl CommandEntry {
+    pub fn viewer(name: impl Into<String>) -> Self {
+        Self::new(name, None, CommandKind::Viewer, '/', None)
+    }
+
+    pub fn claude_skill(name: impl Into<String>) -> Self {
+        Self::new(
+            name,
+            Some(BackendKind::Claude),
+            CommandKind::Skill,
+            '/',
+            None,
+        )
+    }
+
+    pub fn codex_prompt(name: impl Into<String>) -> Self {
+        Self::new(
+            name,
+            Some(BackendKind::Codex),
+            CommandKind::Prompt,
+            '/',
+            None,
+        )
+    }
+
+    pub fn codex_skill(name: impl Into<String>, path: PathBuf) -> Self {
+        Self::new(
+            name,
+            Some(BackendKind::Codex),
+            CommandKind::Skill,
+            '$',
+            Some(path),
+        )
+    }
+
+    fn new(
+        name: impl Into<String>,
+        owner: Option<BackendKind>,
+        kind: CommandKind,
+        sigil: char,
+        codex_skill_path: Option<PathBuf>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            insertion: format!("{sigil}{name} "),
+            name,
+            owner,
+            kind,
+            codex_skill_path,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn insertion(&self) -> &str {
+        &self.insertion
+    }
+
+    pub fn display(&self) -> &str {
+        self.insertion.trim_end()
+    }
+
+    pub fn owner(&self) -> Option<BackendKind> {
+        self.owner
+    }
+
+    pub fn kind(&self) -> CommandKind {
+        self.kind
+    }
+
+    pub fn codex_skill_path(&self) -> Option<&Path> {
+        self.codex_skill_path.as_deref()
+    }
+
+    pub fn detail(&self, catalog: &[CommandEntry]) -> String {
+        let mut detail = match self.owner {
+            Some(owner) => format!("{} {}", owner.name(), self.kind.label()),
+            None => self.kind.label().to_string(),
+        };
+        if let Some(scope) = self.distinguishing_scope(catalog) {
+            detail.push_str("  scope ");
+            detail.push_str(&scope);
+        }
+        detail
+    }
+
+    fn distinguishing_scope(&self, catalog: &[CommandEntry]) -> Option<String> {
+        let path = self.codex_skill_path()?;
+        let duplicates = catalog
+            .iter()
+            .filter(|entry| {
+                entry.name == self.name
+                    && entry.owner == self.owner
+                    && entry.kind == self.kind
+                    && entry.codex_skill_path().is_some_and(|other| other != path)
+            })
+            .filter_map(CommandEntry::codex_skill_path)
+            .collect::<Vec<_>>();
+        if duplicates.is_empty() {
+            return None;
+        }
+
+        let own_parts = path_parts(path);
+        let duplicate_parts = duplicates
+            .iter()
+            .map(|path| path_parts(path))
+            .collect::<Vec<_>>();
+        let common_suffix = (0..own_parts.len())
+            .take_while(|offset| {
+                duplicate_parts.iter().all(|parts| {
+                    parts.len().checked_sub(offset + 1).is_some_and(|index| {
+                        parts[index] == own_parts[own_parts.len() - offset - 1]
+                    })
+                })
+            })
+            .count();
+        let own_scope = &own_parts[..own_parts.len().saturating_sub(common_suffix)];
+        let duplicate_scopes = duplicate_parts
+            .iter()
+            .map(|parts| &parts[..parts.len().saturating_sub(common_suffix.min(parts.len()))])
+            .collect::<Vec<_>>();
+
+        for width in 1..=own_scope.len() {
+            let own_start = own_scope.len().saturating_sub(width);
+            let own_suffix = &own_scope[own_start..];
+            let unique = duplicate_scopes.iter().all(|parts| {
+                let start = parts.len().saturating_sub(width);
+                &parts[start..] != own_suffix
+            });
+            if unique {
+                return Some(format!("…/{}", own_suffix.join("/")));
+            }
+        }
+
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    fn available_for(&self, auto: bool, backend: BackendKind) -> bool {
+        self.owner.is_none() || auto || self.owner == Some(backend)
+    }
+}
+
+fn path_parts(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| {
+            let part = component.as_os_str().to_string_lossy();
+            (!part.is_empty() && part != "/").then(|| part.into_owned())
+        })
+        .collect()
+}
+
 /// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
 /// the task text plus the installed target backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,11 +212,17 @@ pub struct Composer {
     models: Vec<String>,
     /// The backend the `models` list was installed for; the caller re-installs on a change.
     models_key: Option<BackendKind>,
-    /// Slash-command names available for the current backend/target (scanned by the caller
+    /// Commands available for the current backend/target (discovered by the caller
     /// via `set_commands`), with the (backend, target) they were scanned for so the caller
-    /// only re-scans on a change.
-    commands: Vec<String>,
+    /// only reinstalls on a change.
+    commands: Vec<CommandEntry>,
     commands_key: Option<(BackendKind, Option<PathBuf>)>,
+    /// Auto and a concrete backend can share the same underlying backend key but require
+    /// different command sets, so the installed scope is tracked independently.
+    commands_auto: bool,
+    /// The exact accepted entry. It remains authoritative only while its insertion remains
+    /// the prefix and the backend selection has not changed.
+    pinned_command: Option<CommandEntry>,
     /// Highlighted suggestion index, and whether the popup was Esc-dismissed for this word.
     suggest_idx: usize,
     suggest_dismissed: bool,
@@ -90,6 +280,8 @@ impl Composer {
             models_key: None,
             commands: Vec::new(),
             commands_key: None,
+            commands_auto: false,
+            pinned_command: None,
             suggest_idx: 0,
             suggest_dismissed: false,
         }
@@ -112,6 +304,7 @@ impl Composer {
         if let Some(first) = self.available_backends.first().copied()
             && !self.available_backends.contains(&self.backend)
         {
+            self.pinned_command = None;
             self.backend = first;
             self.model = first.default_model().to_string();
             self.models = vec![first.default_model().to_string()];
@@ -137,7 +330,8 @@ impl Composer {
     /// the concrete backend underneath, so the selector can never point at a missing router.
     pub fn set_auto_available(&mut self, available: bool) {
         self.auto_available = available;
-        if !available {
+        if !available && self.auto {
+            self.pinned_command = None;
             self.auto = false;
         }
     }
@@ -202,6 +396,7 @@ impl Composer {
 
     pub fn push_char(&mut self, c: char) {
         self.text.push(c);
+        self.drop_invalid_pin();
         // Editing the command word re-opens a dismissed popup and resets the highlight.
         self.suggest_dismissed = false;
         self.suggest_idx = 0;
@@ -211,6 +406,7 @@ impl Composer {
     pub fn push_str(&mut self, text: &str) {
         self.text
             .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.drop_invalid_pin();
         self.suggest_dismissed = false;
         self.suggest_idx = 0;
     }
@@ -218,18 +414,21 @@ impl Composer {
     /// Backspace on empty is a no-op (not a panic).
     pub fn backspace(&mut self) {
         self.text.pop();
+        self.drop_invalid_pin();
         self.suggest_dismissed = false;
         self.suggest_idx = 0;
     }
 
     pub fn clear(&mut self) {
         self.text.clear();
+        self.pinned_command = None;
         self.suggest_idx = 0;
         self.suggest_dismissed = false;
     }
 
     /// Tab advances through the available concrete backends, then Auto when offered.
     pub fn cycle_backend(&mut self) {
+        self.pinned_command = None;
         if self.auto {
             if let Some(first) = self.available_backends.first().copied() {
                 self.auto = false;
@@ -259,6 +458,7 @@ impl Composer {
     /// reaches `ensure_models`.
     pub fn default_to_auto(&mut self) {
         if self.auto_available {
+            self.pinned_command = None;
             self.auto = true;
             self.set_auto_model();
         }
@@ -269,6 +469,7 @@ impl Composer {
     /// chosen backend is the one already sitting underneath Auto (where a Tab-cycle loop would
     /// exit immediately and leave Auto on, letting `ensure_models` restore the "auto" entry).
     pub fn select_backend(&mut self, backend: BackendKind) {
+        self.pinned_command = None;
         self.auto = false;
         self.backend = backend;
     }
@@ -305,57 +506,80 @@ impl Composer {
         self.commands_key.as_ref()
     }
 
-    /// Install the available slash-command names for the given (backend, target) scan key.
-    pub fn set_commands(&mut self, commands: Vec<String>, key: (BackendKind, Option<PathBuf>)) {
+    /// Install the available commands for the given backend and target cache key.
+    pub fn set_commands(
+        &mut self,
+        commands: Vec<CommandEntry>,
+        key: (BackendKind, Option<PathBuf>),
+    ) {
+        let same_scope = self.commands_match_scope(&key);
+        let highlighted = if same_scope {
+            self.suggestions()
+                .get(self.suggestion_highlight())
+                .map(|command| (*command).clone())
+        } else {
+            None
+        };
         self.commands = commands;
         self.commands_key = Some(key);
-        self.suggest_idx = 0;
+        self.commands_auto = self.auto;
+        self.drop_invalid_pin();
+        self.suggest_idx = highlighted
+            .and_then(|selected| {
+                self.suggestions()
+                    .iter()
+                    .position(|command| *command == &selected)
+            })
+            .unwrap_or(0);
     }
 
-    /// The typed command word: text after a leading "/" up to the first space, or None when
-    /// the text is not a bare "/word" (no slash, or a space already committed the command).
-    fn command_word(&self) -> Option<&str> {
-        let rest = self.text.strip_prefix('/')?;
-        if rest.contains(' ') {
+    pub fn commands(&self) -> &[CommandEntry] {
+        &self.commands
+    }
+
+    pub fn commands_match_scope(&self, key: &(BackendKind, Option<PathBuf>)) -> bool {
+        self.commands_key.as_ref() == Some(key) && self.commands_auto == self.auto
+    }
+
+    /// The typed command token, including its slash or dollar sigil. A space commits it and
+    /// closes the completion popup.
+    fn command_token(&self) -> Option<&str> {
+        if !matches!(self.text.chars().next(), Some('/' | '$')) || self.text.contains(' ') {
             return None; // a space means the command is chosen; stop completing
         }
-        Some(rest)
+        Some(&self.text)
     }
 
-    /// Slash-command suggestions for the current word (prefix match, case-insensitive, capped
-    /// at 8). Empty when the popup is dismissed or the text is not a bare "/word".
-    pub fn suggestions(&self) -> Vec<&str> {
+    /// Command suggestions for the current word (prefix match, case-insensitive, capped at 8).
+    /// Concrete Codex slash completion lists native slash commands before matching dollar-skill
+    /// aliases. Empty when the popup is dismissed or the text is not a bare command word.
+    pub fn suggestions(&self) -> Vec<&CommandEntry> {
         // "/model" is the model meta-command: the slash popup stays closed so the two popups
         // never both show (the model picker takes over).
         if self.suggest_dismissed || self.is_model_command() {
             return Vec::new();
         }
-        let Some(word) = self.command_word() else {
+        let Some(token) = self.command_token() else {
             return Vec::new();
         };
-        let word = word.to_lowercase();
-        let include_theme = !word.is_empty() && "theme".starts_with(word.as_str());
-        let mut suggestions = Vec::with_capacity(8);
-        if include_theme {
-            suggestions.push("theme");
+        let token = token.to_lowercase();
+        let native_matches = self.commands.iter().filter(|command| {
+            command.available_for(self.auto, self.backend)
+                && command.display().to_lowercase().starts_with(&token)
+        });
+        if !self.auto && self.backend == BackendKind::Codex && token.starts_with('/') {
+            let alias = token.strip_prefix('/').expect("token starts with slash");
+            native_matches
+                .chain(self.commands.iter().filter(|command| {
+                    command.owner == Some(BackendKind::Codex)
+                        && command.kind == CommandKind::Skill
+                        && command.name.to_lowercase().starts_with(alias)
+                }))
+                .take(8)
+                .collect()
+        } else {
+            native_matches.take(8).collect()
         }
-        // Under Auto the provider is not known until the router answers, so the backend's own
-        // commands must not be offered: the task may well land on a different provider, where an
-        // backend-only command means nothing. The viewer's own `/theme` is provider-independent.
-        if self.auto {
-            return suggestions;
-        }
-        suggestions.extend(
-            self.commands
-                .iter()
-                .filter(|command| {
-                    (!include_theme || !command.eq_ignore_ascii_case("theme"))
-                        && command.to_lowercase().starts_with(&word)
-                })
-                .map(String::as_str)
-                .take(8 - suggestions.len()),
-        );
-        suggestions
     }
 
     pub fn suggestions_active(&self) -> bool {
@@ -442,19 +666,66 @@ impl Composer {
         true
     }
 
-    /// Tab within the popup: replace the text with "/name " for the highlighted command.
+    /// Tab within the popup: replace the text with the entry's literal insertion and retain
+    /// its owner for submission.
     /// Returns false when there is nothing to accept.
     pub fn accept_suggestion(&mut self) -> bool {
-        let Some(name) = self
+        let Some(command) = self
             .suggestions()
             .get(self.suggestion_highlight())
-            .map(|s| s.to_string())
+            .copied()
+            .cloned()
         else {
             return false;
         };
-        self.text = format!("/{name} ");
+        self.select_command(command);
         self.suggest_idx = 0;
         true
+    }
+
+    /// Insert a popup or palette entry. Viewer commands intentionally remain ownerless.
+    pub fn select_command(&mut self, command: CommandEntry) {
+        self.text = command.insertion.clone();
+        self.pinned_command = command.owner.is_some().then_some(command);
+        self.suggest_idx = 0;
+        self.suggest_dismissed = false;
+    }
+
+    pub fn pinned_command(&self) -> Option<&CommandEntry> {
+        self.pinned_command
+            .as_ref()
+            .filter(|command| self.pin_is_valid(command))
+    }
+
+    /// Resolve the command attached to the submitted text. An accepted entry wins even when
+    /// another provider has the same insertion. Manually typed text infers an entry only when
+    /// exactly one available entry has that literal prefix.
+    pub fn command_for_submission(&self) -> Option<&CommandEntry> {
+        if let Some(command) = self.pinned_command() {
+            return Some(command);
+        }
+        let mut matches = self.commands.iter().filter(|command| {
+            command.available_for(self.auto, self.backend)
+                && self.text.starts_with(command.insertion())
+        });
+        let command = matches.next()?;
+        matches.next().is_none().then_some(command)
+    }
+
+    fn drop_invalid_pin(&mut self) {
+        if self
+            .pinned_command
+            .as_ref()
+            .is_some_and(|command| !self.pin_is_valid(command))
+        {
+            self.pinned_command = None;
+        }
+    }
+
+    fn pin_is_valid(&self, command: &CommandEntry) -> bool {
+        self.text.starts_with(command.insertion())
+            && command.available_for(self.auto, self.backend)
+            && self.commands.contains(command)
     }
 
     /// Esc within the popup: hide it without clearing the text (a second Esc clears as usual).
@@ -499,6 +770,14 @@ impl DetachTracker {
 mod tests {
     use super::*;
 
+    fn auto_composer(commands: Vec<CommandEntry>) -> Composer {
+        let mut composer = Composer::new();
+        composer.set_auto_available(true);
+        composer.default_to_auto();
+        composer.set_commands(commands, (BackendKind::Claude, None));
+        composer
+    }
+
     #[test]
     fn theme_is_suggested_for_matching_prefix_on_every_backend() {
         for backend in [BackendKind::Claude, BackendKind::Codex] {
@@ -506,13 +785,14 @@ mod tests {
             while composer.backend() != backend {
                 composer.cycle_backend();
             }
-            composer.set_commands(Vec::new(), (backend, Some(PathBuf::from("/tmp/project"))));
+            let theme = CommandEntry::viewer("theme");
+            composer.set_commands(
+                vec![theme.clone()],
+                (backend, Some(PathBuf::from("/tmp/project"))),
+            );
             composer.push_str("/th");
 
-            assert!(
-                composer.suggestions().contains(&"theme"),
-                "/theme missing for {backend:?}"
-            );
+            assert_eq!(composer.suggestions(), vec![&theme]);
         }
     }
 
@@ -732,37 +1012,274 @@ mod tests {
         );
     }
 
-    /// Auto has no provider until the router answers, so the backend's own slash commands must
-    /// not be offered: a task routed to codex has no business carrying a claude-only command.
-    /// The viewer's own commands are provider-independent and stay.
     #[test]
-    fn auto_offers_no_backend_slash_commands() {
-        let mut composer = Composer::new();
-        composer.set_auto_available(true);
-        while !composer.is_auto() {
-            composer.cycle_backend();
-        }
-        composer.set_commands(vec!["claude-only".to_string()], (BackendKind::Claude, None));
+    fn auto_offers_the_owned_union_and_keeps_duplicate_slash_entries_distinct() {
+        let claude = CommandEntry::claude_skill("review");
+        let prompt = CommandEntry::codex_prompt("review");
+        let skill = CommandEntry::codex_skill("diagnose", PathBuf::from("/skills/diagnose"));
+        let mut composer = auto_composer(vec![claude.clone(), prompt.clone(), skill.clone()]);
 
-        composer.push_str("/clau");
+        composer.push_str("/re");
+        assert_eq!(composer.suggestions(), vec![&claude, &prompt]);
+        assert_eq!(claude.owner(), Some(BackendKind::Claude));
+        assert_eq!(claude.kind(), CommandKind::Skill);
+        assert_eq!(claude.insertion(), "/review ");
+        assert_eq!(prompt.owner(), Some(BackendKind::Codex));
+        assert_eq!(prompt.kind(), CommandKind::Prompt);
+        assert_eq!(prompt.insertion(), "/review ");
+        assert!(composer.is_auto());
+
+        composer.clear();
+        composer.push_str("/di");
         assert!(
             composer.suggestions().is_empty(),
-            "Auto must offer no backend commands, got {:?}",
-            composer.suggestions()
+            "Auto keeps slash commands separate from Codex dollar skills"
         );
 
         composer.clear();
-        composer.push_str("/th");
-        assert_eq!(composer.suggestions(), vec!["theme"]);
+        composer.push_str("$di");
+        assert_eq!(composer.suggestions(), vec![&skill]);
+        assert_eq!(skill.owner(), Some(BackendKind::Codex));
+        assert_eq!(skill.kind(), CommandKind::Skill);
+        assert_eq!(skill.insertion(), "$diagnose ");
+        assert_eq!(
+            skill.codex_skill_path(),
+            Some(Path::new("/skills/diagnose"))
+        );
+        assert!(composer.accept_suggestion());
+        assert_eq!(composer.text(), "$diagnose ");
+        assert_eq!(composer.pinned_command(), Some(&skill));
+        assert!(composer.is_auto());
+    }
+
+    #[test]
+    fn accepting_duplicate_slash_entries_pins_the_highlighted_owner() {
+        let claude = CommandEntry::claude_skill("review");
+        let prompt = CommandEntry::codex_prompt("review");
+        let mut composer = auto_composer(vec![claude, prompt.clone()]);
+        composer.push_str("/re");
+
+        composer.move_suggestion(1);
+        assert!(composer.accept_suggestion());
+
+        assert_eq!(composer.text(), "/review ");
+        assert_eq!(composer.pinned_command(), Some(&prompt));
+        assert_eq!(
+            composer.command_for_submission(),
+            Some(&prompt),
+            "the duplicate insertion must retain the chosen provider"
+        );
+    }
+
+    #[test]
+    fn late_catalog_refresh_keeps_the_highlighted_entry_identity() {
+        let claude = CommandEntry::claude_skill("review");
+        let prompt = CommandEntry::codex_prompt("review");
+        let mut composer = auto_composer(vec![claude.clone(), prompt.clone()]);
+        composer.push_str("/re");
+        composer.move_suggestion(1);
+        assert_eq!(
+            composer.suggestions()[composer.suggestion_highlight()],
+            &prompt
+        );
+
+        let earlier = CommandEntry::claude_skill("refactor");
+        composer.set_commands(
+            vec![earlier, claude, prompt.clone()],
+            (BackendKind::Claude, None),
+        );
+
+        assert_eq!(
+            composer.suggestions()[composer.suggestion_highlight()],
+            &prompt,
+            "a landing catalog must preserve the selected provider and command kind"
+        );
+        assert!(composer.accept_suggestion());
+        assert_eq!(composer.pinned_command(), Some(&prompt));
+    }
+
+    #[test]
+    fn target_catalog_change_drops_a_pinned_project_codex_skill() {
+        let first = CommandEntry::codex_skill(
+            "review",
+            PathBuf::from("/projects/first/.codex/skills/review/SKILL.md"),
+        );
+        let second = CommandEntry::codex_skill(
+            "review",
+            PathBuf::from("/projects/second/.codex/skills/review/SKILL.md"),
+        );
+        let mut composer = auto_composer(vec![first.clone()]);
+        composer.push_str("$re");
+        assert!(composer.accept_suggestion());
+        assert_eq!(composer.pinned_command(), Some(&first));
+
+        composer.set_commands(
+            vec![second.clone()],
+            (BackendKind::Claude, Some(PathBuf::from("/projects/second"))),
+        );
+
+        assert_eq!(composer.pinned_command(), None);
+        assert_eq!(composer.command_for_submission(), Some(&second));
+        assert_ne!(
+            composer
+                .command_for_submission()
+                .and_then(CommandEntry::codex_skill_path),
+            first.codex_skill_path()
+        );
+
+        composer.set_commands(
+            vec![first.clone()],
+            (BackendKind::Claude, Some(PathBuf::from("/projects/first"))),
+        );
+
+        assert_eq!(composer.pinned_command(), None);
+        assert_eq!(composer.command_for_submission(), Some(&first));
+    }
+
+    #[test]
+    fn codex_filters_the_union_to_its_prompt_and_dollar_skill_entries() {
+        let claude = CommandEntry::claude_skill("review");
+        let prompt = CommandEntry::codex_prompt("review");
+        let skill = CommandEntry::codex_skill("diagnose", PathBuf::from("/skills/diagnose"));
+        let mut composer = Composer::new();
+        composer.select_backend(BackendKind::Codex);
+        composer.set_commands(
+            vec![claude, prompt.clone(), skill.clone()],
+            (BackendKind::Codex, None),
+        );
+
+        composer.push_str("/re");
+        assert_eq!(composer.suggestions(), vec![&prompt]);
+        composer.clear();
+        composer.push_str("$di");
+        assert_eq!(composer.suggestions(), vec![&skill]);
+    }
+
+    #[test]
+    fn concrete_codex_slash_skill_alias_inserts_native_dollar_command_and_path() {
+        let skill = CommandEntry::codex_skill(
+            "diagnose",
+            PathBuf::from("/projects/viewer/.codex/skills/diagnose/SKILL.md"),
+        );
+        let model = CommandEntry::viewer("model");
+        let theme = CommandEntry::viewer("theme");
+        let prompt = CommandEntry::codex_prompt("review");
+        let mut commands = vec![
+            skill.clone(),
+            CommandEntry::codex_skill("audit", PathBuf::from("/skills/audit/SKILL.md")),
+            CommandEntry::codex_skill("bootstrap", PathBuf::from("/skills/bootstrap/SKILL.md")),
+            CommandEntry::codex_skill("format", PathBuf::from("/skills/format/SKILL.md")),
+            CommandEntry::codex_skill("lint", PathBuf::from("/skills/lint/SKILL.md")),
+            CommandEntry::codex_skill("release", PathBuf::from("/skills/release/SKILL.md")),
+            CommandEntry::codex_skill("summarize", PathBuf::from("/skills/summarize/SKILL.md")),
+            CommandEntry::codex_skill("test", PathBuf::from("/skills/test/SKILL.md")),
+            model.clone(),
+            theme.clone(),
+            prompt.clone(),
+        ];
+        commands.sort_by_key(|command| command.display().to_string());
+        let mut composer = Composer::new();
+        composer.select_backend(BackendKind::Codex);
+        composer.set_commands(
+            commands,
+            (BackendKind::Codex, Some(PathBuf::from("/projects/viewer"))),
+        );
+
+        composer.push_str("/");
+        let suggestions = composer.suggestions();
+        for command in [&model, &theme, &prompt, &skill] {
+            assert!(
+                suggestions.contains(&command),
+                "bare slash should retain {command:?} in a crowded Codex catalog"
+            );
+        }
+
+        composer.clear();
+        composer.push_str("/di");
+        assert_eq!(composer.suggestions(), vec![&skill]);
+        assert!(composer.accept_suggestion());
+        assert_eq!(composer.text(), "$diagnose ");
+        assert_eq!(composer.pinned_command(), Some(&skill));
+        assert_eq!(
+            composer
+                .command_for_submission()
+                .and_then(CommandEntry::codex_skill_path),
+            Some(Path::new(
+                "/projects/viewer/.codex/skills/diagnose/SKILL.md"
+            ))
+        );
+
+        composer.clear();
+        composer.push_str("$di");
+        assert_eq!(composer.suggestions(), vec![&skill]);
+    }
+
+    #[test]
+    fn a_pin_only_survives_while_its_exact_insertion_and_backend_selection_survive() {
+        let command = CommandEntry::claude_skill("implement");
+        let mut composer = auto_composer(vec![command.clone()]);
+        composer.push_str("/im");
+        assert!(composer.accept_suggestion());
+        composer.push_str("fix the bug");
+        assert_eq!(composer.pinned_command(), Some(&command));
+
+        for _ in 0.."fix the bug".len() + 1 {
+            composer.backspace();
+        }
+        assert_eq!(composer.text(), "/implement");
+        assert_eq!(composer.pinned_command(), None);
+
+        composer.clear();
+        composer.push_str("/im");
+        assert!(composer.accept_suggestion());
+        composer.cycle_backend();
+        assert!(!composer.is_auto());
+        assert_eq!(composer.pinned_command(), None);
+
+        composer.clear();
+        assert_eq!(composer.pinned_command(), None);
+        assert!(composer.command_for_submission().is_none());
+    }
+
+    #[test]
+    fn manual_insertion_infers_only_one_owned_command() {
+        let unique = CommandEntry::claude_skill("implement");
+        let mut composer = auto_composer(vec![unique.clone()]);
+        composer.push_str("/implement fix the bug");
+
+        assert_eq!(composer.pinned_command(), None);
+        assert_eq!(composer.command_for_submission(), Some(&unique));
+
+        let claude = CommandEntry::claude_skill("review");
+        let codex = CommandEntry::codex_prompt("review");
+        composer.clear();
+        composer.set_commands(
+            vec![claude, codex],
+            (BackendKind::Claude, Some(PathBuf::from("/tmp/project"))),
+        );
+        composer.push_str("/review this change");
+
+        assert_eq!(composer.pinned_command(), None);
+        assert_eq!(
+            composer.command_for_submission(),
+            None,
+            "the same literal insertion on two providers must remain unowned"
+        );
     }
 
     #[test]
     fn tab_accepts_theme_suggestion_as_theme_command() {
         let mut composer = Composer::new();
-        composer.set_commands(Vec::new(), (BackendKind::Claude, None));
+        let theme = CommandEntry::viewer("theme");
+        composer.set_commands(vec![theme.clone()], (BackendKind::Claude, None));
         composer.push_str("/th");
 
         assert!(composer.accept_suggestion());
         assert!(composer.is_theme_command());
+        assert_eq!(composer.text(), "/theme ");
+        assert_eq!(composer.pinned_command(), None);
+        assert_eq!(composer.command_for_submission(), Some(&theme));
+        assert_eq!(theme.owner(), None);
+        assert_eq!(theme.kind(), CommandKind::Viewer);
     }
 }

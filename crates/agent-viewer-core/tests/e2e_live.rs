@@ -5,11 +5,12 @@
 
 use agent_viewer_core::backend::{Backend, Status, all_backends};
 use agent_viewer_core::claude::ClaudeBackend;
-use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::codex::app_server::{
     ensure_daemon, interrupt_thread, probe_daemon, remote_endpoint, spawn_thread,
 };
+use agent_viewer_core::codex::rollout::{TailState, tail_state};
 use agent_viewer_core::codex::status::open_rollout_paths;
+use agent_viewer_core::codex::{CodexBackend, discover_skills, spawn_skill};
 use agent_viewer_core::default_codex_home;
 use agent_viewer_core::pty::{PtySession, spec_from_command};
 use serde_json::Value;
@@ -78,6 +79,94 @@ fn latest_indexed_thread_name(path: &Path, thread_id: &str) -> Option<String> {
     }
 
     latest
+}
+
+#[test]
+#[ignore = "live: discovers and invokes a real codex skill"]
+fn codex_discovered_openai_docs_skill_is_injected_and_replies_active() {
+    let repo = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".."),
+    )
+    .expect("workspace root exists");
+    let skills = discover_skills(&repo);
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.name == "openai-docs")
+        .unwrap_or_else(|| {
+            panic!(
+                "openai-docs was unavailable from production discovery for {}",
+                repo.display()
+            )
+        });
+    let skill_path = skill.path.to_string_lossy().into_owned();
+    let spawned = spawn_skill(&repo, "Reply with exactly ACTIVE.", None, &skill)
+        .expect("production skill spawn succeeds");
+    let thread_id = spawned
+        .session_id
+        .expect("structured skill spawn returns a thread id");
+
+    let mut backend = CodexBackend::new(default_codex_home());
+    let session = poll_session(&mut backend, Duration::from_secs(30), |session| {
+        session.id == thread_id
+    })
+    .unwrap_or_else(|| panic!("structured skill thread {thread_id} did not appear"));
+    let rollout_path = session
+        .rollout_path
+        .expect("structured skill thread has a rollout");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while tail_state(&rollout_path).ok() != Some(TailState::Complete) {
+        assert!(
+            Instant::now() < deadline,
+            "structured skill thread {thread_id} did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let rollout = std::fs::read_to_string(&rollout_path).unwrap_or_else(|error| {
+        panic!(
+            "read structured skill rollout {}: {error}",
+            rollout_path.display()
+        )
+    });
+    assert!(
+        rollout.contains("openai-docs") && rollout.contains(&skill_path),
+        "rollout did not preserve the discovered skill name and path: {}",
+        rollout_path.display()
+    );
+
+    let assistant_messages = rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            value.get("type").and_then(Value::as_str) == Some("response_item")
+                && value.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+                && value.pointer("/payload/role").and_then(Value::as_str) == Some("assistant")
+        })
+        .flat_map(|value| {
+            value
+                .pointer("/payload/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|content| {
+            (content.get("type").and_then(Value::as_str) == Some("output_text"))
+                .then(|| {
+                    content
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_messages.last().map(|message| message.trim()),
+        Some("ACTIVE"),
+        "structured skill thread did not reply with exactly ACTIVE: {assistant_messages:?}"
+    );
+    println!("[skill] thread {thread_id} injected openai-docs and replied ACTIVE");
 }
 
 /// The regression guard for the read-only-sandbox bug: a viewer-spawned session must be able

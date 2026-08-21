@@ -14,9 +14,9 @@
 mod common;
 
 use agent_viewer_core::codex::app_server::{
-    Daemon, SpawnAttempt, daemon_start_command, initialize_request, parse_daemon_version,
-    parse_thread_id, remote_endpoint, stable_daemon_cwd, thread_start_request,
-    turn_interrupt_request, turn_start_request,
+    CodexSkill, Daemon, SpawnAttempt, daemon_start_command, initialize_request,
+    parse_daemon_version, parse_skills_list, parse_thread_id, remote_endpoint, skills_list_request,
+    stable_daemon_cwd, thread_start_request, turn_interrupt_request, turn_start_request,
 };
 use agent_viewer_core::codex::spawn_failure_reason;
 use agent_viewer_core::error::Error;
@@ -175,8 +175,87 @@ fn thread_start_request_carries_a_model_only_when_one_was_picked() {
 }
 
 #[test]
-fn turn_start_request_wraps_the_task_as_one_text_input() {
-    let request = json(&turn_start_request(6, "thread-abc", "do a thing", None));
+fn skills_list_request_uses_the_plural_cwds_array() {
+    let request = json(&skills_list_request(6, Path::new("/home/user/git/proj")));
+    assert_envelope(&request, 6, "skills/list");
+    assert_eq!(
+        request.pointer("/params/cwds"),
+        Some(&serde_json::json!(["/home/user/git/proj"])),
+        "skills/list requires the plural cwds array"
+    );
+    assert_eq!(
+        request
+            .pointer("/params/forceReload")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let params = request
+        .pointer("/params")
+        .and_then(Value::as_object)
+        .expect("params is an object");
+    assert_eq!(params.len(), 2, "only the installed schema fields are sent");
+    assert!(
+        !params.contains_key("cwd"),
+        "the singular cwd field is not part of SkillsListParams"
+    );
+}
+
+#[test]
+fn parse_skills_list_keeps_enabled_names_and_paths() {
+    let line = common::read_fixture("codex_app_server/skills_list.json");
+    assert_eq!(
+        parse_skills_list(&line, 12, Path::new("/home/user/git/proj")),
+        vec![
+            CodexSkill {
+                name: "review".to_string(),
+                path: PathBuf::from("/home/user/.codex/skills/review/SKILL.md"),
+            },
+            CodexSkill {
+                name: "project_check".to_string(),
+                path: PathBuf::from("/home/user/git/proj/.agents/skills/project_check/SKILL.md",),
+            },
+        ],
+        "disabled skills are omitted while enabled skills retain their exact paths"
+    );
+}
+
+#[test]
+fn parse_skills_list_rejects_malformed_or_unrelated_responses() {
+    let cwd = Path::new("/home/user/git/proj");
+    for line in [
+        "",
+        "{not json",
+        r#"{"jsonrpc":"2.0","id":12,"result":{"data":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":12,"result":{"data":[{"cwd":"/home/user/git/proj","errors":[],"skills":"invalid"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":13,"result":{"data":[]}}"#,
+        r#"{"jsonrpc":"2.0","id":12,"error":{"code":-32602,"message":"bad params"}}"#,
+    ] {
+        assert!(
+            parse_skills_list(line, 12, cwd).is_empty(),
+            "must reject: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_skills_list_accepts_empty_results() {
+    let cwd = Path::new("/home/user/git/proj");
+    for line in [
+        r#"{"jsonrpc":"2.0","id":12,"result":{"data":[]}}"#,
+        r#"{"jsonrpc":"2.0","id":12,"result":{"data":[{"cwd":"/home/user/git/proj","errors":[],"skills":[]}]}}"#,
+        r#"{"jsonrpc":"2.0","id":12,"result":{"data":[{"cwd":"/home/user/git/proj","errors":[],"skills":[{"enabled":false,"name":"disabled","path":"/tmp/disabled/SKILL.md"}]}]}}"#,
+    ] {
+        assert!(
+            parse_skills_list(line, 12, cwd).is_empty(),
+            "empty discovery must stay empty: {line}"
+        );
+    }
+}
+
+#[test]
+fn turn_start_request_wraps_an_ordinary_task_as_one_text_input() {
+    let task = "$review inspect this";
+    let request = json(&turn_start_request(6, "thread-abc", task, None, None));
     assert_envelope(&request, 6, "turn/start");
     assert_eq!(
         request.pointer("/params/threadId").and_then(Value::as_str),
@@ -184,8 +263,53 @@ fn turn_start_request_wraps_the_task_as_one_text_input() {
     );
     assert_eq!(
         request.pointer("/params/input"),
-        Some(&serde_json::json!([{"type": "text", "text": "do a thing"}])),
-        "TurnStartParams.input is an array of UserInput; a text one is {{type,text}}"
+        Some(&serde_json::json!([{"type": "text", "text": task}])),
+        "without a selected skill even dollar prefixed text stays ordinary text"
+    );
+}
+
+#[test]
+fn turn_start_request_uses_structured_skill_input_and_retains_its_path() {
+    let skill = CodexSkill {
+        name: "review".to_string(),
+        path: PathBuf::from("/home/user/.codex/skills/review/SKILL.md"),
+    };
+    let request = json(&turn_start_request(
+        7,
+        "thread-abc",
+        "$review inspect this",
+        None,
+        Some(&skill),
+    ));
+    assert_envelope(&request, 7, "turn/start");
+    assert_eq!(
+        request.pointer("/params/input"),
+        Some(&serde_json::json!([
+            {
+                "type": "skill",
+                "name": "review",
+                "path": "/home/user/.codex/skills/review/SKILL.md"
+            },
+            {"type": "text", "text": "inspect this"}
+        ])),
+        "a selected skill is structured and only its following task remains text"
+    );
+
+    let skill_only = json(&turn_start_request(
+        8,
+        "thread-abc",
+        "$review ",
+        None,
+        Some(&skill),
+    ));
+    assert_eq!(
+        skill_only.pointer("/params/input"),
+        Some(&serde_json::json!([{
+            "type": "skill",
+            "name": "review",
+            "path": "/home/user/.codex/skills/review/SKILL.md"
+        }])),
+        "an empty task must not add an empty text input"
     );
 }
 
@@ -197,6 +321,7 @@ fn turn_start_request_carries_effort_only_when_requested() {
         "thread-abc",
         "do a thing",
         Some("xhigh"),
+        None,
     ));
     assert_eq!(
         requested.pointer("/params/effort").and_then(Value::as_str),
@@ -205,7 +330,13 @@ fn turn_start_request_carries_effort_only_when_requested() {
 
     // None means "let codex resolve its own default", so the key must be ABSENT entirely
     // rather than present as a null, which the daemon would read as an explicit value.
-    let defaulted = json(&turn_start_request(10, "thread-abc", "do a thing", None));
+    let defaulted = json(&turn_start_request(
+        10,
+        "thread-abc",
+        "do a thing",
+        None,
+        None,
+    ));
     assert_eq!(defaulted.pointer("/params/effort"), None);
     assert!(
         !defaulted
@@ -223,7 +354,7 @@ fn turn_start_request_round_trips_quotes_and_newlines() {
     // carrying a quote, a newline and a backslash must still parse as JSON at all, and the
     // text must come back out unchanged.
     let task = "say \"hello\"\nthen stop \\ here";
-    let request = json(&turn_start_request(7, "thread-abc", task, None));
+    let request = json(&turn_start_request(7, "thread-abc", task, None, None));
     assert_eq!(
         request
             .pointer("/params/input/0/text")

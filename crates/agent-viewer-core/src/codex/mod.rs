@@ -9,7 +9,7 @@ pub mod status;
 use crate::backend::{
     Backend, BackendKind, Capabilities, Session, SessionOrigin, SpawnResult, Status,
 };
-use crate::error::{AttachRefusal, Result};
+use crate::error::{AttachRefusal, Error, Result};
 use crate::platform::Platform;
 use registry::Registry;
 use status::StatusResolver;
@@ -71,6 +71,19 @@ pub fn spawn_route(daemon: Option<&app_server::Daemon>, exec_opt_in: bool) -> Sp
 /// what it says rather than being silently ignored.
 pub fn exec_spawn_opt_in() -> bool {
     std::env::var(EXEC_SPAWN_ENV).as_deref() == Ok("1")
+}
+
+/// Best-effort Codex skill discovery for one target directory. This may start the shared
+/// app-server daemon, so callers must keep it off latency-sensitive threads. It never stops or
+/// restarts that daemon, and an unavailable transport or failed request yields no skills.
+pub fn discover_skills(cwd: &Path) -> Vec<app_server::CodexSkill> {
+    if crate::platform::current_platform() != Platform::Linux {
+        return Vec::new();
+    }
+    let Ok(daemon) = app_server::ensure_daemon() else {
+        return Vec::new();
+    };
+    app_server::list_skills(&daemon, cwd).unwrap_or_default()
 }
 
 /// How a row is attached: a true join through the hosting daemon, a plain local resume, or a
@@ -159,6 +172,42 @@ pub fn spawn_failure_reason(attempt: &app_server::SpawnAttempt) -> String {
         ),
         app_server::SpawnAttempt::NotCreated(error) => error.to_string(),
     }
+}
+
+fn daemon_spawn_result(attempt: app_server::SpawnAttempt) -> Result<SpawnResult> {
+    match attempt {
+        app_server::SpawnAttempt::Started(thread_id) => Ok(SpawnResult {
+            pid: None,
+            session_id: Some(thread_id),
+        }),
+        attempt => Err(Error::Command(format!(
+            "codex app-server spawn failed: {}",
+            spawn_failure_reason(&attempt)
+        ))),
+    }
+}
+
+/// Spawn a selected Codex skill directly through the app-server structured input protocol.
+/// This route deliberately ignores the exec opt-in because `codex exec` cannot carry the
+/// selected skill's name and path as a structured input.
+pub fn spawn_skill(
+    dir: &Path,
+    task: &str,
+    model: Option<&str>,
+    skill: &app_server::CodexSkill,
+) -> Result<SpawnResult> {
+    if crate::platform::current_platform() != Platform::Linux {
+        return Err(Error::Unsupported(BackendKind::Codex.name()));
+    }
+    let daemon = app_server::ensure_daemon().map_err(Error::Command)?;
+    daemon_spawn_result(app_server::try_spawn_thread(
+        &daemon,
+        dir,
+        task,
+        model,
+        None,
+        Some(skill),
+    ))
 }
 
 /// PURE: is this row a SUBAGENT thread rather than a process's own primary session?
@@ -613,23 +662,13 @@ impl Backend for CodexBackend {
         let daemon = daemon.and_then(std::result::Result::ok);
         match spawn_route(daemon.as_ref(), exec_opt_in) {
             SpawnRoute::Daemon(daemon) => {
-                return match app_server::try_spawn_thread(daemon, dir, task, model, effort) {
-                    // The daemon owns the thread, so its pid must never be handed back as a
-                    // killable one. The exact thread id is safe to return and lets the TUI
-                    // select the new row without guessing from cwd and creation time.
-                    app_server::SpawnAttempt::Started(thread_id) => Ok(SpawnResult {
-                        pid: None,
-                        session_id: Some(thread_id),
-                    }),
-                    // Every other outcome is a hard failure carrying the daemon's own error.
-                    // There is deliberately no exec fallback: it would either double-run the
-                    // task (the thread already exists after `thread/start`) or silently hand
-                    // back an unjoinable session, and both were real defects.
-                    attempt => Err(crate::error::Error::Command(format!(
-                        "codex app-server spawn failed: {}",
-                        spawn_failure_reason(&attempt)
-                    ))),
-                };
+                // The daemon owns the thread, so its pid must never be handed back as a
+                // killable one. Every other outcome is a hard failure carrying the daemon's
+                // own error. There is deliberately no exec fallback: it could double-run the
+                // task or silently hand back an unjoinable session.
+                return daemon_spawn_result(app_server::try_spawn_thread(
+                    daemon, dir, task, model, effort, None,
+                ));
             }
             SpawnRoute::Refuse => {
                 return Err(crate::error::Error::Command(no_daemon_spawn_refusal(&why)));

@@ -5,10 +5,21 @@
 //! picker is populated on the first keystroke instead of after a multi-second probe.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use agent_viewer_core::backend::{BackendKind, all_backends};
+
+use crate::composer::{CommandEntry, file_stems, subdir_names};
+
+pub type CommandCacheKey = (BackendKind, Option<PathBuf>);
+
+enum CommandProbeEvent {
+    Catalog(CommandCacheKey, Vec<CommandEntry>),
+    Finished(CommandCacheKey),
+}
 
 /// Re-probe a backend's catalog at most once a day. Model catalogs change on the scale of
 /// CLI releases, and a stale list still spawns fine (the id is passed straight through).
@@ -24,6 +35,14 @@ pub struct ModelCache {
     /// Cloned into each worker thread `request_with` spawns.
     tx: Sender<(BackendKind, Vec<String>)>,
     rx: Receiver<(BackendKind, Vec<String>)>,
+    /// Provider and target scoped command catalogs. Failed refreshes never replace a usable
+    /// entry, so legacy prompts and filesystem skills remain available when daemon discovery
+    /// returns nothing.
+    command_entries: HashMap<CommandCacheKey, Vec<CommandEntry>>,
+    command_attempted: HashSet<CommandCacheKey>,
+    command_pending: HashSet<CommandCacheKey>,
+    command_tx: Sender<CommandProbeEvent>,
+    command_rx: Receiver<CommandProbeEvent>,
 }
 
 impl Default for ModelCache {
@@ -35,11 +54,17 @@ impl Default for ModelCache {
 impl ModelCache {
     pub fn new() -> ModelCache {
         let (tx, rx) = channel();
+        let (command_tx, command_rx) = channel();
         ModelCache {
             entries: HashMap::new(),
             attempted: HashSet::new(),
             tx,
             rx,
+            command_entries: HashMap::new(),
+            command_attempted: HashSet::new(),
+            command_pending: HashSet::new(),
+            command_tx,
+            command_rx,
         }
     }
 
@@ -98,6 +123,98 @@ impl ModelCache {
         }
         landed
     }
+
+    /// Return a command catalog already discovered for this provider and target. This is a
+    /// memory read only and is safe on key and render adjacent paths.
+    pub fn commands(&self, key: &CommandCacheKey) -> Option<&[CommandEntry]> {
+        self.command_entries.get(key).map(Vec::as_slice)
+    }
+
+    pub fn commands_pending(&self, key: &CommandCacheKey) -> bool {
+        self.command_pending.contains(key)
+    }
+
+    /// Start provider discovery once for a target. All filesystem work and Codex daemon RPC
+    /// stays on this worker; callers only submit the request and read cached results. Returns
+    /// true only when this call starts the worker.
+    pub fn request_commands(&mut self, key: CommandCacheKey) -> bool {
+        self.request_commands_with_codex_discovery(key, agent_viewer_core::codex::discover_skills)
+    }
+
+    /// Command discovery with the blocking Codex lookup injected at its external boundary.
+    /// The worker, local fallback, normalization, and cache handoff are identical to production.
+    #[doc(hidden)]
+    pub fn request_commands_with_codex_discovery<F>(
+        &mut self,
+        key: CommandCacheKey,
+        discover_codex_skills: F,
+    ) -> bool
+    where
+        F: FnOnce(&std::path::Path) -> Vec<agent_viewer_core::codex::app_server::CodexSkill>
+            + Send
+            + 'static,
+    {
+        self.request_commands_with(key, move |key, tx| {
+            let mut entries = probe_local_commands(&key);
+            normalize_commands(&mut entries);
+            if !entries.is_empty() {
+                let _ = tx.send(CommandProbeEvent::Catalog(key.clone(), entries.clone()));
+            }
+            if key.0 == BackendKind::Codex
+                && let Some(target) = key.1.as_deref()
+            {
+                entries.extend(
+                    discover_codex_skills(target)
+                        .into_iter()
+                        .map(|skill| CommandEntry::codex_skill(skill.name, skill.path)),
+                );
+                normalize_commands(&mut entries);
+                let _ = tx.send(CommandProbeEvent::Catalog(key, entries));
+            } else if entries.is_empty() {
+                let _ = tx.send(CommandProbeEvent::Catalog(key, entries));
+            }
+        })
+    }
+
+    fn request_commands_with<F>(&mut self, key: CommandCacheKey, probe: F) -> bool
+    where
+        F: FnOnce(CommandCacheKey, Sender<CommandProbeEvent>) + Send + 'static,
+    {
+        if !self.command_attempted.insert(key.clone()) {
+            return false;
+        }
+        self.command_pending.insert(key.clone());
+        let tx = self.command_tx.clone();
+        thread::spawn(move || {
+            let finished_key = key.clone();
+            let finished_tx = tx.clone();
+            let _ = catch_unwind(AssertUnwindSafe(|| probe(key, tx)));
+            let _ = finished_tx.send(CommandProbeEvent::Finished(finished_key));
+        });
+        true
+    }
+
+    /// Drain completed command probes. Empty results do not evict a previous usable list.
+    /// Returning landed keys lets the caller reinstall the active union without polling or
+    /// touching the filesystem from the UI thread.
+    pub fn poll_commands(&mut self) -> Vec<CommandCacheKey> {
+        let mut landed = Vec::new();
+        while let Ok(event) = self.command_rx.try_recv() {
+            match event {
+                CommandProbeEvent::Catalog(key, entries) => {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    self.command_entries.insert(key.clone(), entries);
+                    landed.push(key);
+                }
+                CommandProbeEvent::Finished(key) => {
+                    self.command_pending.remove(&key);
+                }
+            }
+        }
+        landed
+    }
 }
 
 /// A catalog is only worth keeping if it holds more than the built-in default: every
@@ -120,4 +237,131 @@ fn probe(backend: BackendKind) -> Vec<String> {
         .find(|b| b.kind() == backend)
         .map(|b| b.available_models())
         .unwrap_or_default()
+}
+
+fn probe_local_commands(key: &CommandCacheKey) -> Vec<CommandEntry> {
+    let (backend, target) = key;
+    let home = agent_viewer_core::home_dir();
+    match backend {
+        BackendKind::Claude => {
+            let mut names = subdir_names(&home.join(".claude/skills"));
+            if let Some(target) = target {
+                names.extend(subdir_names(&target.join(".claude/skills")));
+            }
+            names
+                .into_iter()
+                .map(CommandEntry::claude_skill)
+                .collect::<Vec<_>>()
+        }
+        BackendKind::Codex => file_stems(&home.join(".codex/prompts"))
+            .into_iter()
+            .map(CommandEntry::codex_prompt)
+            .collect::<Vec<_>>(),
+    }
+}
+
+fn normalize_commands(entries: &mut Vec<CommandEntry>) {
+    entries.sort_by(|left, right| {
+        left.display()
+            .cmp(right.display())
+            .then_with(|| {
+                left.owner()
+                    .map(BackendKind::name)
+                    .cmp(&right.owner().map(BackendKind::name))
+            })
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| left.codex_skill_path().cmp(&right.codex_skill_path()))
+    });
+    entries.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::Duration;
+
+    #[test]
+    fn empty_refresh_does_not_evict_a_usable_local_catalog() {
+        let mut cache = ModelCache::new();
+        let key = (
+            BackendKind::Codex,
+            Some(PathBuf::from("/tmp/agentviewer-command-cache")),
+        );
+        let fallback = CommandEntry::codex_prompt("review");
+        cache
+            .command_entries
+            .insert(key.clone(), vec![fallback.clone()]);
+        cache
+            .command_tx
+            .send(CommandProbeEvent::Catalog(key.clone(), Vec::new()))
+            .expect("queue empty refresh");
+
+        assert!(cache.poll_commands().is_empty());
+        assert_eq!(cache.commands(&key), Some([fallback].as_slice()));
+    }
+
+    #[test]
+    fn repeated_command_request_starts_only_one_worker() {
+        let mut cache = ModelCache::new();
+        let key = (
+            BackendKind::Claude,
+            Some(PathBuf::from("/tmp/agentviewer-command-dedup")),
+        );
+        let (started_tx, started_rx) = channel();
+
+        for (index, name) in ["first", "second", "third"].into_iter().enumerate() {
+            let started_tx = started_tx.clone();
+            let started = cache.request_commands_with(key.clone(), move |key, results| {
+                started_tx.send(()).expect("record worker start");
+                let _ = results.send(CommandProbeEvent::Catalog(
+                    key,
+                    vec![CommandEntry::claude_skill(name)],
+                ));
+            });
+            assert_eq!(started, index == 0);
+        }
+        drop(started_tx);
+
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Disconnected),
+            "a repeated request for one target must not fan out another worker"
+        );
+    }
+
+    #[test]
+    fn empty_and_failed_command_discovery_clear_pending() {
+        for fail in [false, true] {
+            let mut cache = ModelCache::new();
+            let key = (
+                BackendKind::Codex,
+                Some(PathBuf::from("/tmp/agentviewer_command_pending")),
+            );
+            let (started_tx, started_rx) = channel();
+            cache.request_commands_with(key.clone(), move |key, results| {
+                started_tx.send(()).expect("record worker start");
+                if fail {
+                    return;
+                }
+                let _ = results.send(CommandProbeEvent::Catalog(key, Vec::new()));
+            });
+
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker starts");
+            assert!(cache.commands_pending(&key));
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while cache.commands_pending(&key) {
+                cache.poll_commands();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "completed discovery remained pending"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(cache.commands(&key), None);
+        }
+    }
 }

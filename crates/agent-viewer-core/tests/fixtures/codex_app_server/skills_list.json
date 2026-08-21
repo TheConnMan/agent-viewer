@@ -1,0 +1,29 @@
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "result": {
+    "data": [
+      {
+        "cwd": "/home/user/git/proj",
+        "errors": [],
+        "skills": [
+          {
+            "enabled": true,
+            "name": "review",
+            "path": "/home/user/.codex/skills/review/SKILL.md"
+          },
+          {
+            "enabled": false,
+            "name": "disabled",
+            "path": "/home/user/.codex/skills/disabled/SKILL.md"
+          },
+          {
+            "enabled": true,
+            "name": "project_check",
+            "path": "/home/user/git/proj/.agents/skills/project_check/SKILL.md"
+          }
+        ]
+      }
+    ]
+  }
+}

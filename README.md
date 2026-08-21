@@ -124,19 +124,21 @@ an undiscovered routed Codex catalog shows `auto` alone because its redundant de
 Without routing, either catalog shows just its default until its first probe lands.
 `Shift+Tab` cycles the Claude/Codex lists. The
 target directory is the selected row's project root (by-project view) or its exact cwd
-(by-state view). Bare letters, numbers, and slash always type into the composer, including when
-it is empty; once you have typed anything, every printable key (and space) is task text, and
-`Esc` clears it. After a spawn, the list selects the new row in the first selectable snapshot
+(by-state view). Bare letters, numbers, slash, and dollar always type into the composer,
+including when it is empty; once you have typed anything, every printable key (and space) is
+task text, and `Esc` clears it. After a spawn, the list selects the new row in the first selectable snapshot
 that contains it and keeps that selection. It uses the exact returned identifier first, then the
 exact returned job name, otherwise bounded cwd and invocation-interval matching while excluding
 rows that existed before submission.
 
 ### agent-router
 
-Spawning delegates to the sibling [agent-router](https://github.com/TheConnMan/agent-router)
-project whenever its CLI is on your `PATH`, except when `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`
-selects direct Codex execution. The router names the job and records the decision, so a routed
-job started from the viewer is tracked the same way as one dispatched from anywhere else.
+Ordinary tasks, Claude skills, and Codex prompts delegate to the sibling
+[agent-router](https://github.com/TheConnMan/agent-router) project whenever its CLI is on your
+`PATH`, on both `auto` and concrete providers, except when `AGENT_VIEWER_CODEX_EXEC_SPAWN=1`
+selects direct Codex execution. Structured Codex skills invoke their discovered path directly
+through the app server. The router names routed jobs and records the decision, so a job started
+from the viewer is tracked the same way as one dispatched from anywhere else.
 
 With the router installed the composer STARTS on a third `auto` entry (one `Tab` reaches the
 concrete agents, and the entry sits last in the cycle). It has a single `auto` model, because
@@ -183,12 +185,21 @@ git-shaped task a silent no-op — the session would burn a turn and report back
 not create a branch. Treat a task you type here as something you are running with your own
 shell privileges, because that is what it is.
 
-Typing any other slash command shows a completion popup above the box: the available commands
-for the selected agent (Claude skills under `~/.claude/skills` plus the target's project skills;
-codex prompts under `~/.codex/prompts`),
-prefix-filtered live. While it is open, `↑`/`↓` move the highlight, `Tab` inserts the
-highlighted command, `Esc` dismisses the popup, and `Enter` spawns the text as-is (so
-`/implement RS-123` runs that slash command as the task prompt).
+Typing `/` opens the slash catalog above the box. Claude skills from the user and target
+project remain slash entries with `/name ` insertion, alongside Codex prompts under
+`~/.codex/prompts`. With Codex selected, matching discovered Codex skills also appear in slash
+completion; accepting one inserts its native `$name ` form while retaining its discovered path
+for structured invocation. Typing `$` opens the separate native direct Codex skill catalog. Those
+skills are discovered for the target directory through the app server only on Linux and invoked as
+structured skills with their discovered path. Structured Codex skills bypass `agent-router`, so
+they do not get router derived names or decision log entries.
+
+Auto shows the owned union of Claude and Codex entries while keeping slash and dollar catalogs
+separate. Selecting an owned entry pins its provider; ordinary text without an owned entry
+remains routed by Auto. Duplicate entries in the popup show their owner and kind. Same named
+structured skills also show the shortest scope that distinguishes their paths. While a popup is
+open, `↑`/`↓` move the highlight, `Tab` inserts the highlighted command, `Esc` dismisses the
+popup, and `Enter` spawns the text as-is.
 
 ## Inline rename
 
@@ -212,8 +223,9 @@ its SQLite title still shows the prompt.
   commits and persists it, `Esc` reverts to the one you started on.
 - `Ctrl+K` — command palette. It carries every action in this list (each with its chord, and
   unavailable ones shown as such), plus the header sprites, every visible session to jump to,
-  every discovered model and routed `auto` choice for each backend, and the slash commands for
-  the composer's backend.
+  every discovered model and routed `auto` choice for each backend, and the same owned command
+  entries as the completion popup. Selecting one inserts its exact `/name ` or `$name ` text and
+  pins its provider.
 - `Ctrl+B` — toggle the tail pane, the last 12 turns of the selected session beside the list.
   It needs at least 100 columns; below that opening it is a footer notice naming the width.
 - `Ctrl+W` — video wall (see below). `Ctrl+O` zooms the focused tile to the full attach view.
@@ -331,13 +343,13 @@ own for — archive, rename, stop or remove, or jumping to another session.
 
 Starting a new task goes through that palette too: `Ctrl+K`, then `New session`, floats the
 spawn composer over the grid. It is the list's composer unchanged — `Tab` switches agent,
-`⇧Tab` cycles its model, and slash commands complete as they do below the list — so describe
-the task and press `Enter` to start it, and the keyboard goes straight back to the tiles. `Esc`
-backs out and keeps what you had typed, so glancing at a tile mid-sentence never costs the
-draft. `Ctrl+C` backs out the same way rather than quitting the viewer, and `Ctrl+W` and
+`⇧Tab` cycles its model, and slash and dollar commands complete as they do below the list, so
+describe the task and press `Enter` to start it, and the keyboard goes straight back to the
+tiles. `Esc` backs out and keeps what you had typed, so glancing at a tile mid-sentence never
+costs the draft. `Ctrl+C` backs out the same way rather than quitting the viewer, and `Ctrl+W` and
 `Ctrl+]` still leave for the list — every way out of the box keeps the draft. Picking a slash
-command or a model from the palette opens the same box, since both write into the composer and
-the grid has nowhere else to show it.
+or dollar command or a model from the palette opens the same box, since all write into the
+composer and the grid has nowhere else to show it.
 
 Everything else you type —
 plain arrows, `Enter`, `Esc`, `Ctrl+C`, and every other chord — goes to the focused session:

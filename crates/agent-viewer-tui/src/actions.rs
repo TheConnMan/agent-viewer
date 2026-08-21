@@ -8,13 +8,14 @@ use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::pty::{PtySession, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_core::spawn::now_ms;
-use agent_viewer_tui::app::{DetachTracker, KillStage, file_stems, subdir_names};
+use agent_viewer_tui::app::{DetachTracker, KillStage};
+use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::shared_listing::{SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode, RenameModal, TriageState, triage_queue};
 use crossterm::event::{MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::keys::set_mouse_capture;
+use crate::keys::{refresh_palette_commands, set_mouse_capture};
 use crate::ops::{AttachPlan, Mutation};
 use crate::{Key, Refresher, Ui};
 
@@ -146,42 +147,98 @@ pub(crate) fn open_filter(ui: &mut Ui) {
     ui.mode = Mode::Filter;
 }
 
-/// The slash-command names for a backend (scanned from disk; missing dir -> empty, no error).
-/// claude: skill dir names under ~/.claude/skills plus <target>/.claude/skills (project
-/// skills). codex: file stems under ~/.codex/prompts. All home paths go through core's
-/// `home_dir`.
-fn scan_commands(backend: BackendKind, target: Option<&std::path::Path>) -> Vec<String> {
-    let home = agent_viewer_core::home_dir();
-    let mut cmds = match backend {
-        BackendKind::Claude => {
-            let mut v = subdir_names(&home.join(".claude/skills"));
-            if let Some(t) = target {
-                v.extend(subdir_names(&t.join(".claude/skills")));
-            }
-            v
-        }
-        BackendKind::Codex => file_stems(&home.join(".codex/prompts")),
-    };
-    cmds.sort();
-    cmds.dedup();
-    cmds
+fn command_target(ui: &Ui) -> Option<std::path::PathBuf> {
+    ui.app
+        .spawn_target()
+        .map(|target| target.displayed_directory().to_path_buf())
 }
 
-/// Keep the composer's slash-command list current: re-scan the filesystem only when the
-/// text is a "/…" command AND the (backend, spawn target) it was scanned for has changed.
-pub(crate) fn ensure_completions(ui: &mut Ui) {
-    if !ui.composer.text().starts_with('/') {
+fn installed_commands(ui: &Ui, target: &Option<std::path::PathBuf>) -> Vec<CommandEntry> {
+    let mut commands = vec![CommandEntry::viewer("model"), CommandEntry::viewer("theme")];
+    let providers = if ui.composer.is_auto() {
+        ui.composer.available_backends().to_vec()
+    } else {
+        vec![ui.composer.backend()]
+    };
+    for provider in providers {
+        let key = (provider, target.clone());
+        if let Some(entries) = ui.models.commands(&key) {
+            commands.extend_from_slice(entries);
+        }
+    }
+    commands.sort_by(|left, right| {
+        left.display()
+            .cmp(right.display())
+            .then_with(|| {
+                left.owner()
+                    .map(BackendKind::name)
+                    .cmp(&right.owner().map(BackendKind::name))
+            })
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| left.codex_skill_path().cmp(&right.codex_skill_path()))
+    });
+    commands.dedup();
+    commands
+}
+
+fn command_discovery_pending(ui: &Ui, target: &Option<std::path::PathBuf>) -> bool {
+    let providers = if ui.composer.is_auto() {
+        ui.composer.available_backends().to_vec()
+    } else {
+        vec![ui.composer.backend()]
+    };
+    providers
+        .into_iter()
+        .any(|provider| ui.models.commands_pending(&(provider, target.clone())))
+}
+
+/// Keep the composer's command list current. Discovery starts only when the composer contains
+/// command text. Ordinary navigation may change the cached target scope, but it never probes a
+/// new target by itself.
+pub(crate) fn ensure_completions(ui: &mut Ui) -> usize {
+    let discover = matches!(ui.composer.text().chars().next(), Some('/' | '$'));
+    update_completions(ui, discover)
+}
+
+/// Ctrl K is an explicit request for the full command catalog even when the composer is empty.
+pub(crate) fn request_completions(ui: &mut Ui) -> usize {
+    update_completions(ui, true)
+}
+
+fn update_completions(ui: &mut Ui, discover: bool) -> usize {
+    let target = command_target(ui);
+    let providers = if ui.composer.is_auto() {
+        ui.composer.available_backends().to_vec()
+    } else {
+        vec![ui.composer.backend()]
+    };
+    let mut requested = 0;
+    if discover {
+        for provider in providers {
+            if ui.models.request_commands((provider, target.clone())) {
+                requested += 1;
+            }
+        }
+    }
+    let key = (ui.composer.backend(), target.clone());
+    if !ui.composer.commands_match_scope(&key) {
+        let commands = installed_commands(ui, &target);
+        ui.composer.set_commands(commands, key);
+    }
+    requested
+}
+
+/// Install command discovery results that landed on workers. Failed or empty probes are not
+/// returned by the cache, so an existing usable catalog remains installed.
+pub(crate) fn install_commands(ui: &mut Ui) {
+    if ui.models.poll_commands().is_empty() {
         return;
     }
-    let directory = ui
-        .app
-        .spawn_target()
-        .map(|target| target.displayed_directory().to_path_buf());
-    let key = (ui.composer.backend(), directory);
-    if ui.composer.commands_key() != Some(&key) {
-        let cmds = scan_commands(key.0, key.1.as_deref());
-        ui.composer.set_commands(cmds, key);
-    }
+    let target = command_target(ui);
+    let key = (ui.composer.backend(), target.clone());
+    let commands = installed_commands(ui, &target);
+    ui.composer.set_commands(commands, key);
+    refresh_palette_commands(ui);
 }
 
 /// Keep the composer's discovered model list current: re-install from the model cache only
@@ -631,8 +688,58 @@ pub(crate) fn spawn_from_composer(
         ui.set_notice("no target directory".to_string());
         return false;
     };
+    let target_directory = Some(target.displayed_directory().to_path_buf());
+    if matches!(ui.composer.text().chars().next(), Some('/' | '$'))
+        && command_discovery_pending(ui, &target_directory)
+    {
+        ui.set_notice("discovering commands…".to_string());
+        return false;
+    }
+    let selected_command = ui.composer.command_for_submission().cloned();
+    if let Some(command) = selected_command.as_ref()
+        && command.owner() == Some(BackendKind::Codex)
+        && command.kind() == agent_viewer_tui::composer::CommandKind::Skill
+        && let Some(path) = command.codex_skill_path()
+    {
+        let Some(backend) = backend_of(backends, BackendKind::Codex) else {
+            return false;
+        };
+        if !backend.capabilities().spawn {
+            ui.set_notice("codex does not support spawn".to_string());
+            return false;
+        }
+        let task = ui.composer.text().to_string();
+        let model = if ui.composer.is_auto() || ui.composer.model() == "default" {
+            None
+        } else {
+            Some(ui.composer.model().to_string())
+        };
+        let skill = agent_viewer_core::codex::app_server::CodexSkill {
+            name: command.name().to_string(),
+            path: path.to_path_buf(),
+        };
+        let key = format!("{}:{task}:spawn", BackendKind::Codex.name());
+        let mutation = Mutation::spawn_codex_skill(
+            &ui.app,
+            target,
+            task,
+            model,
+            skill,
+            now_ms(),
+            "spawned on codex skill".to_string(),
+        );
+        let executor = ui.mutation_executor.clone();
+        if !ui.mutations.submit(key, move || executor(mutation)) {
+            return false;
+        }
+        ui.set_notice("spawning… on codex skill".to_string());
+        ui.composer.clear();
+        refresher.force();
+        return true;
+    }
     if ui.composer.is_auto() {
-        return spawn_through_router(refresher, ui, target, None, None);
+        let provider = selected_command.as_ref().and_then(CommandEntry::owner);
+        return spawn_through_router(refresher, ui, target, provider, None);
     }
     let backend_kind = ui.composer.backend();
     let Some(backend) = backend_of(backends, backend_kind) else {
@@ -731,17 +838,22 @@ fn spawn_through_router(
 
 #[cfg(test)]
 mod tests {
-    use super::{hide_request, install_attach_plan, kill_request, spawn_from_composer};
+    use super::{
+        hide_request, install_attach_plan, install_commands, kill_request, spawn_from_composer,
+    };
     use crate::Refresher;
     use crate::keys::handle_paste;
     use crate::keys::tests::{SpawnBackend, sess, test_ui_with};
     use crate::ops::{Mutation, resolve_attach_with_backend};
+    use agent_viewer_core::codex::app_server::CodexSkill;
     use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session, Status};
     use agent_viewer_tui::app::KillStage;
+    use agent_viewer_tui::composer::CommandEntry;
     use agent_viewer_tui::mutations::MutationOutcome;
     use agent_viewer_tui::shared_listing::TargetRequest;
     use agent_viewer_tui::ui::{ATTACHED_CHROME_ROWS, Mode};
+    use std::path::PathBuf;
     use std::sync::{
         Arc, Mutex,
         mpsc::{TryRecvError, channel},
@@ -885,6 +997,53 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    struct CommandSpawnBackend {
+        kind: BackendKind,
+    }
+
+    impl agent_viewer_core::Backend for CommandSpawnBackend {
+        fn kind(&self) -> BackendKind {
+            self.kind
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                spawn: true,
+                ..Capabilities::none()
+            }
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            unreachable!("listing is not exercised by command submission")
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("the mutation recorder intercepts command submission")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, AttachRefusal> {
+            unreachable!("attach is not exercised by command submission")
+        }
+    }
+
+    fn select_auto_command(ui: &mut crate::Ui, command: CommandEntry, typed_prefix: &str) {
+        ui.composer.set_auto_available(true);
+        ui.composer.default_to_auto();
+        ui.composer
+            .set_commands(vec![command], (BackendKind::Claude, None));
+        ui.composer.push_str(typed_prefix);
+        assert!(ui.composer.accept_suggestion());
     }
 
     #[test]
@@ -1205,6 +1364,264 @@ mod tests {
         assert_eq!(
             *routed.lock().unwrap(),
             vec!["route this somewhere".to_string()]
+        );
+    }
+
+    #[test]
+    fn owned_slash_entries_under_auto_route_with_their_selected_provider() {
+        for (command, prefix, provider) in [
+            (
+                CommandEntry::claude_skill("deploy"),
+                "/de",
+                BackendKind::Claude,
+            ),
+            (
+                CommandEntry::codex_prompt("review"),
+                "/re",
+                BackendKind::Codex,
+            ),
+        ] {
+            let routed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&routed);
+            let mut ui = test_ui_with(vec![sess(
+                "router_target",
+                "/tmp/agentviewer_owned_command",
+                100,
+            )]);
+            ui.mutation_executor = Arc::new(move |mutation| {
+                let Mutation::SpawnRouted {
+                    task,
+                    provider,
+                    model,
+                    ..
+                } = mutation
+                else {
+                    panic!("an owned slash entry must use the routed spawn")
+                };
+                recorded.lock().unwrap().push((task, provider, model));
+                Ok(MutationOutcome {
+                    notice: "recorded".to_string(),
+                    spawned: None,
+                })
+            });
+            select_auto_command(&mut ui, command.clone(), prefix);
+            ui.composer.push_str("ship it");
+
+            assert!(spawn_from_composer(&[], &inert_refresher(), &mut ui));
+            assert_eq!(poll_mutation(&mut ui).unwrap().notice, "recorded");
+            assert_eq!(
+                *routed.lock().unwrap(),
+                vec![(
+                    format!("{}ship it", command.insertion()),
+                    Some(provider),
+                    None,
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn manual_auto_slash_inference_routes_only_an_unambiguous_owner() {
+        for (commands, provider) in [
+            (
+                vec![CommandEntry::claude_skill("implement")],
+                Some(BackendKind::Claude),
+            ),
+            (
+                vec![
+                    CommandEntry::claude_skill("review"),
+                    CommandEntry::codex_prompt("review"),
+                ],
+                None,
+            ),
+        ] {
+            let routed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&routed);
+            let mut ui = test_ui_with(vec![sess(
+                "router_target",
+                "/tmp/agentviewer_manual_command",
+                100,
+            )]);
+            ui.mutation_executor = Arc::new(move |mutation| {
+                let Mutation::SpawnRouted { task, provider, .. } = mutation else {
+                    panic!("manual slash insertion must use the routed spawn")
+                };
+                recorded.lock().unwrap().push((task, provider));
+                Ok(MutationOutcome {
+                    notice: "recorded".to_string(),
+                    spawned: None,
+                })
+            });
+            ui.composer.set_auto_available(true);
+            ui.composer.default_to_auto();
+            ui.composer
+                .set_commands(commands, (BackendKind::Claude, None));
+            let task = if provider.is_some() {
+                "/implement fix it"
+            } else {
+                "/review this"
+            };
+            ui.composer.push_str(task);
+            assert_eq!(ui.composer.pinned_command(), None);
+
+            assert!(spawn_from_composer(&[], &inert_refresher(), &mut ui));
+            assert_eq!(poll_mutation(&mut ui).unwrap().notice, "recorded");
+            assert_eq!(*routed.lock().unwrap(), vec![(task.to_string(), provider)]);
+        }
+    }
+
+    #[test]
+    fn a_codex_skill_uses_a_direct_structured_mutation_from_auto_and_codex() {
+        let skill_path = PathBuf::from("/tmp/agentviewer_codex_skill/SKILL.md");
+        let expected_skill = CodexSkill {
+            name: "diagnose".to_string(),
+            path: skill_path.clone(),
+        };
+
+        for auto in [true, false] {
+            let direct = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&direct);
+            let mut ui = test_ui_with(vec![sess(
+                "router_target",
+                "/tmp/agentviewer_codex_skill_target",
+                100,
+            )]);
+            ui.mutation_executor = Arc::new(move |mutation| {
+                let Mutation::Spawn {
+                    backend,
+                    task,
+                    codex_skill,
+                    ..
+                } = mutation
+                else {
+                    panic!("a Codex skill must bypass the routed spawn")
+                };
+                recorded.lock().unwrap().push((backend, task, codex_skill));
+                Ok(MutationOutcome {
+                    notice: "recorded".to_string(),
+                    spawned: None,
+                })
+            });
+            ui.composer.set_auto_available(true);
+            if auto {
+                ui.composer.default_to_auto();
+            } else {
+                ui.composer.select_backend(BackendKind::Codex);
+            }
+            let command = CommandEntry::codex_skill("diagnose", skill_path.clone());
+            ui.composer
+                .set_commands(vec![command], (BackendKind::Codex, None));
+            ui.composer.push_str("$di");
+            assert!(ui.composer.accept_suggestion());
+            ui.composer.push_str("investigate this");
+
+            let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+                vec![Box::new(CommandSpawnBackend {
+                    kind: BackendKind::Codex,
+                })];
+            assert!(spawn_from_composer(&backends, &inert_refresher(), &mut ui));
+            assert_eq!(poll_mutation(&mut ui).unwrap().notice, "recorded");
+            assert_eq!(
+                *direct.lock().unwrap(),
+                vec![(
+                    BackendKind::Codex,
+                    "$diagnose investigate this".to_string(),
+                    Some(expected_skill.clone()),
+                )],
+                "the structured skill must survive the {auto} Auto state"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_command_discovery_blocks_command_text_but_not_ordinary_text() {
+        let target_directory = PathBuf::from("/tmp/agentviewer_delayed_commands");
+        let skill_path = PathBuf::from("/skills/diagnose/SKILL.md");
+        let mut ui = test_ui_with(vec![sess(
+            "delayed_target",
+            target_directory.to_str().expect("utf8 target"),
+            100,
+        )]);
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&submitted);
+        ui.mutation_executor = Arc::new(move |mutation| {
+            match mutation {
+                Mutation::SpawnRouted { task, .. } => {
+                    recorded.lock().unwrap().push((task, None));
+                }
+                Mutation::Spawn {
+                    task, codex_skill, ..
+                } => {
+                    recorded.lock().unwrap().push((task, codex_skill));
+                }
+                _ => panic!("unexpected mutation"),
+            }
+            Ok(MutationOutcome {
+                notice: "recorded".to_string(),
+                spawned: None,
+            })
+        });
+        ui.composer.set_auto_available(true);
+        ui.composer.default_to_auto();
+
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let discovered_path = skill_path.clone();
+        let discovery_key = (BackendKind::Codex, Some(target_directory));
+        assert!(ui.models.request_commands_with_codex_discovery(
+            discovery_key.clone(),
+            move |_| {
+                started_tx.send(()).expect("record discovery start");
+                release_rx.recv().expect("release discovery");
+                vec![CodexSkill {
+                    name: "diagnose".to_string(),
+                    path: discovered_path,
+                }]
+            },
+        ));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("discovery starts");
+        assert!(ui.models.commands_pending(&discovery_key));
+
+        ui.composer.push_str("$diagnose investigate");
+        assert!(!spawn_from_composer(&[], &inert_refresher(), &mut ui));
+        assert_eq!(ui.composer.text(), "$diagnose investigate");
+        assert!(submitted.lock().unwrap().is_empty());
+
+        ui.composer.clear();
+        ui.composer.push_str("ordinary text");
+        assert!(spawn_from_composer(&[], &inert_refresher(), &mut ui));
+        assert_eq!(poll_mutation(&mut ui).unwrap().notice, "recorded");
+        assert_eq!(submitted.lock().unwrap()[0].0, "ordinary text");
+
+        release_tx.send(()).expect("release discovery");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ui.models.commands_pending(&discovery_key) {
+            install_commands(&mut ui);
+            assert!(Instant::now() < deadline, "discovery did not land");
+            std::thread::yield_now();
+        }
+        install_commands(&mut ui);
+        ui.composer.push_str("$diagnose investigate");
+
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
+            vec![Box::new(CommandSpawnBackend {
+                kind: BackendKind::Codex,
+            })];
+        assert!(spawn_from_composer(&backends, &inert_refresher(), &mut ui));
+        assert_eq!(poll_mutation(&mut ui).unwrap().notice, "recorded");
+        let submissions = submitted.lock().unwrap();
+        assert_eq!(submissions.len(), 2);
+        assert_eq!(
+            submissions[1],
+            (
+                "$diagnose investigate".to_string(),
+                Some(CodexSkill {
+                    name: "diagnose".to_string(),
+                    path: skill_path,
+                }),
+            )
         );
     }
 

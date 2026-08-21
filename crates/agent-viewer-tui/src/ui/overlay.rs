@@ -1,5 +1,6 @@
 use super::{display_width, fg};
 use crate::app::Composer;
+use crate::composer::CommandEntry;
 use crate::ui::theme::{Theme, ThemeState};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -67,6 +68,21 @@ pub(super) fn draw_suggestions<S: AsRef<str>>(
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items), area);
+}
+
+pub(super) fn draw_command_suggestions(
+    frame: &mut Frame,
+    suggestions: &[&CommandEntry],
+    catalog: &[CommandEntry],
+    highlight: usize,
+    theme: &Theme,
+    composer_area: Rect,
+) {
+    let labels = suggestions
+        .iter()
+        .map(|command| format!("{}  {}", command.display(), command.detail(catalog)))
+        .collect::<Vec<_>>();
+    draw_suggestions(frame, &labels, highlight, "", theme, composer_area);
 }
 
 pub(super) fn draw_theme_picker(frame: &mut Frame, themes: &ThemeState, composer_area: Rect) {

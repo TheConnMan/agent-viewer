@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use super::overlay::centered_rect;
 use super::sprite::SpriteKind;
 use super::{Theme, fg};
+use crate::composer::CommandEntry;
 use agent_viewer_core::BackendKind;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,7 +60,7 @@ pub enum PaletteTarget {
     Session { backend: BackendKind, id: String },
     Model { backend: BackendKind, name: String },
     Sprite(SpriteKind),
-    Command(String),
+    Command(CommandEntry),
 }
 
 /// The session the ACTION rows were built for, captured when the palette opened.
@@ -172,6 +173,23 @@ impl PaletteState {
     pub fn highlighted(&self) -> Option<&PaletteItem> {
         let index = *self.results.get(self.highlight)?;
         self.items.get(index)
+    }
+
+    /// Replace only command rows after background discovery while retaining palette context.
+    pub fn replace_commands(&mut self, commands: Vec<PaletteItem>) {
+        let highlighted = self.highlighted().map(|item| item.target.clone());
+        self.items
+            .retain(|item| item.group != PaletteGroup::Commands);
+        self.items.extend(commands);
+        self.rank();
+        if let Some(highlighted) = highlighted
+            && let Some(position) = self
+                .results
+                .iter()
+                .position(|index| self.items[*index].target == highlighted)
+        {
+            self.highlight = position;
+        }
     }
 
     pub fn push(&mut self, character: char) {
@@ -537,6 +555,7 @@ fn ellipsize(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PaletteGroup, PaletteItem, PaletteState, PaletteTarget, fuzzy_score};
+    use crate::composer::CommandEntry;
     use agent_viewer_core::BackendKind;
 
     fn item(group: PaletteGroup, name: &str, detail: &str) -> PaletteItem {
@@ -548,7 +567,7 @@ mod tests {
             None,
             true,
             None,
-            PaletteTarget::Command(name.to_string()),
+            PaletteTarget::Command(CommandEntry::viewer(name)),
         )
     }
 
@@ -631,7 +650,7 @@ mod tests {
             Some("⌃D"),
             false,
             Some("unavailable · backend does not support archive".to_string()),
-            PaletteTarget::Command("archive".to_string()),
+            PaletteTarget::Command(CommandEntry::viewer("archive")),
         )]);
         for character in "arch".chars() {
             palette.push(character);

@@ -3,6 +3,7 @@ use agent_viewer_tui::app::{
     App, Composer, DetachTracker, GroupKey, GroupMode, KillStage, Row, Section, format_elapsed,
     row_layout,
 };
+use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::pr_cache::PrStatusCache;
 use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
 use agent_viewer_tui::ui::{Draw, ListHit, Mode, Pulses, ThemeState, draw, theme};
@@ -2131,7 +2132,10 @@ fn composer_slash_suggestions_empty_while_model_command() {
     // picker shows), even when "model" is itself a registered slash command.
     let mut c = Composer::new();
     c.set_commands(
-        vec!["model".into(), "modernize".into()],
+        vec![
+            CommandEntry::claude_skill("model"),
+            CommandEntry::claude_skill("modernize"),
+        ],
         (BackendKind::Claude, None),
     );
     for ch in "/model".chars() {
@@ -2148,8 +2152,11 @@ fn composer_slash_suggestions_empty_while_model_command() {
 #[test]
 fn composer_slash_suggestions_prefix_filter() {
     let mut c = Composer::new();
+    let implement = CommandEntry::claude_skill("implement");
+    let improve = CommandEntry::claude_skill("improve");
+    let review = CommandEntry::claude_skill("review");
     c.set_commands(
-        vec!["implement".into(), "improve".into(), "review".into()],
+        vec![implement.clone(), improve.clone(), review],
         (BackendKind::Claude, None),
     );
     // Non-slash text: no suggestions at all.
@@ -2164,12 +2171,12 @@ fn composer_slash_suggestions_prefix_filter() {
     for ch in "/i".chars() {
         c.push_char(ch);
     }
-    assert_eq!(c.suggestions(), vec!["implement", "improve"]);
+    assert_eq!(c.suggestions(), vec![&implement, &improve]);
     // "/impl" narrows further to just implement.
     for ch in "mpl".chars() {
         c.push_char(ch);
     }
-    assert_eq!(c.suggestions(), vec!["implement"]);
+    assert_eq!(c.suggestions(), vec![&implement]);
     // A space commits the command word -> popup closes.
     for ch in "ement ".chars() {
         c.push_char(ch);
@@ -2180,10 +2187,9 @@ fn composer_slash_suggestions_prefix_filter() {
 #[test]
 fn composer_tab_accepts_suggestion_only_when_popup_open() {
     let mut c = Composer::new();
-    c.set_commands(
-        vec!["implement".into(), "improve".into()],
-        (BackendKind::Claude, None),
-    );
+    let implement = CommandEntry::claude_skill("implement");
+    let improve = CommandEntry::claude_skill("improve");
+    c.set_commands(vec![implement, improve], (BackendKind::Claude, None));
     // No slash: popup closed (Tab would cycle the backend in the key handler).
     assert!(!c.suggestions_active());
     assert!(!c.accept_suggestion());

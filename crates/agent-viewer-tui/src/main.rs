@@ -870,6 +870,7 @@ fn main() -> io::Result<()> {
     ui.composer
         .set_auto_available(agent_viewer_core::router::available());
     ui.composer.default_to_auto();
+    actions::ensure_completions(&mut ui);
 
     // Hand listing backends to the refresh worker. The UI set remains only for cheap capability
     // routing. Attach resolution builds its own fresh backend on the attach worker, and spawn is
@@ -972,6 +973,9 @@ fn run(
 
         // Fold in any model catalog that finished discovering (persisted for the next run).
         actions::install_models(ui);
+        // Command and skill discovery also runs on workers. Installing a landed provider
+        // catalog rebuilds the active concrete list or Auto union from memory.
+        actions::install_commands(ui);
 
         // Fold in the freshest off-thread listing (a no-op until the worker sends one).
         apply_snapshot(refresher, ui);
