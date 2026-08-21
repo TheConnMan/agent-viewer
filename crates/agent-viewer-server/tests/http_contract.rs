@@ -1078,7 +1078,7 @@ async fn claude_terminal_becomes_ready_only_after_startup_markers_clear() {
     let calls = Arc::new(FakeCalls::default());
     let mut attachable_session = session(fixture.cwd.clone());
     attachable_session.backend = BackendKind::Claude;
-    let script = "sleep 0.15; printf 'Waking session\\r\\n'; sleep 0.15; printf '\\033[2J\\033[HAttaching\\r\\n'; sleep 0.15; printf '\\033[2J\\033[H❯\\r\\n'; sleep 30";
+    let script = "sleep 0.15; printf 'Waking session\\r\\n'; sleep 0.15; printf '\\033[2J\\033[HAttaching\\r\\n'; sleep 0.15; printf '\\033[2J\\033[H❯ '; sleep 30";
     let app =
         agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
             BackendKind::Claude,
@@ -1119,6 +1119,8 @@ async fn claude_terminal_becomes_ready_only_after_startup_markers_clear() {
     })
     .await;
     assert_eq!(prompt["ready"], false);
+    assert_eq!(prompt["cursor_row"], 0);
+    assert_eq!(prompt["cursor_col"], 2);
 
     let premature = timeout(Duration::from_millis(550), async {
         terminal_json_matching(&mut socket, |value| value["ready"] == true).await
@@ -1141,7 +1143,7 @@ async fn claude_terminal_becomes_ready_when_startup_and_prompt_share_one_pty_rea
     let calls = Arc::new(FakeCalls::default());
     let mut attachable_session = session(fixture.cwd.clone());
     attachable_session.backend = BackendKind::Claude;
-    let script = "sleep 0.15; printf 'Attaching\\r\\n\\033[2J\\033[H❯\\r\\n'; sleep 30";
+    let script = "sleep 0.15; printf 'Attaching\\r\\n\\033[2J\\033[H❯ '; sleep 30";
     let app =
         agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
             BackendKind::Claude,
@@ -1168,12 +1170,210 @@ async fn claude_terminal_becomes_ready_when_startup_and_prompt_share_one_pty_rea
     })
     .await;
     assert_eq!(prompt["ready"], false);
+    assert_eq!(prompt["cursor_row"], 0);
+    assert_eq!(prompt["cursor_col"], 2);
 
     timeout(Duration::from_millis(1_500), async {
         terminal_json_matching(&mut socket, |value| value["ready"] == true).await
     })
     .await
     .expect("stable Claude composer becomes ready without an observed startup snapshot");
+}
+
+#[tokio::test]
+async fn claude_transcript_prompt_off_cursor_row_stays_unready_and_rejects_submit() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.15; printf '\\033[2J\\033[H❯\\r\\nassistant transcript'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+
+    let transcript = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| line.as_str() == Some("❯"))
+                && lines
+                    .iter()
+                    .any(|line| line.as_str() == Some("assistant transcript"))
+        })
+    })
+    .await;
+    assert_eq!(transcript["cursor_row"], 1);
+    assert_eq!(transcript["ready"], false);
+    let unexpected_ready = timeout(Duration::from_millis(750), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(
+        unexpected_ready.is_err(),
+        "Claude transcript prompt must remain unready after the settle window"
+    );
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 47, "text": "must not reach transcript prompt" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit with Claude transcript prompt");
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(response["type"], "error");
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 47
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "unready Claude transcript prompt must not be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn claude_prompt_with_hidden_cursor_stays_unready_and_rejects_submit() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.backend = BackendKind::Claude;
+    let script = "sleep 0.15; printf '\\033[2J\\033[H❯ \\033[?25l'; sleep 30";
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
+            BackendKind::Claude,
+            attachable_session,
+            Arc::clone(&calls),
+            script,
+        ))]);
+    let server = start_server(app).await;
+    let mut socket = connect_terminal_for_backend(
+        &server,
+        BackendKind::Claude,
+        Some(LOGIN),
+        Some(ANDROID_ORIGIN),
+    )
+    .await
+    .expect("attach terminal");
+
+    let prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines
+                .first()
+                .and_then(Value::as_str)
+                .is_some_and(|line| line.trim() == "❯")
+        })
+    })
+    .await;
+    assert_eq!(prompt["cursor_row"], 0);
+    assert_eq!(prompt["cursor_col"], 2);
+    assert_eq!(prompt["ready"], false);
+    let unexpected_ready = timeout(Duration::from_millis(750), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(
+        unexpected_ready.is_err(),
+        "Claude prompt with hidden cursor must remain unready after the settle window"
+    );
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 59, "text": "must wait for visible cursor" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit with hidden Claude cursor");
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(response["type"], "error");
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 59
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "unready hidden cursor prompt must not be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn codex_prompt_without_startup_marker_stays_unready_and_rejects_submit() {
+    let calls = Arc::new(FakeCalls::default());
+    let script = "sleep 0.15; printf '\\033[2J\\033[H› ready'; sleep 30";
+    let server = start_server(attachable_app(script, calls)).await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+
+    let prompt = terminal_json_matching(&mut socket, |value| {
+        value["lines"].as_array().is_some_and(|lines| {
+            lines.iter().any(|line| {
+                line.as_str()
+                    .is_some_and(|line| line.trim_start().starts_with("› "))
+            })
+        })
+    })
+    .await;
+    assert_eq!(prompt["cursor_row"], 0);
+    assert_eq!(prompt["ready"], false);
+    let unexpected_ready = timeout(Duration::from_millis(750), async {
+        terminal_json_matching(&mut socket, |value| value["ready"] == true).await
+    })
+    .await;
+    assert!(
+        unexpected_ready.is_err(),
+        "Codex prompt without startup marker must remain unready"
+    );
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "submit", "id": 53, "text": "must wait for Codex startup" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("submit before Codex startup marker");
+    let response = terminal_json_matching(&mut socket, |value| {
+        value["type"] == "error" || value["type"] == "ack"
+    })
+    .await;
+    assert_eq!(response["type"], "error");
+    let ack = timeout(Duration::from_millis(250), async {
+        terminal_json_matching(&mut socket, |value| {
+            value["type"] == "ack" && value["id"] == 53
+        })
+        .await
+    })
+    .await;
+    assert!(
+        ack.is_err(),
+        "unready Codex prompt must not be acknowledged"
+    );
 }
 
 #[tokio::test]
@@ -1368,7 +1568,7 @@ async fn claude_startup_words_in_transcript_do_not_revoke_latched_readiness() {
     let calls = Arc::new(FakeCalls::default());
     let mut attachable_session = session(fixture.cwd.clone());
     attachable_session.backend = BackendKind::Claude;
-    let script = "sleep 0.1; printf 'Attaching\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H❯\\r\\n'; sleep 0.8; printf '\\033[2J\\033[HTranscript says Attaching completed\\r\\n'; sleep 30";
+    let script = "sleep 0.1; printf 'Attaching\\r\\n'; sleep 0.1; printf '\\033[2J\\033[H❯ '; sleep 0.8; printf '\\r\\nTranscript says Attaching completed\\r\\n❯ '; sleep 30";
     let app =
         agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable_kind(
             BackendKind::Claude,
@@ -1388,12 +1588,19 @@ async fn claude_startup_words_in_transcript_do_not_revoke_latched_readiness() {
     terminal_json_matching(&mut socket, |value| value["ready"] == true).await;
 
     let transcript = terminal_json_matching(&mut socket, |value| {
-        value["lines"].as_array().is_some_and(|lines| {
-            lines.iter().any(|line| {
-                line.as_str()
-                    .is_some_and(|line| line.contains("Transcript says Attaching"))
-            })
-        })
+        let Some(lines) = value["lines"].as_array() else {
+            return false;
+        };
+        let Some(cursor_row) = value["cursor_row"].as_u64() else {
+            return false;
+        };
+        lines.iter().any(|line| {
+            line.as_str()
+                .is_some_and(|line| line.contains("Transcript says Attaching"))
+        }) && lines
+            .get(cursor_row as usize)
+            .and_then(Value::as_str)
+            .is_some_and(|line| line.trim() == "❯")
     })
     .await;
     assert_eq!(

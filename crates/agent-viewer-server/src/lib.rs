@@ -151,7 +151,30 @@ impl TerminalReadiness {
         }
     }
 
-    fn observe(&mut self, lines: &[String], running: bool) -> bool {
+    fn observe(
+        &mut self,
+        lines: &[String],
+        cursor_row: u16,
+        cursor_visible: bool,
+        running: bool,
+    ) -> bool {
+        self.observe_at(
+            lines,
+            cursor_row,
+            cursor_visible,
+            running,
+            std::time::Instant::now(),
+        )
+    }
+
+    fn observe_at(
+        &mut self,
+        lines: &[String],
+        cursor_row: u16,
+        cursor_visible: bool,
+        running: bool,
+        now: std::time::Instant,
+    ) -> bool {
         if !running {
             self.candidate_since = None;
             self.ready = false;
@@ -174,23 +197,97 @@ impl TerminalReadiness {
             self.ready = false;
             return false;
         }
-        if !self.saw_startup {
+        if matches!(self.backend, BackendKind::Codex) && !self.saw_startup {
             return false;
         }
         let prompt_visible = match self.backend {
             BackendKind::Codex => lines.iter().any(|line| line.trim_start().starts_with("› ")),
-            BackendKind::Claude => lines.iter().any(|line| line.trim() == "❯"),
+            BackendKind::Claude => {
+                cursor_visible
+                    && lines
+                        .get(usize::from(cursor_row))
+                        .is_some_and(|line| line.trim() == "❯")
+            }
         };
         if !prompt_visible {
             self.candidate_since = None;
             self.ready = false;
             return false;
         }
-        let since = self
-            .candidate_since
-            .get_or_insert_with(std::time::Instant::now);
-        self.ready = since.elapsed() >= TERMINAL_READY_SETTLE;
+        let since = self.candidate_since.get_or_insert(now);
+        self.ready = now.saturating_duration_since(*since) >= TERMINAL_READY_SETTLE;
         self.ready
+    }
+}
+
+#[cfg(test)]
+mod terminal_readiness_tests {
+    use super::{BackendKind, TERMINAL_READY_SETTLE, TerminalReadiness};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn claude_prompt_on_cursor_row_settles_without_observed_startup_marker() {
+        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
+        let lines = vec!["❯".to_owned()];
+        let started = Instant::now();
+
+        assert!(!readiness.observe_at(&lines, 0, true, true, started));
+        assert!(!readiness.observe_at(
+            &lines,
+            0,
+            true,
+            true,
+            started + TERMINAL_READY_SETTLE - Duration::from_millis(1)
+        ));
+        assert!(readiness.observe_at(&lines, 0, true, true, started + TERMINAL_READY_SETTLE));
+    }
+
+    #[test]
+    fn claude_prompt_off_cursor_row_never_starts_readiness_settle() {
+        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
+        let lines = vec!["❯".to_owned(), "assistant transcript".to_owned()];
+        let started = Instant::now();
+
+        assert!(!readiness.observe_at(&lines, 1, true, true, started));
+        assert!(!readiness.observe_at(
+            &lines,
+            1,
+            true,
+            true,
+            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn codex_prompt_without_startup_marker_never_starts_readiness_settle() {
+        let mut readiness = TerminalReadiness::new(BackendKind::Codex);
+        let lines = vec!["› ready".to_owned()];
+        let started = Instant::now();
+
+        assert!(!readiness.observe_at(&lines, 0, true, true, started));
+        assert!(!readiness.observe_at(
+            &lines,
+            0,
+            true,
+            true,
+            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn claude_prompt_with_hidden_cursor_never_starts_readiness_settle() {
+        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
+        let lines = vec!["❯".to_owned()];
+        let started = Instant::now();
+
+        assert!(!readiness.observe_at(&lines, 0, false, true, started));
+        assert!(!readiness.observe_at(
+            &lines,
+            0,
+            false,
+            true,
+            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
+        ));
     }
 }
 
@@ -884,7 +981,7 @@ fn terminal_screen_state(
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let lines = screen.rows(0, cols).collect::<Vec<_>>();
-        let ready = readiness.observe(&lines, running);
+        let ready = readiness.observe(&lines, cursor_row, !screen.hide_cursor(), running);
         TerminalScreenState {
             rows,
             cols,
