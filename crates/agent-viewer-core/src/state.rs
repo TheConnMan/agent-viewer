@@ -296,11 +296,12 @@ fn listing_lease_owner(now_ms: i64) -> String {
     format!("{}:{now_ms}:{sequence}", std::process::id())
 }
 
-/// "codex" | "claude" back into a BackendKind (None for unknown text).
+/// A persisted backend name back into a BackendKind (None for unknown text).
 fn backend_from_str(s: &str) -> Option<BackendKind> {
     match s {
         "codex" => Some(BackendKind::Codex),
         "claude" => Some(BackendKind::Claude),
+        "grok" => Some(BackendKind::Grok),
         _ => None,
     }
 }

@@ -285,6 +285,7 @@ fn provider_kind(name: &str) -> std::result::Result<BackendKind, String> {
     match name {
         "codex" => Ok(BackendKind::Codex),
         "claude" => Ok(BackendKind::Claude),
+        "grok" => Ok(BackendKind::Grok),
         other => Err(format!(
             "`{ROUTER_BIN}` routed to unknown provider {other:?}"
         )),

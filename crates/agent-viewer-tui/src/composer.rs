@@ -6,6 +6,12 @@ use agent_viewer_core::BackendKind;
 use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnRoute {
+    DirectBackend,
+    Router,
+}
+
 /// Inline spawn composer (item 8): a persistent multiline input above the footer. Holds
 /// the task text plus the installed target backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +137,15 @@ impl Composer {
     /// whenever this is true, and only falls back to calling the backend directly when it is not.
     pub fn router_available(&self) -> bool {
         self.auto_available
+    }
+
+    pub fn spawn_route(&self, codex_exec_opt_in: bool) -> SpawnRoute {
+        let direct_codex = self.backend == BackendKind::Codex && codex_exec_opt_in;
+        if self.auto || (self.auto_available && !direct_codex) {
+            SpawnRoute::Router
+        } else {
+            SpawnRoute::DirectBackend
+        }
     }
 
     /// Offer (or withdraw) the Auto entry. Withdrawing it while it is selected falls back to

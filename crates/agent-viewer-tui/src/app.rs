@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 // The composer, DetachTracker, and command-scan helpers moved to `crate::composer`; re-export
 // them here so `agent_viewer_tui::app::{Composer, DetachTracker, subdir_names, file_stems}`
 // still resolves for every existing import site.
-pub use crate::composer::{Composer, DetachTracker, file_stems, subdir_names};
+pub use crate::composer::{Composer, DetachTracker, SpawnRoute, file_stems, subdir_names};
 
 /// Grouping mode for the flat list. `ByProject` is the startup default (Ctrl+S toggles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,6 +775,7 @@ impl App {
                 let backend_key = |backend| match backend {
                     BackendKind::Codex => 0,
                     BackendKind::Claude => 1,
+                    BackendKind::Grok => 2,
                 };
                 self.sessions[a]
                     .created_at_ms

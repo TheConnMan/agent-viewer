@@ -14,6 +14,7 @@ use ratatui_image::protocol::Protocol;
 /// time so there is no runtime asset path to resolve.
 const CLAUDE_SVG: &str = include_str!("../assets/logos/claude.svg");
 const CODEX_SVG: &str = include_str!("../assets/logos/codex.svg");
+const GROK_SVG: &str = include_str!("../assets/logos/grok.svg");
 /// The Auto spawn entry is not a backend, so it carries a neutral robot mark instead of a brand.
 const AUTO_SVG: &str = include_str!("../assets/logos/auto.svg");
 
@@ -27,9 +28,11 @@ const RASTER_PX: u32 = 64;
 pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
+    grok: Protocol,
     auto: Protocol,
     composer_claude: Option<Protocol>,
     composer_codex: Option<Protocol>,
+    composer_grok: Option<Protocol>,
     composer_auto: Option<Protocol>,
 }
 
@@ -52,13 +55,16 @@ impl LogoMarks {
     fn from_picker(picker: &Picker) -> anyhow::Result<LogoMarks> {
         let (claude, composer_claude) = build_protocols(picker, CLAUDE_SVG)?;
         let (codex, composer_codex) = build_protocols(picker, CODEX_SVG)?;
+        let (grok, composer_grok) = build_protocols(picker, GROK_SVG)?;
         let (auto, composer_auto) = build_protocols(picker, AUTO_SVG)?;
         Ok(LogoMarks {
             claude,
             codex,
+            grok,
             auto,
             composer_claude,
             composer_codex,
+            composer_grok,
             composer_auto,
         })
     }
@@ -68,6 +74,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => &self.claude,
             BackendKind::Codex => &self.codex,
+            BackendKind::Grok => &self.grok,
         }
     }
 
@@ -77,6 +84,7 @@ impl LogoMarks {
         match backend {
             BackendKind::Claude => self.composer_claude.as_ref().unwrap_or(&self.claude),
             BackendKind::Codex => self.composer_codex.as_ref().unwrap_or(&self.codex),
+            BackendKind::Grok => self.composer_grok.as_ref().unwrap_or(&self.grok),
         }
     }
 

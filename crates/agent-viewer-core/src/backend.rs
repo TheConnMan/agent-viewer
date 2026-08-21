@@ -2,6 +2,7 @@
 pub enum BackendKind {
     Codex,
     Claude,
+    Grok,
 }
 
 /// A nonsecret namespace for one concrete backend listing source.
@@ -107,11 +108,12 @@ pub struct SpawnResult {
 }
 
 impl BackendKind {
-    /// "codex" | "claude"
+    /// "codex" | "claude" | "grok"
     pub fn name(self) -> &'static str {
         match self {
             BackendKind::Codex => "codex",
             BackendKind::Claude => "claude",
+            BackendKind::Grok => "grok",
         }
     }
     /// The model label a spawn uses when the user has picked nothing: the leading entry of
@@ -122,6 +124,7 @@ impl BackendKind {
         match self {
             BackendKind::Codex => "default",
             BackendKind::Claude => "opus[1m]",
+            BackendKind::Grok => "default",
         }
     }
     /// "[cx]" | "[cc]"  (row + composer prefix)
@@ -129,6 +132,7 @@ impl BackendKind {
         match self {
             BackendKind::Codex => "[cx]",
             BackendKind::Claude => "[cc]",
+            BackendKind::Grok => "[gx]",
         }
     }
 }
@@ -418,6 +422,7 @@ pub fn all_backends() -> Vec<Box<dyn Backend>> {
     vec![
         Box::new(crate::codex::CodexBackend::new(crate::default_codex_home())),
         Box::new(crate::claude::ClaudeBackend::new()),
+        Box::new(crate::grok::GrokBackend::new()),
     ]
 }
 

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use agent_viewer_core::backend::{Backend, BackendKind};
 use agent_viewer_core::claude::{ClaudeBackend, ensure_trusted};
 use agent_viewer_core::codex::CodexBackend;
+use agent_viewer_core::grok::GrokBackend;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::router::RouterOutcome;
 use agent_viewer_core::spawn::now_ms;
@@ -80,10 +81,10 @@ impl Mutation {
             task,
             provider,
             model,
-            // Collected for both backends even on a pinned route: it costs one cheap id scan,
+            // Collected for every backend even on a pinned route: it costs one cheap id scan,
             // and it keeps the submission snapshot independent of a dispatch that has not
             // happened yet.
-            preexisting_ids: [BackendKind::Codex, BackendKind::Claude]
+            preexisting_ids: [BackendKind::Codex, BackendKind::Claude, BackendKind::Grok]
                 .into_iter()
                 .map(|backend| (backend, app.session_ids_for_backend(backend)))
                 .collect(),
@@ -142,6 +143,7 @@ fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
+        BackendKind::Grok => Box::new(GrokBackend::new()),
     }
 }
 

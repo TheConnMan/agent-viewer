@@ -1271,6 +1271,7 @@ fn palette_commands(backend: Option<BackendKind>, target: Option<&std::path::Pat
             commands
         }
         Some(BackendKind::Codex) => file_stems(&home.join(".codex/prompts")),
+        Some(BackendKind::Grok) => Vec::new(),
         None => Vec::new(),
     };
     commands.extend(["model".to_string(), "theme".to_string()]);
@@ -2298,6 +2299,7 @@ pub(crate) mod tests {
                     "done; ",
                     "sleep 30"
                 ),
+                BackendKind::Grok => "",
             };
             command.args(["-c", script]);
             Ok(command)
@@ -5723,6 +5725,7 @@ pub(crate) mod tests {
 
                     wait_for_pty_screen(&ui, &key, "WHEEL-1: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
+                BackendKind::Grok => {}
             }
 
             set_mouse_capture(&mut ui, false);
@@ -5785,6 +5788,7 @@ pub(crate) mod tests {
                     .expect("forward retained Claude wheel");
                     wait_for_pty_screen(&ui, &key, "WHEEL-2: 1b 5b 3c 36 34 3b 36 3b 35 4d");
                 }
+                BackendKind::Grok => {}
             }
         }
     }
