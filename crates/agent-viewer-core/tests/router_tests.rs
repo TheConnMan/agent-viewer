@@ -56,6 +56,31 @@ fn a_dispatched_decision_parses_provider_effort_and_weekly_headroom() {
 }
 
 #[test]
+fn a_dispatched_grok_decision_preserves_the_exact_provider_and_job_identity() {
+    let grok = dispatched_fixture()
+        .replace("\"provider\": \"codex\"", "\"provider\": \"grok\"")
+        .replace("\"model\": \"gpt-5.6-luna\"", "\"model\": \"grok-4\"");
+
+    let outcome = parse_outcome(&grok, Some(BackendKind::Grok)).expect("parsed Grok decision");
+    assert_eq!(outcome.provider, BackendKind::Grok);
+    assert_eq!(outcome.requested, Some(BackendKind::Grok));
+    assert_eq!(outcome.model.as_deref(), Some("grok-4"));
+    assert_eq!(outcome.job_id.as_deref(), Some("0199c0de-thread"));
+    assert_eq!(
+        outcome.job_name.as_deref(),
+        Some("Add a unit test for the trunc")
+    );
+}
+
+#[test]
+fn grok_acceptance_does_not_open_router_parsing_to_a_sibling_provider() {
+    let unknown =
+        dispatched_fixture().replace("\"provider\": \"codex\"", "\"provider\": \"gemini\"");
+    let error = parse_outcome(&unknown, None).expect_err("unrecognized providers remain closed");
+    assert!(error.contains("unknown provider") && error.contains("gemini"));
+}
+
+#[test]
 fn a_dispatched_decision_rejects_an_empty_job_id() {
     let empty_id =
         dispatched_fixture().replace("\"job_id\": \"0199c0de-thread\"", "\"job_id\": \"\"");

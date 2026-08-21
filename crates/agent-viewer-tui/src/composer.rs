@@ -134,14 +134,18 @@ impl Composer {
 
     /// Whether `agent-router` was found on PATH at startup. It gates more than the Auto entry:
     /// a spawn on a concrete backend routes through the router too (pinned with `--provider`)
-    /// whenever this is true, and only falls back to calling the backend directly when it is not.
+    /// whenever this is true, except for Grok until Router accepts that provider. A Codex exec
+    /// opt-in also stays direct.
     pub fn router_available(&self) -> bool {
         self.auto_available
     }
 
     pub fn spawn_route(&self, codex_exec_opt_in: bool) -> SpawnRoute {
-        let direct_codex = self.backend == BackendKind::Codex && codex_exec_opt_in;
-        if self.auto || (self.auto_available && !direct_codex) {
+        let routes_through_router = self.auto
+            || (self.auto_available
+                && self.backend != BackendKind::Grok
+                && !(self.backend == BackendKind::Codex && codex_exec_opt_in));
+        if routes_through_router {
             SpawnRoute::Router
         } else {
             SpawnRoute::DirectBackend
