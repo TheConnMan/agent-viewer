@@ -1,0 +1,9 @@
+{"type":"user","content":[{"type":"text","text":"Please open a PR. Also see https://github.com/TheConnMan/agent-viewer/pull/7 from last week."}]}
+{"type":"assistant","content":"Checking the existing review PR first.","tool_calls":[{"id":"call-view-1","name":"run_terminal_command","arguments":"{\"command\": \"gh pr view 7 --json url,title\", \"description\": \"View existing pull request\"}"}]}
+{"type":"tool_result","tool_call_id":"call-view-1","content":"exit: 0\n{\"url\":\"https://github.com/TheConnMan/agent-viewer/pull/7\",\"title\":\"old\"}\n"}
+{"type":"assistant","content":"Creating the pull request.","tool_calls":[{"id":"call-create-1","name":"run_terminal_command","arguments":"{\"command\": \"git push -u origin HEAD && gh pr create --base main --title \\\"Add Grok PR badges\\\" --body \\\"body\\\"\", \"description\": \"Create GitHub pull request\"}"}]}
+{"type":"tool_result","tool_call_id":"call-create-1","content":"exit: 0\nhttps://github.com/TheConnMan/agent-viewer/pull/42\nsee also https://github.com/TheConnMan/agent-viewer/pull/42/files\nand again https://github.com/TheConnMan/agent-viewer/pull/42\n"}
+{"type":"assistant","content":"Opening the connector PR too.","tool_calls":[{"id":"call-connector-1","name":"mcp__github__create_pull_request","arguments":"{\"title\": \"Connector PR\", \"body\": \"via github connector\"}"}]}
+{"type":"tool_result","tool_call_id":"call-connector-1","content":"{\"url\":\"https://github.com/TheConnMan/agent-viewer/pull/99\",\"number\":99}\n"}
+{"type":"assistant","content":"Looking up related code.","tool_calls":[{"id":"call-grep-1","name":"grep","arguments":"{\"pattern\": \"https://github.com/TheConnMan/agent-viewer/pull/13\"}"}]}
+{"type":"tool_result","tool_call_id":"call-grep-1","content":"SPEC.md\n283: https://github.com/TheConnMan/agent-viewer/pull/13 is incidental\n"}
