@@ -335,11 +335,15 @@ Live `chat_history.jsonl` records (verified 2026-08-22) carry assistant `tool_ca
 `id`/`name`/`arguments` and paired `tool_result` entries with matching `tool_call_id` and a
 `content` string. A PR is attributed to the session only through those pairs:
 
-- **`gh pr create`.** A `run_terminal_command` call whose parsed `arguments.command` contains
-  `gh pr create` is pending until its `tool_result` arrives. Live shell results start with
-  `exit: N\n`; only `exit: 0` badges the `github.com/<owner>/<repo>/pull/<n>` URLs in that
-  content. A nonzero exit, a missing pair, or a result for a different `tool_call_id` badges
-  nothing. `gh pr view`, `gh pr list`, and issue history are not creation.
+- **`gh pr create`.** A `run_terminal_command` call whose parsed `arguments.command` invokes
+  `gh pr create` as a shell command (start of the script, or after `;` / `&` / `|` / `(` /
+  newline — so `git push && gh pr create` matches) is pending until its `tool_result` arrives.
+  A python script, comment, or commit message that merely mentions the string is not creation;
+  that substring match badged this session's research dumps as four PRs instead of `#3`.
+  Live shell results start with `exit: N\n`; only `exit: 0` badges the
+  `github.com/<owner>/<repo>/pull/<n>` URLs in that content. A nonzero exit, a missing pair, or
+  a result for a different `tool_call_id` badges nothing. `gh pr view`, `gh pr list`, and issue
+  history are not creation. `sudo gh pr create` is a known miss.
 - **A GitHub connector / MCP tool whose name ends with `create_pull_request`.** Live Grok
   results have no structured `url` field like Codex's `mcp_tool_call_end`; the URL is scanned
   out of the paired `tool_result` content. `is_error: true` (not observed live, but the field

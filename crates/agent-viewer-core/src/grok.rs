@@ -741,9 +741,10 @@ fn push_capped_pr_ref(refs: &mut Vec<PrRef>, owner: String, repo: String, number
     }
 }
 
-/// Explicit Grok PR-creation tools: `run_terminal_command` whose command contains
-/// `gh pr create`, or any tool whose name ends with `create_pull_request` (GitHub
-/// connector / MCP). `gh pr view` / `gh pr list` / issue research are not creation.
+/// Explicit Grok PR-creation tools: `run_terminal_command` that invokes
+/// `gh pr create` as a shell command, or any tool whose name ends with
+/// `create_pull_request` (GitHub connector / MCP). `gh pr view` / `gh pr list`,
+/// issue research, and scripts that merely mention the string are not creation.
 #[cfg(target_os = "linux")]
 fn is_grok_pr_create_call(name: &str, arguments: Option<&Value>) -> bool {
     if name.ends_with("create_pull_request") {
@@ -765,17 +766,59 @@ fn run_terminal_command_creates_pr(arguments: &Value) -> bool {
             Ok(parsed) => parsed
                 .get("command")
                 .and_then(Value::as_str)
-                .is_some_and(|command| command.contains("gh pr create")),
+                .is_some_and(command_invokes_gh_pr_create),
             // Malformed arguments JSON is scanned as a blob, same as Codex scanning
             // exec input as a string rather than requiring a parsed command field.
-            Err(_) => raw.contains("gh pr create"),
+            Err(_) => command_invokes_gh_pr_create(raw),
         },
         Value::Object(_) => arguments
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|command| command.contains("gh pr create")),
+            .is_some_and(command_invokes_gh_pr_create),
         _ => false,
     }
+}
+
+/// True when `gh pr create` is a shell command in `command`, not a mention inside
+/// a python script, comment, commit message, or quoted string. `gh` must sit at a
+/// command position: start of the script, or after `;` / `&` / `|` / `(` / newline.
+/// `git push && gh pr create --title ...` matches; `# find gh pr create` and
+/// `if "gh pr create" in cmd` do not. `sudo gh pr create` is a known miss.
+#[cfg(target_os = "linux")]
+fn command_invokes_gh_pr_create(command: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = command[search_from..].find("gh") {
+        let at = search_from + rel;
+        if is_shell_command_start(&command[..at]) {
+            let rest = command[at + 2..].trim_start();
+            if let Some(after_pr) = rest.strip_prefix("pr") {
+                let after_pr = after_pr.trim_start();
+                if let Some(after_create) = after_pr.strip_prefix("create")
+                    && (after_create.is_empty()
+                        || after_create.starts_with(|character: char| {
+                            character.is_whitespace()
+                                || matches!(character, ';' | '&' | '|' | ')' | '#')
+                        }))
+                {
+                    return true;
+                }
+            }
+        }
+        search_from = at + 2;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_shell_command_start(before: &str) -> bool {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    trimmed.is_empty()
+        || trimmed.ends_with('\n')
+        || trimmed.ends_with('\r')
+        || trimmed.ends_with(';')
+        || trimmed.ends_with('|')
+        || trimmed.ends_with('&')
+        || trimmed.ends_with('(')
 }
 
 /// Live Grok `run_terminal_command` results start with `exit: N\n`. Honor that wrapper

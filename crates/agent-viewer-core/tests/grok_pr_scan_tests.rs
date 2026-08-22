@@ -67,6 +67,6 @@ fn list_does_not_badge_failed_unpaired_or_incidental_pr_urls() {
     );
     assert!(
         find(&rows, "session-incidental").pr_refs.is_empty(),
-        "research, issue history, gh pr view/list, and arbitrary tool output must not badge"
+        "research, issue history, gh pr view/list, python that mentions gh pr create, and arbitrary tool output must not badge"
     );
 }
