@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::backend::PrRef;
 use crate::backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, Session, SessionOrigin, SpawnResult,
     Status, TailEvent,
@@ -490,6 +492,21 @@ const GROK_SUMMARY_MAX_BYTES: u64 = 1024 * 1024;
 const GROK_DURABLE_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const GROK_STATUS_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const GROK_DURABLE_STATUS_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Per-file ceiling for the chat-history PR scan. Live Grok histories on this box
+/// top out around 1 MiB; a file past this is skipped rather than truncated, because
+/// a cut through a PR URL would mint a sticky truncated number.
+#[cfg(target_os = "linux")]
+const GROK_PR_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// Aggregate chat-history bytes the listing may scan for PR refs in one pass,
+/// matching the durable summary and status ceilings. Grok fleets are small enough
+/// that a bounded full parse per refresh is cheaper than Codex's per-file offset
+/// scanner; skipping a session's refs when the budget is gone is the safe fallback.
+#[cfg(target_os = "linux")]
+const GROK_PR_SCAN_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Most successfully created PRs kept per session. Each ref costs a live `gh`
+/// fetch in the TUI status cache.
+#[cfg(target_os = "linux")]
+const GROK_MAX_PR_REFS: usize = 4;
 
 #[cfg(target_os = "linux")]
 fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
@@ -517,6 +534,7 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
     let mut bytes_read = 0_u64;
     let mut status_bytes_read = 0_u64;
+    let mut pr_bytes_read = 0_u64;
     for cwd_name in cwd_names {
         let Ok(cwd_directory) = sessions_directory.open_directory(&cwd_name) else {
             continue;
@@ -594,15 +612,24 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
                     .filter(|text| !text.trim().is_empty())
                     .unwrap_or(&summary.session_summary),
             );
-            let history = session_directory
-                .open_regular(std::ffi::OsStr::new("chat_history.jsonl"))
-                .is_ok()
-                .then(|| {
-                    home.join("sessions")
-                        .join(&cwd_name)
-                        .join(&session_name)
-                        .join("chat_history.jsonl")
-                });
+            let (history, pr_refs) =
+                match session_directory.open_regular(std::ffi::OsStr::new("chat_history.jsonl")) {
+                    Ok(file) => {
+                        let remaining = GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read);
+                        let (refs, used) = read_durable_pr_refs(file, remaining);
+                        pr_bytes_read = pr_bytes_read.saturating_add(used);
+                        (
+                            Some(
+                                home.join("sessions")
+                                    .join(&cwd_name)
+                                    .join(&session_name)
+                                    .join("chat_history.jsonl"),
+                            ),
+                            refs,
+                        )
+                    }
+                    Err(_) => (None, Vec::new()),
+                };
             let (status, status_bytes) = read_durable_status(
                 &session_directory,
                 &summary.info.id,
@@ -630,12 +657,241 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
                 summary: summary_text,
                 pid: None,
                 rollout_path: history,
-                pr_refs: Vec::new(),
+                pr_refs,
                 daemon_hosted: false,
             });
         }
     }
     Ok(sessions)
+}
+
+/// Read one chat_history.jsonl for PR refs. Missing, unreadable, oversized, or
+/// over-budget files contribute no refs and never fail the row.
+#[cfg(target_os = "linux")]
+fn read_durable_pr_refs(file: std::fs::File, remaining_bytes: u64) -> (Vec<PrRef>, u64) {
+    use std::io::Read as _;
+
+    if remaining_bytes == 0 {
+        return (Vec::new(), 0);
+    }
+    let Ok(metadata) = file.metadata() else {
+        return (Vec::new(), 0);
+    };
+    let file_len = metadata.len();
+    if file_len == 0 || file_len > GROK_PR_SCAN_MAX_BYTES || file_len > remaining_bytes {
+        // Skip rather than parse a prefix: a create call and its result can straddle
+        // the cut, and a torn github.com/.../pull/10 for an in-flight 1089 is sticky.
+        return (Vec::new(), 0);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(file_len).unwrap_or_default());
+    if file.take(file_len).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != file_len {
+        return (Vec::new(), bytes.len() as u64);
+    }
+    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return (Vec::new(), file_len);
+    };
+    let body = String::from_utf8_lossy(&bytes[..=last_newline]);
+    (scan_grok_chat_history_pr_refs(&body), file_len)
+}
+
+/// Bytes legal in the path part of a github PR URL. Anything else (a quote, comma,
+/// backslash, paren, whitespace) ends the candidate — Grok tool results embed URLs
+/// in plain text or JSON, so the delimiter is nearly always one of those.
+#[cfg(target_os = "linux")]
+fn is_pr_url_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/')
+}
+
+/// Call `on_key` with every github PR link in `text`, in the order they appear, as
+/// (owner, repo, number). Deduping and capping are the caller's.
+#[cfg(target_os = "linux")]
+fn scan_pr_keys(text: &str, mut on_key: impl FnMut(String, String, u64)) {
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        hits.extend(text.match_indices(prefix).map(|(at, _)| (at, prefix.len())));
+    }
+    hits.sort_unstable();
+    let bytes = text.as_bytes();
+    for (start, prefix_len) in hits {
+        let mut end = start + prefix_len;
+        while end < bytes.len() && is_pr_url_path_byte(bytes[end]) {
+            end += 1;
+        }
+        if let Some((owner, repo, number)) = crate::pr_status::parse_pr_url(&text[start..end]) {
+            on_key(owner, repo, number);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn push_capped_pr_ref(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) {
+    let href = format!("https://github.com/{owner}/{repo}/pull/{number}");
+    if refs
+        .iter()
+        .any(|r| r.href.as_deref() == Some(href.as_str()))
+    {
+        return;
+    }
+    refs.push(PrRef {
+        id: number.to_string(),
+        href: Some(href),
+    });
+    if refs.len() > GROK_MAX_PR_REFS {
+        refs.remove(0);
+    }
+}
+
+/// Explicit Grok PR-creation tools: `run_terminal_command` that invokes
+/// `gh pr create` as a shell command, or any tool whose name ends with
+/// `create_pull_request` (GitHub connector / MCP). `gh pr view` / `gh pr list`,
+/// issue research, and scripts that merely mention the string are not creation.
+#[cfg(target_os = "linux")]
+fn is_grok_pr_create_call(name: &str, arguments: Option<&Value>) -> bool {
+    if name.ends_with("create_pull_request") {
+        return true;
+    }
+    if name != "run_terminal_command" {
+        return false;
+    }
+    let Some(arguments) = arguments else {
+        return false;
+    };
+    run_terminal_command_creates_pr(arguments)
+}
+
+#[cfg(target_os = "linux")]
+fn run_terminal_command_creates_pr(arguments: &Value) -> bool {
+    match arguments {
+        Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(parsed) => parsed
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(command_invokes_gh_pr_create),
+            // Malformed arguments JSON is scanned as a blob, same as Codex scanning
+            // exec input as a string rather than requiring a parsed command field.
+            Err(_) => command_invokes_gh_pr_create(raw),
+        },
+        Value::Object(_) => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(command_invokes_gh_pr_create),
+        _ => false,
+    }
+}
+
+/// True when `gh pr create` is a shell command in `command`, not a mention inside
+/// a python script, comment, commit message, or quoted string. `gh` must sit at a
+/// command position: start of the script, or after `;` / `&` / `|` / `(` / newline.
+/// `git push && gh pr create --title ...` matches; `# find gh pr create` and
+/// `if "gh pr create" in cmd` do not. `sudo gh pr create` is a known miss.
+#[cfg(target_os = "linux")]
+fn command_invokes_gh_pr_create(command: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = command[search_from..].find("gh") {
+        let at = search_from + rel;
+        if is_shell_command_start(&command[..at]) {
+            let rest = command[at + 2..].trim_start();
+            if let Some(after_pr) = rest.strip_prefix("pr") {
+                let after_pr = after_pr.trim_start();
+                if let Some(after_create) = after_pr.strip_prefix("create")
+                    && (after_create.is_empty()
+                        || after_create.starts_with(|character: char| {
+                            character.is_whitespace()
+                                || matches!(character, ';' | '&' | '|' | ')' | '#')
+                        }))
+                {
+                    return true;
+                }
+            }
+        }
+        search_from = at + 2;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_shell_command_start(before: &str) -> bool {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    trimmed.is_empty()
+        || trimmed.ends_with('\n')
+        || trimmed.ends_with('\r')
+        || trimmed.ends_with(';')
+        || trimmed.ends_with('|')
+        || trimmed.ends_with('&')
+        || trimmed.ends_with('(')
+}
+
+/// Live Grok `run_terminal_command` results start with `exit: N\n`. Honor that wrapper
+/// whenever it is present, on any tool. `is_error: true` (not observed live, but the
+/// field a future Grok result may grow) is also failure. A result with neither signal
+/// is treated as success so a connector result that is only the PR URL still badges.
+#[cfg(target_os = "linux")]
+fn grok_tool_result_succeeded(record: &Value) -> bool {
+    if record.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    let Some(content) = record.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Some(rest) = content.strip_prefix("exit:") {
+        return rest
+            .trim_start()
+            .split(['\n', '\r', ' '])
+            .next()
+            .and_then(|code| code.parse::<i64>().ok())
+            == Some(0);
+    }
+    true
+}
+
+/// Pair assistant tool_calls with later tool_result records by tool_call_id, and
+/// keep canonical GitHub pull URLs only from successful PR-creation results.
+#[cfg(target_os = "linux")]
+fn scan_grok_chat_history_pr_refs(body: &str) -> Vec<PrRef> {
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut refs = Vec::new();
+    for line in body.lines() {
+        let Some(value) = crate::parse_json_line(line) else {
+            continue;
+        };
+        match crate::json_str(&value, "type") {
+            Some("assistant") => {
+                let Some(calls) = value.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for call in calls {
+                    let Some(id) = crate::json_str(call, "id").filter(|id| !id.is_empty()) else {
+                        continue;
+                    };
+                    let Some(name) = crate::json_str(call, "name") else {
+                        continue;
+                    };
+                    if is_grok_pr_create_call(name, call.get("arguments")) {
+                        pending.insert(id.to_owned());
+                    }
+                }
+            }
+            Some("tool_result") => {
+                let Some(call_id) = crate::json_str(&value, "tool_call_id") else {
+                    continue;
+                };
+                if !pending.remove(call_id) {
+                    continue;
+                }
+                if !grok_tool_result_succeeded(&value) {
+                    continue;
+                }
+                let Some(text) = value.get("content").and_then(Value::as_str) else {
+                    continue;
+                };
+                scan_pr_keys(text, |owner, repo, number| {
+                    push_capped_pr_ref(&mut refs, owner, repo, number);
+                });
+            }
+            _ => {}
+        }
+    }
+    refs
 }
 
 #[cfg(target_os = "linux")]
