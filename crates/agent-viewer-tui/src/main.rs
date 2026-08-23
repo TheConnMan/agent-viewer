@@ -406,6 +406,12 @@ fn process_event<B: ratatui::backend::Backend, W: io::Write>(
             keys::handle_key(key, backends, refresher, ui, terminal)?
         }
         Event::Resize(_, _) => {
+            // Inline graphics protocols encode pixel dimensions from the terminal font size.
+            // Ctrl+/- changes that size, so rebuild the whole cache while retaining the current
+            // set if the fresh terminal query or any protocol construction fails.
+            if let Some(logos) = ui.logos.as_mut() {
+                let _ = logos.refresh();
+            }
             if let Some(key) = &ui.focused
                 && let Some(pty) = ui.attached.get_mut(key)
             {
@@ -605,7 +611,7 @@ struct Ui {
     /// "process exited" header). Read-only during draw so the render path stays `&`.
     focused_exited: bool,
     /// The brand-logo protocols, Some when the startup graphics probe succeeded. Borrowed
-    /// immutably each frame by the render path.
+    /// immutably by the render path and atomically refreshed after terminal resizes.
     logos: Option<LogoMarks>,
     /// Latest list geometry, written by `draw` each frame and read by the mouse handler to
     /// hit-test click/hover to a row. Interior mutability keeps the draw path `&`-only.
@@ -746,9 +752,9 @@ fn main() -> io::Result<()> {
     let available_backends =
         available_spawn_backends(current_platform(), std::env::var_os("PATH").as_deref());
 
-    // Inline brand-logo images are always attempted. The probe queries the terminal (stdin
-    // raw-mode toggle) so it runs BEFORE ratatui::init() takes the alt screen; on a non-tty or
-    // unsupported terminal the build fails and the textual marks stay as a fallback.
+    // Inline brand-logo images are initially attempted before ratatui takes the alternate
+    // screen. On a non-tty or query failure, textual marks remain the fallback; a successful
+    // cache is re-queried and rebuilt when the terminal later reports a resize.
     let logos = match LogoMarks::build() {
         Ok(l) => {
             ui::set_logo_marks(true);

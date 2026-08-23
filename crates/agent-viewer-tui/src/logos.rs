@@ -1,4 +1,5 @@
-//! Optional brand logo marks rasterized once at startup from the backend SVGs.
+//! Optional brand logo marks rasterized from the backend SVGs at startup and after terminal
+//! resizes so graphics protocols keep matching the terminal's current font size.
 //! List rows use fixed two cell protocols. Kitty, iTerm2, and Sixel composers use separate
 //! three cell protocols whose artwork is offset by half a cell. Halfblocks composers reuse
 //! the two cell list protocols because that fallback cannot represent a horizontal half cell.
@@ -22,9 +23,9 @@ const AUTO_SVG: &str = include_str!("../assets/logos/auto.svg");
 /// two cell slot; oversampling keeps the half blocks fallback from looking chunky.
 const RASTER_PX: u32 = 64;
 
-/// Fixed two cell list protocols for each backend, plus separate three cell composer protocols
-/// when the graphics format supports a half cell offset. Halfblocks composers reuse the list
-/// protocols. The `Image` widget borrows these immutably, so one set serves every frame.
+/// Two cell list protocols for each backend, plus separate three cell composer protocols when
+/// the graphics format supports a half cell offset. Halfblocks composers reuse the list
+/// protocols. The `Image` widget borrows these immutably between terminal resize events.
 pub struct LogoMarks {
     claude: Protocol,
     codex: Protocol,
@@ -39,17 +40,45 @@ pub struct LogoMarks {
 impl LogoMarks {
     /// Query the terminal for its graphics protocol and font size, then build the list and
     /// supported composer protocols. `from_query_stdio` performs terminal I/O and temporarily
-    /// toggles raw mode on stdin, so call this before crossterm takes the alternate screen.
+    /// toggles raw mode on stdin, so it may be called during startup or after a terminal resize.
     /// When stdin is not a terminal, it errors and the caller keeps the textual marks.
     pub fn build() -> anyhow::Result<LogoMarks> {
         let picker = Picker::from_query_stdio().map_err(|e| anyhow::anyhow!("{e}"))?;
         Self::from_picker(&picker)
     }
 
+    /// Re-query the terminal and atomically replace every cached protocol with versions built
+    /// for its current font size. A failed query or rebuild leaves the last known-good set live.
+    pub fn refresh(&mut self) -> anyhow::Result<()> {
+        let picker = Picker::from_query_stdio().map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.rebuild(&picker)
+    }
+
     #[cfg(test)]
     pub(crate) fn halfblocks_for_test() -> anyhow::Result<LogoMarks> {
         let picker = Picker::halfblocks();
         Self::from_picker(&picker)
+    }
+
+    #[cfg(test)]
+    fn rebuild_for_test(&mut self, picker: &Picker) -> anyhow::Result<()> {
+        self.rebuild(picker)
+    }
+
+    fn rebuild(&mut self, picker: &Picker) -> anyhow::Result<()> {
+        // A resize re-query can transiently fall back to Halfblocks even though the existing
+        // cache was built for a graphics-capable terminal. Keep that last known-good cache:
+        // replacing it would disable the graphics protocol (and its pixel-aware scaling) until
+        // a later query succeeds. Genuine Halfblocks caches may still rebuild normally.
+        if picker.protocol_type() == ProtocolType::Halfblocks
+            && !matches!(&self.claude, Protocol::Halfblocks(_))
+        {
+            return Ok(());
+        }
+
+        let replacement = Self::from_picker(picker)?;
+        *self = replacement;
+        Ok(())
     }
 
     fn from_picker(picker: &Picker) -> anyhow::Result<LogoMarks> {
@@ -226,6 +255,65 @@ mod tests {
         );
         assert_eq!(logos.auto.size(), Size::new(2, 1));
         assert_eq!(logos.composer_auto_image().size(), Size::new(3, 1));
+    }
+
+    #[allow(deprecated)]
+    fn iterm_picker(font_size: FontSize) -> Picker {
+        let mut picker = Picker::from_fontsize(font_size);
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        picker
+    }
+
+    fn assert_iterm_pixel_size(protocol: &Protocol, width: u16, height: u16) {
+        let Protocol::ITerm2(protocol) = protocol else {
+            panic!("expected an iTerm2 graphics protocol");
+        };
+
+        assert!(
+            protocol
+                .data
+                .contains(&format!("width={width}px;height={height}px")),
+            "protocol did not encode the expected pixel dimensions"
+        );
+    }
+
+    #[test]
+    fn graphics_protocols_rebuild_for_the_new_terminal_font_size() {
+        let initial_picker = iterm_picker(FontSize::new(10, 20));
+        let resized_picker = iterm_picker(FontSize::new(16, 32));
+        let mut logos = LogoMarks::from_picker(&initial_picker).unwrap();
+
+        assert_eq!(logos.image(BackendKind::Codex).size(), Size::new(2, 1));
+        assert_eq!(
+            logos.composer_image(BackendKind::Codex).size(),
+            Size::new(3, 1)
+        );
+        assert_iterm_pixel_size(logos.image(BackendKind::Codex), 20, 20);
+        assert_iterm_pixel_size(logos.composer_image(BackendKind::Codex), 30, 20);
+
+        logos.rebuild_for_test(&resized_picker).unwrap();
+
+        assert_eq!(logos.image(BackendKind::Codex).size(), Size::new(2, 1));
+        assert_eq!(
+            logos.composer_image(BackendKind::Codex).size(),
+            Size::new(3, 1)
+        );
+        assert_iterm_pixel_size(logos.image(BackendKind::Codex), 32, 32);
+        assert_iterm_pixel_size(logos.composer_image(BackendKind::Codex), 48, 32);
+    }
+
+    #[test]
+    fn graphics_cache_refuses_a_halfblocks_refresh() {
+        let initial_picker = iterm_picker(FontSize::new(10, 20));
+        let mut logos = LogoMarks::from_picker(&initial_picker).unwrap();
+
+        logos.rebuild_for_test(&Picker::halfblocks()).unwrap();
+
+        for backend in [BackendKind::Claude, BackendKind::Codex, BackendKind::Grok] {
+            assert_iterm_pixel_size(logos.image(backend), 20, 20);
+            assert_iterm_pixel_size(logos.composer_image(backend), 30, 20);
+        }
+        assert_iterm_pixel_size(logos.composer_auto_image(), 30, 20);
     }
 
     #[test]
