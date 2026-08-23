@@ -1,0 +1,4 @@
+{"type":"user","content":[{"type":"text","text":"Did a PR get created? https://github.com/TheConnMan/agent-viewer/pull/60"}]}
+{"type":"tool_result","tool_call_id":"call-missing-create","content":"exit: 0\nhttps://github.com/TheConnMan/agent-viewer/pull/61\n"}
+{"type":"assistant","content":"Creating the pull request.","tool_calls":[{"id":"call-never-returns","name":"run_terminal_command","arguments":"{\"command\": \"gh pr create --base main --title \\\"Unpaired\\\" --body \\\"body\\\"\", \"description\": \"Create GitHub pull request\"}"}]}
+{"type":"tool_result","tool_call_id":"call-other-id","content":"exit: 0\nhttps://github.com/TheConnMan/agent-viewer/pull/62\n"}

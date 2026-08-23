@@ -1,0 +1,5 @@
+{"type":"user","content":[{"type":"text","text":"Open a PR please"}]}
+{"type":"assistant","content":"Creating the pull request.","tool_calls":[{"id":"call-failed-1","name":"run_terminal_command","arguments":"{\"command\": \"gh pr create --base main --title \\\"Failed create\\\" --body \\\"body\\\"\", \"description\": \"Create GitHub pull request\"}"}]}
+{"type":"tool_result","tool_call_id":"call-failed-1","content":"exit: 1\nhttps://github.com/TheConnMan/agent-viewer/pull/50\ngh: pull request create failed\n"}
+{"type":"assistant","content":"Retrying via connector.","tool_calls":[{"id":"call-failed-connector","name":"mcp__github__create_pull_request","arguments":"{\"title\": \"Failed connector\"}"}]}
+{"type":"tool_result","tool_call_id":"call-failed-connector","content":"https://github.com/TheConnMan/agent-viewer/pull/51\n","is_error":true}

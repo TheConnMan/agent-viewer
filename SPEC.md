@@ -280,14 +280,16 @@ cache rereads every thirty seconds.
 - The status classifier reads a 64 KiB tail window. The tail *pane* reads a wider one; see
   "Bounded transcript tails".
 
-## PR refs — codex reads them out of the transcript
+## PR refs — transcripts, not registries
 
 Claude records its PRs in `jobs/<short>/state.json` (`children[]` where `kind == "pr"`). Codex
-records them nowhere: the registry has no PR column, and `threads.git_branch` is captured when
-the thread starts, so it is stale the moment the agent branches (measured: the thread that
-opened `curie-eng/curie/pull/1089` still reports `task/fix-interactive-clippy`). Branch lookups
-are therefore not a usable source. The rollout transcript is the source only when it proves that
-the same thread successfully opened the PR.
+and Grok record them nowhere: the Codex registry has no PR column, Grok `summary.json` has no
+PR field, and `threads.git_branch` is captured when the Codex thread starts, so it is stale the
+moment the agent branches (measured: the thread that opened `curie-eng/curie/pull/1089` still
+reports `task/fix-interactive-clippy`). Branch lookups are therefore not a usable source. The
+transcript is the source only when it proves that the same session successfully opened the PR.
+
+### Codex
 
 A thread opens a PR through one of two channels, and both are read, because reading only the
 first badged nothing at all on this box:
@@ -326,6 +328,34 @@ or other calls are incidental and are excluded. Cost rules, all load bearing at 
 - **`MAX_REFS_PER_SESSION`**, keeping the most recent successful refs. Each ref costs a live
   `gh` fetch in the TUI's status cache, and one real batch creation rollout successfully opened
   115 distinct PRs.
+
+### Grok
+
+Live `chat_history.jsonl` records (verified 2026-08-22) carry assistant `tool_calls` with
+`id`/`name`/`arguments` and paired `tool_result` entries with matching `tool_call_id` and a
+`content` string. A PR is attributed to the session only through those pairs:
+
+- **`gh pr create`.** A `run_terminal_command` call whose parsed `arguments.command` invokes
+  `gh pr create` as a shell command (start of the script, or after `;` / `&` / `|` / `(` /
+  newline — so `git push && gh pr create` matches) is pending until its `tool_result` arrives.
+  A python script, comment, or commit message that merely mentions the string is not creation;
+  that substring match badged this session's research dumps as four PRs instead of `#3`.
+  Live shell results start with `exit: N\n`; only `exit: 0` badges the
+  `github.com/<owner>/<repo>/pull/<n>` URLs in that content. A nonzero exit, a missing pair, or
+  a result for a different `tool_call_id` badges nothing. `gh pr view`, `gh pr list`, and issue
+  history are not creation. `sudo gh pr create` is a known miss.
+- **A GitHub connector / MCP tool whose name ends with `create_pull_request`.** Live Grok
+  results have no structured `url` field like Codex's `mcp_tool_call_end`; the URL is scanned
+  out of the paired `tool_result` content. `is_error: true` (not observed live, but the field
+  a future result may grow) badges nothing. A result with no `exit:` wrapper and no `is_error`
+  is treated as success so a connector result that is only the PR URL still badges.
+
+An unpaired or failed command does not badge a PR, and URLs in messages, `gh pr view` /
+research output, grep/read of other files, or other calls are incidental and are excluded.
+Grok fleets are tens of sessions and a few megabytes of history, so listing does a bounded
+full parse of each `chat_history.jsonl` (2 MiB per file, 32 MiB aggregate, complete lines
+only) rather than Codex's per-file offset scanner. `MAX_REFS` is 4, keeping the most recent
+successful refs. Roster-only rows with no durable history keep empty `pr_refs`.
 
 ## Status detection — TWO signals, both required
 
@@ -876,8 +906,9 @@ Cargo workspace, two crates plus one vendored dependency. Live-refresh the regis
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
   trust bootstrap, and spawn/attach/stop/remove/rename.
 - `grok.rs` is the Grok backend and the reusable public `GrokLifecycle`: read only durable
-  discovery, bounded transcript tails, leader registration and framing, roster precedence,
-  lifecycle requests, diagnostics, model fallback, and exact official attach construction.
+  discovery, bounded transcript tails, PR refs from successful chat-history creation pairs,
+  leader registration and framing, roster precedence, lifecycle requests, diagnostics, model
+  fallback, and exact official attach construction.
 - `router.rs` is the `agent-router` shell out used for ordinary tasks and text commands by Auto
   and by pinned Codex or Claude when
   the binary is installed. It deliberately is not a `Backend`: it enumerates nothing and owns
