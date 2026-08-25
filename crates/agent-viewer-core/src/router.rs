@@ -111,6 +111,9 @@ pub struct RouterOutcome {
     /// id had not surfaced yet is findable by name.
     pub job_id: Option<String>,
     pub job_name: Option<String>,
+    /// The router made a valid decision but proved that none of its configured providers has a
+    /// capability the task needs. No backend was started, so there is no dispatch identity.
+    pub capability_blocked: Option<String>,
     /// The gate tags that fired, in order (`claude_signals`, `headroom_tiebreak`, ...).
     pub gates: Vec<String>,
     pub rationale: String,
@@ -128,6 +131,15 @@ impl RouterOutcome {
     /// The headroom stays on both, since it is the same free reading either way.
     pub fn notice(&self) -> String {
         let routed_by_provider = self.requested.is_none();
+        if let Some(reason) = &self.capability_blocked {
+            return format!(
+                "{}: blocked: {} (codex weekly {:.0}%, claude {:.0}%)",
+                if routed_by_provider { "auto" } else { "spawn" },
+                one_line(reason),
+                self.codex_weekly_pct,
+                self.claude_weekly_pct
+            );
+        }
         let mut line = if routed_by_provider {
             format!("auto: {}", self.provider.name())
         } else {
@@ -182,10 +194,29 @@ pub fn parse_outcome(
     if dry_run {
         return Err(format!("`{ROUTER_BIN}` json reports dry_run true"));
     }
-    let dispatch = required_object(&value, "dispatch")?;
     let gates = required_string_array(&value, "gates")?;
     let rationale = required_str(&value, "rationale")?.to_string();
     let usage = required_object(&value, "usage")?;
+    // `capability_blocked` was added after the viewer's first router integration. Its absence is
+    // therefore the old dispatched contract, while a present null keeps the current contract
+    // explicit. A present malformed value remains an error rather than a guessed outcome.
+    let capability_blocked = optional_nullable_string(&value, "capability_blocked")?;
+    if capability_blocked.is_some() {
+        return Ok(RouterOutcome {
+            provider,
+            requested,
+            model: nullable_string(&value, "model")?,
+            effort: nullable_string(&value, "effort")?,
+            job_id: None,
+            job_name: None,
+            capability_blocked,
+            gates,
+            rationale,
+            claude_weekly_pct: weekly_pct(usage, "claude")?,
+            codex_weekly_pct: weekly_pct(usage, "codex")?,
+        });
+    }
+    let dispatch = required_object(&value, "dispatch")?;
     let job_id = nullable_string_from_object(dispatch, "job_id")
         .map_err(|error| format!("dispatch: {error}"))?;
     if job_id.as_deref() == Some("") {
@@ -215,6 +246,7 @@ pub fn parse_outcome(
         effort: nullable_string(&value, "effort")?,
         job_id,
         job_name,
+        capability_blocked: None,
         gates,
         rationale,
         claude_weekly_pct: weekly_pct(usage, "claude")?,
@@ -327,6 +359,16 @@ fn nullable_string(
     key: &str,
 ) -> std::result::Result<Option<String>, String> {
     nullable_string_value(value.get(key), key)
+}
+
+fn optional_nullable_string(
+    value: &serde_json::Value,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    match value.get(key) {
+        Some(value) => nullable_string_value(Some(value), key),
+        None => Ok(None),
+    }
 }
 
 fn nullable_string_from_object(

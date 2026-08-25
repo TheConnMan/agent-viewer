@@ -169,6 +169,34 @@ fn a_real_router_run_rejects_dry_run_or_undispatched_output() {
     assert!(error.contains("dispatch"), "got {error:?}");
 }
 
+/// A capability block is a completed router decision that deliberately starts no backend. It is
+/// not malformed dispatch JSON, and the viewer must preserve its reason for the composer footer.
+#[test]
+fn a_capability_blocked_decision_parses_without_a_dispatch_object() {
+    let mut blocked: serde_json::Value =
+        serde_json::from_str(&dispatched_fixture()).expect("fixture json");
+    let object = blocked.as_object_mut().expect("fixture object");
+    object.insert("dispatch".to_string(), serde_json::Value::Null);
+    object.insert(
+        "capability_blocked".to_string(),
+        serde_json::json!("Granola is unavailable to the routed job"),
+    );
+    let outcome =
+        parse_outcome(&blocked.to_string(), None).expect("a capability block is readable");
+
+    assert_eq!(
+        outcome.capability_blocked.as_deref(),
+        Some("Granola is unavailable to the routed job")
+    );
+    assert_eq!(outcome.job_id, None);
+    assert_eq!(outcome.job_name, None);
+    assert!(
+        outcome.notice().contains("blocked"),
+        "got {:?}",
+        outcome.notice()
+    );
+}
+
 #[test]
 fn a_real_router_run_requires_gates_rationale_and_usage() {
     for field in ["gates", "rationale", "usage"] {
@@ -194,6 +222,7 @@ fn malformed_router_field_types_reject_the_decision() {
         ("usage", serde_json::json!("unavailable")),
         ("dry_run", serde_json::json!("false")),
         ("dispatch", serde_json::json!([])),
+        ("capability_blocked", serde_json::json!(["not", "text"])),
         (
             "dispatch",
             serde_json::json!({

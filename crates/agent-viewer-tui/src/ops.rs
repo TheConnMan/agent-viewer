@@ -452,6 +452,12 @@ fn run_spawn_routed(
     // window can expire before the row appears.
     let submitted_at_ms = now_ms();
     let outcome = route(&directory, task, provider, model)?;
+    if outcome.capability_blocked.is_some() {
+        return Ok(MutationOutcome {
+            notice: outcome.notice(),
+            spawned: None,
+        });
+    }
     let spawned_at_ms = now_ms();
     // The dispatching provider's cached listing predates the job it now owns: fence it, same as a
     // direct spawn does, so the next tick refetches instead of waiting out the freshness window.
@@ -632,6 +638,7 @@ mod tests {
                     effort: Some("xhigh".to_string()),
                     job_id: None,
                     job_name: Some("a routed task".to_string()),
+                    capability_blocked: None,
                     gates: Vec::new(),
                     rationale: String::new(),
                     claude_weekly_pct: 0.0,
@@ -648,6 +655,48 @@ mod tests {
             "the stamp must be taken after routing: {} is not at least {}",
             selection.spawned_at_ms,
             submitted_at + routing_ms as i64
+        );
+    }
+
+    #[test]
+    fn a_capability_blocked_routed_spawn_returns_a_notice_without_selecting_a_session() {
+        let outcome = run_spawn_routed(
+            &SpawnTarget::ExplicitDirectory(PathBuf::from("/tmp/routed_blocked")),
+            "inspect a remote-only source",
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            |_directory, _task, _provider, _model| {
+                Ok(RouterOutcome {
+                    requested: None,
+                    provider: BackendKind::Codex,
+                    model: None,
+                    effort: None,
+                    job_id: None,
+                    job_name: None,
+                    gates: vec!["capability_blocked".to_string()],
+                    rationale: String::new(),
+                    capability_blocked: Some(
+                        "Granola is unavailable to the routed job".to_string(),
+                    ),
+                    claude_weekly_pct: 0.0,
+                    codex_weekly_pct: 0.0,
+                })
+            },
+        )
+        .expect("a capability block is an intelligible mutation result");
+
+        assert_eq!(outcome.spawned, None);
+        assert!(
+            outcome.notice.contains("blocked"),
+            "got {:?}",
+            outcome.notice
+        );
+        assert!(
+            outcome.notice.contains("Granola"),
+            "got {:?}",
+            outcome.notice
         );
     }
 
@@ -687,6 +736,7 @@ mod tests {
                     effort: None,
                     job_id: Some("routed-short-id".to_string()),
                     job_name: None,
+                    capability_blocked: None,
                     gates: Vec::new(),
                     rationale: String::new(),
                     claude_weekly_pct: 0.0,
@@ -739,6 +789,7 @@ mod tests {
                     // The short-id resolution missed, so the row is matched by cwd + time.
                     job_id: None,
                     job_name: Some("a routed task".to_string()),
+                    capability_blocked: None,
                     gates: Vec::new(),
                     rationale: String::new(),
                     claude_weekly_pct: 0.0,
