@@ -1171,16 +1171,19 @@ in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawn
 
 ### Triage inbox (`Ctrl+N`)
 
-A modal walking every session that is awaiting input, longest wait first, with the session
-itself attached live into the middle panel. Three chords are reserved (`Ctrl+N` next, `Ctrl+P`
-previous, `Ctrl+]` leave) and everything else goes to the session, because typing into the
+A modal walking every session awaiting input, then every active completed session (excluding
+archived, companion, and hold history), longest wait first within each cohort, with the session itself
+attached live into the middle panel. The reserved controls are `Ctrl+N` next, `Ctrl+P` previous,
+`Ctrl+D` applies the main-view `Ctrl+X`-twice action (including stop-then-remove for an active
+item), and bare `Esc` leaves
+(`Ctrl+]` remains a compatibility detach chord). Everything else goes to the session, because typing into the
 agent's own input path is how a prompt gets answered; there is no second reply mechanism. The
 queue is snapshotted when the modal opens so a background refresh cannot reorder it mid-answer.
 
-Sessions are attached one at a time as they are reached, never prefetched, and a visit lasts
-exactly as long as the item is on screen: `release_triage_attachment` closes the child both when
-you move off an item and when you close the queue. Keeping every visited child alive would
-accumulate invisible processes across a walk. The one exception is a key the video wall owns,
+The current session and only its immediate successor may be attached: the successor is
+prefetched so advancing does not wait for resume. `release_triage_attachment` closes a child
+when it leaves that two-item window or the queue closes. Keeping every visited child alive would
+accumulate invisible processes across a walk. The other exception is a key the video wall owns,
 which the wall is responsible for and triage must not tear down underneath it.
 
 ### Tail pane (`Ctrl+B`) and command palette (`Ctrl+K`)

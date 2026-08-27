@@ -556,6 +556,11 @@ enum AttachOutcome {
         key: Key,
         plan: Result<ops::AttachPlan, String>,
     },
+    /// One-item-ahead triage preload, held off-screen until it becomes current.
+    TriagePrefetch {
+        key: Key,
+        plan: Result<ops::AttachPlan, String>,
+    },
 }
 
 /// Everything the run loop mutates, threaded through the key/tick handlers.
@@ -1153,6 +1158,25 @@ fn apply_attach_result<B: ratatui::backend::Backend, W: io::Write>(
             }
         }
         Ok(AttachOutcome::Wall { key, plan }) => install_wall_join(ui, key, plan),
+        Ok(AttachOutcome::TriagePrefetch { key, plan }) => {
+            let should_keep = matches!(&ui.mode, Mode::Triage(state) if state.next().map(|item| item.key()).as_ref() == Some(&key));
+            if !should_keep {
+                return Ok(());
+            }
+            let Ok(plan) = plan else {
+                return Ok(());
+            };
+            let Some(current_key) = (match &ui.mode {
+                Mode::Triage(state) => state.current().map(|item| item.key()),
+                _ => None,
+            }) else {
+                return Ok(());
+            };
+            let current_session = ui.app.session_for(&current_key).cloned();
+            install_completed_attach_plan(ui, terminal, plan, writer, applied_mouse_capture)?;
+            ui.focused = Some(current_key);
+            ui.focused_session = current_session;
+        }
         Err(notice) => ui.set_notice(notice),
     }
     Ok(())
@@ -2310,6 +2334,57 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_triage_attach_retains_history_for_viewer_scroll() {
+        let mut done = session(BackendKind::Claude, "done", 1_000, false);
+        done.status = agent_viewer_core::Status::Done;
+        let mut ui = test_ui(vec![done.clone()]);
+        ui.mode = Mode::Triage(agent_viewer_tui::ui::TriageState::new(
+            agent_viewer_tui::ui::triage_queue(&[done.clone()]),
+        ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16)).unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "seq 1 100; sleep 30"]);
+
+        actions::install_attach_plan(
+            &mut ui,
+            &mut terminal,
+            ops::AttachPlan {
+                session: done.clone(),
+                command,
+            },
+        )
+        .expect("install Claude triage attach");
+
+        let key = (done.backend, done.id.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ui.attached[&key].with_screen(|screen| !screen.contents().contains("100")) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Claude triage child did not emit history"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        keys::handle_mouse_event(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 5,
+                row: 6,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("route triage wheel event");
+        assert!(
+            ui.attached[&key].with_screen(|screen| screen.scrollback()) > 0,
+            "a real wheel event must scroll retained Claude triage history"
+        );
+        ui.attached.get_mut(&key).expect("the child").kill();
+    }
+
+    #[test]
     fn attached_ctrl_y_emits_exact_unicode_frame_once_and_retains_child_interrupt() {
         let attached_session = session(BackendKind::Codex, "copy", 1_000, false);
         let pty = PtySession::spawn(agent_viewer_core::pty::PtySpec {
@@ -2875,6 +2950,7 @@ mod tests {
                         break plan.expect("event bridge attach resolved a plan");
                     }
                     AttachOutcome::Wall { .. } => panic!("expected a focus attach"),
+                    AttachOutcome::TriagePrefetch { .. } => panic!("expected a focus attach"),
                 }
             }
             assert!(

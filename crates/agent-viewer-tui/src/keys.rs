@@ -19,11 +19,12 @@ use agent_viewer_tui::ui::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
-    activate_selected, apply_rename, attach_selected, back_triage_item, close_triage,
-    ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected, kill_request,
-    kill_selected, move_wall_selection, open_filter, open_rename, open_rename_request, open_reply,
-    open_triage, request_completions, scroll_wall_tile, send_reply, skip_triage_item,
-    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
+    activate_selected, apply_rename, archive_triage_item, attach_selected, back_triage_item,
+    close_triage, ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected,
+    kill_request, kill_selected, move_wall_selection, open_filter, open_rename,
+    open_rename_request, open_reply, open_triage, request_completions, scroll_wall_tile,
+    send_reply, skip_triage_item, spawn_from_composer, submit_attach, toggle_group_if_header,
+    toggle_wall,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -117,7 +118,7 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         }
         Mode::Rename(_) => handle_rename_key(key.code, ui),
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
-        Mode::Triage(_) => handle_triage_key(key, ui)?,
+        Mode::Triage(_) => handle_triage_key(key, backends, ui)?,
         // Reached from the palette while the wall is on: the composer floats over the grid and
         // takes the keyboard back off the focused tile for as long as it is up.
         Mode::Compose => handle_compose_key(key, ctrl, backends, refresher, ui),
@@ -128,8 +129,8 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
 /// Route a mouse event. While attached, Codex wheel events scroll the local viewport because
 /// Codex discards native wheel reports. Other Codex pointer events and all Claude events stay
 /// native. In the list, click or hover selects the row under the cursor
-/// and the wheel walks the selection using geometry recorded by the last draw. Modals own
-/// their surface, so mouse is inert there.
+/// and the wheel walks the selection using geometry recorded by the last draw. Triage keeps
+/// its child’s ordinary input intact, but its wheel reads the retained viewport.
 pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
     // Text-select mode: the terminal owns the mouse, so any report still in flight (or sent
     // by a terminal that ignored the disable sequence) must not steer the selection.
@@ -169,6 +170,24 @@ pub(crate) fn handle_mouse(me: MouseEvent, ui: &mut Ui) -> MouseAction {
         return MouseAction::None;
     }
     match &ui.mode {
+        Mode::Triage(_) => {
+            let Some(fkey) = ui.focused.clone() else {
+                return MouseAction::None;
+            };
+            let Some(pty) = ui.attached.get_mut(&fkey) else {
+                return MouseAction::None;
+            };
+            match me.kind {
+                MouseEventKind::ScrollUp => {
+                    pty.scroll_viewport_up(ATTACHED_CODEX_WHEEL_ROWS);
+                }
+                MouseEventKind::ScrollDown => {
+                    pty.scroll_viewport_down(ATTACHED_CODEX_WHEEL_ROWS);
+                }
+                _ => {}
+            }
+            MouseAction::None
+        }
         Mode::Attached => {
             let Some(fkey) = ui.focused.clone() else {
                 return MouseAction::None;
@@ -272,8 +291,64 @@ pub(crate) fn handle_mouse_event<B: ratatui::backend::Backend>(
     me: MouseEvent,
     _backends: &[Box<dyn Backend>],
     ui: &mut Ui,
-    _terminal: &mut ratatui::Terminal<B>,
+    terminal: &mut ratatui::Terminal<B>,
 ) -> io::Result<()> {
+    if matches!(ui.mode, Mode::Triage(_))
+        && ui.mouse_capture
+        && matches!(
+            me.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+    {
+        let Some(fkey) = ui.focused.clone() else {
+            return Ok(());
+        };
+        let Some(pty) = ui.attached.get_mut(&fkey) else {
+            return Ok(());
+        };
+        if fkey.0 == BackendKind::Codex {
+            if matches!(me.kind, MouseEventKind::ScrollUp) {
+                pty.scroll_viewport_up(ATTACHED_CODEX_WHEEL_ROWS);
+            } else {
+                pty.scroll_viewport_down(ATTACHED_CODEX_WHEEL_ROWS);
+            }
+            return Ok(());
+        }
+
+        let area: ratatui::layout::Rect = terminal
+            .size()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .into();
+        let Some(layout) = agent_viewer_tui::ui::triage_layout(area) else {
+            return Ok(());
+        };
+        if !layout
+            .panel
+            .contains(ratatui::layout::Position::new(me.column, me.row))
+        {
+            return Ok(());
+        }
+        let local = MouseEvent {
+            column: me.column.saturating_sub(layout.panel.x),
+            row: me.row.saturating_sub(layout.panel.y),
+            ..me
+        };
+        let (mode, encoding) = pty.with_screen(|screen| {
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        });
+        if let Some(bytes) = agent_viewer_tui::mouse::encode_mouse_report(local, mode, encoding, 0)
+        {
+            let _ = pty.write_input(&bytes);
+        } else if matches!(me.kind, MouseEventKind::ScrollUp) {
+            pty.scroll_viewport_up(ATTACHED_CODEX_WHEEL_ROWS);
+        } else {
+            pty.scroll_viewport_down(ATTACHED_CODEX_WHEEL_ROWS);
+        }
+        return Ok(());
+    }
     match handle_mouse(me, ui) {
         MouseAction::None => Ok(()),
         MouseAction::ActivateSelected => {
@@ -1118,8 +1193,8 @@ fn palette_action_items(
         ),
         action_item(
             PaletteAction::Triage,
-            "Triage sessions waiting for input",
-            "walk the needs-input queue, longest wait first",
+            "Triage sessions needing attention",
+            "walk needs-input, then completed sessions",
             Some("⌃N"),
             // Not gated on the selected row: triage is a queue over every session, so the
             // only thing that can disable it is an empty queue, which the action reports
@@ -1675,46 +1750,73 @@ fn handle_reply_key<B: ratatui::backend::Backend>(
 ///
 /// Nothing here touches `ui.composer` or the list selection: walking the inbox is not walking
 /// the list, and the composer must hold whatever was in it when Ctrl+N was pressed.
-/// Triage key routing: three reserved chords drive the queue, EVERY other key is written to
+/// Triage key routing: four reserved chords drive the queue, EVERY other key is written to
 /// the attached child.
 ///
 /// The panel is a real session, so the agent's own input handling is the answer path — there
 /// is no payload, no option parsing, and no second delivery shape. That is also why the
 /// reserved set is this small: every chord taken here is a chord the session can never see,
 /// and the session is the thing you came to talk to.
-fn handle_triage_key(key: KeyEvent, ui: &mut Ui) -> io::Result<()> {
+fn handle_triage_key(key: KeyEvent, _backends: &[Box<dyn Backend>], ui: &mut Ui) -> io::Result<()> {
     match triage_command(key) {
         Some(TriageCommand::Next) => skip_triage_item(ui),
         Some(TriageCommand::Previous) => back_triage_item(ui),
+        Some(TriageCommand::Archive) => archive_triage_item(ui),
+        Some(TriageCommand::ScrollUp) => scroll_triage_viewport(ui, true),
+        Some(TriageCommand::ScrollDown) => scroll_triage_viewport(ui, false),
         Some(TriageCommand::Leave) => close_triage(ui),
         None => forward_to_triage_child(key, ui),
     }
     Ok(())
 }
 
-/// The three chords triage keeps for itself.
+/// The small set of controls triage keeps for itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TriageCommand {
     Next,
     Previous,
+    Archive,
+    ScrollUp,
+    ScrollDown,
     Leave,
 }
 
 /// PURE: the queue command a keystroke means, or None when it belongs to the session.
 ///
-/// Ctrl+] already means "detach" in the full-screen attach view, so it means "leave" here too.
-/// Ctrl+N is the chord that opened the modal, which makes it the obvious "next". Bare Esc,
-/// Enter, arrows and digits are all deliberately NOT reserved: they are how you answer a
-/// prompt, and stealing them would break the thing the panel exists for.
+/// Bare Esc leaves the modal. Ctrl+] remains accepted as a compatibility detach chord, while
+/// Ctrl+N is the chord that opened the modal and therefore means "next". Enter, arrows and
+/// digits are deliberately NOT reserved: they are how you answer a prompt, and stealing them
+/// would break the thing the panel exists for.
 fn triage_command(key: KeyEvent) -> Option<TriageCommand> {
+    if key.code == KeyCode::Esc {
+        return Some(TriageCommand::Leave);
+    }
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
     match key.code {
         KeyCode::Char('n') => Some(TriageCommand::Next),
         KeyCode::Char('p') => Some(TriageCommand::Previous),
+        KeyCode::Char('d') => Some(TriageCommand::Archive),
+        KeyCode::Up => Some(TriageCommand::ScrollUp),
+        KeyCode::Down => Some(TriageCommand::ScrollDown),
         code if is_leave_chord(code) => Some(TriageCommand::Leave),
         _ => None,
+    }
+}
+
+/// Scroll triage's retained child viewport without sending a navigation key to the agent.
+fn scroll_triage_viewport(ui: &mut Ui, up: bool) {
+    let Some(key) = ui.focused.clone() else {
+        return;
+    };
+    let Some(pty) = ui.attached.get_mut(&key) else {
+        return;
+    };
+    if up {
+        pty.scroll_viewport_up(ATTACHED_CODEX_WHEEL_ROWS);
+    } else {
+        pty.scroll_viewport_down(ATTACHED_CODEX_WHEEL_ROWS);
     }
 }
 
@@ -2165,6 +2267,9 @@ pub(crate) mod tests {
         match outcome {
             crate::AttachOutcome::Focus { plan, .. } => plan.expect("resolved attach plan"),
             crate::AttachOutcome::Wall { .. } => panic!("expected a focus attach, got a wall join"),
+            crate::AttachOutcome::TriagePrefetch { .. } => {
+                panic!("expected a focus attach, got a triage preload")
+            }
         }
     }
 
@@ -6012,6 +6117,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn claude_triage_wheel_reaches_the_child_in_panel_coordinates() {
+        let mut session = sess("claude-triage-scroll", "/tmp", 100);
+        session.status = Status::Done;
+        let key = (BackendKind::Claude, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        ui.attached
+            .insert(key.clone(), mouse_scroll_forwarding_pty());
+        ui.focused = Some(key.clone());
+        ui.focused_session = Some(session.clone());
+        ui.mode = Mode::Triage(TriageState::new(agent_viewer_tui::ui::triage_queue(&[
+            session,
+        ])));
+        wait_for_pty_screen(&ui, &key, "READY");
+        let mut terminal = test_terminal();
+
+        handle_mouse_event(
+            mouse(MouseEventKind::ScrollUp, 5, 5),
+            &[],
+            &mut ui,
+            &mut terminal,
+        )
+        .expect("forward Claude triage wheel event");
+
+        wait_for_pty_screen(&ui, &key, "1b 5b 3c 36 34 3b 32 3b 32 4d");
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+    }
+
+    #[test]
     fn codex_and_claude_scroll_immediately_after_attach_without_ctrl_t() {
         for backend in [BackendKind::Codex, BackendKind::Claude] {
             let id = "shared-attach";
@@ -6631,7 +6764,7 @@ pub(crate) mod tests {
     }
 
     fn press_triage(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers) {
-        handle_triage_key(key(code, modifiers), ui).expect("triage key routing");
+        handle_triage_key(key(code, modifiers), &[], ui).expect("triage key routing");
     }
 
     fn press_palette_code(
@@ -6691,9 +6824,11 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_n_opens_triage_on_the_needs_input_queue_oldest_first() {
+        let mut busy = sess("busy", "/tmp", 2_000);
+        busy.status = Status::Working;
         let mut ui = test_ui_with(vec![
             blocked_session("newer", 3_000),
-            sess("busy", "/tmp", 2_000),
+            busy,
             blocked_session("older", 1_000),
         ]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
@@ -6712,7 +6847,9 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_n_on_an_empty_queue_notices_instead_of_opening_a_modal() {
-        let mut ui = test_ui_with(vec![sess("busy", "/tmp", 1_000)]);
+        let mut busy = sess("busy", "/tmp", 1_000);
+        busy.status = Status::Working;
+        let mut ui = test_ui_with(vec![busy]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
 
         press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
@@ -6721,7 +6858,108 @@ pub(crate) mod tests {
             matches!(ui.mode, Mode::Normal),
             "no modal over an empty queue"
         );
-        assert_eq!(ui.notice.text(), "nothing waiting for input");
+        assert_eq!(ui.notice.text(), "nothing needs triage");
+    }
+
+    #[test]
+    fn ctrl_d_on_a_completed_claude_triage_item_submits_remove() {
+        let mut done = sess("claude-full-session-id", "/tmp", 1_000);
+        done.short_id = Some("short-id".to_string());
+        let mut ui = test_ui_with(vec![done]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let crate::ops::Mutation::Remove {
+                request,
+                require_finished,
+            } = mutation
+            else {
+                panic!("Ctrl+D must submit the completed-session removal path");
+            };
+            assert!(require_finished);
+            tx.send(request.id().to_string())
+                .expect("record triage removal");
+            Ok(MutationOutcome {
+                notice: "removed: test session".to_string(),
+                spawned: None,
+            })
+        });
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        let key = triage_state(&ui).current().expect("completed item").key();
+        attach_a_child(&mut ui, key.clone());
+        press_triage(&mut ui, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert!(
+            !ui.attached.contains_key(&key),
+            "the attach client must be dropped before completed removal"
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("Ctrl+D submitted remove"),
+            "claude-full-session-id"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_on_a_needs_input_claude_item_stops_then_removes_like_ctrl_x_twice() {
+        let mut blocked = blocked_session("claude-full-session-id", 1_000);
+        blocked.backend = BackendKind::Claude;
+        blocked.short_id = Some("claude01".to_string());
+        blocked.origin = agent_viewer_core::SessionOrigin::Background;
+        let key = (blocked.backend, blocked.id.clone());
+        let mut ui = test_ui_with(vec![blocked]);
+        attach_a_child(&mut ui, key.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let label = match mutation {
+                crate::ops::Mutation::Stop(request) => format!("stop:{}", request.id()),
+                crate::ops::Mutation::Remove {
+                    request,
+                    require_finished,
+                } => {
+                    assert!(!require_finished);
+                    format!("remove:{}", request.id())
+                }
+                _ => panic!("Ctrl+D must use the main-view stop/remove pipeline"),
+            };
+            tx.send(label).expect("record triage mutation");
+            Ok(MutationOutcome {
+                notice: "mutation complete".to_string(),
+                spawned: None,
+            })
+        });
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        press_triage(&mut ui, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert!(!ui.attached.contains_key(&key));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("Ctrl+D submitted stop"),
+            "stop:claude-full-session-id"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let stop_result = loop {
+            if let Some(result) = ui.mutations.poll() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stop result did not reach the mutation runner"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            stop_result.is_ok(),
+            "successful stop must release the dependent removal"
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("Ctrl+D submitted dependent remove"),
+            "remove:claude-full-session-id"
+        );
     }
 
     #[test]
@@ -6794,17 +7032,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// Esc, Enter, arrows and digits are how you answer an agent's prompt. Reserving any of
-    /// them for the queue would break the panel for the sessions it exists to serve.
+    /// Enter, arrows and digits are how you answer an agent's prompt. Reserving any of them
+    /// for the queue would break the panel for the sessions it exists to serve.
     #[test]
-    fn escape_and_the_arrows_belong_to_the_session_not_the_queue() {
+    fn arrows_and_digits_belong_to_the_session_not_the_queue() {
         let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
         press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
         let item = triage_state(&ui).current().expect("an item").key();
         attach_a_child(&mut ui, item);
 
-        for code in [KeyCode::Esc, KeyCode::Down, KeyCode::Char('2')] {
+        for code in [KeyCode::Down, KeyCode::Char('2')] {
             press_triage(&mut ui, code, KeyModifiers::NONE);
             assert!(
                 matches!(ui.mode, Mode::Triage(_)),
@@ -6815,6 +7053,18 @@ pub(crate) mod tests {
             screen_contains(&ui, "2"),
             "a digit types into the session like any other key"
         );
+    }
+
+    #[test]
+    fn bare_escape_leaves_triage() {
+        let mut ui = test_ui_with(vec![blocked_session("blocked", 100)]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
+        press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
+        assert!(matches!(ui.mode, Mode::Triage(_)));
+
+        press_triage(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(ui.mode, Mode::Normal), "Esc lands on the list");
     }
 
     #[test]

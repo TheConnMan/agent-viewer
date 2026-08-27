@@ -324,7 +324,8 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// `Ctrl+N` — open the triage inbox on the needs-input queue, oldest first.
+/// `Ctrl+N` — open the triage inbox on needs-input work, then completed work, oldest first
+/// within each group.
 ///
 /// The queue is snapshotted here and not rebuilt while the modal is up: the 1s background
 /// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
@@ -332,11 +333,47 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
 pub(crate) fn open_triage(ui: &mut Ui) {
     let items = triage_queue(ui.app.sessions());
     if items.is_empty() {
-        ui.set_notice("nothing waiting for input".to_string());
+        ui.set_notice("nothing needs triage".to_string());
         return;
     }
     ui.mode = Mode::Triage(TriageState::new(items));
     attach_triage_item(ui);
+}
+
+/// `Ctrl+D` in triage runs the same two-stage state machine as pressing list-view `Ctrl+X`
+/// twice against this exact session, then advances the queue. An active/needs-input item is
+/// stopped first and removed only after that succeeds. Codex implements the completed-session
+/// action as a reversible archive; Claude and Grok use their existing row-removal commands.
+pub(crate) fn archive_triage_item(ui: &mut Ui) {
+    let Some(item) = (match &ui.mode {
+        Mode::Triage(state) => state.current().cloned(),
+        _ => None,
+    }) else {
+        return;
+    };
+    let key = item.key();
+    let Some(session) = ui.app.session_for(&key).cloned() else {
+        ui.set_notice(format!("{} is no longer listed", item.title));
+        return;
+    };
+    // A prefetched/current Claude or Grok item owns a live attach client. Their remove
+    // operations can refuse or race while that client is still resident, unlike Codex archive.
+    // Drop it before the mutation worker performs its fresh authoritative listing and remove.
+    release_triage_attachment(ui, Some(key));
+    let now = now_ms();
+    let should_stop = !session.status.is_finished();
+    for _ in 0..2 {
+        let stage = ui
+            .app
+            .kill_stage_for(session.backend, session.id.clone(), should_stop, now);
+        kill_request(
+            ui,
+            TargetRequest::from(&session),
+            session.title.clone(),
+            stage,
+        );
+    }
+    skip_triage_item(ui);
 }
 
 /// Put the item under the cursor live in the panel, using the SAME attach the list's Enter
@@ -347,8 +384,8 @@ pub(crate) fn open_triage(ui: &mut Ui) {
 ///
 /// Attach resolution is off-thread, so this only submits; `install_attach_plan` lands the
 /// child. A session that is somehow already connected (the wall holds a tile for it) is
-/// reused rather than respawned. Nothing is prefetched, and leaving an item closes its child,
-/// so walking a queue of forty costs one live connection, not forty.
+/// reused rather than respawned. Only the immediate next item is prefetched, and leaving that
+/// two-item window closes its child, so walking a queue never accumulates live connections.
 pub(crate) fn attach_triage_item(ui: &mut Ui) {
     let Mode::Triage(state) = &ui.mode else {
         return;
@@ -366,9 +403,37 @@ pub(crate) fn attach_triage_item(ui: &mut Ui) {
     };
     ui.focused_session = Some(session.clone());
     if ui.attached.contains_key(&key) {
+        preload_triage_next(ui);
         return;
     }
     submit_attach(ui, TargetRequest::from(&session));
+    preload_triage_next(ui);
+}
+
+/// Resolve and start exactly the next triage item while the current one is on screen. The
+/// result lands as a hidden PTY, then becomes visible immediately when the user advances.
+pub(crate) fn preload_triage_next(ui: &mut Ui) {
+    let Some(item) = (match &ui.mode {
+        Mode::Triage(state) => state.next().cloned(),
+        _ => None,
+    }) else {
+        return;
+    };
+    let key = item.key();
+    if ui.attached.contains_key(&key) {
+        return;
+    }
+    let Some(session) = ui.app.session_for(&key).cloned() else {
+        return;
+    };
+    let executor = ui.attach_executor.clone();
+    let runner_key = format!("triage-preload:{}:{}", key.0.name(), key.1);
+    ui.attaches.submit(runner_key, move || {
+        Ok(crate::AttachOutcome::TriagePrefetch {
+            key,
+            plan: executor(TargetRequest::from(&session)),
+        })
+    });
 }
 
 /// `Ctrl+N` inside the modal — step to the next item; running off the end closes the modal.
@@ -424,8 +489,13 @@ fn release_triage_attachment(ui: &mut Ui, key: Option<Key>) {
 /// keeps running — detaching has never meant stopping — but nothing stays connected once it is
 /// off screen, exactly as the attach view and the wall behave.
 pub(crate) fn close_triage(ui: &mut Ui) {
+    let preload = match &ui.mode {
+        Mode::Triage(state) => state.next().map(|item| item.key()),
+        _ => None,
+    };
     let showing = ui.focused.take();
     release_triage_attachment(ui, showing);
+    release_triage_attachment(ui, preload);
     ui.mode = Mode::Normal;
     ui.focused = None;
     ui.focused_session = None;
@@ -643,7 +713,10 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     } else {
         let mut spec = spec_from_command(&command, rows, cols);
         spec.palette = palette;
-        if session.backend == BackendKind::Codex {
+        // Triage scrolls the viewer-owned viewport for every backend. Full-screen Claude and
+        // Grok can delegate wheel input to their child, but the modal cannot rely on that
+        // protocol, so its PTY must retain history just like Codex does.
+        if triage || session.backend == BackendKind::Codex {
             spec.scrollback_rows = VIEWPORT_SCROLLBACK_ROWS;
         }
         match PtySession::spawn(spec) {
@@ -2135,6 +2208,7 @@ mod async_attach_tests {
         match result {
             Ok(crate::AttachOutcome::Focus { plan, .. }) => plan.as_ref().err().map(String::as_str),
             Ok(crate::AttachOutcome::Wall { .. }) => panic!("expected a focus attach"),
+            Ok(crate::AttachOutcome::TriagePrefetch { .. }) => panic!("expected a focus attach"),
             Err(error) => Some(error.as_str()),
         }
     }

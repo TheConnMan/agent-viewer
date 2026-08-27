@@ -78,7 +78,7 @@ fn section_from_storage(name: &str) -> Option<Section> {
     }
 }
 
-fn is_hold_title(title: &str) -> bool {
+pub(crate) fn is_hold_title(title: &str) -> bool {
     title.eq_ignore_ascii_case("hold")
 }
 
@@ -429,6 +429,18 @@ impl App {
             return KillStage::Noop;
         };
 
+        self.kill_stage_for(backend, id, should_stop, now_ms)
+    }
+
+    /// The same two-stage Ctrl+X state machine targeted at an explicit session. Triage uses
+    /// this because its queue cursor deliberately does not move the main-list selection.
+    pub fn kill_stage_for(
+        &mut self,
+        backend: BackendKind,
+        id: String,
+        should_stop: bool,
+        now_ms: i64,
+    ) -> KillStage {
         if let Some((armed_backend, armed_id, armed_at)) = &self.armed_kill
             && *armed_backend == backend
             && armed_id == &id
