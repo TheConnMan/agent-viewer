@@ -179,6 +179,12 @@ impl TriageState {
         &self.items[start..end]
     }
 
+    /// The next item is the only one triage preloads. Keeping the look-ahead to one limits the
+    /// experiment to two live children while still hiding most resume latency on `Ctrl+N`.
+    pub fn next(&self) -> Option<&TriageItem> {
+        self.upcoming().first()
+    }
+
     /// Step to the next item. Returns false when the queue is finished — it never wraps,
     /// because a wrap would make the `3 of 7` counter a lie.
     pub fn advance(&mut self) -> bool {
@@ -353,7 +359,7 @@ pub(super) fn draw(
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "⌃N next · ⌃P previous · ⌃D archive completed · ⌃] leave · every other key goes to the session",
+            "⌃N/P queue · ⌃D archive current · wheel scroll · Esc leave",
             fg(theme.faint),
         ))),
         Rect {
