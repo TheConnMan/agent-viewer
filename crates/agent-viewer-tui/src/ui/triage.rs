@@ -1,5 +1,5 @@
-//! The Ctrl+N triage inbox: a modal over the list that walks the needs-input sessions oldest
-//! first, one at a time, with the session itself live inside it.
+//! The Ctrl+N triage inbox: a modal over the list that walks needs-input sessions and then
+//! completed sessions, oldest first within each group, with the session itself live inside it.
 //!
 //! The modal owns the queue (order, position, up-next) and nothing else. The panel in the
 //! middle is the real attached session — the same `PtySession` the list's Enter attaches to,
@@ -50,15 +50,33 @@ pub struct TriageItem {
     pub title: String,
     pub project: String,
     pub updated_at_ms: i64,
+    pub kind: TriageKind,
+}
+
+/// Why an otherwise non-working session is in the triage queue.
+///
+/// Needs-input work comes first so the inbox preserves its original urgent purpose. Completed
+/// work follows, where the operator can archive a session after reviewing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriageKind {
+    NeedsInput,
+    Completed,
 }
 
 impl TriageItem {
     pub fn key(&self) -> (BackendKind, String) {
         (self.backend, self.id.clone())
     }
+
+    pub fn is_completed(&self) -> bool {
+        self.kind == TriageKind::Completed
+    }
 }
 
-/// PURE queue construction: every `NeedsInput` session, oldest first.
+/// PURE queue construction: every needs-input session, then every active completed session,
+/// oldest first within each group. Completed history is intentionally excluded: archived,
+/// companion, and hold rows are not in the default viewer list, so triage must not turn their
+/// backlog into an archive-review queue.
 ///
 /// Built from the App's whole session set rather than `visible()`, so the queue length equals
 /// the header's "N awaiting input" — a filter or a collapsed group must not silently shrink
@@ -68,22 +86,43 @@ impl TriageItem {
 pub fn triage_queue(sessions: &[Session]) -> Vec<TriageItem> {
     let mut items = sessions
         .iter()
-        .filter(|session| matches!(session.status, Status::NeedsInput { .. }))
-        .map(|session| TriageItem {
-            backend: session.backend,
-            id: session.id.clone(),
-            title: session.title.clone(),
-            project: project_label(&session.cwd),
-            updated_at_ms: session.updated_at_ms,
+        .filter_map(|session| {
+            let kind = match session.status {
+                Status::NeedsInput { .. } => TriageKind::NeedsInput,
+                Status::Done
+                    if !session.hidden
+                        && !session.companion
+                        && !crate::app::is_hold_title(&session.title) =>
+                {
+                    TriageKind::Completed
+                }
+                _ => return None,
+            };
+            Some(TriageItem {
+                backend: session.backend,
+                id: session.id.clone(),
+                title: session.title.clone(),
+                project: project_label(&session.cwd),
+                updated_at_ms: session.updated_at_ms,
+                kind,
+            })
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        left.updated_at_ms
-            .cmp(&right.updated_at_ms)
+        triage_kind_rank(left.kind)
+            .cmp(&triage_kind_rank(right.kind))
+            .then_with(|| left.updated_at_ms.cmp(&right.updated_at_ms))
             .then_with(|| left.backend.name().cmp(right.backend.name()))
             .then_with(|| left.id.cmp(&right.id))
     });
     items
+}
+
+fn triage_kind_rank(kind: TriageKind) -> u8 {
+    match kind {
+        TriageKind::NeedsInput => 0,
+        TriageKind::Completed => 1,
+    }
 }
 
 /// The trailing two path components, matching how the design labels a session's project
@@ -232,7 +271,10 @@ pub(super) fn draw(
     let (position, total) = state.progress();
     let progress = format!("{position} of {total}");
     let age = crate::app::format_elapsed(now_ms - item.updated_at_ms);
-    let right = format!("waiting {age} · oldest first");
+    let right = match item.kind {
+        TriageKind::NeedsInput => format!("waiting {age} · needs input"),
+        TriageKind::Completed => format!("done {age} · archive with Ctrl+D"),
+    };
     let mark = backend_mark(item.backend, theme);
     let left_width = display(&progress) + 1 + display(mark) + 1 + display(&item.title) + 1;
     let pad = full.saturating_sub(left_width + display(&right) + 1);
@@ -311,7 +353,7 @@ pub(super) fn draw(
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "⌃N next · ⌃P previous · ⌃] leave · every other key goes to the session",
+            "⌃N next · ⌃P previous · ⌃D archive completed · ⌃] leave · every other key goes to the session",
             fg(theme.faint),
         ))),
         Rect {
@@ -381,16 +423,42 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_is_the_blocked_sessions_oldest_first() {
+    fn the_queue_visits_needs_input_before_completed_sessions() {
         let items = triage_queue(&[
             blocked("newer", 3_000),
+            session("done-first", 500, Status::Done),
             session("busy", 1_000, Status::Working),
             blocked("older", 2_000),
+            session("done-second", 1_000, Status::Done),
         ]);
         assert_eq!(
             items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
-            vec!["older", "newer"],
-            "only blocked sessions, longest wait first"
+            vec!["older", "newer", "done-first", "done-second"],
+            "needs-input sessions come first; each cohort is oldest first"
+        );
+        assert_eq!(items[2].kind, TriageKind::Completed);
+    }
+
+    #[test]
+    fn completed_history_does_not_enter_triage() {
+        let mut archived = session("archived", 1, Status::Done);
+        archived.hidden = true;
+        let mut companion = session("companion", 2, Status::Done);
+        companion.companion = true;
+        let hold = session("hold", 3, Status::Done);
+        let items = triage_queue(&[
+            archived,
+            companion,
+            hold,
+            session("active", 4, Status::Done),
+        ]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active"],
+            "only completed sessions in the normal viewer list are triaged"
         );
     }
 

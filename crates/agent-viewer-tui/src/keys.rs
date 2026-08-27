@@ -19,11 +19,12 @@ use agent_viewer_tui::ui::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
-    activate_selected, apply_rename, attach_selected, back_triage_item, close_triage,
-    ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected, kill_request,
-    kill_selected, move_wall_selection, open_filter, open_rename, open_rename_request, open_reply,
-    open_triage, request_completions, scroll_wall_tile, send_reply, skip_triage_item,
-    spawn_from_composer, submit_attach, toggle_group_if_header, toggle_wall,
+    activate_selected, apply_rename, archive_triage_item, attach_selected, back_triage_item,
+    close_triage, ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected,
+    kill_request, kill_selected, move_wall_selection, open_filter, open_rename,
+    open_rename_request, open_reply, open_triage, request_completions, scroll_wall_tile,
+    send_reply, skip_triage_item, spawn_from_composer, submit_attach, toggle_group_if_header,
+    toggle_wall,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -117,7 +118,7 @@ pub(crate) fn handle_key<B: ratatui::backend::Backend>(
         }
         Mode::Rename(_) => handle_rename_key(key.code, ui),
         Mode::Reply(_) => handle_reply_key(key.code, backends, ui, terminal)?,
-        Mode::Triage(_) => handle_triage_key(key, ui)?,
+        Mode::Triage(_) => handle_triage_key(key, backends, ui)?,
         // Reached from the palette while the wall is on: the composer floats over the grid and
         // takes the keyboard back off the focused tile for as long as it is up.
         Mode::Compose => handle_compose_key(key, ctrl, backends, refresher, ui),
@@ -1118,8 +1119,8 @@ fn palette_action_items(
         ),
         action_item(
             PaletteAction::Triage,
-            "Triage sessions waiting for input",
-            "walk the needs-input queue, longest wait first",
+            "Triage sessions needing attention",
+            "walk needs-input, then completed sessions",
             Some("⌃N"),
             // Not gated on the selected row: triage is a queue over every session, so the
             // only thing that can disable it is an empty queue, which the action reports
@@ -1675,28 +1676,30 @@ fn handle_reply_key<B: ratatui::backend::Backend>(
 ///
 /// Nothing here touches `ui.composer` or the list selection: walking the inbox is not walking
 /// the list, and the composer must hold whatever was in it when Ctrl+N was pressed.
-/// Triage key routing: three reserved chords drive the queue, EVERY other key is written to
+/// Triage key routing: four reserved chords drive the queue, EVERY other key is written to
 /// the attached child.
 ///
 /// The panel is a real session, so the agent's own input handling is the answer path — there
 /// is no payload, no option parsing, and no second delivery shape. That is also why the
 /// reserved set is this small: every chord taken here is a chord the session can never see,
 /// and the session is the thing you came to talk to.
-fn handle_triage_key(key: KeyEvent, ui: &mut Ui) -> io::Result<()> {
+fn handle_triage_key(key: KeyEvent, backends: &[Box<dyn Backend>], ui: &mut Ui) -> io::Result<()> {
     match triage_command(key) {
         Some(TriageCommand::Next) => skip_triage_item(ui),
         Some(TriageCommand::Previous) => back_triage_item(ui),
+        Some(TriageCommand::Archive) => archive_triage_item(backends, ui),
         Some(TriageCommand::Leave) => close_triage(ui),
         None => forward_to_triage_child(key, ui),
     }
     Ok(())
 }
 
-/// The three chords triage keeps for itself.
+/// The four chords triage keeps for itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TriageCommand {
     Next,
     Previous,
+    Archive,
     Leave,
 }
 
@@ -1713,6 +1716,7 @@ fn triage_command(key: KeyEvent) -> Option<TriageCommand> {
     match key.code {
         KeyCode::Char('n') => Some(TriageCommand::Next),
         KeyCode::Char('p') => Some(TriageCommand::Previous),
+        KeyCode::Char('d') => Some(TriageCommand::Archive),
         code if is_leave_chord(code) => Some(TriageCommand::Leave),
         _ => None,
     }
@@ -6631,7 +6635,7 @@ pub(crate) mod tests {
     }
 
     fn press_triage(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers) {
-        handle_triage_key(key(code, modifiers), ui).expect("triage key routing");
+        handle_triage_key(key(code, modifiers), &[], ui).expect("triage key routing");
     }
 
     fn press_palette_code(
@@ -6691,9 +6695,11 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_n_opens_triage_on_the_needs_input_queue_oldest_first() {
+        let mut busy = sess("busy", "/tmp", 2_000);
+        busy.status = Status::Working;
         let mut ui = test_ui_with(vec![
             blocked_session("newer", 3_000),
-            sess("busy", "/tmp", 2_000),
+            busy,
             blocked_session("older", 1_000),
         ]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
@@ -6712,7 +6718,9 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_n_on_an_empty_queue_notices_instead_of_opening_a_modal() {
-        let mut ui = test_ui_with(vec![sess("busy", "/tmp", 1_000)]);
+        let mut busy = sess("busy", "/tmp", 1_000);
+        busy.status = Status::Working;
+        let mut ui = test_ui_with(vec![busy]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = Vec::new();
 
         press_normal_key(&mut ui, &backends, 'n', KeyModifiers::CONTROL);
@@ -6721,7 +6729,7 @@ pub(crate) mod tests {
             matches!(ui.mode, Mode::Normal),
             "no modal over an empty queue"
         );
-        assert_eq!(ui.notice.text(), "nothing waiting for input");
+        assert_eq!(ui.notice.text(), "nothing needs triage");
     }
 
     #[test]

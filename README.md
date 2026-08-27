@@ -262,8 +262,9 @@ its SQLite title still shows the prompt.
 - `Ctrl+E` — reserved. Reply is deliberately out of scope for this rebuild (see below); on a
   selected session it reports a footer notice that reply is not supported, and with nothing
   selected it does nothing at all.
-- `Ctrl+N` — open the triage inbox on every session waiting for input, longest wait first
-  (see below). Nothing waiting is a footer notice, not a modal.
+- `Ctrl+N` — open the triage inbox on every session needing attention: needs-input sessions
+  first, then completed sessions, longest wait first within each group (see below). Nothing to
+  triage is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
   Claude row, which has no job dir) is a no-op with a footer notice.
@@ -400,17 +401,20 @@ daemon and are joined live.
 
 ## Triage inbox
 
-`Ctrl+N` (or "Triage sessions waiting for input" in the `Ctrl+K` palette) opens a modal over
-the list that walks every session waiting for input, one at a time, longest wait first, with
-a `3 of 7` progress counter and the next few items named underneath.
+`Ctrl+N` (or "Triage sessions needing attention" in the `Ctrl+K` palette) opens a modal over
+the list that walks every session waiting for input, then every active completed session, one at
+a time and longest wait first within each group, with a `3 of 7` progress counter and the next
+few items named underneath. Archived, companion, and hold history is excluded from the completed
+phase. On a completed session, `Ctrl+D` applies the same removal action as `Ctrl+X` in the main
+viewer and advances: Codex archives; Claude removes its completed background job.
 
 The panel in the middle is the session itself, live — the same attach the list's `Enter`
 gives you, drawn into the panel instead of the whole screen. So you see the agent's own
 interface: its real question, its own numbered options, whatever it drew. Every key you press
 goes to it, and your answer is delivered by the agent's own input handling.
 
-Three chords are reserved for the queue: `Ctrl+N` next, `Ctrl+P` previous, `Ctrl+]` leave.
-Everything else — `Enter`, `Esc`, the arrows, digits, paste — belongs to the session, because
+Four chords are reserved for the queue: `Ctrl+N` next, `Ctrl+P` previous, `Ctrl+D` archive a
+completed session, `Ctrl+]` leave. Everything else — `Enter`, `Esc`, the arrows, digits, paste — belongs to the session, because
 those are how you answer a prompt. Running off the end closes the modal; it never wraps.
 
 Attaching is the existing attach, so triage inherits each backend's semantics exactly (Claude

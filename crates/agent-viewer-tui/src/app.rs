@@ -78,7 +78,7 @@ fn section_from_storage(name: &str) -> Option<Section> {
     }
 }
 
-fn is_hold_title(title: &str) -> bool {
+pub(crate) fn is_hold_title(title: &str) -> bool {
     title.eq_ignore_ascii_case("hold")
 }
 

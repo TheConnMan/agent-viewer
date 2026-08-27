@@ -324,7 +324,8 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// `Ctrl+N` — open the triage inbox on the needs-input queue, oldest first.
+/// `Ctrl+N` — open the triage inbox on needs-input work, then completed work, oldest first
+/// within each group.
 ///
 /// The queue is snapshotted here and not rebuilt while the modal is up: the 1s background
 /// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
@@ -332,11 +333,49 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
 pub(crate) fn open_triage(ui: &mut Ui) {
     let items = triage_queue(ui.app.sessions());
     if items.is_empty() {
-        ui.set_notice("nothing waiting for input".to_string());
+        ui.set_notice("nothing needs triage".to_string());
         return;
     }
     ui.mode = Mode::Triage(TriageState::new(items));
     attach_triage_item(ui);
+}
+
+/// `Ctrl+D` in triage applies the same finished-session removal action as the list's `Ctrl+X`,
+/// then advances the queue. Codex implements that action as a reversible archive; Claude
+/// implements its existing row-removal command. Needs-input items deliberately retain Ctrl+D
+/// for the live session: removal is only a triage decision once a session is done.
+pub(crate) fn archive_triage_item(backends: &[Box<dyn Backend>], ui: &mut Ui) {
+    let Some(item) = (match &ui.mode {
+        Mode::Triage(state) => state.current().cloned(),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !item.is_completed() {
+        ui.set_notice("archive is available for completed triage items".to_string());
+        return;
+    }
+    let key = item.key();
+    let Some(session) = ui.app.session_for(&key).cloned() else {
+        ui.set_notice(format!("{} is no longer listed", item.title));
+        return;
+    };
+    let supports_remove = backend_of(backends, session.backend)
+        .is_some_and(|backend| backend.capabilities_for(&session).delete);
+    if !supports_remove {
+        ui.set_notice(format!(
+            "{} does not support remove",
+            session.backend.name()
+        ));
+        return;
+    }
+    kill_request(
+        ui,
+        TargetRequest::from(&session),
+        session.title,
+        KillStage::Remove,
+    );
+    skip_triage_item(ui);
 }
 
 /// Put the item under the cursor live in the panel, using the SAME attach the list's Enter

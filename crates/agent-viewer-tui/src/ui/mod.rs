@@ -42,7 +42,7 @@ pub use palette::{
 pub use sprite::SpriteKind;
 pub use tail::{TAIL_EVENTS, TAIL_MIN_TOTAL_WIDTH, TailView};
 pub use theme::{Theme, ThemeState};
-pub use triage::{TriageItem, TriageLayout, TriageState, panel_pty_size, triage_queue};
+pub use triage::{TriageItem, TriageKind, TriageLayout, TriageState, panel_pty_size, triage_queue};
 pub use wall::{WallState, WallTile, WallView};
 
 /// A live spawn-bloom one-shot, keyed by session, holding the ms it started (now_ms).
@@ -203,7 +203,7 @@ pub enum Mode {
     Filter,
     Rename(RenameModal),
     Reply(ReplyModal),
-    /// The Ctrl+N triage inbox: a modal walk over the needs-input queue, drawn over the list.
+    /// The Ctrl+N triage inbox: a modal walk over needs-input then completed sessions.
     Triage(TriageState),
     Help,
     Attached,

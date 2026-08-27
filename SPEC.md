@@ -1171,9 +1171,11 @@ in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawn
 
 ### Triage inbox (`Ctrl+N`)
 
-A modal walking every session that is awaiting input, longest wait first, with the session
-itself attached live into the middle panel. Three chords are reserved (`Ctrl+N` next, `Ctrl+P`
-previous, `Ctrl+]` leave) and everything else goes to the session, because typing into the
+A modal walking every session awaiting input, then every active completed session (excluding
+archived, companion, and hold history), longest wait first within each cohort, with the session itself
+attached live into the middle panel. Four chords are
+reserved (`Ctrl+N` next, `Ctrl+P` previous, `Ctrl+D` applies the main-view `Ctrl+X` completed
+session action, `Ctrl+]` leave) and everything else goes to the session, because typing into the
 agent's own input path is how a prompt gets answered; there is no second reply mechanism. The
 queue is snapshotted when the modal opens so a background refresh cannot reorder it mid-answer.
 
