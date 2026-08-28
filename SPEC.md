@@ -1171,7 +1171,7 @@ in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawn
 
 ### Triage inbox (`Ctrl+N`)
 
-A modal walking every session awaiting input, then every active completed session (excluding
+A modal walking every session awaiting input, then every active completed or Codex-idle session (excluding
 archived, companion, and hold history), longest wait first within each cohort, with the session itself
 attached live into the middle panel. The reserved controls are `Ctrl+N` next, `Ctrl+P` previous,
 `Ctrl+D` applies the main-view `Ctrl+X`-twice action (including stop-then-remove for an active

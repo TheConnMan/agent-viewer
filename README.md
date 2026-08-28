@@ -263,8 +263,8 @@ its SQLite title still shows the prompt.
   selected session it reports a footer notice that reply is not supported, and with nothing
   selected it does nothing at all.
 - `Ctrl+N` — open the triage inbox on every session needing attention: needs-input sessions
-  first, then completed sessions, longest wait first within each group (see below). Nothing to
-  triage is a footer notice, not a modal.
+  first, then completed or Codex-idle sessions, longest wait first within each group (see below).
+  Nothing to triage is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
   Claude row, which has no job dir) is a no-op with a footer notice.
@@ -402,7 +402,7 @@ daemon and are joined live.
 ## Triage inbox
 
 `Ctrl+N` (or "Triage sessions needing attention" in the `Ctrl+K` palette) opens a modal over
-the list that walks every session waiting for input, then every active completed session, one at
+the list that walks every session waiting for input, then every active completed or Codex-idle session, one at
 a time and longest wait first within each group, with a `3 of 7` progress counter and the next
 few items named underneath. Archived, companion, and hold history is excluded from the completed
 phase. `Ctrl+D` applies the same action as pressing `Ctrl+X` twice in the main viewer and
