@@ -73,10 +73,12 @@ impl TriageItem {
     }
 }
 
-/// PURE queue construction: every needs-input session, then every active completed session,
-/// oldest first within each group. Completed history is intentionally excluded: archived,
-/// companion, and hold rows are not in the default viewer list, so triage must not turn their
-/// backlog into an archive-review queue.
+/// PURE queue construction: every needs-input session, then every active completed or Codex-idle
+/// session, oldest first within each group. A Codex idle session has a finished turn but still
+/// has an attached client, so it remains reviewable rather than disappearing from triage.
+/// Claude's idle state remains live/dormant work and is excluded. Completed history is
+/// intentionally excluded: archived, companion, and hold rows are not in the default viewer
+/// list, so triage must not turn their backlog into an archive-review queue.
 ///
 /// Built from the App's whole session set rather than `visible()`, so the queue length equals
 /// the header's "N awaiting input" — a filter or a collapsed group must not silently shrink
@@ -91,6 +93,14 @@ pub fn triage_queue(sessions: &[Session]) -> Vec<TriageItem> {
                 Status::NeedsInput { .. } => TriageKind::NeedsInput,
                 Status::Done
                     if !session.hidden
+                        && !session.companion
+                        && !crate::app::is_hold_title(&session.title) =>
+                {
+                    TriageKind::Completed
+                }
+                Status::Idle
+                    if session.backend == BackendKind::Codex
+                        && !session.hidden
                         && !session.companion
                         && !crate::app::is_hold_title(&session.title) =>
                 {
@@ -279,7 +289,7 @@ pub(super) fn draw(
     let age = crate::app::format_elapsed(now_ms - item.updated_at_ms);
     let right = match item.kind {
         TriageKind::NeedsInput => format!("waiting {age} · needs input"),
-        TriageKind::Completed => format!("done {age} · archive with Ctrl+D"),
+        TriageKind::Completed => format!("review {age} · archive with Ctrl+D"),
     };
     let mark = backend_mark(item.backend, theme);
     let left_width = display(&progress) + 1 + display(mark) + 1 + display(&item.title) + 1;
@@ -443,6 +453,25 @@ mod tests {
             "needs-input sessions come first; each cohort is oldest first"
         );
         assert_eq!(items[2].kind, TriageKind::Completed);
+    }
+
+    #[test]
+    fn idle_sessions_enter_the_review_queue() {
+        let mut codex_idle = session("codex-idle", 2_000, Status::Idle);
+        codex_idle.backend = BackendKind::Codex;
+        let items = triage_queue(&[
+            session("done", 3_000, Status::Done),
+            codex_idle,
+            session("claude-idle", 1_000, Status::Idle),
+        ]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-idle", "done"],
+            "an attached, completed Codex session is reviewable but a live Claude idle session is not"
+        );
     }
 
     #[test]

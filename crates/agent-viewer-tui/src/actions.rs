@@ -361,7 +361,9 @@ pub(crate) fn archive_triage_item(ui: &mut Ui) {
     // Drop it before the mutation worker performs its fresh authoritative listing and remove.
     release_triage_attachment(ui, Some(key));
     let now = now_ms();
-    let should_stop = !session.status.is_finished();
+    // A triageable Codex idle row is a completed turn with an attached client. It never needs a
+    // stop before the usual archive/remove action.
+    let should_stop = !item.is_completed();
     for _ in 0..2 {
         let stage = ui
             .app
