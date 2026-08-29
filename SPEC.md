@@ -803,8 +803,12 @@ job's worker, not the shared `claude daemon run --origin transient` supervisor. 
 that worker is treated as a crash: the supervisor `--resume`s the same JSONL and the thread
 reappears, so archive-then-stop never actually stops the job. Codex already withholds
 SIGTERM when `daemon_hosted` is true; Claude now sets that flag from the state.json overlay
-and the same gate applies. Stop and remove stay CLI (`claude stop <short>`, then
-`claude rm <short>`). There is still no Claude archive capability. `remove` waits longer
+for status and the longer settle window. Removal uses a stronger rule: Agent Viewer never
+pre-signals a Claude pid, even when the marker is missing or unreadable. Stop and remove stay
+CLI (`claude stop <short>`, then `claude rm <short>`), so a foreign state-file failure cannot
+fail open into the daemon's crash-restart path. Live 2.1.251 verification showed `claude rm`
+itself durably terminated an active daemon job, making a Viewer-side pre-signal unnecessary.
+There is still no Claude archive capability. `remove` waits longer
 for a Claude daemon-hosted row to settle after stop (~2s, taken from the fresh
 `authoritative_target` row, not a cached one) and fails closed if it is still
 Working/NeedsInput; the 300ms settle stays for everyone else. The viewer never writes or

@@ -302,7 +302,13 @@ fn remove_settled_target(
             session.backend.name()
         ));
     }
-    if let Some(pid) = session.pid.filter(|_| !session.daemon_hosted) {
+    // Claude owns both halves of its lifecycle through `claude stop` / `claude rm`. Never
+    // pre-signal a Claude pid here: `daemon_hosted` comes from a foreign state.json and a
+    // missing, torn, or future-shaped file must not turn the daemon's crash-restart path back
+    // on. Live 2.1.251 evidence also shows `claude rm` itself terminates an active daemon job,
+    // so Viewer has no cleanup gap to fill with SIGTERM.
+    let viewer_may_signal = session.backend != BackendKind::Claude && !session.daemon_hosted;
+    if let Some(pid) = session.pid.filter(|_| viewer_may_signal) {
         let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
     }
     match backend.remove(&session) {
@@ -1520,6 +1526,41 @@ mod tests {
         assert!(
             alive,
             "remove SIGTERMed a Claude daemon-hosted worker; the shared daemon would resume it"
+        );
+    }
+
+    #[test]
+    fn remove_does_not_sigterm_claude_when_the_daemon_marker_is_missing() {
+        let (dir, mut victim) = claude_named_victim("missing-daemon-marker");
+        let mut session = claude_session(Some("unknown1"), victim.id());
+        session.status = Status::Idle;
+        session.daemon_hosted = false;
+        let request = TargetRequest::from(&session);
+        let mut backend = RecordingRemoveBackend::new(session);
+
+        let result = run_remove(&mut backend, None, &request, false);
+
+        std::thread::sleep(Duration::from_millis(250));
+        let alive = victim.try_wait().expect("try_wait").is_none();
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result,
+            Ok(super::MutationOutcome {
+                notice: "removed: probe".to_string(),
+                spawned: None,
+            })
+        );
+        assert_eq!(
+            *backend.removed_ids.borrow(),
+            vec!["3f9c1a2e-0000-4000-8000-000000000001".to_string()]
+        );
+        assert!(
+            alive,
+            "remove SIGTERMed a Claude worker because its daemon marker was unavailable"
         );
     }
 
