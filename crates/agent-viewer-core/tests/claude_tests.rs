@@ -61,6 +61,13 @@ fn claude_parse_maps_six_states_and_pid() {
     assert_eq!(nostate.status, Status::Unknown);
     assert_eq!(nostate.pid, None);
     assert_eq!(nostate.short_id, Some("nost0001".to_string()));
+
+    // 2.1.251 `claude agents --json --all` does not publish `backend`; existing fixtures
+    // stay false so a missing field cannot look daemon-hosted.
+    assert!(
+        parsed.iter().all(|session| !session.daemon_hosted),
+        "agents JSON without backend must leave daemon_hosted false"
+    );
 }
 
 // `kind` is the only input to SessionOrigin: "background" -> Background, EVERYTHING else
@@ -549,6 +556,57 @@ fn parse_job_state_keeps_working_when_shells_are_still_in_flight() {
 }
 
 #[test]
+fn parse_job_state_daemon_hosted_is_true_only_for_backend_daemon() {
+    // Legacy/non-daemon fixtures predate the 2.1.251 `backend` key and must stay false.
+    assert!(!parse_job_state(&common::read_fixture("claude_state_working.json")).daemon_hosted);
+    assert!(!parse_job_state(&common::read_fixture("claude_state_blocked.json")).daemon_hosted);
+    assert!(!parse_job_state("{}").daemon_hosted);
+
+    assert!(
+        parse_job_state(&common::read_fixture("claude_state_working_daemon.json")).daemon_hosted
+    );
+    assert!(parse_job_state(r#"{"backend":"daemon"}"#).daemon_hosted);
+
+    // Any other backend string is the non-daemon case, including an empty value.
+    assert!(!parse_job_state(r#"{"backend":"subprocess"}"#).daemon_hosted);
+    assert!(!parse_job_state(r#"{"backend":"cli"}"#).daemon_hosted);
+    assert!(!parse_job_state(r#"{"backend":""}"#).daemon_hosted);
+}
+
+#[test]
+fn parse_agents_json_daemon_hosted_only_when_backend_is_daemon() {
+    let daemon = parse_agents_json(
+        r#"[{
+            "id": "dhost001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": "session_daemon",
+            "name": "Daemon Agents Row",
+            "state": "idle",
+            "backend": "daemon"
+        }]"#,
+    )
+    .expect("parse daemon agents json");
+    assert!(by_title(&daemon, "Daemon Agents Row").daemon_hosted);
+
+    let other = parse_agents_json(
+        r#"[{
+            "id": "other001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": "session_other",
+            "name": "Other Backend Row",
+            "state": "idle",
+            "backend": "subprocess"
+        }]"#,
+    )
+    .expect("parse other-backend agents json");
+    assert!(!by_title(&other, "Other Backend Row").daemon_hosted);
+}
+
+#[test]
 fn claude_list_demotes_working_row_whose_tempo_is_idle() {
     // End-to-end over `list()`: `claude agents --json` reports BOTH of these as "working",
     // and only the state.json `tempo` separates the finished-but-mislabelled one from the
@@ -613,6 +671,109 @@ fn claude_list_demotes_working_row_whose_tempo_is_idle() {
     assert_eq!(
         by_title(&sessions, "Waiting On Suite").status,
         Status::Working
+    );
+}
+
+#[test]
+fn claude_list_overlays_daemon_hosted_from_job_state() {
+    // 2.1.251 agents JSON has no `backend` field; list() must overlay from state.json so
+    // a daemon-hosted worker is not SIGTERMed on archive. A missing or non-daemon
+    // state.json stays false, and a true agents-JSON signal must survive a missing-backend
+    // overlay.
+    let dir = tempfile::TempDir::new().unwrap();
+    let binary = dir.path().join("claude");
+    let agents = serde_json::json!([
+        {
+            "id": "dhost001",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 1000,
+            "sessionId": "session_daemon",
+            "name": "Daemon Hosted",
+            "state": "working"
+        },
+        {
+            "id": "legacy01",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 2000,
+            "sessionId": "session_legacy",
+            "name": "Legacy Working",
+            "state": "working"
+        },
+        {
+            "id": "missing1",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 3000,
+            "sessionId": "session_missing",
+            "name": "Missing State",
+            "state": "idle"
+        },
+        {
+            "id": "blockd01",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 4000,
+            "sessionId": "session_blocked",
+            "name": "Blocked Daemon",
+            "state": "blocked"
+        },
+        {
+            "id": "agents01",
+            "cwd": "/tmp/project",
+            "kind": "background",
+            "startedAt": 5000,
+            "sessionId": "session_agents",
+            "name": "Agents Signal",
+            "state": "idle",
+            "backend": "daemon"
+        }
+    ]);
+    write_stub_claude(&binary, &format!("#!/bin/sh\nprintf '%s\\n' '{agents}'\n"));
+
+    let jobs_root = dir.path().join("jobs");
+    let blocked_daemon = {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&common::read_fixture("claude_state_blocked.json")).unwrap();
+        value["backend"] = serde_json::json!("daemon");
+        value.to_string()
+    };
+    for (short_id, contents) in [
+        (
+            "dhost001",
+            common::read_fixture("claude_state_working_daemon.json"),
+        ),
+        (
+            "legacy01",
+            common::read_fixture("claude_state_working.json"),
+        ),
+        ("blockd01", blocked_daemon),
+        (
+            "agents01",
+            common::read_fixture("claude_state_working.json"),
+        ),
+    ] {
+        let state_path = jobs_root.join(short_id).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&state_path, contents).unwrap();
+    }
+
+    let mut backend = ClaudeBackend::with_roots(
+        binary.to_str().unwrap(),
+        jobs_root,
+        dir.path().join("sessions"),
+    );
+    let sessions = backend.list().expect("list claude sessions");
+    assert!(by_title(&sessions, "Daemon Hosted").daemon_hosted);
+    assert!(!by_title(&sessions, "Legacy Working").daemon_hosted);
+    assert!(!by_title(&sessions, "Missing State").daemon_hosted);
+    let blocked = by_title(&sessions, "Blocked Daemon");
+    assert!(blocked.daemon_hosted);
+    assert_eq!(blocked.status, Status::needs_input());
+    assert!(
+        by_title(&sessions, "Agents Signal").daemon_hosted,
+        "a missing-backend state.json must not clobber an agents-JSON daemon signal"
     );
 }
 

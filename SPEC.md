@@ -789,6 +789,27 @@ path is declared and never assigned, so no session has one and Fleet View's own 
 writing `name` into a finished job's state.json made `claude agents --json --all` report the new
 name on the next listing.
 
+**Claude 2.1.251 daemon-hosted jobs (measured 2026-08-29).** Background jobs write
+`backend: "daemon"` (and `respawnFlags`) into `~/.claude/jobs/<short>/state.json`.
+`claude agents --json --all` on that build publishes
+`cwd,id,kind,name,pid,sessionId,startedAt,state,status` and does NOT include `backend`, so
+the overlay from state.json is load-bearing. A missing or non-`daemon` backend is the
+legacy non-daemon case (`daemon_hosted: false`). Agents JSON may still be parsed for
+`backend == "daemon"` if a later build starts publishing it; a missing-backend state.json
+must not clobber that signal.
+
+**THE GUARD: do not SIGTERM a Claude daemon-hosted worker.** The pid in agents JSON is the
+job's worker, not the shared `claude daemon run --origin transient` supervisor. Signalling
+that worker is treated as a crash: the supervisor `--resume`s the same JSONL and the thread
+reappears, so archive-then-stop never actually stops the job. Codex already withholds
+SIGTERM when `daemon_hosted` is true; Claude now sets that flag from the state.json overlay
+and the same gate applies. Stop and remove stay CLI (`claude stop <short>`, then
+`claude rm <short>`). There is still no Claude archive capability. `remove` waits longer
+for a Claude daemon-hosted row to settle after stop (~2s, taken from the fresh
+`authoritative_target` row, not a cached one) and fails closed if it is still
+Working/NeedsInput; the 300ms settle stays for everyone else. The viewer never writes or
+deletes state.json on this path, and never kills the daemon.
+
 **What the rendezvous socket is not.** The per-session rendezvous socket authenticates its FIRST
 frame as `attacher-caps` and answers anything else with `{"type":"reply-rejected"}`; merely
 opening it evicts the daemon's supervisor connection for that live session. The

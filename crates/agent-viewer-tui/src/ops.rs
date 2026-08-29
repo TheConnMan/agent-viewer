@@ -245,7 +245,19 @@ where
 /// beat later. Poll `authoritative_target` again within this bounded window before concluding
 /// the session is genuinely active again, rather than refusing on the very next stale read.
 const REMOVE_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Claude 2.1.251 daemon-hosted jobs take longer to drop Working after `claude stop`: the
+/// shared daemon treats a vanished worker as a crash and `--resume`s unless stop has fully
+/// landed. Everyone else keeps the 300ms window.
+const CLAUDE_DAEMON_REMOVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOVE_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(60);
+
+fn remove_settle_timeout(session: &Session) -> Duration {
+    if session.backend == BackendKind::Claude && session.daemon_hosted {
+        CLAUDE_DAEMON_REMOVE_SETTLE_TIMEOUT
+    } else {
+        REMOVE_SETTLE_TIMEOUT
+    }
+}
 
 fn run_remove(
     backend: &mut dyn Backend,
@@ -263,14 +275,20 @@ fn remove_settled_target(
     request: &TargetRequest,
     require_finished: bool,
 ) -> Result<MutationOutcome, String> {
-    let deadline = Instant::now() + REMOVE_SETTLE_TIMEOUT;
     let mut session = authoritative_target(backend, request).map_err(target_failure)?;
+    // A settle poll can miss a rewrite of Claude state.json and drop daemon_hosted; once
+    // true on this remove, keep it so the SIGTERM gate and the 2s window cannot shrink.
+    let mut daemon_hosted = session.daemon_hosted;
+    let started = Instant::now();
     while matches!(session.status, Status::Working | Status::NeedsInput { .. })
-        && Instant::now() < deadline
+        && Instant::now() < started + remove_settle_timeout(&session)
     {
         std::thread::sleep(REMOVE_SETTLE_POLL_INTERVAL);
         session = authoritative_target(backend, request).map_err(target_failure)?;
+        daemon_hosted |= session.daemon_hosted;
+        session.daemon_hosted = daemon_hosted;
     }
+    session.daemon_hosted = daemon_hosted;
     if !backend.capabilities_for(&session).delete {
         return Err(format!(
             "{} does not support remove",
@@ -607,11 +625,11 @@ mod tests {
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::mutations::MutationRunner;
     use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A routed row with no job id is matched by `match_spawn`'s cwd + creation-time rule, and
     /// that window closes 30s after the stamp. Classification plus dispatch can run for most of
@@ -1314,6 +1332,47 @@ mod tests {
     struct RecordingRemoveBackend {
         session: Session,
         removed_ids: RefCell<Vec<String>>,
+        /// When set, `list` reports Working until this duration elapses, then Idle.
+        settle_after: Option<Duration>,
+        started: Instant,
+        /// After the first `list()`, report this row instead (state.json flicker).
+        later: Option<Session>,
+        listed: Cell<bool>,
+    }
+
+    impl RecordingRemoveBackend {
+        fn new(session: Session) -> Self {
+            Self {
+                session,
+                removed_ids: RefCell::new(Vec::new()),
+                settle_after: None,
+                started: Instant::now(),
+                later: None,
+                listed: Cell::new(false),
+            }
+        }
+
+        fn settling(session: Session, after: Duration) -> Self {
+            Self {
+                session,
+                removed_ids: RefCell::new(Vec::new()),
+                settle_after: Some(after),
+                started: Instant::now(),
+                later: None,
+                listed: Cell::new(false),
+            }
+        }
+
+        fn flickering(first: Session, later: Session) -> Self {
+            Self {
+                session: first,
+                removed_ids: RefCell::new(Vec::new()),
+                settle_after: None,
+                started: Instant::now(),
+                later: Some(later),
+                listed: Cell::new(false),
+            }
+        }
     }
 
     impl Backend for RecordingRemoveBackend {
@@ -1329,7 +1388,20 @@ mod tests {
         }
 
         fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            Ok(vec![self.session.clone()])
+            let already = self.listed.replace(true);
+            let mut session = if already {
+                self.later.clone().unwrap_or_else(|| self.session.clone())
+            } else {
+                self.session.clone()
+            };
+            if let Some(after) = self.settle_after {
+                session.status = if self.started.elapsed() < after {
+                    Status::Working
+                } else {
+                    Status::Idle
+                };
+            }
+            Ok(vec![session])
         }
 
         fn spawn(
@@ -1370,10 +1442,7 @@ mod tests {
             let request = TargetRequest::from(&cached);
             let mut fresh = cached;
             fresh.status = fresh_status;
-            let mut backend = RecordingRemoveBackend {
-                session: fresh,
-                removed_ids: RefCell::new(Vec::new()),
-            };
+            let mut backend = RecordingRemoveBackend::new(fresh);
 
             let result = run_remove(&mut backend, None, &request, require_finished);
 
@@ -1416,6 +1485,150 @@ mod tests {
         assert!(
             alive,
             "unsupported remove killed the live process before declining"
+        );
+    }
+
+    #[test]
+    fn remove_of_a_claude_daemon_hosted_row_does_not_sigterm_the_worker() {
+        let (dir, mut victim) = claude_named_victim("daemon-hosted");
+        let mut session = claude_session(Some("dhost00"), victim.id());
+        session.status = Status::Idle;
+        session.daemon_hosted = true;
+        let request = TargetRequest::from(&session);
+        let mut backend = RecordingRemoveBackend::new(session);
+
+        let result = run_remove(&mut backend, None, &request, false);
+
+        std::thread::sleep(Duration::from_millis(250));
+        let alive = victim.try_wait().expect("try_wait").is_none();
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result,
+            Ok(super::MutationOutcome {
+                notice: "removed: probe".to_string(),
+                spawned: None,
+            })
+        );
+        assert_eq!(
+            *backend.removed_ids.borrow(),
+            vec!["3f9c1a2e-0000-4000-8000-000000000001".to_string()]
+        );
+        assert!(
+            alive,
+            "remove SIGTERMed a Claude daemon-hosted worker; the shared daemon would resume it"
+        );
+    }
+
+    #[test]
+    fn remove_keeps_claude_daemon_hosted_sticky_across_a_settle_poll() {
+        let (dir, mut victim) = claude_named_victim("sticky-hosted");
+        let mut first = claude_session(Some("dhost03"), victim.id());
+        first.status = Status::Working;
+        first.daemon_hosted = true;
+        let mut later = first.clone();
+        later.status = Status::Idle;
+        later.daemon_hosted = false;
+        let request = TargetRequest::from(&first);
+        let mut backend = RecordingRemoveBackend::flickering(first, later);
+
+        let result = run_remove(&mut backend, None, &request, false);
+
+        std::thread::sleep(Duration::from_millis(250));
+        let alive = victim.try_wait().expect("try_wait").is_none();
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result,
+            Ok(super::MutationOutcome {
+                notice: "removed: probe".to_string(),
+                spawned: None,
+            })
+        );
+        assert_eq!(
+            *backend.removed_ids.borrow(),
+            vec!["3f9c1a2e-0000-4000-8000-000000000001".to_string()]
+        );
+        assert!(
+            alive,
+            "a later list() that dropped daemon_hosted SIGTERMed the worker"
+        );
+    }
+
+    #[test]
+    fn remove_waits_for_a_claude_daemon_hosted_row_to_settle() {
+        let mut session = claude_session(Some("dhost01"), 1);
+        session.pid = None;
+        session.status = Status::Idle;
+        session.daemon_hosted = true;
+        let request = TargetRequest::from(&session);
+        let mut backend = RecordingRemoveBackend::settling(session, Duration::from_millis(400));
+
+        let result = run_remove(&mut backend, None, &request, false);
+
+        assert!(
+            result.is_ok(),
+            "a Claude daemon-hosted row that settles after 300ms must still be removable: {result:?}"
+        );
+        assert_eq!(
+            *backend.removed_ids.borrow(),
+            vec!["3f9c1a2e-0000-4000-8000-000000000001".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_does_not_extend_settle_for_non_daemon_claude() {
+        let mut session = claude_session(Some("legacy01"), 1);
+        session.pid = None;
+        session.status = Status::Idle;
+        session.daemon_hosted = false;
+        let request = TargetRequest::from(&session);
+        let mut backend = RecordingRemoveBackend::settling(session, Duration::from_millis(400));
+
+        let start = Instant::now();
+        let result = run_remove(&mut backend, None, &request, false);
+
+        assert!(
+            result.is_err(),
+            "non-daemon Claude must keep the 300ms settle and refuse a row still Working then"
+        );
+        assert!(backend.removed_ids.borrow().is_empty());
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "non-daemon settle must stay ~300ms, not the daemon-hosted window"
+        );
+    }
+
+    #[test]
+    fn remove_fails_closed_when_a_claude_daemon_hosted_row_stays_working() {
+        let mut session = claude_session(Some("dhost02"), 1);
+        session.pid = None;
+        session.status = Status::Working;
+        session.daemon_hosted = true;
+        let request = TargetRequest::from(&session);
+        let mut backend = RecordingRemoveBackend::new(session);
+
+        let start = Instant::now();
+        let result = run_remove(&mut backend, None, &request, false);
+
+        assert!(
+            result.is_err(),
+            "a Claude daemon-hosted row still Working after settle must not be removed"
+        );
+        assert!(backend.removed_ids.borrow().is_empty());
+        assert!(
+            start.elapsed() >= Duration::from_millis(1500),
+            "daemon-hosted settle must wait ~2s, not 300ms"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "daemon-hosted settle must fail closed instead of hanging"
         );
     }
 }
