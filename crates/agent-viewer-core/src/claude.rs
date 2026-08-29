@@ -230,6 +230,9 @@ impl Backend for ClaudeBackend {
                 if detail.idle_despite_working && matches!(session.status, Status::Working) {
                     session.status = Status::Idle;
                 }
+                // 2.1.251 `claude agents --json` does not publish `backend`; state.json does.
+                // OR so a missing-backend state.json cannot clobber an agents-JSON daemon signal.
+                session.daemon_hosted |= detail.daemon_hosted;
                 if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
                     session.updated_at_ms = since.as_millis() as i64;
                 }
@@ -579,6 +582,8 @@ pub fn mark_sdk_companions(
 /// missing or unknown -> Unknown. pid: entry "pid" as u32 when present.
 /// The agents output does not publish `tempo`, so a `working` here may still be demoted to
 /// `Idle` by `list()` from the job's state.json (see `parse_job_state`).
+/// `daemon_hosted` is false unless the entry itself carries `backend: "daemon"` (2.1.251
+/// `claude agents --json` does not; `list()` overlays that flag from state.json).
 /// The SHORT id (entry "id") the caller needs for the jobs path is folded into
 /// `Session.short_id` only when it is a single path component; empty, `.`, `..`,
 /// separators, and multi-component values become None so they cannot be stored or
@@ -618,6 +623,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             _ => Status::Unknown,
         };
         let pid = entry.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+        let daemon_hosted = crate::json_str(&entry, "backend") == Some("daemon");
         sessions.push(Session {
             backend: BackendKind::Claude,
             id: session_id.to_string(),
@@ -638,7 +644,7 @@ pub fn parse_agents_json(stdout: &str) -> Result<Vec<Session>> {
             pid,
             rollout_path: None,
             pr_refs: Vec::new(),
-            daemon_hosted: false,
+            daemon_hosted,
         });
     }
     Ok(sessions)
@@ -685,7 +691,8 @@ pub fn parse_claude_json_models(json: &str) -> Vec<String> {
     out
 }
 
-/// Parsed subset of a claude jobs `state.json` (verified fields 2026-07-11).
+/// Parsed subset of a claude jobs `state.json` (verified fields 2026-07-11;
+/// `backend` added from the 2.1.251 daemon-hosted shape measured 2026-08-29).
 /// The file's own ISO updatedAt is deliberately NOT parsed — the caller uses the
 /// state.json file mtime as the updated_at signal.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -703,10 +710,13 @@ pub struct JobDetail {
     /// `inFlight` reports at least one running `local_bash` task: the session is parked on a
     /// shell it started. Suppresses `idle_despite_working`; see `parse_job_state`.
     pub shells_in_flight: bool,
+    /// `backend == "daemon"`: the job is hosted by the shared Claude daemon. Missing or any
+    /// other value is the legacy non-daemon case. `list()` overlays this onto the session.
+    pub daemon_hosted: bool,
 }
 
-/// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath, tempo;
-/// blocked jobs carry needs, working/done carry detail).
+/// PURE parse of state.json text (verified fields: state, detail, needs, linkScanPath, tempo,
+/// backend; blocked jobs carry needs, working/done carry detail).
 ///
 /// `state` is a self-report written when a turn ends, and it describes what the session
 /// believed it was doing, not whether it is running. A session that finished a turn saying
@@ -775,6 +785,7 @@ pub fn parse_job_state(text: &str) -> JobDetail {
         prs,
         idle_despite_working,
         shells_in_flight,
+        daemon_hosted: crate::json_str(&value, "backend") == Some("daemon"),
     }
 }
 
