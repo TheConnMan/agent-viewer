@@ -279,7 +279,8 @@ its SQLite title still shows the prompt.
   signalling it would take the parent and every sibling down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
-- `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only).
+- `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only). While attached, `Ctrl+D` archives
+  that session and returns to the main view.
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `Ctrl+Y` — while attached, send the exact visible PTY viewport to the client terminal as an
   OSC 52 clipboard request. This includes a visible scrolled historical viewport. It does not
