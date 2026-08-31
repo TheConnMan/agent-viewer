@@ -248,9 +248,19 @@ impl App {
     }
 
     /// Every known session, before the filter/show-all/grouping that shapes `visible()`.
-    /// The triage queue is built from this so its length matches `needs_input_count`.
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+
+    /// Sessions represented by visible list rows, after filtering and collapsed groups are
+    /// applied. Triage uses this so it only walks work the operator chose to show.
+    pub fn shown_sessions(&self) -> impl Iterator<Item = &Session> {
+        self.rows.iter().filter_map(move |row| {
+            let Row::Session { backend, id, .. } = row else {
+                return None;
+            };
+            self.find_session(*backend, id)
+        })
     }
 
     pub fn set_activity_ribbon(&mut self, backend: BackendKind, id: &str, ribbon: Option<String>) {

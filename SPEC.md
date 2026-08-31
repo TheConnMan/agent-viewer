@@ -1196,13 +1196,14 @@ in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawn
 
 ### Triage inbox (`Ctrl+N`)
 
-A modal walking every session awaiting input, then every active completed or Codex-idle session (excluding
+A modal walking every shown session awaiting input, then every shown active completed or Codex-idle session (excluding
 archived, companion, and hold history), longest wait first within each cohort, with the session itself
 attached live into the middle panel. The reserved controls are `Ctrl+N` next, `Ctrl+P` previous,
 `Ctrl+D` applies the main-view `Ctrl+X`-twice action (including stop-then-remove for an active
 item), and bare `Esc` leaves
 (`Ctrl+]` remains a compatibility detach chord). Everything else goes to the session, because typing into the
-agent's own input path is how a prompt gets answered; there is no second reply mechanism. The
+agent's own input path is how a prompt gets answered; there is no second reply mechanism. Collapsed groups and
+filter results are outside the snapshot until they are shown again. The
 queue is snapshotted when the modal opens so a background refresh cannot reorder it mid-answer.
 
 The current session and only its immediate successor may be attached: the successor is
