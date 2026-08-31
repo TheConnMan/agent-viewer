@@ -403,10 +403,10 @@ daemon and are joined live.
 ## Triage inbox
 
 `Ctrl+N` (or "Triage sessions needing attention" in the `Ctrl+K` palette) opens a modal over
-the list that walks every session waiting for input, then every active completed or Codex-idle session, one at
+the list that walks the shown sessions waiting for input, then every shown active completed or Codex-idle session, one at
 a time and longest wait first within each group, with a `3 of 7` progress counter and the next
 few items named underneath. Archived, companion, and hold history is excluded from the completed
-phase. `Ctrl+D` applies the same action as pressing `Ctrl+X` twice in the main viewer and
+phase. Collapsed groups and filter results are not triaged until they are shown again. `Ctrl+D` applies the same action as pressing `Ctrl+X` twice in the main viewer and
 advances: a Needs Input item is stopped and then removed, while a completed Codex session is
 archived and a completed Claude background job is removed.
 

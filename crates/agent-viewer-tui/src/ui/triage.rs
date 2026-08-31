@@ -80,14 +80,13 @@ impl TriageItem {
 /// intentionally excluded: archived, companion, and hold rows are not in the default viewer
 /// list, so triage must not turn their backlog into an archive-review queue.
 ///
-/// Built from the App's whole session set rather than `visible()`, so the queue length equals
-/// the header's "N awaiting input" — a filter or a collapsed group must not silently shrink
-/// the inbox. Ordering is ascending `updated_at_ms` (longest wait first), broken by
+/// Built from the sessions shown in the list, so filters and collapsed groups also scope the
+/// inbox. Ordering is ascending `updated_at_ms` (longest wait first), broken by
 /// `(backend, id)` so the order is total and a refresh tick cannot shuffle two rows stamped
 /// the same millisecond.
-pub fn triage_queue(sessions: &[Session]) -> Vec<TriageItem> {
+pub fn triage_queue<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> Vec<TriageItem> {
     let mut items = sessions
-        .iter()
+        .into_iter()
         .filter_map(|session| {
             let kind = match session.status {
                 Status::NeedsInput { .. } => TriageKind::NeedsInput,

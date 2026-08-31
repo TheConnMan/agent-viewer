@@ -331,7 +331,7 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
 /// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
 /// opens nothing — a footer notice, and the list is untouched.
 pub(crate) fn open_triage(ui: &mut Ui) {
-    let items = triage_queue(ui.app.sessions());
+    let items = triage_queue(ui.app.shown_sessions());
     if items.is_empty() {
         ui.set_notice("nothing needs triage".to_string());
         return;
@@ -2169,8 +2169,10 @@ mod async_attach_tests {
     use crate::keys::tests::{sess, test_ui_with};
     use crate::ops::AttachPlan;
     use agent_viewer_core::{BackendKind, Session, Status};
+    use agent_viewer_tui::app::{GroupKey, Row};
     use agent_viewer_tui::shared_listing::TargetRequest;
     use agent_viewer_tui::ui::Mode;
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex, mpsc::channel};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -2503,5 +2505,37 @@ mod async_attach_tests {
             Some(&(BackendKind::Claude, second.id.clone())),
             "the panel stays pointed at the item the queue is actually on"
         );
+    }
+
+    #[test]
+    fn triage_omits_sessions_in_collapsed_groups() {
+        let shown = blocked("shown", 100);
+        let mut collapsed = blocked("collapsed", 200);
+        collapsed.cwd = "/tmp/agentviewer_triage_collapsed".into();
+        let mut ui = test_ui_with(vec![shown, collapsed.clone()]);
+        let collapsed_root = ui
+            .app
+            .visible()
+            .iter()
+            .find_map(|row| match row {
+                Row::ProjectHeader { root, .. }
+                    if root == &std::path::PathBuf::from(&collapsed.cwd) =>
+                {
+                    Some(root.clone())
+                }
+                _ => None,
+            })
+            .expect("collapsed session has a project header");
+        ui.app
+            .set_collapsed(HashSet::from([GroupKey::Project(collapsed_root)]));
+        ui.attach_executor = Arc::new(|_| Err("attach is not part of this test".to_string()));
+
+        open_triage(&mut ui);
+
+        let Mode::Triage(state) = &ui.mode else {
+            panic!("triage should open for the visible session");
+        };
+        assert_eq!(state.progress(), (1, 1));
+        assert_eq!(state.current().map(|item| item.id.as_str()), Some("shown"));
     }
 }
