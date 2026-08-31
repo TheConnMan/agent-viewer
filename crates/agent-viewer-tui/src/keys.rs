@@ -1603,9 +1603,9 @@ fn select_palette_model(ui: &mut Ui, backend: BackendKind, name: String) {
     let _ = ui.composer.select_model(&name);
 }
 
-/// While attached: Ctrl+] always leaves; Left leaves when the input line is empty (else it
-/// is forwarded); a dead child leaves on any key; everything else is encoded
-/// to bytes and written to the PTY.
+/// While attached: Ctrl+D archives the attached session and returns to the list; Ctrl+] always
+/// leaves; Left leaves when the input line is empty (else it is forwarded); a dead child leaves
+/// on any key; everything else is encoded to bytes and written to the PTY.
 fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let Some(fkey) = ui.focused.clone() else {
@@ -1619,6 +1619,19 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
 
     // Ctrl+] always leaves, closing the connection, so the header/help "ctrl+]" is honored here.
     if ctrl && is_leave_chord(key.code) {
+        close_attached(ui);
+        return;
+    }
+
+    // Archive the session that owns this terminal, rather than the list's potentially refreshed
+    // selection. Close the PTY after scheduling the background mutation so the user returns to
+    // the main view immediately.
+    if ctrl && matches!(key.code, KeyCode::Char('d')) {
+        if let Some(session) = ui.focused_session.clone() {
+            hide_request(ui, TargetRequest::from(&session), session.title, true);
+        } else {
+            ui.set_notice("attached session is no longer available".to_string());
+        }
         close_attached(ui);
         return;
     }
@@ -5105,6 +5118,44 @@ pub(crate) mod tests {
             "the per-PTY input gate must die with its PTY"
         );
         assert!(!pid_alive(pid), "child {pid} outlived the session view");
+    }
+
+    #[test]
+    fn ctrl_d_archives_the_attached_session_and_returns_to_the_list() {
+        let session = sess("attached-archive", "/tmp/agentviewer-attached-archive", 100);
+        let other = sess("list-selection", "/tmp/agentviewer-list-selection", 200);
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone(), other.clone()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let crate::ops::Mutation::Hide(request) = mutation else {
+                panic!("Ctrl+D must archive the attached session");
+            };
+            tx.send(request.id().to_string())
+                .expect("record attached archive");
+            Ok(MutationOutcome {
+                notice: "archived".to_string(),
+                spawned: None,
+            })
+        });
+        ui.attached.insert(target.clone(), wall_tile_pty());
+        ui.detach_trackers
+            .insert(target.clone(), DetachTracker::new());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+        ui.focused_session = Some(session);
+        assert!(ui.app.select_by_key(&(other.backend, other.id)));
+
+        handle_attached_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        assert!(!ui.attached.contains_key(&target));
+        assert!(!ui.detach_trackers.contains_key(&target));
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .as_deref(),
+            Ok("attached-archive")
+        );
     }
 
     /// The one exception: the wall owns its tiles, and zooming into one then backing out
