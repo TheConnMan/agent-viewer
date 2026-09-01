@@ -1,4 +1,6 @@
-use super::{AttachView, fg, mark_for, status_glyph, truncate};
+use super::{AttachView, fg, logo_marks, mark_for, mark_width, status_glyph, truncate};
+use crate::logos::LogoMarks;
+use crate::ui::list;
 use crate::ui::theme::Theme;
 use agent_viewer_core::pty::TerminalPalette;
 use ratatui::Frame;
@@ -7,6 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use ratatui_image::Image;
 use tui_term::{
     vt100,
     widget::{PseudoTerminal, Screen},
@@ -14,11 +17,19 @@ use tui_term::{
 
 pub const ATTACHED_CHROME_ROWS: u16 = 2;
 
+struct HeaderContext<'a> {
+    pr_status: &'a crate::pr_cache::PrStatusCache,
+    logos: Option<&'a LogoMarks>,
+    theme: &'a Theme,
+}
+
 pub(super) fn draw(
     frame: &mut Frame,
     av: &AttachView<'_>,
     notice: &str,
     now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    logos: Option<&LogoMarks>,
     theme: &Theme,
 ) {
     let area = frame.area();
@@ -31,7 +42,12 @@ pub(super) fn draw(
         ])
         .split(area);
 
-    draw_header(frame, av.session, av.exited, now_ms, theme, chunks[0]);
+    let header = HeaderContext {
+        pr_status,
+        logos,
+        theme,
+    };
+    draw_header(frame, av.session, av.exited, now_ms, &header, chunks[0]);
     render_screen(frame, chunks[1], av);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(notice.to_string(), fg(theme.warn)))),
@@ -111,38 +127,76 @@ fn draw_header(
     session: &agent_viewer_core::Session,
     exited: bool,
     now_ms: i64,
-    theme: &Theme,
+    context: &HeaderContext<'_>,
     area: Rect,
 ) {
-    let (glyph, glyph_color) = status_glyph(&session.status, now_ms, theme);
+    let (glyph, glyph_color) = status_glyph(&session.status, now_ms, context.theme);
     let right = if exited {
         "ctrl+y send copy request to terminal · process exited · press any key"
     } else {
         "ctrl+y send copy request to terminal · ← back · ctrl+] close"
     };
-    let left = format!(
-        " {glyph} {} {}  {}",
-        mark_for(session.backend, true),
-        session.title,
-        session.cwd.display()
-    );
+    let use_logo = context.logos.is_some() && logo_marks();
+    let mark = if use_logo {
+        "  "
+    } else {
+        mark_for(session.backend, true)
+    };
+    let prefix = format!(" {glyph} {mark} ");
+    let pr = list::pr_badge(&session.pr_refs);
+    let pr_chip = (!pr.is_empty()).then(|| format!(" {pr} "));
     let width = area.width as usize;
+    let pr_width = pr_chip.as_ref().map_or(0, |chip| chip.chars().count());
     let right_width = right.chars().count();
-    let left = truncate(&left, width.saturating_sub(right_width + 1));
-    let pad = width.saturating_sub(left.chars().count() + right_width);
+    let available = width.saturating_sub(right_width + 1);
+    let fixed_width = prefix.chars().count() + pr_width;
+    let title = truncate(&session.title, available.saturating_sub(fixed_width));
+    let used = fixed_width + title.chars().count();
+    let cwd = truncate(
+        &format!("  {}", session.cwd.display()),
+        available.saturating_sub(used),
+    );
+    let pad = width.saturating_sub(used + cwd.chars().count() + right_width);
     let line = Line::from(vec![
-        Span::styled(format!(" {glyph}"), fg(glyph_color)),
-        Span::styled(left.chars().skip(2).collect::<String>(), fg(theme.text)),
+        Span::styled(format!(" {glyph} "), fg(glyph_color)),
+        Span::styled(mark.to_string(), fg(context.theme.text)),
+        Span::raw(" "),
+        Span::styled(title, fg(context.theme.text)),
+        Span::styled(
+            pr_chip.unwrap_or_default(),
+            fg(list::pr_badge_theme_color(
+                context.pr_status.badge_color(&session.pr_refs),
+                context.theme,
+            )),
+        ),
+        Span::styled(cwd, fg(context.theme.muted)),
         Span::raw(" ".repeat(pad)),
         Span::styled(
             right.to_string(),
-            fg(if exited { theme.err } else { theme.muted }),
+            fg(if exited {
+                context.theme.err
+            } else {
+                context.theme.muted
+            }),
         ),
     ]);
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.selbg)),
+        Paragraph::new(line).style(Style::default().bg(context.theme.selbg)),
         area,
     );
+    if let Some(logos) = context.logos.filter(|_| use_logo)
+        && area.width >= 5
+    {
+        frame.render_widget(
+            Image::new(logos.image(session.backend)),
+            Rect {
+                x: area.x + 3,
+                y: area.y,
+                width: mark_width(mark) as u16,
+                height: 1,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +261,8 @@ mod tests {
                     },
                     notice,
                     0,
+                    &crate::pr_cache::PrStatusCache::new(),
+                    None,
                     &theme,
                 );
             })
@@ -241,7 +297,20 @@ mod tests {
             let mut session = attached_session();
             session.backend = backend;
             terminal
-                .draw(|frame| draw_header(frame, &session, false, 0, &theme, frame.area()))
+                .draw(|frame| {
+                    draw_header(
+                        frame,
+                        &session,
+                        false,
+                        0,
+                        &HeaderContext {
+                            pr_status: &crate::pr_cache::PrStatusCache::new(),
+                            logos: None,
+                            theme: &theme,
+                        },
+                        frame.area(),
+                    )
+                })
                 .expect("draw attached header");
 
             let header = (0..terminal.backend().buffer().area.width)
@@ -250,5 +319,39 @@ mod tests {
             assert!(header.contains(expected), "header was {header:?}");
             assert!(!header.contains(backend.tag()), "header was {header:?}");
         }
+    }
+
+    #[test]
+    fn attached_header_shows_the_session_pr_chip() {
+        let theme = crate::ui::theme::amber(false);
+        let mut session = attached_session();
+        session.pr_refs.push(agent_viewer_core::PrRef {
+            id: "123".to_string(),
+            href: None,
+        });
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_header(
+                    frame,
+                    &session,
+                    false,
+                    0,
+                    &HeaderContext {
+                        pr_status: &crate::pr_cache::PrStatusCache::new(),
+                        logos: None,
+                        theme: &theme,
+                    },
+                    frame.area(),
+                )
+            })
+            .expect("draw attached header");
+
+        let header = (0..terminal.backend().buffer().area.width)
+            .map(|column| terminal.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        let pr_at = header.find("#123").expect("PR chip in header");
+        assert!(pr_at < 50, "PR chip was not in left metadata: {header:?}");
     }
 }

@@ -348,7 +348,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     if matches!(d.mode, Mode::Attached)
         && let Some(av) = &d.attach
     {
-        attach::draw(frame, av, d.notice, d.now_ms, theme);
+        attach::draw(frame, av, d.notice, d.now_ms, d.pr_status, d.logos, theme);
         return;
     }
 
@@ -437,7 +437,15 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
     let mut hit = match &d.wall {
         Some(view) => {
-            *d.wall_rects.borrow_mut() = wall::draw(frame, view, d.now_ms, theme, vertical[1]);
+            *d.wall_rects.borrow_mut() = wall::draw(
+                frame,
+                view,
+                d.now_ms,
+                d.pr_status,
+                d.logos,
+                theme,
+                vertical[1],
+            );
             ListHit::default()
         }
         None => {
