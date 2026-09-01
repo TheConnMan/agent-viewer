@@ -14,9 +14,13 @@
 //! since `PtySession::resize` needs `&mut` and draw is `&`-only).
 
 use super::list::truncate_display_width as truncate_display;
-use super::theme::{MarkSet, Theme};
-use super::{backend_mark_color, display_width, fg, mark_for, mark_width, status_glyph};
+use super::theme::Theme;
+use super::{
+    backend_mark_color, display_width, fg, logo_marks, mark_for, mark_width, status_glyph,
+};
 use crate::app::{App, Row};
+use crate::logos::LogoMarks;
+use crate::ui::list;
 use agent_viewer_core::pty::PtySession;
 use agent_viewer_core::{BackendKind, Session, Status};
 use ratatui::Frame;
@@ -24,11 +28,19 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui_image::Image;
 use std::collections::{HashMap, HashSet};
 
 /// Hard cap on tiles. Each tile is a live child being resized and re-parsed, so this is a
 /// process budget, not a rendering one. Above the cap the footer carries the overflow count.
 pub const MAX_TILES: usize = 9;
+
+struct RenderContext<'a> {
+    now_ms: i64,
+    pr_status: &'a crate::pr_cache::PrStatusCache,
+    logos: Option<&'a LogoMarks>,
+    theme: &'a Theme,
+}
 
 /// How long a session that has stopped working keeps its tile. A tile vanishing the instant a
 /// run finishes is jarring, and that moment is exactly when the wall is most useful: the reply
@@ -407,6 +419,8 @@ pub(super) fn draw(
     frame: &mut Frame,
     view: &WallView,
     now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    logos: Option<&LogoMarks>,
     theme: &Theme,
     area: Rect,
 ) -> Vec<Rect> {
@@ -415,8 +429,14 @@ pub(super) fn draw(
         return Vec::new();
     }
     let rects = tile_rects(area, view.tiles.len() + view.overflow);
+    let context = RenderContext {
+        now_ms,
+        pr_status,
+        logos,
+        theme,
+    };
     for (index, (tile, rect)) in view.tiles.iter().zip(&rects).enumerate() {
-        draw_tile(frame, tile, index == view.selected, now_ms, theme, *rect);
+        draw_tile(frame, tile, index == view.selected, &context, *rect);
     }
     rects
 }
@@ -449,14 +469,18 @@ fn draw_tile(
     frame: &mut Frame,
     tile: &WallTile,
     selected: bool,
-    now_ms: i64,
-    theme: &Theme,
+    context: &RenderContext<'_>,
     rect: Rect,
 ) {
     // A blocked tile owns its own border and header and nothing else: the flash stays on the
     // outline, with no full-surface repaint and no reordering the grid to float the tile
     // forward. Grid stability is what lets you keep your place in the tile you were reading.
-    let (border_color, weight) = tile_border(&tile.session.status, selected, now_ms, theme);
+    let (border_color, weight) = tile_border(
+        &tile.session.status,
+        selected,
+        context.now_ms,
+        context.theme,
+    );
     let border_style = if selected {
         fg(border_color).add_modifier(Modifier::BOLD)
     } else {
@@ -466,7 +490,7 @@ fn draw_tile(
         .borders(Borders::ALL)
         .border_type(weight)
         .border_style(border_style)
-        .style(Style::default().bg(theme.surface));
+        .style(Style::default().bg(context.theme.surface));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.width == 0 || inner.height == 0 {
@@ -474,15 +498,22 @@ fn draw_tile(
     }
 
     frame.render_widget(
-        Paragraph::new(header_line(
-            tile,
-            selected,
-            now_ms,
-            inner.width as usize,
-            theme,
-        )),
+        Paragraph::new(header_line(tile, selected, context, inner.width as usize)),
         Rect { height: 1, ..inner },
     );
+    if let Some(logos) = context.logos.filter(|_| logo_marks())
+        && inner.width >= 6
+    {
+        frame.render_widget(
+            Image::new(logos.image(tile.session.backend)),
+            Rect {
+                x: inner.x + 4,
+                y: inner.y,
+                width: 2,
+                height: 1,
+            },
+        );
+    }
     if inner.height <= 1 {
         return;
     }
@@ -493,8 +524,8 @@ fn draw_tile(
         // one says why — the wall connects on its own, so a silent empty box would read as
         // a broken session rather than a broken join.
         let (text, color) = match tile.error {
-            Some(error) => (format!("could not connect · {error}"), theme.err),
-            None => ("connecting…".to_string(), theme.faint),
+            Some(error) => (format!("could not connect · {error}"), context.theme.err),
+            None => ("connecting…".to_string(), context.theme.faint),
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -522,56 +553,77 @@ fn draw_tile(
 fn header_line(
     tile: &WallTile,
     selected: bool,
-    now_ms: i64,
+    context: &RenderContext<'_>,
     width: usize,
-    theme: &Theme,
 ) -> Line<'static> {
-    let (glyph, glyph_color) = status_glyph(&tile.session.status, now_ms, theme);
-    // Bypass logo mode here: it blanks the mark slot for an image overlay the wall does not
-    // draw, which would leave a tile with no backend signal at all.
-    let mark = mark_for(tile.session.backend, theme.mark_set == MarkSet::Glyph);
+    let (glyph, glyph_color) = status_glyph(&tile.session.status, context.now_ms, context.theme);
+    let mark = if context.logos.is_some() && logo_marks() {
+        "  "
+    } else {
+        mark_for(tile.session.backend, true)
+    };
+    let pr = list::pr_badge(&tile.session.pr_refs);
+    let pr_width = if pr.is_empty() {
+        0
+    } else {
+        display_width(&pr) + 1
+    };
     let started_at_ms = if tile.session.created_at_ms > 0 {
         tile.session.created_at_ms
     } else {
         tile.session.updated_at_ms
     };
-    let elapsed = crate::app::format_elapsed(now_ms - started_at_ms);
+    let elapsed = crate::app::format_elapsed(context.now_ms - started_at_ms);
     let plan = header_plan(
         &tile.session.title,
         &tile.project,
         &elapsed,
-        mark_width(mark),
+        mark_width(mark) + pr_width,
         width,
     );
 
-    let left = CARET_COLS + 1 + 1 + mark_width(mark) + 1 + display_width(&plan.title);
+    let left = CARET_COLS + 1 + 1 + mark_width(mark) + 1 + display_width(&plan.title) + pr_width;
     let pad = width.saturating_sub(left + right_width(&plan.project, &plan.elapsed));
     // The caret, not the border color, is what makes the selection readable in mono16.
     let caret = if selected { "▸ " } else { "  " };
     let mut spans = vec![
-        Span::styled(caret, fg(theme.accent)),
+        Span::styled(caret, fg(context.theme.accent)),
         Span::styled(glyph.to_string(), fg(glyph_color)),
         Span::raw(" "),
         Span::styled(
             mark.to_string(),
-            fg(backend_mark_color(tile.session.backend, theme)),
+            fg(backend_mark_color(tile.session.backend, context.theme)),
         ),
         Span::raw(" "),
         Span::styled(
             plan.title,
-            fg(if selected { theme.text } else { theme.muted }),
+            fg(if selected {
+                context.theme.text
+            } else {
+                context.theme.muted
+            }),
         ),
     ];
+    if !pr.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            pr,
+            fg(list::pr_badge_theme_color(
+                context.pr_status.badge_color(&tile.session.pr_refs),
+                context.theme,
+            )),
+        ));
+    }
     if !plan.project.is_empty() || !plan.elapsed.is_empty() {
         spans.push(Span::raw(" ".repeat(pad + 2)));
         if !plan.project.is_empty() {
-            spans.push(Span::styled(plan.project.clone(), fg(theme.faint)));
+            spans.push(Span::styled(plan.project.clone(), fg(context.theme.faint)));
         }
         if !plan.project.is_empty() && !plan.elapsed.is_empty() {
             spans.push(Span::raw(" "));
         }
         if !plan.elapsed.is_empty() {
-            spans.push(Span::styled(plan.elapsed, fg(theme.muted)));
+            spans.push(Span::styled(plan.elapsed, fg(context.theme.muted)));
         }
     }
     Line::from(spans)
@@ -935,7 +987,15 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &view, 2_000, &theme, Rect::new(0, 0, 80, 10));
+                draw(
+                    frame,
+                    &view,
+                    2_000,
+                    &crate::pr_cache::PrStatusCache::new(),
+                    None,
+                    &theme,
+                    Rect::new(0, 0, 80, 10),
+                );
             })
             .expect("draw wall");
         let rendered: String = terminal
@@ -998,18 +1058,63 @@ mod tests {
             pty: Some(&pty),
             error: None,
         };
-        let line = header_line(&tile, false, 2_000, 20, &theme);
+        let line = header_line(
+            &tile,
+            false,
+            &RenderContext {
+                now_ms: 2_000,
+                pr_status: &crate::pr_cache::PrStatusCache::new(),
+                logos: None,
+                theme: &theme,
+            },
+            20,
+        );
         let rendered: String = line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
         assert!(rendered.contains('✽'), "glyph missing from {rendered:?}");
+        assert!(rendered.contains('◆'), "mark missing from {rendered:?}");
         assert!(
-            rendered.contains(BackendKind::Codex.tag()),
-            "mark missing from {rendered:?}"
+            !rendered.contains(BackendKind::Codex.tag()),
+            "legacy tag leaked into {rendered:?}"
         );
         pty.kill();
+    }
+
+    #[test]
+    fn tile_header_shows_the_session_pr_chip() {
+        let theme = crate::ui::theme::amber(false);
+        let mut session = session("PR session", Status::Working);
+        session.pr_refs.push(agent_viewer_core::PrRef {
+            id: "123".to_string(),
+            href: None,
+        });
+        let tile = WallTile {
+            session: &session,
+            project: String::new(),
+            pty: None,
+            error: None,
+        };
+        let line = header_line(
+            &tile,
+            false,
+            &RenderContext {
+                now_ms: 2_000,
+                pr_status: &crate::pr_cache::PrStatusCache::new(),
+                logos: None,
+                theme: &theme,
+            },
+            80,
+        );
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let pr_at = rendered.find("#123").expect("PR chip in header");
+        assert!(pr_at < 40, "PR chip was not in left metadata: {rendered:?}");
     }
 
     /// Colour is the session's state, and every state that is not "still working" gets its own
@@ -1138,7 +1243,15 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &view, 0, &theme, Rect::new(0, 0, 40, 10));
+                draw(
+                    frame,
+                    &view,
+                    0,
+                    &crate::pr_cache::PrStatusCache::new(),
+                    None,
+                    &theme,
+                    Rect::new(0, 0, 40, 10),
+                );
             })
             .expect("draw wall");
 
@@ -1173,7 +1286,15 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &view, 0, &theme, Rect::new(0, 0, 80, 6));
+                draw(
+                    frame,
+                    &view,
+                    0,
+                    &crate::pr_cache::PrStatusCache::new(),
+                    None,
+                    &theme,
+                    Rect::new(0, 0, 80, 6),
+                );
             })
             .expect("draw empty wall");
         let buffer = terminal.backend().buffer();

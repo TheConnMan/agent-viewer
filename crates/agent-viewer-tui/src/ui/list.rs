@@ -176,7 +176,7 @@ pub(super) fn pr_badge(pr_refs: &[PrRef]) -> String {
     }
 }
 
-fn pr_badge_theme_color(color: PrBadgeColor, theme: &Theme) -> ratatui::style::Color {
+pub(super) fn pr_badge_theme_color(color: PrBadgeColor, theme: &Theme) -> ratatui::style::Color {
     match color {
         PrBadgeColor::Default => theme.accent,
         PrBadgeColor::Attention => theme.warn,
