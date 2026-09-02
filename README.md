@@ -237,6 +237,47 @@ popup, and `Enter` spawns the text as-is.
 field is not a modal. A Codex rename is retained immediately in its session index, even when
 its SQLite title still shows the prompt.
 
+## Archive, stop, and delete
+
+Three words, used the same way for every backend. The backends implement them with different
+primitives, and that is where the confusion has come from, so this table is the contract and the
+per-backend notes underneath say what actually happens.
+
+- **Archive** — the row leaves the main view. That is the whole definition. Whether it can come
+  back depends on the backend: a backend with a native archive flag keeps the session and
+  `Ctrl+U` restores it; a backend without one can only leave the view by deleting the
+  session, so there archive *is* delete and there is nothing to restore. `Ctrl+A` shows
+  archived rows only for the backends where archive is reversible.
+- **Stop** — the agent stops working, and the row stays in the view. The session and its
+  transcript are kept, it still attaches, and you can send it a new turn later. Stop never
+  removes anything.
+- **Delete** — the backend's own record of the session is removed. The row is gone from the
+  main view and from `Ctrl+A`, and cannot be restored from the viewer.
+
+| Backend | Archive | Restore (`Ctrl+U`) | Stop | Delete |
+|---|---|---|---|---|
+| Codex | native archive flag via the `codex` CLI; session kept | yes | interrupt the current turn through the app-server daemon (a signal for a pid-only row; unsupported for a subagent row) | none. Codex has no delete, so the remove stage archives instead |
+| Claude | no native flag. The only way off the view is delete | no | `claude stop` on a nonterminal background job; row kept for later attach | `claude rm <short-id>`: deletes the background job **and its worktree**. Interactive rows have no job dir and cannot be deleted |
+| Grok | no native flag. The only way off the view is delete | no | leader `cancel` on the session | leader `delete`: removes the session from Grok's own store |
+
+How the keys map onto those words today:
+
+- `Ctrl+D` in the list and while attached runs **archive** in the reversible sense only. On a
+  Codex row it archives. On a Claude or Grok row the mutation worker refuses with
+  `<backend> does not support hide` (while attached you are already back in the list by the
+  time the notice lands, which is why it looks like a dead key). It never falls through to
+  delete.
+- `Ctrl+X` once is **stop**. `Ctrl+X` again within 2s queues the remove stage: on Codex that is
+  archive, on Claude and Grok it is delete.
+- `Ctrl+D` inside the triage inbox is the `Ctrl+X` twice gesture, not the list's `Ctrl+D`. It
+  stops a still-active item and then runs the remove stage, so it archives a Codex session and
+  deletes a Claude or Grok one. This is the key that takes a Grok session off the view.
+
+The code names differ from these words, and reading them as synonyms is the trap. `hide` /
+`unhide` is the reversible archive flag. `stop` is stop. `remove` is the remove stage, which is
+archive on Codex and delete on Claude and Grok. `kill` is the two-stage `Ctrl+X` machine
+(stop, then remove), not any single one of them.
+
 ## Keys
 
 - `↑`/`↓` — move selection.
@@ -279,8 +320,10 @@ its SQLite title still shows the prompt.
   signalling it would take the parent and every sibling down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
-- `Ctrl+D` / `Ctrl+U` — archive / unarchive (Codex only). While attached, `Ctrl+D` archives
-  that session and returns to the main view.
+- `Ctrl+D` / `Ctrl+U` — archive / unarchive, in the reversible sense only, so Codex only; a
+  Claude or Grok row reports `<backend> does not support hide`. While attached, `Ctrl+D` runs
+  the same archive on that session and returns to the main view. See "Archive, stop, and
+  delete" above for what each word means per backend.
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
 - `Ctrl+Y` — while attached, send the exact visible PTY viewport to the client terminal as an
   OSC 52 clipboard request. This includes a visible scrolled historical viewport. It does not
@@ -406,9 +449,10 @@ daemon and are joined live.
 the list that walks the shown sessions waiting for input, then every shown active idle or done session, one at
 a time and longest wait first within each group, with a `3 of 7` progress counter and the next
 few items named underneath. Archived, companion, and hold history is excluded from the completed
-phase. Collapsed groups and filter results are not triaged until they are shown again. `Ctrl+D` applies the same action as pressing `Ctrl+X` twice in the main viewer and
-advances: a Needs Input item is stopped and then removed, while a completed Codex session is
-archived and a completed Claude background job is removed.
+phase. Collapsed groups and filter results are not triaged until they are shown again. `Ctrl+D` here is the `Ctrl+X` twice gesture, not the list's `Ctrl+D`, and it
+advances: a Needs Input item is stopped and then goes through the remove stage, which archives a
+Codex session and deletes a Claude background job or a Grok session (see "Archive, stop, and
+delete").
 
 The panel in the middle is the session itself, live — the same attach the list's `Enter`
 gives you, drawn into the panel instead of the whole screen. So you see the agent's own

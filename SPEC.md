@@ -409,6 +409,23 @@ notice behavior.
 
 ## Mutations — delegate to Codex subcommands, never write the DB
 
+**Vocabulary.** README "Archive, stop, and delete" is the user-facing contract: *archive* means
+the row leaves the main view, *stop* means the agent stops and the row stays, *delete* means the
+backend's record is gone. The code does not use those words one-to-one, and treating the code
+names as synonyms is what keeps producing "Ctrl+D did nothing" reports:
+
+| Code name | Where | User word |
+|---|---|---|
+| `Backend::hide` / `unhide`, `Mutation::Hide` / `Unhide`, `Capabilities::archive` | core + `ops.rs` | reversible archive. Only Codex advertises it; Claude and Grok refuse with `does not support hide` |
+| `Backend::stop`, `Mutation::Stop`, `KillStage::Stop` | core + `ops.rs` + `actions.rs` | stop |
+| `Backend::remove`, `Mutation::Remove`, `KillStage::Remove`, `Capabilities::delete` | core + `ops.rs` + `actions.rs` | the remove stage: archive on Codex (`remove` calls `cli::archive`), delete on Claude (`claude rm`) and Grok (leader `delete`) |
+| `kill_*`, `KillStage`, `armed_kill` | `actions.rs`, `app.rs` | the two-stage `Ctrl+X` gesture (stop, then remove); never one primitive |
+
+The list's `Ctrl+D` and the attached `Ctrl+D` both submit `Mutation::Hide` and stop there.
+Triage's `Ctrl+D` runs `archive_triage_item`, which drives `kill_stage_for` twice (arm, then
+`Remove`), so it is the `Ctrl+X` twice gesture under an archive label. That asymmetry is the
+open question, not a bug in either path: the README table documents what each key does today.
+
 All verified present in `codex --help` (0.144.1):
 - **Create (req 1):** background a detached `codex exec`. Shape:
   ```
