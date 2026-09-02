@@ -356,6 +356,10 @@ full-screen embedded terminal. Codex joins the `codex app-server` daemon that ho
 job and a finished one (waking it in place); a row with no background-job id falls back to
 `claude -r`. `←` returns to the list when the
 input line is empty (otherwise it moves the child's cursor), and `Ctrl+]` always returns.
+The line counts as empty again after the child's own clear chords: `Ctrl+C` or `Ctrl+U` in
+either backend, and a quick double `Esc` in Claude (a single `Esc` leaves the text alone when
+idle and interrupts mid-turn, as in the bare CLI; Codex never clears on `Esc`). So `Ctrl+U`,
+`←` backs out of a half-typed line anywhere, and `Esc`, `Esc`, `←` does in Claude.
 A session is connected exactly while it is on screen: leaving it closes that connection, so
 there is never a session still connected in the background. Opening it again reconnects, which
 takes a second or two. Conversation state lives in each backend's own store, so nothing is lost
