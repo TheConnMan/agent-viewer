@@ -324,8 +324,8 @@ pub(crate) fn send_reply<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// `Ctrl+N` — open the triage inbox on needs-input work, then completed work, oldest first
-/// within each group.
+/// `Ctrl+N` — open the triage inbox on needs-input work, then idle and done work, oldest
+/// first within each group.
 ///
 /// The queue is snapshotted here and not rebuilt while the modal is up: the 1s background
 /// refresh must not reorder or resize it under the user's fingers mid-answer. An empty queue
@@ -361,8 +361,8 @@ pub(crate) fn archive_triage_item(ui: &mut Ui) {
     // Drop it before the mutation worker performs its fresh authoritative listing and remove.
     release_triage_attachment(ui, Some(key));
     let now = now_ms();
-    // A triageable Codex idle row is a completed turn with an attached client. It never needs a
-    // stop before the usual archive/remove action.
+    // A triageable idle or done row is a finished turn. It never needs a stop before the
+    // usual archive/remove action.
     let should_stop = !item.is_completed();
     for _ in 0..2 {
         let stage = ui

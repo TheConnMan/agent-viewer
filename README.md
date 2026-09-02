@@ -263,7 +263,7 @@ its SQLite title still shows the prompt.
   selected session it reports a footer notice that reply is not supported, and with nothing
   selected it does nothing at all.
 - `Ctrl+N` — open the triage inbox on every session needing attention: needs-input sessions
-  first, then completed or Codex-idle sessions, longest wait first within each group (see below).
+  first, then idle and done sessions, longest wait first within each group (see below).
   Nothing to triage is a footer notice, not a modal.
 - `Ctrl+R` — rename the selected session inline (the row becomes an edit field).
   Capability-gated per row, not per backend: a row the backend cannot rename (an interactive
@@ -403,7 +403,7 @@ daemon and are joined live.
 ## Triage inbox
 
 `Ctrl+N` (or "Triage sessions needing attention" in the `Ctrl+K` palette) opens a modal over
-the list that walks the shown sessions waiting for input, then every shown active completed or Codex-idle session, one at
+the list that walks the shown sessions waiting for input, then every shown active idle or done session, one at
 a time and longest wait first within each group, with a `3 of 7` progress counter and the next
 few items named underneath. Archived, companion, and hold history is excluded from the completed
 phase. Collapsed groups and filter results are not triaged until they are shown again. `Ctrl+D` applies the same action as pressing `Ctrl+X` twice in the main viewer and

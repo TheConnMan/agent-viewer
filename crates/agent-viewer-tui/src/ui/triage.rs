@@ -1,5 +1,5 @@
 //! The Ctrl+N triage inbox: a modal over the list that walks needs-input sessions and then
-//! completed sessions, oldest first within each group, with the session itself live inside it.
+//! idle and done sessions, oldest first within each group, with the session itself live inside it.
 //!
 //! The modal owns the queue (order, position, up-next) and nothing else. The panel in the
 //! middle is the real attached session — the same `PtySession` the list's Enter attaches to,
@@ -73,12 +73,11 @@ impl TriageItem {
     }
 }
 
-/// PURE queue construction: every needs-input session, then every active completed or Codex-idle
-/// session, oldest first within each group. A Codex idle session has a finished turn but still
-/// has an attached client, so it remains reviewable rather than disappearing from triage.
-/// Claude's idle state remains live/dormant work and is excluded. Completed history is
-/// intentionally excluded: archived, companion, and hold rows are not in the default viewer
-/// list, so triage must not turn their backlog into an archive-review queue.
+/// PURE queue construction: every needs-input session, then every shown idle or done session,
+/// oldest first within each group. Idle means the turn is finished and still reviewable,
+/// regardless of backend. Completed history is intentionally excluded: archived, companion,
+/// and hold rows are not in the default viewer list, so triage must not turn their backlog
+/// into an archive-review queue.
 ///
 /// Built from the sessions shown in the list, so filters and collapsed groups also scope the
 /// inbox. Ordering is ascending `updated_at_ms` (longest wait first), broken by
@@ -90,16 +89,8 @@ pub fn triage_queue<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> Vec<
         .filter_map(|session| {
             let kind = match session.status {
                 Status::NeedsInput { .. } => TriageKind::NeedsInput,
-                Status::Done
+                Status::Done | Status::Idle
                     if !session.hidden
-                        && !session.companion
-                        && !crate::app::is_hold_title(&session.title) =>
-                {
-                    TriageKind::Completed
-                }
-                Status::Idle
-                    if session.backend == BackendKind::Codex
-                        && !session.hidden
                         && !session.companion
                         && !crate::app::is_hold_title(&session.title) =>
                 {
@@ -458,9 +449,13 @@ mod tests {
     fn idle_sessions_enter_the_review_queue() {
         let mut codex_idle = session("codex-idle", 2_000, Status::Idle);
         codex_idle.backend = BackendKind::Codex;
+        let mut grok_idle = session("grok-idle", 1_500, Status::Idle);
+        grok_idle.backend = BackendKind::Grok;
         let items = triage_queue(&[
             session("done", 3_000, Status::Done),
+            session("busy", 500, Status::Working),
             codex_idle,
+            grok_idle,
             session("claude-idle", 1_000, Status::Idle),
         ]);
         assert_eq!(
@@ -468,8 +463,8 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["codex-idle", "done"],
-            "an attached, completed Codex session is reviewable but a live Claude idle session is not"
+            vec!["claude-idle", "grok-idle", "codex-idle", "done"],
+            "idle and done sessions of every backend are reviewable; working sessions are not"
         );
     }
 
