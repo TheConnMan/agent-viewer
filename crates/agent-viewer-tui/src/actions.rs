@@ -595,10 +595,10 @@ pub(crate) fn hide_request(ui: &mut Ui, request: TargetRequest, title: String, h
 
 /// Backends where "archive" (the row leaves the main view, README "Archive, stop, and delete")
 /// has no reversible flag behind it and can only be delete. Grok's leader offers cancel and
-/// delete but nothing to hide with. Claude is in the same position, but `claude rm` also
-/// deletes the job's worktree, so it deliberately keeps refusing `Ctrl+D` until that is chosen.
+/// delete but nothing to hide with. Claude is the same: `claude rm` deletes the background
+/// job and its worktree, which is the chosen meaning of archive on that backend.
 pub(crate) fn archive_is_delete(backend: BackendKind) -> bool {
-    matches!(backend, BackendKind::Grok)
+    matches!(backend, BackendKind::Grok | BackendKind::Claude)
 }
 
 /// Archive on a backend without a hide flag: the `Ctrl+X` twice gesture triage already uses,
@@ -1254,7 +1254,8 @@ mod tests {
     /// whose worker died would ever show.
     #[test]
     fn a_repeated_archive_while_one_is_pending_reports_that_it_is_still_working() {
-        let session = sess("dedup_hide", "/tmp/agentviewer_dedup_hide", 100);
+        let mut session = sess("dedup_hide", "/tmp/agentviewer_dedup_hide", 100);
+        session.backend = BackendKind::Codex;
         let request = TargetRequest::from(&session);
         let mut ui = test_ui_with(vec![session]);
         let (started_tx, started_rx) = channel();
