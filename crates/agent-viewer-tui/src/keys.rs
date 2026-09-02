@@ -5,12 +5,13 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
 use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_tui::app::{Row, Section};
 use agent_viewer_tui::attach::key_to_bytes;
-use agent_viewer_tui::composer::CommandEntry;
+use agent_viewer_tui::composer::{CommandEntry, DetachTracker};
 use agent_viewer_tui::shared_listing::TargetRequest;
 use agent_viewer_tui::ui::{
     Mode, PaletteAction, PaletteGroup, PaletteItem, PaletteSessionTarget, PaletteState,
@@ -755,12 +756,7 @@ fn handle_wall_key(
     // tracker — so the first Left after typing on the wall would back out instead of moving
     // the cursor, mid-edit.
     let tracker = ui.detach_trackers.entry(fkey.clone()).or_default();
-    match key.code {
-        KeyCode::Char(_) => tracker.on_char(),
-        KeyCode::Backspace => tracker.on_backspace(),
-        KeyCode::Enter => tracker.on_enter(),
-        _ => {}
-    }
+    feed_detach_tracker(tracker, key, fkey.0);
     if let Some(bytes) = key_to_bytes(key)
         && let Some(pty) = ui.attached.get_mut(&fkey)
     {
@@ -1676,18 +1672,37 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
 
     // Track pending input so the Left-gate knows whether the line is mid-edit.
     if let Some(tracker) = ui.detach_trackers.get_mut(&fkey) {
-        match key.code {
-            KeyCode::Char(_) => tracker.on_char(),
-            KeyCode::Backspace => tracker.on_backspace(),
-            KeyCode::Enter => tracker.on_enter(),
-            _ => {}
-        }
+        feed_detach_tracker(tracker, key, fkey.0);
     }
 
     if let Some(bytes) = key_to_bytes(key)
         && let Some(pty) = ui.attached.get_mut(&fkey)
     {
         let _ = pty.write_input(&bytes);
+    }
+}
+
+/// Keep a session's Left-gate tracker in step with one forwarded key.
+///
+/// Plain characters and Backspace move the pending count; Enter submits. The chords the child
+/// treats as "discard the line" reset it, and which those are was measured live on 2026-09-02
+/// (Claude 2.1.258 `attach`, Codex 0.152.1): Ctrl+C and Ctrl+U clear the draft in both;
+/// Ctrl+L clears neither (Claude keeps the text, Codex only repaints); Esc clears in Claude as
+/// a fast double-tap and never in Codex. So Esc feeds the double-tap rule for Claude only —
+/// a reset the child did not perform would open the gate on a line that still has text, and
+/// the next Left would back out mid-edit, which is worse than a gate stuck shut. A Ctrl chord
+/// is never a typed character, so `Ctrl+C` must not count as one. Every key is still
+/// forwarded unchanged; Esc mid-turn stays the child's interrupt.
+fn feed_detach_tracker(tracker: &mut DetachTracker, key: KeyEvent, backend: BackendKind) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc if backend == BackendKind::Claude => tracker.on_esc(Instant::now()),
+        KeyCode::Char('c' | 'u') if ctrl => tracker.on_clear(),
+        KeyCode::Char(_) if ctrl => tracker.on_other(),
+        KeyCode::Char(_) => tracker.on_char(),
+        KeyCode::Backspace => tracker.on_backspace(),
+        KeyCode::Enter => tracker.on_enter(),
+        _ => tracker.on_other(),
     }
 }
 
@@ -1882,9 +1897,10 @@ fn edit_reply(code: KeyCode, ui: &mut Ui) {
 pub(crate) mod tests {
     use super::{
         ATTACHED_CODEX_WHEEL_ROWS, MouseAction, MouseTarget, ensure_completions,
-        handle_attached_key, handle_key, handle_mouse, handle_mouse_event, handle_palette_key,
-        handle_paste, handle_rename_key, handle_triage_key, is_quit_chord, open_filter,
-        open_palette, palette_items, request_completions, set_mouse_capture, wall_input_target,
+        feed_detach_tracker, handle_attached_key, handle_key, handle_mouse, handle_mouse_event,
+        handle_palette_key, handle_paste, handle_rename_key, handle_triage_key, is_quit_chord,
+        open_filter, open_palette, palette_items, request_completions, set_mouse_capture,
+        wall_input_target,
     };
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
@@ -2744,6 +2760,83 @@ pub(crate) mod tests {
             "a half-typed wall line must not read as an empty input line"
         );
         kill_attached(&mut ui);
+    }
+
+    /// The child's own clear chords empty its line; the gate has to follow, or the Left after
+    /// a Ctrl+C is forwarded as cursor motion until something is submitted.
+    #[test]
+    fn clear_chords_reopen_the_left_gate_on_every_backend() {
+        for backend in [BackendKind::Claude, BackendKind::Codex] {
+            for c in ['c', 'u'] {
+                let mut tracker = DetachTracker::new();
+                feed_detach_tracker(
+                    &mut tracker,
+                    key(KeyCode::Char('x'), KeyModifiers::NONE),
+                    backend,
+                );
+                assert!(!tracker.detach_on_left(), "typing must shut the gate");
+
+                feed_detach_tracker(
+                    &mut tracker,
+                    key(KeyCode::Char(c), KeyModifiers::CONTROL),
+                    backend,
+                );
+
+                assert!(
+                    tracker.detach_on_left(),
+                    "Ctrl+{c} must reopen the gate on {backend:?}"
+                );
+            }
+        }
+    }
+
+    /// Claude clears on a fast double Esc; Codex never clears on Esc, so its gate must stay
+    /// shut or the next Left would back out of a line that still has text.
+    #[test]
+    fn a_fast_double_esc_reopens_the_gate_for_claude_only() {
+        for (backend, reopens) in [(BackendKind::Claude, true), (BackendKind::Codex, false)] {
+            let mut tracker = DetachTracker::new();
+            feed_detach_tracker(
+                &mut tracker,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                backend,
+            );
+            feed_detach_tracker(&mut tracker, key(KeyCode::Esc, KeyModifiers::NONE), backend);
+            assert!(
+                !tracker.detach_on_left(),
+                "a lone Esc never reopens the gate"
+            );
+
+            feed_detach_tracker(&mut tracker, key(KeyCode::Esc, KeyModifiers::NONE), backend);
+
+            assert_eq!(tracker.detach_on_left(), reopens, "{backend:?}");
+        }
+    }
+
+    /// Ctrl+L repaints in Codex and keeps the text in Claude, so it is neither a clear nor
+    /// typed text; other Ctrl chords (Ctrl+O, Ctrl+B) are not typed text either.
+    #[test]
+    fn non_clearing_ctrl_chords_leave_the_gate_where_it_was() {
+        let mut empty = DetachTracker::new();
+        feed_detach_tracker(
+            &mut empty,
+            key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            BackendKind::Claude,
+        );
+        assert!(empty.detach_on_left());
+
+        let mut dirty = DetachTracker::new();
+        feed_detach_tracker(
+            &mut dirty,
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            BackendKind::Claude,
+        );
+        feed_detach_tracker(
+            &mut dirty,
+            key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            BackendKind::Claude,
+        );
+        assert!(!dirty.detach_on_left());
     }
 
     /// The wheel scrolls the tile under the pointer back over its retained output, and does

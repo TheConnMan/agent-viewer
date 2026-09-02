@@ -5,6 +5,7 @@
 use agent_viewer_core::BackendKind;
 use agent_viewer_core::router::AUTO_MODEL;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// What an entry invokes. The owner is stored separately because viewer commands have no
 /// provider and a provider can expose more than one command kind.
@@ -757,25 +758,63 @@ impl Composer {
 #[derive(Debug, Clone, Default)]
 pub struct DetachTracker {
     pending: u32,
+    /// When the last Esc arrived, while a second one would still count as a double-tap.
+    esc_armed: Option<Instant>,
 }
+
+/// How close two Escs must be for Claude to treat them as "clear the input". Claude's own
+/// window is 600 ms (measured 2026-09-02 on 2.1.258: 150 ms apart cleared, 1.5 s apart did
+/// not). Ours is deliberately shorter: a pair Claude accepted but we missed only leaves the
+/// gate shut until the next clear, while a pair we accepted but Claude ignored would open
+/// the gate on a line that still has text — and the next Left would back out mid-edit.
+pub const ESC_DOUBLE_TAP: Duration = Duration::from_millis(500);
 
 impl DetachTracker {
     pub fn new() -> DetachTracker {
-        DetachTracker { pending: 0 }
+        DetachTracker {
+            pending: 0,
+            esc_armed: None,
+        }
     }
 
     pub fn on_char(&mut self) {
         self.pending += 1;
+        self.esc_armed = None;
     }
 
     /// Backspace saturates at zero (no underflow).
     pub fn on_backspace(&mut self) {
         self.pending = self.pending.saturating_sub(1);
+        self.esc_armed = None;
     }
 
     /// Enter (submit) resets the pending count.
     pub fn on_enter(&mut self) {
         self.pending = 0;
+        self.esc_armed = None;
+    }
+
+    /// A chord the child treats as "discard the line" (Ctrl+C, Ctrl+U in both backends)
+    /// resets the pending count. The chord is still forwarded; this only keeps the gate
+    /// honest, so the Left after a clear backs out instead of nudging an empty line's cursor.
+    pub fn on_clear(&mut self) {
+        self.pending = 0;
+        self.esc_armed = None;
+    }
+
+    /// Esc clears only as a double-tap inside [`ESC_DOUBLE_TAP`], which is Claude's rule; a
+    /// lone Esc leaves the line alone there, and Codex never clears on Esc at all, so the
+    /// caller only routes Claude's Esc here.
+    pub fn on_esc(&mut self, now: Instant) {
+        match self.esc_armed.take() {
+            Some(armed) if now.duration_since(armed) <= ESC_DOUBLE_TAP => self.pending = 0,
+            _ => self.esc_armed = Some(now),
+        }
+    }
+
+    /// Any other key breaks an Esc double-tap in progress.
+    pub fn on_other(&mut self) {
+        self.esc_armed = None;
     }
 
     /// Left detaches only when there is no pending input.
@@ -787,6 +826,62 @@ impl DetachTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_chord_reopens_the_left_gate_after_typing() {
+        let mut tracker = DetachTracker::new();
+        tracker.on_char();
+        tracker.on_char();
+        assert!(
+            !tracker.detach_on_left(),
+            "typed text must hold the gate shut"
+        );
+
+        tracker.on_clear();
+
+        assert!(
+            tracker.detach_on_left(),
+            "a cleared line must read as empty"
+        );
+    }
+
+    #[test]
+    fn esc_clears_only_as_a_fast_double_tap() {
+        let start = Instant::now();
+        let mut tracker = DetachTracker::new();
+        tracker.on_char();
+
+        tracker.on_esc(start);
+        assert!(
+            !tracker.detach_on_left(),
+            "a lone Esc leaves the line alone"
+        );
+
+        tracker.on_esc(start + ESC_DOUBLE_TAP + Duration::from_millis(1));
+        assert!(
+            !tracker.detach_on_left(),
+            "a slow second Esc is a new lone Esc"
+        );
+
+        tracker.on_esc(start + ESC_DOUBLE_TAP + Duration::from_millis(100));
+        assert!(
+            tracker.detach_on_left(),
+            "an Esc inside the window completes the double-tap"
+        );
+    }
+
+    #[test]
+    fn a_key_between_two_escs_breaks_the_double_tap() {
+        let start = Instant::now();
+        let mut tracker = DetachTracker::new();
+        tracker.on_char();
+        tracker.on_esc(start);
+        tracker.on_other();
+
+        tracker.on_esc(start + Duration::from_millis(50));
+
+        assert!(!tracker.detach_on_left());
+    }
 
     fn auto_composer(commands: Vec<CommandEntry>) -> Composer {
         let mut composer = Composer::new();
