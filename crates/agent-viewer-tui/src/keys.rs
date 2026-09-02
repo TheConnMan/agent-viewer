@@ -1155,15 +1155,29 @@ fn palette_action_items(
         capability_reason(selected, capabilities.attach, "attach"),
     )];
     if !is_claude_without_archive {
+        // Archive is "the row leaves the main view"; on a backend with no hide flag that is
+        // delete, and the row must say so rather than promise a reversible hide.
+        let archive_by_delete =
+            selected.is_some_and(|session| crate::actions::archive_is_delete(session.backend));
         items.push(action_item(
             PaletteAction::Archive,
             "Archive session",
-            "hide the selected session",
+            if archive_by_delete {
+                "delete the selected session (no archive flag on this backend)"
+            } else {
+                "hide the selected session"
+            },
             Some("⌃D"),
             selected
                 .filter(|session| session.hidden)
                 .map(|_| "unavailable · session is already archived".to_string())
-                .or_else(|| capability_reason(selected, capabilities.archive, "archive")),
+                .or_else(|| {
+                    capability_reason(
+                        selected,
+                        capabilities.archive || archive_by_delete,
+                        "archive",
+                    )
+                }),
         ));
     }
     items.extend([
@@ -5118,6 +5132,95 @@ pub(crate) mod tests {
             "the per-PTY input gate must die with its PTY"
         );
         assert!(!pid_alive(pid), "child {pid} outlived the session view");
+    }
+
+    /// Every mutation the executor sees, by variant name and target id.
+    fn recording_mutation_log(
+        ui: &mut Ui,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = log.clone();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let entry = match &mutation {
+                crate::ops::Mutation::Hide(request) => ("hide", request.id().to_string()),
+                crate::ops::Mutation::Stop(request) => ("stop", request.id().to_string()),
+                crate::ops::Mutation::Remove { request, .. } => {
+                    ("remove", request.id().to_string())
+                }
+                _ => ("other", String::new()),
+            };
+            sink.lock().unwrap().push((entry.0.to_string(), entry.1));
+            Ok(MutationOutcome {
+                notice: "ok".to_string(),
+                spawned: None,
+            })
+        });
+        log
+    }
+
+    fn wait_for_log(
+        log: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        ui: &mut Ui,
+        len: usize,
+    ) -> Vec<(String, String)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            while ui.mutations.poll().is_some() {}
+            if log.lock().unwrap().len() >= len {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        log.lock().unwrap().clone()
+    }
+
+    fn grok_sess(id: &str, status: Status) -> Session {
+        let mut session = sess(id, "/tmp/agentviewer-grok", 100);
+        session.backend = BackendKind::Grok;
+        session.status = status;
+        session
+    }
+
+    #[test]
+    fn ctrl_d_on_a_finished_grok_session_deletes_instead_of_hiding() {
+        let session = grok_sess("grok-done", Status::Done);
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let log = recording_mutation_log(&mut ui);
+        ui.attached.insert(target.clone(), wall_tile_pty());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+        ui.focused_session = Some(session);
+
+        handle_attached_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        let seen = wait_for_log(&log, &mut ui, 1);
+        assert_eq!(
+            seen,
+            vec![("remove".to_string(), "grok-done".to_string())],
+            "a finished Grok session must go straight to delete, never hide"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_on_an_active_grok_session_stops_then_deletes() {
+        let session = grok_sess("grok-busy", Status::Working);
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let log = recording_mutation_log(&mut ui);
+        assert!(ui.app.select_by_key(&(session.backend, session.id.clone())));
+
+        crate::actions::hide_selected(&[], &mut ui, true);
+
+        let seen = wait_for_log(&log, &mut ui, 2);
+        assert_eq!(
+            seen,
+            vec![
+                ("stop".to_string(), "grok-busy".to_string()),
+                ("remove".to_string(), "grok-busy".to_string()),
+            ],
+            "an active Grok session is stopped, then the remove stage runs behind it"
+        );
     }
 
     #[test]

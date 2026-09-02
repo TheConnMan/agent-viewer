@@ -262,11 +262,12 @@ per-backend notes underneath say what actually happens.
 
 How the keys map onto those words today:
 
-- `Ctrl+D` in the list and while attached runs **archive** in the reversible sense only. On a
-  Codex row it archives. On a Claude or Grok row the mutation worker refuses with
-  `<backend> does not support hide` (while attached you are already back in the list by the
-  time the notice lands, which is why it looks like a dead key). It never falls through to
-  delete.
+- `Ctrl+D` in the list, while attached, and as "Archive session" in the palette is **archive**
+  as defined above. On a Codex row it sets the reversible flag. On a Grok row it is the
+  `Ctrl+X` twice gesture: an active session is stopped and then deleted, a finished one is
+  deleted straight away, and the palette row says "delete" so nothing promises a restore. On a
+  Claude row it is still refused with `claude does not support hide`, because `claude rm` also
+  deletes the job's worktree and that fall-through has not been chosen yet.
 - `Ctrl+X` once is **stop**. `Ctrl+X` again within 2s queues the remove stage: on Codex that is
   archive, on Claude and Grok it is delete.
 - `Ctrl+D` inside the triage inbox is the `Ctrl+X` twice gesture, not the list's `Ctrl+D`. It
@@ -320,8 +321,9 @@ archive on Codex and delete on Claude and Grok. `kill` is the two-stage `Ctrl+X`
   signalling it would take the parent and every sibling down with it.
 - `Ctrl+S` — toggle grouping by project / by state.
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
-- `Ctrl+D` / `Ctrl+U` — archive / unarchive, in the reversible sense only, so Codex only; a
-  Claude or Grok row reports `<backend> does not support hide`. While attached, `Ctrl+D` runs
+- `Ctrl+D` / `Ctrl+U` — archive / unarchive. Codex sets and clears its reversible flag. Grok
+  has no flag, so `Ctrl+D` stops and deletes and `Ctrl+U` reports `grok does not support
+  unhide`. A Claude row reports `claude does not support hide`. While attached, `Ctrl+D` runs
   the same archive on that session and returns to the main view. See "Archive, stop, and
   delete" above for what each word means per backend.
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).

@@ -576,6 +576,10 @@ pub(crate) fn hide_selected(_backends: &[Box<dyn Backend>], ui: &mut Ui, hide: b
 
 pub(crate) fn hide_request(ui: &mut Ui, request: TargetRequest, title: String, hide: bool) {
     if hide {
+        if archive_is_delete(request.backend()) {
+            archive_by_delete(ui, request, title);
+            return;
+        }
         submit_mutation(ui, request, &title, "hide", "archiving", Mutation::Hide);
     } else {
         submit_mutation(
@@ -586,6 +590,39 @@ pub(crate) fn hide_request(ui: &mut Ui, request: TargetRequest, title: String, h
             "unarchiving",
             Mutation::Unhide,
         );
+    }
+}
+
+/// Backends where "archive" (the row leaves the main view, README "Archive, stop, and delete")
+/// has no reversible flag behind it and can only be delete. Grok's leader offers cancel and
+/// delete but nothing to hide with. Claude is in the same position, but `claude rm` also
+/// deletes the job's worktree, so it deliberately keeps refusing `Ctrl+D` until that is chosen.
+pub(crate) fn archive_is_delete(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Grok)
+}
+
+/// Archive on a backend without a hide flag: the `Ctrl+X` twice gesture triage already uses,
+/// so an active session is stopped and the remove stage is queued behind the stop, while a
+/// finished one goes straight to remove. Running the stage machine twice arms then fires it.
+fn archive_by_delete(ui: &mut Ui, request: TargetRequest, title: String) {
+    let key = (request.backend(), request.id().to_string());
+    let Some(should_stop) = ui
+        .app
+        .session_for(&key)
+        .map(|session| !session.status.is_finished())
+    else {
+        ui.set_notice("session is no longer available".to_string());
+        return;
+    };
+    let now = now_ms();
+    for _ in 0..2 {
+        let stage = ui.app.kill_stage_for(
+            request.backend(),
+            request.id().to_string(),
+            should_stop,
+            now,
+        );
+        kill_request(ui, request.clone(), title.clone(), stage);
     }
 }
 

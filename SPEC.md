@@ -421,10 +421,13 @@ names as synonyms is what keeps producing "Ctrl+D did nothing" reports:
 | `Backend::remove`, `Mutation::Remove`, `KillStage::Remove`, `Capabilities::delete` | core + `ops.rs` + `actions.rs` | the remove stage: archive on Codex (`remove` calls `cli::archive`), delete on Claude (`claude rm`) and Grok (leader `delete`) |
 | `kill_*`, `KillStage`, `armed_kill` | `actions.rs`, `app.rs` | the two-stage `Ctrl+X` gesture (stop, then remove); never one primitive |
 
-The list's `Ctrl+D` and the attached `Ctrl+D` both submit `Mutation::Hide` and stop there.
-Triage's `Ctrl+D` runs `archive_triage_item`, which drives `kill_stage_for` twice (arm, then
-`Remove`), so it is the `Ctrl+X` twice gesture under an archive label. That asymmetry is the
-open question, not a bug in either path: the README table documents what each key does today.
+Every archive entry point (list `Ctrl+D`, attached `Ctrl+D`, palette "Archive session") goes
+through `hide_request`. For a backend where `archive_is_delete` holds (Grok today) it runs
+`archive_by_delete`, which drives `kill_stage_for` twice (arm, then `Remove`) exactly as
+triage's `archive_triage_item` does, so an active session is stopped and the remove is chained
+behind the stop. Everyone else submits `Mutation::Hide`, and a backend without the capability
+refuses there. Claude is deliberately not in `archive_is_delete`: `claude rm` deletes the job's
+worktree, so the fall-through waits on an explicit decision.
 
 All verified present in `codex --help` (0.144.1):
 - **Create (req 1):** background a detached `codex exec`. Shape:
