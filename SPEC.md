@@ -422,12 +422,12 @@ names as synonyms is what keeps producing "Ctrl+D did nothing" reports:
 | `kill_*`, `KillStage`, `armed_kill` | `actions.rs`, `app.rs` | the two-stage `Ctrl+X` gesture (stop, then remove); never one primitive |
 
 Every archive entry point (list `Ctrl+D`, attached `Ctrl+D`, palette "Archive session") goes
-through `hide_request`. For a backend where `archive_is_delete` holds (Grok today) it runs
+through `hide_request`. For a backend where `archive_is_delete` holds (Claude and Grok) it runs
 `archive_by_delete`, which drives `kill_stage_for` twice (arm, then `Remove`) exactly as
 triage's `archive_triage_item` does, so an active session is stopped and the remove is chained
 behind the stop. Everyone else submits `Mutation::Hide`, and a backend without the capability
-refuses there. Claude is deliberately not in `archive_is_delete`: `claude rm` deletes the job's
-worktree, so the fall-through waits on an explicit decision.
+refuses there. Claude's remove is `claude rm`, which deletes the job's worktree; that is the
+chosen meaning of archive on Claude.
 
 All verified present in `codex --help` (0.144.1):
 - **Create (req 1):** background a detached `codex exec`. Shape:
@@ -824,7 +824,8 @@ pre-signals a Claude pid, even when the marker is missing or unreadable. Stop an
 CLI (`claude stop <short>`, then `claude rm <short>`), so a foreign state-file failure cannot
 fail open into the daemon's crash-restart path. Live 2.1.251 verification showed `claude rm`
 itself durably terminated an active daemon job, making a Viewer-side pre-signal unnecessary.
-There is still no Claude archive capability. `remove` waits longer
+Claude still advertises no reversible archive flag; user-facing archive is delete via
+`claude rm`. `remove` waits longer
 for a Claude daemon-hosted row to settle after stop (~2s, taken from the fresh
 `authoritative_target` row, not a cached one) and fails closed if it is still
 Working/NeedsInput; the 300ms settle stays for everyone else. The viewer never writes or

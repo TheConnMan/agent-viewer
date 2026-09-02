@@ -1141,8 +1141,6 @@ fn palette_action_items(
     ui: &Ui,
     tail_open: bool,
 ) -> Vec<PaletteItem> {
-    let is_claude_without_archive = selected
-        .is_some_and(|session| session.backend == BackendKind::Claude && !capabilities.archive);
     let mut items = vec![action_item(
         PaletteAction::Attach,
         "Attach session",
@@ -1150,32 +1148,30 @@ fn palette_action_items(
         Some("⏎"),
         capability_reason(selected, capabilities.attach, "attach"),
     )];
-    if !is_claude_without_archive {
-        // Archive is "the row leaves the main view"; on a backend with no hide flag that is
-        // delete, and the row must say so rather than promise a reversible hide.
-        let archive_by_delete =
-            selected.is_some_and(|session| crate::actions::archive_is_delete(session.backend));
-        items.push(action_item(
-            PaletteAction::Archive,
-            "Archive session",
-            if archive_by_delete {
-                "delete the selected session (no archive flag on this backend)"
-            } else {
-                "hide the selected session"
-            },
-            Some("⌃D"),
-            selected
-                .filter(|session| session.hidden)
-                .map(|_| "unavailable · session is already archived".to_string())
-                .or_else(|| {
-                    capability_reason(
-                        selected,
-                        capabilities.archive || archive_by_delete,
-                        "archive",
-                    )
-                }),
-        ));
-    }
+    // Archive is "the row leaves the main view"; on a backend with no hide flag that is
+    // delete, and the row must say so rather than promise a reversible hide.
+    let archive_by_delete =
+        selected.is_some_and(|session| crate::actions::archive_is_delete(session.backend));
+    items.push(action_item(
+        PaletteAction::Archive,
+        "Archive session",
+        if archive_by_delete {
+            "delete the selected session (no archive flag on this backend)"
+        } else {
+            "hide the selected session"
+        },
+        Some("⌃D"),
+        selected
+            .filter(|session| session.hidden)
+            .map(|_| "unavailable · session is already archived".to_string())
+            .or_else(|| {
+                capability_reason(
+                    selected,
+                    capabilities.archive || archive_by_delete,
+                    "archive",
+                )
+            }),
+    ));
     items.extend([
         action_item(
             PaletteAction::Unarchive,
@@ -3144,7 +3140,9 @@ pub(crate) mod tests {
         let Mode::Palette(palette) = &ui.mode else {
             panic!("Ctrl+K opens the wall quickswitcher");
         };
-        assert!(!palette.results().any(|item| item.name == "Archive session"));
+        assert!(palette.results().any(|item| {
+            item.name == "Archive session" && item.detail.contains("delete") && item.enabled
+        }));
         assert!(palette.results().any(|item| {
             item.name == "Stop or remove session"
                 && matches!(
@@ -4127,7 +4125,7 @@ pub(crate) mod tests {
 
     impl agent_viewer_core::Backend for ArchivingBackend {
         fn kind(&self) -> BackendKind {
-            BackendKind::Claude
+            BackendKind::Codex
         }
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
             agent_viewer_core::Capabilities {
@@ -5273,6 +5271,15 @@ pub(crate) mod tests {
         session
     }
 
+    fn claude_sess(id: &str, status: Status) -> Session {
+        let mut session = sess(id, "/tmp/agentviewer-claude", 100);
+        session.backend = BackendKind::Claude;
+        session.short_id = Some(id.to_string());
+        session.origin = agent_viewer_core::SessionOrigin::Background;
+        session.status = status;
+        session
+    }
+
     #[test]
     fn ctrl_d_on_a_finished_grok_session_deletes_instead_of_hiding() {
         let session = grok_sess("grok-done", Status::Done);
@@ -5316,8 +5323,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ctrl_d_on_a_finished_claude_session_deletes_instead_of_hiding() {
+        let session = claude_sess("claude-done", Status::Done);
+        let target = (session.backend, session.id.clone());
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let log = recording_mutation_log(&mut ui);
+        ui.attached.insert(target.clone(), wall_tile_pty());
+        ui.mode = Mode::Attached;
+        ui.focused = Some(target.clone());
+        ui.focused_session = Some(session);
+
+        handle_attached_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut ui);
+
+        assert!(matches!(ui.mode, Mode::Normal));
+        let seen = wait_for_log(&log, &mut ui, 1);
+        assert_eq!(
+            seen,
+            vec![("remove".to_string(), "claude-done".to_string())],
+            "a finished Claude session must go straight to delete, never hide"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_on_an_active_claude_session_stops_then_deletes() {
+        let session = claude_sess("claude-busy", Status::Working);
+        let mut ui = test_ui_with(vec![session.clone()]);
+        let log = recording_mutation_log(&mut ui);
+        assert!(ui.app.select_by_key(&(session.backend, session.id.clone())));
+
+        crate::actions::hide_selected(&[], &mut ui, true);
+
+        let seen = wait_for_log(&log, &mut ui, 2);
+        assert_eq!(
+            seen,
+            vec![
+                ("stop".to_string(), "claude-busy".to_string()),
+                ("remove".to_string(), "claude-busy".to_string()),
+            ],
+            "an active Claude session is stopped, then the remove stage runs behind it"
+        );
+    }
+
+    #[test]
     fn ctrl_d_archives_the_attached_session_and_returns_to_the_list() {
-        let session = sess("attached-archive", "/tmp/agentviewer-attached-archive", 100);
+        let mut session = sess("attached-archive", "/tmp/agentviewer-attached-archive", 100);
+        session.backend = BackendKind::Codex;
         let other = sess("list-selection", "/tmp/agentviewer-list-selection", 200);
         let target = (session.backend, session.id.clone());
         let mut ui = test_ui_with(vec![session.clone(), other.clone()]);
@@ -6768,7 +6818,9 @@ pub(crate) mod tests {
     #[test]
     fn ctrl_d_and_ctrl_u_submit_their_archive_operations() {
         for (c, operation) in [('d', "hide"), ('u', "unhide")] {
-            let mut ui = test_ui_with(vec![sess("s1", "/tmp/agentviewer-archive", 100)]);
+            let mut session = sess("s1", "/tmp/agentviewer-archive", 100);
+            session.backend = BackendKind::Codex;
+            let mut ui = test_ui_with(vec![session]);
             select_session_row(&mut ui, "s1");
             let backends: Vec<Box<dyn agent_viewer_core::Backend>> =
                 vec![Box::new(ArchivingBackend)];
@@ -6780,7 +6832,7 @@ pub(crate) mod tests {
                 KeyModifiers::CONTROL
             ));
             assert!(
-                ui.mutations.in_flight(&format!("claude:s1:{operation}")),
+                ui.mutations.in_flight(&format!("codex:s1:{operation}")),
                 "ctrl+{c} must submit {operation}"
             );
             assert!(ui.composer.is_empty());
@@ -6941,20 +6993,22 @@ pub(crate) mod tests {
     /// whichever row the selection was clamped onto in the meantime.
     #[test]
     fn a_palette_action_archives_the_row_it_was_opened_on_not_a_moved_selection() {
-        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
-        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        alpha.backend = BackendKind::Codex;
+        let mut bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        bravo.backend = BackendKind::Codex;
         let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
         let archived = recording_archive_executor(&mut ui);
         assert!(
             ui.app
-                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+                .select_by_key(&(BackendKind::Codex, alpha.id.clone()))
         );
 
         open_palette(&backends, &mut ui);
         assert!(
             ui.app
-                .select_by_key(&(BackendKind::Claude, bravo.id.clone()))
+                .select_by_key(&(BackendKind::Codex, bravo.id.clone()))
         );
         highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::Archive));
         press_palette_code(&mut ui, &backends, KeyCode::Enter);
@@ -6972,14 +7026,16 @@ pub(crate) mod tests {
     /// following the selection onto a session the user never chose.
     #[test]
     fn a_palette_action_whose_row_left_the_listing_notices_instead_of_acting() {
-        let alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
-        let bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        let mut alpha = sess("alpha", "/tmp/agentviewer-palette-alpha", 200);
+        alpha.backend = BackendKind::Codex;
+        let mut bravo = sess("bravo", "/tmp/agentviewer-palette-bravo", 100);
+        bravo.backend = BackendKind::Codex;
         let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
         let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
         let archived = recording_archive_executor(&mut ui);
         assert!(
             ui.app
-                .select_by_key(&(BackendKind::Claude, alpha.id.clone()))
+                .select_by_key(&(BackendKind::Codex, alpha.id.clone()))
         );
 
         open_palette(&backends, &mut ui);
