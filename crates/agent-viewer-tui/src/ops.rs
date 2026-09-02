@@ -1,4 +1,4 @@
-//! Blocking backend mutations (stop/remove/rename/hide), each run to completion on a
+//! Blocking thread commands (archive/unarchive/stop/delete/rename), each run to completion on a
 //! `MutationRunner` worker thread with all data owned (Send).
 
 use std::collections::{HashMap, HashSet};
@@ -33,8 +33,8 @@ pub(crate) enum Mutation {
         require_finished: bool,
     },
     Rename(TargetRequest, String),
-    Hide(TargetRequest),
-    Unhide(TargetRequest),
+    Archive(TargetRequest),
+    Unarchive(TargetRequest),
     /// Spawn a new session. On the runner, not the key path: a codex spawn now talks to the
     /// app-server daemon and may start one, so it is a multi-second blocking call on a bad day
     /// and would freeze the composer if it ran inline like it used to.
@@ -220,7 +220,7 @@ fn run_targeted<F>(
     action: F,
 ) -> Result<MutationOutcome, String>
 where
-    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+    F: FnOnce(&mut dyn Backend, &Session) -> Result<MutationOutcome, String>,
 {
     let result = match authoritative_target(backend, request) {
         Ok(session) => action(backend, &session),
@@ -232,7 +232,7 @@ where
 
 fn run_with_fresh_backend<F>(request: TargetRequest, action: F) -> Result<MutationOutcome, String>
 where
-    F: FnOnce(&dyn Backend, &Session) -> Result<MutationOutcome, String>,
+    F: FnOnce(&mut dyn Backend, &Session) -> Result<MutationOutcome, String>,
 {
     let mut backend = fresh_backend(request.backend());
     let db = ViewerDb::open_default().ok();
@@ -251,7 +251,7 @@ const REMOVE_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
 const CLAUDE_DAEMON_REMOVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOVE_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(60);
 
-fn remove_settle_timeout(session: &Session) -> Duration {
+fn delete_settle_timeout(session: &Session) -> Duration {
     if session.backend == BackendKind::Claude && session.daemon_hosted {
         CLAUDE_DAEMON_REMOVE_SETTLE_TIMEOUT
     } else {
@@ -281,7 +281,7 @@ fn remove_settled_target(
     let mut daemon_hosted = session.daemon_hosted;
     let started = Instant::now();
     while matches!(session.status, Status::Working | Status::NeedsInput { .. })
-        && Instant::now() < started + remove_settle_timeout(&session)
+        && Instant::now() < started + delete_settle_timeout(&session)
     {
         std::thread::sleep(REMOVE_SETTLE_POLL_INTERVAL);
         session = authoritative_target(backend, request).map_err(target_failure)?;
@@ -289,11 +289,24 @@ fn remove_settled_target(
         session.daemon_hosted = daemon_hosted;
     }
     session.daemon_hosted = daemon_hosted;
-    if !backend.capabilities_for(&session).delete {
+    let capabilities = backend.capabilities_for(&session);
+    if !capabilities.delete && !capabilities.can_archive() {
         return Err(format!(
             "{} does not support remove",
             session.backend.name()
         ));
+    }
+    // A provider without delete may still implement the app's remove gesture as archive.
+    // Codex is that provider: it has no destructive delete, so a second Ctrl+X uses the same
+    // reversible archive command as every other archive surface.
+    if !capabilities.delete {
+        return backend
+            .archive(&session)
+            .map(|()| MutationOutcome {
+                notice: format!("archived: {}", session.title),
+                spawned: None,
+            })
+            .map_err(|error| format!("archive failed: {error}"));
     }
     let freshly_active = matches!(session.status, Status::Working | Status::NeedsInput { .. });
     if freshly_active || require_finished && !session.status.is_finished() {
@@ -311,7 +324,7 @@ fn remove_settled_target(
     if let Some(pid) = session.pid.filter(|_| viewer_may_signal) {
         let _ = agent_viewer_core::spawn::terminate(pid, session.backend.name());
     }
-    match backend.remove(&session) {
+    match backend.delete(&session) {
         Ok(()) => Ok(MutationOutcome {
             notice: format!("removed: {}", session.title),
             spawned: None,
@@ -544,32 +557,35 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
                 })
                 .map_err(|error| format!("rename failed: {error}"))
         }),
-        Mutation::Hide(request) => run_with_fresh_backend(request, |backend, session| {
-            if !backend.capabilities_for(session).archive {
-                return Err(format!("{} does not support hide", session.backend.name()));
-            }
-            backend
-                .hide(&session.id)
-                .map(|()| MutationOutcome {
-                    notice: format!("archived: {}", session.title),
-                    spawned: None,
-                })
-                .map_err(|error| format!("{}: {error}", session.backend.name()))
-        }),
-        Mutation::Unhide(request) => run_with_fresh_backend(request, |backend, session| {
-            if !backend.capabilities_for(session).archive {
+        Mutation::Archive(request) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).can_archive() {
                 return Err(format!(
-                    "{} does not support unhide",
+                    "{} does not support archive",
                     session.backend.name()
                 ));
             }
             backend
-                .unhide(&session.id)
+                .archive(session)
+                .map(|()| MutationOutcome {
+                    notice: format!("archived: {}", session.title),
+                    spawned: None,
+                })
+                .map_err(|error| format!("archive failed: {error}"))
+        }),
+        Mutation::Unarchive(request) => run_with_fresh_backend(request, |backend, session| {
+            if !backend.capabilities_for(session).can_unarchive() {
+                return Err(format!(
+                    "{} does not support unarchive",
+                    session.backend.name()
+                ));
+            }
+            backend
+                .unarchive(session)
                 .map(|()| MutationOutcome {
                     notice: format!("unarchived: {}", session.title),
                     spawned: None,
                 })
-                .map_err(|error| format!("{}: {error}", session.backend.name()))
+                .map_err(|error| format!("unarchive failed: {error}"))
         }),
         Mutation::SpawnRouted {
             target,
@@ -877,7 +893,8 @@ mod tests {
         assert!(capabilities.stop);
         assert!(capabilities.rename);
         assert!(capabilities.delete);
-        assert!(!capabilities.archive);
+        assert!(capabilities.can_archive());
+        assert!(!capabilities.can_unarchive());
 
         let command = backend
             .attach_command(&grok)
@@ -1420,7 +1437,7 @@ mod tests {
             unreachable!("spawn is not exercised by remove")
         }
 
-        fn remove(&self, session: &Session) -> agent_viewer_core::Result<()> {
+        fn delete(&self, session: &Session) -> agent_viewer_core::Result<()> {
             self.removed_ids.borrow_mut().push(session.id.clone());
             Ok(())
         }

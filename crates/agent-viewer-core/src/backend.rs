@@ -150,11 +150,21 @@ pub enum SessionOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// The provider keeps the thread and can restore it later.
+    Reversible,
+    /// The provider has no archive flag, so archiving removes its thread record.
+    Deletes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub spawn: bool,
     pub attach: bool,
     pub rename: bool,
-    pub archive: bool,
+    /// `None` when this particular thread cannot be archived. The mode tells callers whether
+    /// archive is reversible without teaching the app which providers have archive flags.
+    pub archive: Option<ArchiveMode>,
     pub delete: bool,
     pub stop: bool,
 }
@@ -166,10 +176,18 @@ impl Capabilities {
             spawn: false,
             attach: false,
             rename: false,
-            archive: false,
+            archive: None,
             delete: false,
             stop: false,
         }
+    }
+
+    pub const fn can_archive(self) -> bool {
+        self.archive.is_some()
+    }
+
+    pub const fn can_unarchive(self) -> bool {
+        matches!(self.archive, Some(ArchiveMode::Reversible))
     }
 }
 
@@ -415,20 +433,22 @@ pub trait Backend: Send {
     fn available_models(&self) -> Vec<String> {
         vec!["default".to_string()]
     }
-    fn hide(&self, id: &str) -> crate::error::Result<()> {
-        let _ = id;
+    /// Archive this thread according to the provider's own lifecycle. Providers without a
+    /// reversible archive flag implement this as stop-if-active followed by delete.
+    fn archive(&mut self, session: &Session) -> crate::error::Result<()> {
+        let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
-    fn unhide(&self, id: &str) -> crate::error::Result<()> {
-        let _ = id;
+    fn unarchive(&mut self, session: &Session) -> crate::error::Result<()> {
+        let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
     fn stop(&self, session: &Session) -> crate::error::Result<()> {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
-    /// Second-stage Ctrl+X hard-remove. Default Unsupported.
-    fn remove(&self, session: &Session) -> crate::error::Result<()> {
+    /// Delete the provider's thread record. Default Unsupported.
+    fn delete(&self, session: &Session) -> crate::error::Result<()> {
         let _ = session;
         Err(crate::error::Error::Unsupported(self.kind().name()))
     }
@@ -444,6 +464,38 @@ pub trait Backend: Send {
         &self,
         session: &Session,
     ) -> std::result::Result<std::process::Command, crate::error::AttachRefusal>;
+}
+
+/// Wait for a successful provider stop to become authoritative before a destructive archive
+/// continues. This is part of the thread-action boundary: callers issue one Archive command;
+/// providers that archive by deletion use this helper internally rather than exposing a
+/// stop-then-delete workflow to the app.
+pub(crate) fn wait_until_stopped<B: Backend + ?Sized>(
+    backend: &mut B,
+    id: &str,
+    timeout: std::time::Duration,
+) -> crate::error::Result<Session> {
+    let started = std::time::Instant::now();
+    loop {
+        let session = backend
+            .list()?
+            .into_iter()
+            .find(|session| session.id == id)
+            .ok_or_else(|| {
+                crate::error::Error::Command(
+                    "thread disappeared while waiting for stop to settle".to_string(),
+                )
+            })?;
+        if !matches!(session.status, Status::Working | Status::NeedsInput { .. }) {
+            return Ok(session);
+        }
+        if started.elapsed() >= timeout {
+            return Err(crate::error::Error::Command(
+                "archive refused: thread remained active after stop".to_string(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
 }
 
 /// Remove duplicates while preserving first-seen order (case-sensitive exact match).

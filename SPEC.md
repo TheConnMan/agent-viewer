@@ -128,8 +128,9 @@ returned `sessionId` exactly, and submits the prompt to that identity. It return
 exact identity reports `Working` in the resident roster. The official leader continues the turn
 after Agent Viewer disconnects. Rename uses `_x.ai/session/rename`; delete uses
 `_x.ai/session/delete`; model discovery uses `_x.ai/models/list`. A model discovery failure
-returns the built in `default` model. Grok exposes no archive or unarchive operation, so those
-capabilities remain false. Attach is exactly `grok --leader --resume <session id>` with the child
+returns the built in `default` model. Grok exposes no native archive or unarchive operation, so
+its user-facing archive is stop-if-active plus delete and cannot be restored. Attach is exactly
+`grok --leader --resume <session id>` with the child
 working directory set to the selected row's working directory. The explicit hidden leader flag
 prevents the embedded pager startup path from terminating the shared leader before resume.
 
@@ -411,23 +412,22 @@ notice behavior.
 
 **Vocabulary.** README "Archive, stop, and delete" is the user-facing contract: *archive* means
 the row leaves the main view, *stop* means the agent stops and the row stays, *delete* means the
-backend's record is gone. The code does not use those words one-to-one, and treating the code
-names as synonyms is what keeps producing "Ctrl+D did nothing" reports:
+backend's record is gone. The provider interface uses those words directly:
 
 | Code name | Where | User word |
 |---|---|---|
-| `Backend::hide` / `unhide`, `Mutation::Hide` / `Unhide`, `Capabilities::archive` | core + `ops.rs` | reversible archive. Only Codex advertises it; Claude and Grok refuse with `does not support hide` |
+| `Backend::archive` / `unarchive`, `Mutation::Archive` / `Unarchive`, `Capabilities::archive` | core + `ops.rs` | archive. `ArchiveMode::Reversible` for Codex; `ArchiveMode::Deletes` for deletable Claude and Grok rows |
 | `Backend::stop`, `Mutation::Stop`, `KillStage::Stop` | core + `ops.rs` + `actions.rs` | stop |
-| `Backend::remove`, `Mutation::Remove`, `KillStage::Remove`, `Capabilities::delete` | core + `ops.rs` + `actions.rs` | the remove stage: archive on Codex (`remove` calls `cli::archive`), delete on Claude (`claude rm`) and Grok (leader `delete`) |
+| `Backend::delete`, `Mutation::Remove`, `KillStage::Remove`, `Capabilities::delete` | core + `ops.rs` + `actions.rs` | the remove gesture's destructive option: unsupported on Codex, `claude rm` on Claude, leader `delete` on Grok. The gesture falls back to Archive when delete is unsupported |
 | `kill_*`, `KillStage`, `armed_kill` | `actions.rs`, `app.rs` | the two-stage `Ctrl+X` gesture (stop, then remove); never one primitive |
 
 Every archive entry point (list `Ctrl+D`, attached `Ctrl+D`, palette "Archive session") goes
-through `hide_request`. For a backend where `archive_is_delete` holds (Claude and Grok) it runs
-`archive_by_delete`, which drives `kill_stage_for` twice (arm, then `Remove`) exactly as
-triage's `archive_triage_item` does, so an active session is stopped and the remove is chained
-behind the stop. Everyone else submits `Mutation::Hide`, and a backend without the capability
-refuses there. Claude's remove is `claude rm`, which deletes the job's worktree; that is the
-chosen meaning of archive on Claude.
+through `archive_request` and submits one `Mutation::Archive`; triage calls the same function.
+The mutation worker resolves a fresh authoritative thread and calls `Backend::archive`. Codex
+implements that with its reversible CLI flag. Claude and Grok implement it as stop-if-active,
+wait for authoritative status to settle, then provider delete. No TUI surface knows or rebuilds
+those provider steps. `Mutation::Stop` likewise resolves one fresh thread and calls only
+`Backend::stop`, so stop never removes a row.
 
 All verified present in `codex --help` (0.144.1):
 - **Create (req 1):** background a detached `codex exec`. Shape:
@@ -473,14 +473,13 @@ All verified present in `codex --help` (0.144.1):
   reached. The sandbox posture is unchanged and carried onto the new path: `thread/start` pins
   `sandbox: danger-full-access` and `approvalPolicy: never` for exactly the evidence above.
   See "Codex attach/resume" below.
-- **Hide (req 3):** `codex archive <id>`; **unhide:** `codex unarchive <id>`.
-- **Remove is archive, deliberately.** The optional `codex delete <id>` hard-delete this spec
-  once contemplated was not built: `CodexBackend::remove` calls `cli::archive`, the same
-  `codex archive <id>` that `Ctrl+D` runs. So the second `Ctrl+X` press on a Codex row hides it
-  rather than destroying its transcript, and `Ctrl+U` brings it back. Claude's `remove` is a
-  real delete (`claude rm <short>`, which also removes the job's worktree), so the two backends
-  genuinely differ here and the row's capabilities, not a shared assumption, decide what a
-  remove costs.
+- **Archive (req 3):** `codex archive <id>`; **unarchive:** `codex unarchive <id>`.
+- **Delete is unsupported; the remove gesture uses archive deliberately.** The optional
+  `codex delete <id>` hard-delete this spec once contemplated was not built. Codex advertises
+  no delete capability, so the second `Ctrl+X` press routes through the same `Backend::archive`
+  command as `Ctrl+D`. It hides the row without destroying its transcript, and `Ctrl+U` brings
+  it back. Claude and Grok advertise real delete, so the row's capabilities decide what the
+  remove gesture costs without assigning Codex a false delete capability.
 - **Attach/resume (superseded, kept for the record):** `codex resume <id>` (or
   `codex exec resume <id>`), exec'd into the user's terminal from the TUI. This is still the
   command for a session with no live turn, but it is NOT how a live session is joined; see
@@ -769,7 +768,8 @@ model list and safely retains its built in `default` entry when that request is 
 ## Claude mutations — CLI subcommands, plus one deliberate state-file write
 
 Spawn is `claude --bg`, attach is `claude attach <short>`, stop is `claude stop <short>` for
-nonterminal background rows, and remove is `claude rm <short>`. Stop retains the
+nonterminal background rows, archive is stop-if-active followed by `claude rm <short>`, and
+delete is `claude rm <short>`. Stop retains the
 conversation for later attach. A second press queues removal after stop succeeds. If stop fails,
 removal is discarded and confirmation is cleared, so the next press retries stop. Rename is the
 single exception to "delegate to a CLI subcommand": Claude ships no `rename` subcommand, so
@@ -944,9 +944,9 @@ Cargo workspace, two crates plus one vendored dependency. Live-refresh the regis
   `app_server.rs` is the JSON-RPC client for the `codex app-server` daemon (discovery, the pure
   request builders, and the blocking WebSocket exchange that starts and interrupts threads); and
   `mod.rs` carries the `Backend` impl plus the three pure routing seams (`spawn_route`,
-  `attach_route`, `stop_route`).
+  `attach_route`, `stop_route`, and its reversible archive implementation).
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
-  trust bootstrap, and spawn/attach/stop/remove/rename.
+  trust bootstrap, and spawn/attach/archive/stop/delete/rename.
 - `grok.rs` is the Grok backend and the reusable public `GrokLifecycle`: read only durable
   discovery, bounded transcript tails, PR refs from successful chat-history creation pairs,
   leader registration and framing, roster precedence, lifecycle requests, diagnostics, model
@@ -1216,8 +1216,8 @@ in flight, since `install_wall_join` bails on `!wall.owns(&key)` before it spawn
 A modal walking every shown session awaiting input, then every shown active idle or done session (excluding))
 archived, companion, and hold history), longest wait first within each cohort, with the session itself
 attached live into the middle panel. The reserved controls are `Ctrl+N` next, `Ctrl+P` previous,
-`Ctrl+D` applies the main-view `Ctrl+X`-twice action (including stop-then-remove for an active
-item), and bare `Esc` leaves
+`Ctrl+D` submits the same provider-neutral archive command as the list, attached view, and
+palette, and bare `Esc` leaves
 (`Ctrl+]` remains a compatibility detach chord). Everything else goes to the session, because typing into the
 agent's own input path is how a prompt gets answered; there is no second reply mechanism. Collapsed groups and
 filter results are outside the snapshot until they are shown again. The

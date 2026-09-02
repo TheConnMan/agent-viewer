@@ -1,5 +1,5 @@
 //! Key routing for every input mode, plus the actions those keys trigger (attach, spawn,
-//! rename, stop/remove, hide). Everything here mutates the shared `Ui` state owned by the
+//! rename, stop/remove, archive). Everything here mutates the shared `Ui` state owned by the
 //! run loop in `main.rs`.
 
 use std::collections::HashSet;
@@ -7,7 +7,9 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Session, Status};
+use agent_viewer_core::backend::{
+    ArchiveMode, Backend, BackendKind, Capabilities, Session, Status,
+};
 use agent_viewer_core::router::AUTO_MODEL;
 use agent_viewer_tui::app::{Row, Section};
 use agent_viewer_tui::attach::key_to_bytes;
@@ -20,12 +22,12 @@ use agent_viewer_tui::ui::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::actions::{
-    activate_selected, apply_rename, archive_triage_item, attach_selected, back_triage_item,
-    close_triage, ensure_completions, ensure_models, focus_wall_tile, hide_request, hide_selected,
+    activate_selected, apply_rename, archive_request, archive_triage_item, attach_selected,
+    back_triage_item, close_triage, ensure_completions, ensure_models, focus_wall_tile,
     kill_request, kill_selected, move_wall_selection, open_filter, open_rename,
     open_rename_request, open_reply, open_triage, request_completions, scroll_wall_tile,
-    send_reply, skip_triage_item, spawn_from_composer, submit_attach, toggle_group_if_header,
-    toggle_wall,
+    send_reply, set_archive_selected, skip_triage_item, spawn_from_composer, submit_attach,
+    toggle_group_if_header, toggle_wall, unarchive_request,
 };
 use crate::{Key, Refresher, Ui};
 
@@ -782,8 +784,8 @@ fn handle_normal_key<B: ratatui::backend::Backend>(
     if ctrl {
         match key.code {
             KeyCode::Char('a') => ui.app.toggle_show_all(),
-            KeyCode::Char('d') => hide_selected(backends, ui, true),
-            KeyCode::Char('u') => hide_selected(backends, ui, false),
+            KeyCode::Char('d') => set_archive_selected(backends, ui, true),
+            KeyCode::Char('u') => set_archive_selected(backends, ui, false),
             KeyCode::Char('s') => ui.app.toggle_group_mode(),
             KeyCode::Char('r') => open_rename(backends, ui),
             KeyCode::Char('e') => open_reply(backends, ui),
@@ -1150,12 +1152,11 @@ fn palette_action_items(
     )];
     // Archive is "the row leaves the main view"; on a backend with no hide flag that is
     // delete, and the row must say so rather than promise a reversible hide.
-    let archive_by_delete =
-        selected.is_some_and(|session| crate::actions::archive_is_delete(session.backend));
+    let destructive_archive = matches!(capabilities.archive, Some(ArchiveMode::Deletes));
     items.push(action_item(
         PaletteAction::Archive,
         "Archive session",
-        if archive_by_delete {
+        if destructive_archive {
             "delete the selected session (no archive flag on this backend)"
         } else {
             "hide the selected session"
@@ -1164,13 +1165,7 @@ fn palette_action_items(
         selected
             .filter(|session| session.hidden)
             .map(|_| "unavailable · session is already archived".to_string())
-            .or_else(|| {
-                capability_reason(
-                    selected,
-                    capabilities.archive || archive_by_delete,
-                    "archive",
-                )
-            }),
+            .or_else(|| capability_reason(selected, capabilities.can_archive(), "archive")),
     ));
     items.extend([
         action_item(
@@ -1181,7 +1176,7 @@ fn palette_action_items(
             selected
                 .filter(|session| !session.hidden)
                 .map(|_| "unavailable · session is not archived".to_string())
-                .or_else(|| capability_reason(selected, capabilities.archive, "unarchive")),
+                .or_else(|| capability_reason(selected, capabilities.can_unarchive(), "unarchive")),
         ),
         action_item(
             PaletteAction::Rename,
@@ -1214,7 +1209,7 @@ fn palette_action_items(
             Some("⌃X"),
             capability_reason(
                 selected,
-                capabilities.stop || capabilities.delete,
+                capabilities.stop || capabilities.delete || capabilities.can_archive(),
                 "stop or remove",
             ),
         ),
@@ -1472,15 +1467,29 @@ fn execute_cached_palette_action(
         PaletteAction::Attach => {
             submit_attach(ui, request);
         }
-        PaletteAction::Archive => hide_request(ui, request, title, true),
+        PaletteAction::Archive => archive_request(ui, request, title),
         PaletteAction::Unarchive => {
-            hide_request(ui, request, title, false);
+            unarchive_request(ui, request, title);
         }
         PaletteAction::Rename => {
             open_rename_request(ui, request);
         }
         PaletteAction::StopOrRemove => {
-            let stage = ui.app.kill_stage(agent_viewer_core::spawn::now_ms());
+            let key = (request.backend(), request.id().to_string());
+            let Some(should_stop) = ui
+                .app
+                .session_for(&key)
+                .map(|session| !session.status.is_finished())
+            else {
+                ui.set_notice("session is no longer available".to_string());
+                return;
+            };
+            let stage = ui.app.kill_stage_for(
+                request.backend(),
+                request.id().to_string(),
+                should_stop,
+                agent_viewer_core::spawn::now_ms(),
+            );
             kill_request(ui, request, title, stage);
         }
         _ => {}
@@ -1548,8 +1557,8 @@ fn execute_palette_selection<B: ratatui::backend::Backend>(
             PaletteAction::Attach => {
                 attach_selected(ui);
             }
-            PaletteAction::Archive => hide_selected(backends, ui, true),
-            PaletteAction::Unarchive => hide_selected(backends, ui, false),
+            PaletteAction::Archive => set_archive_selected(backends, ui, true),
+            PaletteAction::Unarchive => set_archive_selected(backends, ui, false),
             PaletteAction::Rename => open_rename(backends, ui),
             PaletteAction::Reply => open_reply(backends, ui),
             PaletteAction::Triage => open_triage(ui),
@@ -1630,15 +1639,17 @@ fn handle_attached_key(key: KeyEvent, ui: &mut Ui) {
     }
 
     // Archive the session that owns this terminal, rather than the list's potentially refreshed
-    // selection. Close the PTY after scheduling the background mutation so the user returns to
-    // the main view immediately.
+    // selection. Close the PTY before scheduling the background mutation: Claude and Grok
+    // archive by deletion, and their provider command must not race a still-resident attach
+    // client for the same thread.
     if ctrl && matches!(key.code, KeyCode::Char('d')) {
-        if let Some(session) = ui.focused_session.clone() {
-            hide_request(ui, TargetRequest::from(&session), session.title, true);
+        let session = ui.focused_session.clone();
+        close_attached(ui);
+        if let Some(session) = session {
+            archive_request(ui, TargetRequest::from(&session), session.title);
         } else {
             ui.set_notice("attached session is no longer available".to_string());
         }
-        close_attached(ui);
         return;
     }
 
@@ -1901,7 +1912,7 @@ pub(crate) mod tests {
     use crate::{NoticeState, Ui};
     use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS};
     use agent_viewer_core::router::AUTO_MODEL;
-    use agent_viewer_core::{BackendKind, Session, Status};
+    use agent_viewer_core::{ArchiveMode, BackendKind, Session, Status};
     use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, GroupMode, Row, Section};
     use agent_viewer_tui::composer::CommandEntry;
     use agent_viewer_tui::mutations::{AttachRunner, MutationOutcome, MutationRunner};
@@ -4129,7 +4140,7 @@ pub(crate) mod tests {
         }
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
             agent_viewer_core::Capabilities {
-                archive: true,
+                archive: Some(ArchiveMode::Reversible),
                 ..agent_viewer_core::Capabilities::none()
             }
         }
@@ -4162,14 +4173,14 @@ pub(crate) mod tests {
 
         fn capabilities(&self) -> agent_viewer_core::Capabilities {
             agent_viewer_core::Capabilities {
-                archive: true,
+                archive: Some(ArchiveMode::Reversible),
                 ..agent_viewer_core::Capabilities::none()
             }
         }
 
         fn capabilities_for(&self, session: &Session) -> agent_viewer_core::Capabilities {
             agent_viewer_core::Capabilities {
-                archive: session.daemon_hosted,
+                archive: session.daemon_hosted.then_some(ArchiveMode::Reversible),
                 ..agent_viewer_core::Capabilities::none()
             }
         }
@@ -4903,7 +4914,7 @@ pub(crate) mod tests {
         .expect("accept disabled action");
 
         assert!(matches!(ui.mode, Mode::Normal));
-        assert!(ui.mutations.in_flight("codex:external:hide"));
+        assert!(ui.mutations.in_flight("codex:external:archive"));
     }
 
     /// Picking a model explicitly is a decision to use that provider, so it must leave Auto even
@@ -5232,7 +5243,7 @@ pub(crate) mod tests {
         let sink = log.clone();
         ui.mutation_executor = std::sync::Arc::new(move |mutation| {
             let entry = match &mutation {
-                crate::ops::Mutation::Hide(request) => ("hide", request.id().to_string()),
+                crate::ops::Mutation::Archive(request) => ("archive", request.id().to_string()),
                 crate::ops::Mutation::Stop(request) => ("stop", request.id().to_string()),
                 crate::ops::Mutation::Remove { request, .. } => {
                     ("remove", request.id().to_string())
@@ -5281,7 +5292,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_d_on_a_finished_grok_session_deletes_instead_of_hiding() {
+    fn ctrl_d_on_a_finished_grok_session_submits_archive() {
         let session = grok_sess("grok-done", Status::Done);
         let target = (session.backend, session.id.clone());
         let mut ui = test_ui_with(vec![session.clone()]);
@@ -5294,36 +5305,37 @@ pub(crate) mod tests {
         handle_attached_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut ui);
 
         assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&target),
+            "attached Ctrl+D must close Grok before its destructive archive runs"
+        );
         let seen = wait_for_log(&log, &mut ui, 1);
         assert_eq!(
             seen,
-            vec![("remove".to_string(), "grok-done".to_string())],
-            "a finished Grok session must go straight to delete, never hide"
+            vec![("archive".to_string(), "grok-done".to_string())],
+            "every Grok archive surface must submit the provider-neutral archive command"
         );
     }
 
     #[test]
-    fn ctrl_d_on_an_active_grok_session_stops_then_deletes() {
+    fn ctrl_d_on_an_active_grok_session_submits_archive() {
         let session = grok_sess("grok-busy", Status::Working);
         let mut ui = test_ui_with(vec![session.clone()]);
         let log = recording_mutation_log(&mut ui);
         assert!(ui.app.select_by_key(&(session.backend, session.id.clone())));
 
-        crate::actions::hide_selected(&[], &mut ui, true);
+        crate::actions::set_archive_selected(&[], &mut ui, true);
 
-        let seen = wait_for_log(&log, &mut ui, 2);
+        let seen = wait_for_log(&log, &mut ui, 1);
         assert_eq!(
             seen,
-            vec![
-                ("stop".to_string(), "grok-busy".to_string()),
-                ("remove".to_string(), "grok-busy".to_string()),
-            ],
-            "an active Grok session is stopped, then the remove stage runs behind it"
+            vec![("archive".to_string(), "grok-busy".to_string())],
+            "active Grok archive orchestration belongs behind the provider interface"
         );
     }
 
     #[test]
-    fn ctrl_d_on_a_finished_claude_session_deletes_instead_of_hiding() {
+    fn ctrl_d_on_a_finished_claude_session_submits_archive() {
         let session = claude_sess("claude-done", Status::Done);
         let target = (session.backend, session.id.clone());
         let mut ui = test_ui_with(vec![session.clone()]);
@@ -5336,31 +5348,32 @@ pub(crate) mod tests {
         handle_attached_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut ui);
 
         assert!(matches!(ui.mode, Mode::Normal));
+        assert!(
+            !ui.attached.contains_key(&target),
+            "attached Ctrl+D must close Claude before its destructive archive runs"
+        );
         let seen = wait_for_log(&log, &mut ui, 1);
         assert_eq!(
             seen,
-            vec![("remove".to_string(), "claude-done".to_string())],
-            "a finished Claude session must go straight to delete, never hide"
+            vec![("archive".to_string(), "claude-done".to_string())],
+            "every Claude archive surface must submit the provider-neutral archive command"
         );
     }
 
     #[test]
-    fn ctrl_d_on_an_active_claude_session_stops_then_deletes() {
+    fn ctrl_d_on_an_active_claude_session_submits_archive() {
         let session = claude_sess("claude-busy", Status::Working);
         let mut ui = test_ui_with(vec![session.clone()]);
         let log = recording_mutation_log(&mut ui);
         assert!(ui.app.select_by_key(&(session.backend, session.id.clone())));
 
-        crate::actions::hide_selected(&[], &mut ui, true);
+        crate::actions::set_archive_selected(&[], &mut ui, true);
 
-        let seen = wait_for_log(&log, &mut ui, 2);
+        let seen = wait_for_log(&log, &mut ui, 1);
         assert_eq!(
             seen,
-            vec![
-                ("stop".to_string(), "claude-busy".to_string()),
-                ("remove".to_string(), "claude-busy".to_string()),
-            ],
-            "an active Claude session is stopped, then the remove stage runs behind it"
+            vec![("archive".to_string(), "claude-busy".to_string())],
+            "active Claude archive orchestration belongs behind the provider interface"
         );
     }
 
@@ -5373,7 +5386,7 @@ pub(crate) mod tests {
         let mut ui = test_ui_with(vec![session.clone(), other.clone()]);
         let (tx, rx) = std::sync::mpsc::channel();
         ui.mutation_executor = std::sync::Arc::new(move |mutation| {
-            let crate::ops::Mutation::Hide(request) = mutation else {
+            let crate::ops::Mutation::Archive(request) = mutation else {
                 panic!("Ctrl+D must archive the attached session");
             };
             tx.send(request.id().to_string())
@@ -6732,8 +6745,8 @@ pub(crate) mod tests {
             assert_eq!(ui.composer.text(), c.to_string(), "{c:?} must compose");
             assert!(!ui.app.show_all(), "{c:?} must not change list scope");
             assert!(
-                !ui.mutations.in_flight("claude:s1:hide")
-                    && !ui.mutations.in_flight("claude:s1:unhide"),
+                !ui.mutations.in_flight("claude:s1:archive")
+                    && !ui.mutations.in_flight("claude:s1:unarchive"),
                 "{c:?} must not submit a mutation"
             );
             assert_eq!(
@@ -6817,7 +6830,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ctrl_d_and_ctrl_u_submit_their_archive_operations() {
-        for (c, operation) in [('d', "hide"), ('u', "unhide")] {
+        for (c, operation) in [('d', "archive"), ('u', "unarchive")] {
             let mut session = sess("s1", "/tmp/agentviewer-archive", 100);
             session.backend = BackendKind::Codex;
             let mut ui = test_ui_with(vec![session]);
@@ -6851,12 +6864,12 @@ pub(crate) mod tests {
             vec![Box::new(RowScopedArchivingBackend)];
 
         select_session_row(&mut ui, "external");
-        crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("codex:external:hide"));
+        crate::actions::set_archive_selected(&backends, &mut ui, true);
+        assert!(ui.mutations.in_flight("codex:external:archive"));
 
         select_session_row(&mut ui, "managed");
-        crate::actions::hide_selected(&backends, &mut ui, true);
-        assert!(ui.mutations.in_flight("codex:managed:hide"));
+        crate::actions::set_archive_selected(&backends, &mut ui, true);
+        assert!(ui.mutations.in_flight("codex:managed:archive"));
     }
 
     #[test]
@@ -6973,8 +6986,8 @@ pub(crate) mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
         ui.mutation_executor = std::sync::Arc::new(move |mutation| {
-            let crate::ops::Mutation::Hide(request) = mutation else {
-                panic!("the palette archive row must only ever hide");
+            let crate::ops::Mutation::Archive(request) = mutation else {
+                panic!("the palette archive row must submit archive");
             };
             tx.lock()
                 .expect("mutation recorder")
@@ -7019,6 +7032,49 @@ pub(crate) mod tests {
                 .as_deref(),
             Ok("alpha"),
             "the palette must archive the row it was opened on"
+        );
+    }
+
+    #[test]
+    fn a_palette_stop_targets_the_row_it_was_opened_on_not_a_moved_selection() {
+        let mut alpha = sess("stop-alpha", "/tmp/agentviewer-palette-alpha", 200);
+        alpha.backend = BackendKind::Codex;
+        alpha.status = Status::Working;
+        let mut bravo = sess("stop-bravo", "/tmp/agentviewer-palette-bravo", 100);
+        bravo.backend = BackendKind::Codex;
+        bravo.status = Status::Working;
+        let mut ui = test_ui_with(vec![alpha.clone(), bravo.clone()]);
+        let backends: Vec<Box<dyn agent_viewer_core::Backend>> = vec![Box::new(ArchivingBackend)];
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.mutation_executor = std::sync::Arc::new(move |mutation| {
+            let crate::ops::Mutation::Stop(request) = mutation else {
+                panic!("the first palette stop/remove action must submit stop");
+            };
+            tx.send(request.id().to_string())
+                .expect("record stopped session");
+            Ok(MutationOutcome {
+                notice: String::new(),
+                spawned: None,
+            })
+        });
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, alpha.id.clone()))
+        );
+
+        open_palette(&backends, &mut ui);
+        assert!(
+            ui.app
+                .select_by_key(&(BackendKind::Codex, bravo.id.clone()))
+        );
+        highlight_palette_target(&mut ui, &PaletteTarget::Action(PaletteAction::StopOrRemove));
+        press_palette_code(&mut ui, &backends, KeyCode::Enter);
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .as_deref(),
+            Ok("stop-alpha"),
+            "the palette must stop the row it was opened on"
         );
     }
 
@@ -7164,24 +7220,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ctrl_d_on_a_completed_claude_triage_item_submits_remove() {
+    fn ctrl_d_on_a_completed_claude_triage_item_submits_archive() {
         let mut done = sess("claude-full-session-id", "/tmp", 1_000);
         done.short_id = Some("short-id".to_string());
         let mut ui = test_ui_with(vec![done]);
         let (tx, rx) = std::sync::mpsc::channel();
         ui.mutation_executor = std::sync::Arc::new(move |mutation| {
-            let crate::ops::Mutation::Remove {
-                request,
-                require_finished,
-            } = mutation
-            else {
-                panic!("Ctrl+D must submit the completed-session removal path");
+            let crate::ops::Mutation::Archive(request) = mutation else {
+                panic!("Ctrl+D must submit the archive command");
             };
-            assert!(require_finished);
             tx.send(request.id().to_string())
-                .expect("record triage removal");
+                .expect("record triage archive");
             Ok(MutationOutcome {
-                notice: "removed: test session".to_string(),
+                notice: "archived: test session".to_string(),
                 spawned: None,
             })
         });
@@ -7194,17 +7245,17 @@ pub(crate) mod tests {
 
         assert!(
             !ui.attached.contains_key(&key),
-            "the attach client must be dropped before completed removal"
+            "the attach client must be dropped before completed archive"
         );
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("Ctrl+D submitted remove"),
+                .expect("Ctrl+D submitted archive"),
             "claude-full-session-id"
         );
     }
 
     #[test]
-    fn ctrl_d_on_a_needs_input_claude_item_stops_then_removes_like_ctrl_x_twice() {
+    fn ctrl_d_on_a_needs_input_claude_item_submits_the_same_archive_command() {
         let mut blocked = blocked_session("claude-full-session-id", 1_000);
         blocked.backend = BackendKind::Claude;
         blocked.short_id = Some("claude01".to_string());
@@ -7214,17 +7265,10 @@ pub(crate) mod tests {
         attach_a_child(&mut ui, key.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         ui.mutation_executor = std::sync::Arc::new(move |mutation| {
-            let label = match mutation {
-                crate::ops::Mutation::Stop(request) => format!("stop:{}", request.id()),
-                crate::ops::Mutation::Remove {
-                    request,
-                    require_finished,
-                } => {
-                    assert!(!require_finished);
-                    format!("remove:{}", request.id())
-                }
-                _ => panic!("Ctrl+D must use the main-view stop/remove pipeline"),
+            let crate::ops::Mutation::Archive(request) = mutation else {
+                panic!("Ctrl+D must use the provider-neutral archive command");
             };
+            let label = format!("archive:{}", request.id());
             tx.send(label).expect("record triage mutation");
             Ok(MutationOutcome {
                 notice: "mutation complete".to_string(),
@@ -7239,28 +7283,8 @@ pub(crate) mod tests {
         assert!(!ui.attached.contains_key(&key));
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("Ctrl+D submitted stop"),
-            "stop:claude-full-session-id"
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let stop_result = loop {
-            if let Some(result) = ui.mutations.poll() {
-                break result;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "stop result did not reach the mutation runner"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        assert!(
-            stop_result.is_ok(),
-            "successful stop must release the dependent removal"
-        );
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("Ctrl+D submitted dependent remove"),
-            "remove:claude-full-session-id"
+                .expect("Ctrl+D submitted archive"),
+            "archive:claude-full-session-id"
         );
     }
 

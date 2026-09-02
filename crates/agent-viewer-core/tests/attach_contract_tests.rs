@@ -89,7 +89,8 @@ fn claude_capabilities_advertise_native_mutations() {
     assert!(caps.delete, "claude advertises native rm as delete");
     assert!(caps.spawn);
     assert!(caps.attach);
-    assert!(!caps.archive);
+    assert!(caps.can_archive());
+    assert!(!caps.can_unarchive());
     assert!(caps.stop);
     // Rename is a bg-job state.json write, gated per row on the short id (see rename_tests).
     assert!(caps.rename);
@@ -103,8 +104,9 @@ fn portable_codex_capabilities_disable_unsafe_process_actions() {
         assert!(!caps.attach, "{platform:?} cannot safely attach Codex");
         assert!(!caps.stop, "{platform:?} cannot safely stop Codex");
         assert!(caps.rename);
-        assert!(caps.archive);
-        assert!(caps.delete);
+        assert!(caps.can_archive());
+        assert!(caps.can_unarchive());
+        assert!(!caps.delete);
     }
 }
 

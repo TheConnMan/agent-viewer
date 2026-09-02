@@ -1,4 +1,6 @@
-use crate::backend::{Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status};
+use crate::backend::{
+    ArchiveMode, Backend, BackendKind, Capabilities, PrRef, Session, SessionOrigin, Status,
+};
 use crate::error::{AttachRefusal, Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -137,7 +139,7 @@ pub fn capabilities_for_platform(platform: crate::platform::Platform) -> Capabil
         spawn: true,
         attach: true,
         rename: platform != crate::platform::Platform::Windows,
-        archive: false,
+        archive: Some(ArchiveMode::Deletes),
         delete: true,
         stop: true,
     }
@@ -185,6 +187,7 @@ pub fn capabilities_for_session_on_platform(
     capabilities.delete = has_short_id
         && (platform == crate::platform::Platform::Linux
             || (session.pid.is_none() && session.status.is_finished()));
+    capabilities.archive = capabilities.delete.then_some(ArchiveMode::Deletes);
     capabilities.stop = has_short_id && !session.status.is_finished();
     capabilities
 }
@@ -357,7 +360,25 @@ impl Backend for ClaudeBackend {
             &job_state_with_name(&existing, name, SystemTime::now())?,
         )
     }
-    fn remove(&self, session: &Session) -> Result<()> {
+    fn archive(&mut self, session: &Session) -> Result<()> {
+        if !capabilities_for_session_on_platform(crate::platform::current_platform(), session)
+            .can_archive()
+        {
+            return Err(Error::Unsupported(self.kind().name()));
+        }
+        if !session.status.is_finished() {
+            self.stop(session)?;
+            let timeout = if session.daemon_hosted {
+                std::time::Duration::from_secs(2)
+            } else {
+                std::time::Duration::from_millis(300)
+            };
+            let settled = crate::backend::wait_until_stopped(self, &session.id, timeout)?;
+            return self.remove_for_platform(crate::platform::current_platform(), &settled);
+        }
+        self.remove_for_platform(crate::platform::current_platform(), session)
+    }
+    fn delete(&self, session: &Session) -> Result<()> {
         self.remove_for_platform(crate::platform::current_platform(), session)
     }
     fn stop(&self, session: &Session) -> Result<()> {

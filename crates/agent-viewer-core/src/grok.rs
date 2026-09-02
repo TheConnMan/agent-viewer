@@ -389,7 +389,7 @@ impl Backend for GrokBackend {
                 spawn: true,
                 attach: true,
                 rename: true,
-                archive: false,
+                archive: Some(crate::backend::ArchiveMode::Deletes),
                 delete: true,
                 stop: true,
             }
@@ -440,7 +440,20 @@ impl Backend for GrokBackend {
         self.lifecycle.cancel(&session.id)
     }
 
-    fn remove(&self, session: &Session) -> Result<()> {
+    fn archive(&mut self, session: &Session) -> Result<()> {
+        if !session.status.is_finished() {
+            self.stop(session)?;
+            let settled = crate::backend::wait_until_stopped(
+                self,
+                &session.id,
+                std::time::Duration::from_millis(300),
+            )?;
+            return self.lifecycle.delete(&settled.id);
+        }
+        self.lifecycle.delete(&session.id)
+    }
+
+    fn delete(&self, session: &Session) -> Result<()> {
         self.lifecycle.delete(&session.id)
     }
 
