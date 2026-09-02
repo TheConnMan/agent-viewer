@@ -619,7 +619,8 @@ fn grok_advertises_only_implemented_official_actions_and_exact_attach_argv() {
     assert!(capabilities.rename);
     assert!(capabilities.delete);
     assert!(capabilities.stop);
-    assert!(!capabilities.archive);
+    assert!(capabilities.can_archive());
+    assert!(!capabilities.can_unarchive());
 
     let command = backend
         .attach_command(&session("session-selected", None))

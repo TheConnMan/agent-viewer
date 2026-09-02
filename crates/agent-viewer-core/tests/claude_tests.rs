@@ -1417,6 +1417,55 @@ fn claude_stop_invokes_the_native_cli_for_an_idle_row() {
 }
 
 #[test]
+fn claude_archive_stops_an_active_job_then_deletes_it() {
+    let directory = tempfile::TempDir::new().expect("create fake cli directory");
+    let binary = directory.path().join("claude");
+    let args_path = directory.path().join("claude.args");
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\nprintf '%s ' \"$@\" >> \"${0}.args\"\nprintf '\\n' >> \"${0}.args\"\nif [ \"$1\" = agents ]; then\n  printf '%s\\n' '[{\"id\":\"archive01\",\"cwd\":\"/tmp\",\"kind\":\"background\",\"startedAt\":0,\"sessionId\":\"3f9c1a2e-0000-4000-8000-000000000001\",\"name\":\"probe\",\"state\":\"stopped\"}]'\nfi\n",
+    );
+    let _ = std::fs::remove_file(&args_path);
+
+    let session = session_with_short_id(Some("archive01"));
+    let mut backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
+
+    backend
+        .archive(&session)
+        .expect("archive active Claude job");
+
+    assert_eq!(
+        std::fs::read_to_string(args_path).expect("read cli calls"),
+        "stop archive01 \nagents --json --all \nrm archive01 \n"
+    );
+}
+
+#[test]
+fn claude_archive_deletes_a_finished_job_without_stopping_it() {
+    let directory = tempfile::TempDir::new().expect("create fake cli directory");
+    let binary = directory.path().join("claude");
+    let args_path = directory.path().join("claude.args");
+    write_stub_claude(
+        &binary,
+        "#!/bin/sh\nprintf '%s ' \"$@\" >> \"${0}.args\"\nprintf '\\n' >> \"${0}.args\"\n",
+    );
+    let _ = std::fs::remove_file(&args_path);
+
+    let mut session = session_with_short_id(Some("archive02"));
+    session.status = Status::Done;
+    let mut backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
+
+    backend
+        .archive(&session)
+        .expect("archive finished Claude job");
+
+    assert_eq!(
+        std::fs::read_to_string(args_path).expect("read cli calls"),
+        "rm archive02 \n"
+    );
+}
+
+#[test]
 fn claude_stop_capability_requires_nonterminal_status_and_short_id() {
     use agent_viewer_core::claude::capabilities_for_session_on_platform;
     use agent_viewer_core::platform::Platform;
@@ -1551,7 +1600,7 @@ fn claude_remove_rejects_a_traversing_short_id_before_cli() {
     session.status = Status::Done;
     let backend = ClaudeBackend::with_binary(binary.to_str().expect("utf8 cli path"));
 
-    Backend::remove(&backend, &session).expect_err("traversing short_id must not reach claude rm");
+    Backend::delete(&backend, &session).expect_err("traversing short_id must not reach claude rm");
     assert!(
         !args_path.exists(),
         "claude rm must not be invoked with a traversing short_id"

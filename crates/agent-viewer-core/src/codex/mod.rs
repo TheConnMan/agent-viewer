@@ -7,7 +7,7 @@ pub mod source;
 pub mod status;
 
 use crate::backend::{
-    Backend, BackendKind, Capabilities, Session, SessionOrigin, SpawnResult, Status,
+    ArchiveMode, Backend, BackendKind, Capabilities, Session, SessionOrigin, SpawnResult, Status,
 };
 use crate::error::{AttachRefusal, Error, Result};
 use crate::platform::Platform;
@@ -686,12 +686,12 @@ impl Backend for CodexBackend {
         })
     }
 
-    fn hide(&self, id: &str) -> Result<()> {
-        cli::archive(id)
+    fn archive(&mut self, session: &Session) -> Result<()> {
+        cli::archive(&session.id)
     }
 
-    fn unhide(&self, id: &str) -> Result<()> {
-        cli::unarchive(id)
+    fn unarchive(&mut self, session: &Session) -> Result<()> {
+        cli::unarchive(&session.id)
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
@@ -712,10 +712,6 @@ impl Backend for CodexBackend {
             StopRoute::Signal(pid) => crate::spawn::terminate(pid, "codex"),
             StopRoute::Unsupported => Err(crate::error::Error::Unsupported(self.kind().name())),
         }
-    }
-
-    fn remove(&self, session: &Session) -> Result<()> {
-        cli::archive(&session.id)
     }
 
     fn rename(&self, session: &Session, name: &str) -> Result<()> {
@@ -766,16 +762,16 @@ pub const fn capabilities_for_platform(platform: Platform) -> Capabilities {
             spawn: true,
             attach: true,
             rename: true,
-            archive: true,
-            delete: true,
+            archive: Some(ArchiveMode::Reversible),
+            delete: false,
             stop: true,
         },
         Platform::Macos | Platform::Windows => Capabilities {
             spawn: false,
             attach: false,
             rename: true,
-            archive: true,
-            delete: true,
+            archive: Some(ArchiveMode::Reversible),
+            delete: false,
             stop: false,
         },
     }

@@ -42,8 +42,9 @@ or newer because secure durable traversal uses `openat2`, with no insecure fallb
 leader is reachable, its roster supplies live status and its ACP lifecycle supplies spawn,
 selected session cancel, rename, delete, and model discovery. Attach runs
 `grok --leader --resume <session id>` from the selected session's working directory so opening
-the session joins the shared leader instead of replacing it. Grok has no archive
-or unarchive capability. Durable `updates.jsonl` records identify unambiguous completed and
+the session joins the shared leader instead of replacing it. Grok has no reversible archive
+flag: archive stops an active session and deletes it, and unarchive is unsupported. Durable
+`updates.jsonl` records identify unambiguous completed and
 failed turns. Live active roster state wins; idle or dormant roster state preserves an
 unambiguous durable terminal result. Ambiguous or later activity remains unknown. A shared
 leader never becomes row process ownership, and Agent Viewer never stops or restarts it.
@@ -264,21 +265,22 @@ How the keys map onto those words today:
 
 - `Ctrl+D` in the list, while attached, and as "Archive session" in the palette is **archive**
   as defined above. On a Codex row it sets the reversible flag. On a Claude or Grok row it is
-  the `Ctrl+X` twice gesture: an active session is stopped and then deleted, a finished one is
-  deleted straight away, and the palette row says "delete" so nothing promises a restore.
+  one provider-level archive command: an active session is stopped, allowed to settle, and then
+  deleted; a finished one is deleted straight away. The palette row says "delete" so nothing
+  promises a restore.
   Claude's delete is `claude rm`, which also removes the job's worktree. An interactive Claude
   row has no job dir and cannot be deleted, so that press is a footer notice.
 - `Ctrl+X` once is **stop**. `Ctrl+X` again within 2s queues the remove stage: on Codex that is
   archive, on Claude and Grok it is delete.
-- `Ctrl+D` inside the triage inbox is the `Ctrl+X` twice gesture. It stops a still-active item
-  and then runs the remove stage, so it archives a Codex session and deletes a Claude or Grok
-  one. On Claude and Grok that is the same as list `Ctrl+D`; on Codex it is the two-stage
-  remove rather than the reversible hide.
+- `Ctrl+D` inside the triage inbox submits that exact same archive command, so it has the same
+  provider behavior as list, attached, and palette archive.
 
-The code names differ from these words, and reading them as synonyms is the trap. `hide` /
-`unhide` is the reversible archive flag. `stop` is stop. `remove` is the remove stage, which is
-archive on Codex and delete on Claude and Grok. `kill` is the two-stage `Ctrl+X` machine
-(stop, then remove), not any single one of them.
+The backend interface uses these words directly: every provider implements `archive`,
+`unarchive`, `stop`, and `delete`, and advertises those actions per thread. Archive capability
+also says whether the provider can restore it or must delete it. The TUI submits one
+provider-neutral archive or stop command and never reconstructs provider lifecycle steps.
+`remove` remains only the two-stage `Ctrl+X` gesture: it chooses delete when the provider has
+one and archive otherwise.
 
 ## Keys
 
@@ -324,7 +326,7 @@ archive on Codex and delete on Claude and Grok. `kill` is the two-stage `Ctrl+X`
 - `Ctrl+A` — show all (companions + archived + deleted-dir rows).
 - `Ctrl+D` / `Ctrl+U` — archive / unarchive. Codex sets and clears its reversible flag. Claude
   and Grok have no flag, so `Ctrl+D` stops and deletes and `Ctrl+U` reports that the backend
-  does not support unhide. While attached, `Ctrl+D` runs the same archive on that session and
+  does not support unarchive. While attached, `Ctrl+D` runs the same archive on that session and
   returns to the main view. See "Archive, stop, and delete" above for what each word means per
   backend.
 - `Ctrl+F` — filter by title or directory (searches hidden/archived sessions too).
@@ -455,10 +457,9 @@ the list that walks the shown sessions waiting for input, then every shown activ
 a time and longest wait first within each group, with a `3 of 7` progress counter and the next
 few items named underneath. Archived, companion, and hold history is excluded from the completed
 phase. Collapsed groups and filter results are not triaged until they are shown again. `Ctrl+D`
-here is the `Ctrl+X` twice gesture, and it advances: a Needs Input item is stopped and then
-goes through the remove stage, which archives a Codex session and deletes a Claude background
-job or a Grok session (see "Archive, stop, and delete"). On Claude and Grok that is the same
-as list `Ctrl+D`.
+here submits the same archive command as every other surface and advances. Codex sets its
+reversible archive flag. Claude and Grok stop an active thread, wait for that stop to settle,
+and delete it (see "Archive, stop, and delete").
 
 The panel in the middle is the session itself, live — the same attach the list's `Enter`
 gives you, drawn into the panel instead of the whole screen. So you see the agent's own

@@ -303,17 +303,35 @@ fn codex_spawn_running_then_done() {
     println!("[e2e] observed Done after {:?}", spawn_at.elapsed());
 
     // 6. hide/unhide round-trip, then leave hidden.
-    backend.hide(&id).expect("hide");
+    let session = backend
+        .list()
+        .expect("list before archive")
+        .into_iter()
+        .find(|session| session.id == id)
+        .expect("session before archive");
+    backend.archive(&session).expect("archive");
     let hidden = poll_until(&mut backend, Duration::from_secs(10), |s| {
         s.id == id && s.hidden
     });
     assert!(hidden.is_some(), "hide did not take");
-    backend.unhide(&id).expect("unhide");
+    let session = backend
+        .list()
+        .expect("list archived session")
+        .into_iter()
+        .find(|session| session.id == id)
+        .expect("archived session");
+    backend.unarchive(&session).expect("unarchive");
     let unhidden = poll_until(&mut backend, Duration::from_secs(10), |s| {
         s.id == id && !s.hidden
     });
     assert!(unhidden.is_some(), "unhide did not take");
-    backend.hide(&id).expect("re-hide (tidy)");
+    let session = backend
+        .list()
+        .expect("list unarchived session")
+        .into_iter()
+        .find(|session| session.id == id)
+        .expect("unarchived session");
+    backend.archive(&session).expect("re-archive (tidy)");
 }
 
 #[test]
@@ -639,7 +657,7 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
     );
 
     // Tidy: keep the box's session list clean.
-    let _ = backend.hide(&thread_id);
+    let _ = backend.archive(&stopped);
 }
 
 #[test]
@@ -728,7 +746,13 @@ fn codex_spawn_identity_and_immediate_rename_persists() {
         later_titles.push(title);
     }
 
-    let cleanup = backend.hide(&thread_id);
+    let cleanup_session = backend
+        .list()
+        .expect("list before cleanup archive")
+        .into_iter()
+        .find(|session| session.id == thread_id)
+        .expect("thread before cleanup archive");
+    let cleanup = backend.archive(&cleanup_session);
     assert!(
         later_titles.iter().all(|title| title == &user_name),
         "backend listing did not overlay the persisted user name: {later_titles:?}"
@@ -820,5 +844,5 @@ fn codex_exec_row_is_unjoinable_and_falls_back_to_the_read_only_tail() {
 
     let _ = child.kill();
     let _ = child.wait();
-    let _ = backend.hide(&row.id);
+    let _ = backend.archive(&row);
 }

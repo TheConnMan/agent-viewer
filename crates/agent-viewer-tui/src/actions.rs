@@ -1,5 +1,5 @@
 //! The actions the key handlers trigger: attach/spawn, reply delivery, rename, stop/remove,
-//! hide, and the completion/model list refresh. Split out of `keys` so that module holds only
+//! archive, and the completion/model list refresh. Split out of `keys` so that module holds only
 //! per-mode key routing. Every fn mutates the shared `Ui` state owned by the run loop.
 
 use std::io;
@@ -340,10 +340,9 @@ pub(crate) fn open_triage(ui: &mut Ui) {
     attach_triage_item(ui);
 }
 
-/// `Ctrl+D` in triage runs the same two-stage state machine as pressing list-view `Ctrl+X`
-/// twice against this exact session, then advances the queue. An active/needs-input item is
-/// stopped first and removed only after that succeeds. Codex implements the completed-session
-/// action as a reversible archive; Claude and Grok use their existing row-removal commands.
+/// `Ctrl+D` in triage submits the same provider-neutral archive command as every other archive
+/// surface, then advances the queue. The backend owns whether that means a reversible flag or
+/// stop-if-active followed by deletion.
 pub(crate) fn archive_triage_item(ui: &mut Ui) {
     let Some(item) = (match &ui.mode {
         Mode::Triage(state) => state.current().cloned(),
@@ -356,25 +355,11 @@ pub(crate) fn archive_triage_item(ui: &mut Ui) {
         ui.set_notice(format!("{} is no longer listed", item.title));
         return;
     };
-    // A prefetched/current Claude or Grok item owns a live attach client. Their remove
-    // operations can refuse or race while that client is still resident, unlike Codex archive.
-    // Drop it before the mutation worker performs its fresh authoritative listing and remove.
+    // A prefetched/current Claude or Grok item owns a live attach client. Their archive
+    // implementations delete, which can refuse or race while that client is still resident.
+    // Drop it before the mutation worker performs its fresh authoritative listing and archive.
     release_triage_attachment(ui, Some(key));
-    let now = now_ms();
-    // A triageable idle or done row is a finished turn. It never needs a stop before the
-    // usual archive/remove action.
-    let should_stop = !item.is_completed();
-    for _ in 0..2 {
-        let stage = ui
-            .app
-            .kill_stage_for(session.backend, session.id.clone(), should_stop, now);
-        kill_request(
-            ui,
-            TargetRequest::from(&session),
-            session.title.clone(),
-            stage,
-        );
-    }
+    archive_request(ui, TargetRequest::from(&session), session.title.clone());
     skip_triage_item(ui);
 }
 
@@ -566,64 +551,38 @@ pub(crate) fn kill_request(ui: &mut Ui, request: TargetRequest, title: String, s
     }
 }
 
-pub(crate) fn hide_selected(_backends: &[Box<dyn Backend>], ui: &mut Ui, hide: bool) {
+pub(crate) fn set_archive_selected(_backends: &[Box<dyn Backend>], ui: &mut Ui, archive: bool) {
     let Some(session) = ui.app.selected().cloned() else {
         return;
     };
     let request = TargetRequest::from(&session);
-    hide_request(ui, request, session.title, hide);
-}
-
-pub(crate) fn hide_request(ui: &mut Ui, request: TargetRequest, title: String, hide: bool) {
-    if hide {
-        if archive_is_delete(request.backend()) {
-            archive_by_delete(ui, request, title);
-            return;
-        }
-        submit_mutation(ui, request, &title, "hide", "archiving", Mutation::Hide);
+    if archive {
+        archive_request(ui, request, session.title);
     } else {
-        submit_mutation(
-            ui,
-            request,
-            &title,
-            "unhide",
-            "unarchiving",
-            Mutation::Unhide,
-        );
+        unarchive_request(ui, request, session.title);
     }
 }
 
-/// Backends where "archive" (the row leaves the main view, README "Archive, stop, and delete")
-/// has no reversible flag behind it and can only be delete. Grok's leader offers cancel and
-/// delete but nothing to hide with. Claude is the same: `claude rm` deletes the background
-/// job and its worktree, which is the chosen meaning of archive on that backend.
-pub(crate) fn archive_is_delete(backend: BackendKind) -> bool {
-    matches!(backend, BackendKind::Grok | BackendKind::Claude)
+pub(crate) fn archive_request(ui: &mut Ui, request: TargetRequest, title: String) {
+    submit_mutation(
+        ui,
+        request,
+        &title,
+        "archive",
+        "archiving",
+        Mutation::Archive,
+    );
 }
 
-/// Archive on a backend without a hide flag: the `Ctrl+X` twice gesture triage already uses,
-/// so an active session is stopped and the remove stage is queued behind the stop, while a
-/// finished one goes straight to remove. Running the stage machine twice arms then fires it.
-fn archive_by_delete(ui: &mut Ui, request: TargetRequest, title: String) {
-    let key = (request.backend(), request.id().to_string());
-    let Some(should_stop) = ui
-        .app
-        .session_for(&key)
-        .map(|session| !session.status.is_finished())
-    else {
-        ui.set_notice("session is no longer available".to_string());
-        return;
-    };
-    let now = now_ms();
-    for _ in 0..2 {
-        let stage = ui.app.kill_stage_for(
-            request.backend(),
-            request.id().to_string(),
-            should_stop,
-            now,
-        );
-        kill_request(ui, request.clone(), title.clone(), stage);
-    }
+pub(crate) fn unarchive_request(ui: &mut Ui, request: TargetRequest, title: String) {
+    submit_mutation(
+        ui,
+        request,
+        &title,
+        "unarchive",
+        "unarchiving",
+        Mutation::Unarchive,
+    );
 }
 
 fn submit_kill_mutation(
@@ -945,7 +904,7 @@ fn spawn_through_router(
 #[cfg(test)]
 mod tests {
     use super::{
-        hide_request, install_attach_plan, install_commands, kill_request, spawn_from_composer,
+        archive_request, install_attach_plan, install_commands, kill_request, spawn_from_composer,
     };
     use crate::Refresher;
     use crate::keys::handle_paste;
@@ -1262,8 +1221,8 @@ mod tests {
         let (release_tx, release_rx) = channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
         ui.mutation_executor = Arc::new(move |mutation| {
-            let Mutation::Hide(_) = mutation else {
-                panic!("archive must only ever hide");
+            let Mutation::Archive(_) = mutation else {
+                panic!("archive surfaces must submit the archive command");
             };
             started_tx.send(()).expect("report archive start");
             release_rx
@@ -1277,13 +1236,13 @@ mod tests {
             })
         });
 
-        hide_request(&mut ui, request.clone(), "dedup hide".to_string(), true);
+        archive_request(&mut ui, request.clone(), "dedup hide".to_string());
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("archive started");
         assert_eq!(ui.notice.text, "archiving… dedup hide");
 
-        hide_request(&mut ui, request, "dedup hide".to_string(), true);
+        archive_request(&mut ui, request, "dedup hide".to_string());
 
         assert_eq!(ui.notice.text, "still archiving dedup hide");
         release_tx.send(()).expect("finish archive");
