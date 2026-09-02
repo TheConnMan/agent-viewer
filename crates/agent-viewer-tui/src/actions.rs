@@ -736,22 +736,14 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
             size.width.max(1),
         )
     };
-    let palette = ui
-        .themes
-        .active()
-        .terminal_palette()
-        .or(ui.terminal_palette);
-
     if let Some(pty) = ui.attached.get_mut(&key) {
         // The wall already holds a connection to this session and the user is zooming into
         // that tile: reuse the live PTY, resized to the full content area. This is the only
         // way a PTY exists here, since leaving a session otherwise closes it.
-        pty.set_palette(palette);
         let _ = pty.resize(rows, cols);
         ui.detach_trackers.entry(key.clone()).or_default();
     } else {
         let mut spec = spec_from_command(&command, rows, cols);
-        spec.palette = palette;
         // Triage scrolls the viewer-owned viewport for every backend. Full-screen Claude and
         // Grok can delegate wheel input to their child, but the modal cannot rely on that
         // protocol, so its PTY must retain history just like Codex does.
@@ -960,7 +952,6 @@ mod tests {
     use crate::keys::tests::{SpawnBackend, sess, test_ui_with};
     use crate::ops::{Mutation, resolve_attach_with_backend};
     use agent_viewer_core::codex::app_server::CodexSkill;
-    use agent_viewer_core::pty::TerminalPalette;
     use agent_viewer_core::{AttachRefusal, BackendKind, Capabilities, Session, Status};
     use agent_viewer_tui::app::KillStage;
     use agent_viewer_tui::composer::CommandEntry;
@@ -973,53 +964,6 @@ mod tests {
         mpsc::{TryRecvError, channel},
     };
     use std::time::{Duration, Instant};
-
-    struct PaletteQueryBackend {
-        session: Session,
-    }
-
-    impl agent_viewer_core::Backend for PaletteQueryBackend {
-        fn kind(&self) -> BackendKind {
-            BackendKind::Claude
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                attach: true,
-                ..Capabilities::none()
-            }
-        }
-
-        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
-            Ok(vec![self.session.clone()])
-        }
-
-        fn spawn(
-            &self,
-            _dir: &std::path::Path,
-            _task: &str,
-            _model: Option<&str>,
-            _effort: Option<&str>,
-        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
-            unreachable!("spawning is not exercised by palette attach")
-        }
-
-        fn attach_command(
-            &self,
-            _session: &Session,
-        ) -> Result<std::process::Command, AttachRefusal> {
-            let script = concat!(
-                "stty raw -echo; ",
-                "printf '\\033]10;?\\007\\033]11;?\\007'; ",
-                "bytes=$(dd bs=1 count=50 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); ",
-                "printf 'OSC:%s\\r\\n' \"$bytes\"; ",
-                "sleep 30"
-            );
-            let mut command = std::process::Command::new("sh");
-            command.args(["-c", script]);
-            Ok(command)
-        }
-    }
 
     struct RefusingAttachBackend {
         session: Session,
@@ -1057,39 +1001,6 @@ mod tests {
             _session: &Session,
         ) -> Result<std::process::Command, AttachRefusal> {
             Err(self.refusal.clone())
-        }
-    }
-
-    fn osc_reply_hex(slot: u8, color: [u8; 3]) -> String {
-        let [red, green, blue] = color;
-        format!(
-            "\x1b]{slot};rgb:{red:02X}{red:02X}/{green:02X}{green:02X}/{blue:02X}{blue:02X}\x1b\\"
-        )
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-    }
-
-    fn osc_replies(palette: TerminalPalette) -> String {
-        format!(
-            "OSC:{}{}",
-            osc_reply_hex(10, palette.foreground),
-            osc_reply_hex(11, palette.background),
-        )
-    }
-
-    fn wait_for_attached_screen(ui: &crate::Ui, key: &(BackendKind, String), needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !ui
-            .attached
-            .get(key)
-            .is_some_and(|pty| pty.with_screen(|screen| screen.contents().contains(needle)))
-        {
-            assert!(
-                Instant::now() < deadline,
-                "attached child screen did not contain {needle:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1971,194 +1882,6 @@ mod tests {
             .get_mut(&key)
             .expect("retained attached pty")
             .kill();
-    }
-
-    #[test]
-    fn new_attach_answers_osc_palette_queries_with_the_active_amber_theme() {
-        let mut session = sess("palette", "/tmp/agentviewer-palette", 100);
-        session.short_id = Some("palette".into());
-        let mut ui = test_ui_with(vec![session.clone()]);
-        ui.terminal_palette = Some(TerminalPalette {
-            foreground: [0x01, 0x02, 0x03],
-            background: [0x04, 0x05, 0x06],
-        });
-        let mut backend = PaletteQueryBackend {
-            session: session.clone(),
-        };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
-            .expect("test terminal");
-
-        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
-            .expect("resolve palette query child");
-        assert!(
-            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
-        );
-
-        let theme = agent_viewer_tui::ui::theme::amber(false);
-        let ratatui::style::Color::Rgb(red, green, blue) = theme.text else {
-            panic!("amber text must be RGB");
-        };
-        let ratatui::style::Color::Rgb(bg_red, bg_green, bg_blue) = theme.bg else {
-            panic!("amber background must be RGB");
-        };
-        let expected = format!(
-            "OSC:{}{}",
-            osc_reply_hex(10, [red, green, blue]),
-            osc_reply_hex(11, [bg_red, bg_green, bg_blue]),
-        );
-        let key = (BackendKind::Claude, session.id.clone());
-
-        wait_for_attached_screen(&ui, &key, &expected);
-
-        ui.attached.get_mut(&key).expect("attached child").kill();
-    }
-
-    #[test]
-    fn reattaching_a_retained_pty_refreshes_its_palette_for_the_new_active_theme() {
-        let mut session = sess("palette_refresh", "/tmp/agentviewer_palette_refresh", 100);
-        session.short_id = Some("palette_refresh".into());
-        let mut ui = test_ui_with(vec![session.clone()]);
-        let old_palette = ui
-            .themes
-            .active()
-            .terminal_palette()
-            .expect("default amber palette");
-        let mut backend = PaletteQueryBackend {
-            session: session.clone(),
-        };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
-            .expect("test terminal");
-        let key = (BackendKind::Claude, session.id.clone());
-
-        let initial_plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
-            .expect("resolve initial palette attach");
-        assert!(
-            install_attach_plan(&mut ui, &mut terminal, initial_plan)
-                .expect("initial palette attach")
-        );
-        let first_pty = ui.attached.get(&key).expect("initial retained pty") as *const _;
-        let first_pid = ui
-            .attached
-            .get(&key)
-            .expect("initial retained pty")
-            .pid()
-            .expect("initial retained pty pid");
-        assert_eq!(
-            ui.attached
-                .get(&key)
-                .expect("initial retained pty")
-                .palette(),
-            Some(old_palette)
-        );
-
-        ui.themes.move_preview(2);
-        let new_palette = ui
-            .themes
-            .active()
-            .terminal_palette()
-            .expect("new active RGB theme palette");
-        assert_ne!(old_palette, new_palette);
-
-        let retained_plan =
-            resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
-                .expect("resolve retained palette attach");
-        assert!(
-            install_attach_plan(&mut ui, &mut terminal, retained_plan)
-                .expect("reattach retained pty")
-        );
-        let retained_pty = ui.attached.get(&key).expect("retained pty after reattach");
-        assert_eq!(
-            first_pty, retained_pty as *const _,
-            "reattach must preserve the original PtySession instance"
-        );
-        assert_eq!(
-            retained_pty.pid(),
-            Some(first_pid),
-            "reattach must preserve the original PTY child"
-        );
-        assert_eq!(
-            retained_pty.palette(),
-            Some(new_palette),
-            "reattach must replace the retained PTY palette with the active theme"
-        );
-
-        ui.attached.get_mut(&key).expect("retained child").kill();
-    }
-
-    #[test]
-    fn terminal_match_attach_answers_osc_palette_queries_with_the_captured_host_palette() {
-        let mut session = sess("terminal-palette", "/tmp/agentviewer-terminal-palette", 100);
-        session.short_id = Some("terminal-palette".into());
-        let host_palette = TerminalPalette {
-            foreground: [0x11, 0x22, 0x33],
-            background: [0x44, 0x55, 0x66],
-        };
-        let mut ui = test_ui_with(vec![session.clone()]);
-        ui.terminal_palette = Some(host_palette);
-        ui.themes.move_preview(1);
-        assert_eq!(ui.themes.active().id, "terminal");
-        let mut backend = PaletteQueryBackend {
-            session: session.clone(),
-        };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
-            .expect("test terminal");
-
-        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
-            .expect("resolve host palette attach");
-        assert!(
-            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
-        );
-
-        let key = (BackendKind::Claude, session.id.clone());
-        wait_for_attached_screen(&ui, &key, &osc_replies(host_palette));
-
-        ui.attached.get_mut(&key).expect("attached child").kill();
-    }
-
-    #[test]
-    fn rgb_theme_named_terminal_answers_osc_queries_with_its_own_palette() {
-        let theme_dir = tempfile::tempdir().expect("theme directory");
-        std::fs::write(
-            theme_dir.path().join("terminal.theme"),
-            "text=#010203\nbg=#040506\n",
-        )
-        .expect("user theme");
-        let (mut themes, notices) =
-            agent_viewer_tui::ui::ThemeState::load(false, None, theme_dir.path());
-        assert!(notices.is_empty());
-        let user_theme_index = themes.themes().len() - 1;
-        themes.move_preview(user_theme_index as i32);
-        assert_eq!(themes.active_index(), user_theme_index);
-        assert_eq!(themes.active().id, "terminal");
-        let expected_palette = themes
-            .active()
-            .terminal_palette()
-            .expect("user theme palette");
-
-        let mut session = sess("rgb-terminal", "/tmp/agentviewer-rgb-terminal", 100);
-        session.short_id = Some("rgb-terminal".into());
-        let mut ui = test_ui_with(vec![session.clone()]);
-        ui.themes = themes;
-        ui.terminal_palette = Some(TerminalPalette {
-            foreground: [0xa1, 0xb2, 0xc3],
-            background: [0xd4, 0xe5, 0xf6],
-        });
-        let mut backend = PaletteQueryBackend {
-            session: session.clone(),
-        };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
-            .expect("test terminal");
-
-        let plan = resolve_attach_with_backend(&mut backend, TargetRequest::from(&session))
-            .expect("resolve RGB palette attach");
-        assert!(
-            install_attach_plan(&mut ui, &mut terminal, plan).expect("attach palette query child")
-        );
-
-        let key = (BackendKind::Claude, session.id.clone());
-        wait_for_attached_screen(&ui, &key, &osc_replies(expected_palette));
-
-        ui.attached.get_mut(&key).expect("attached child").kill();
     }
 
     #[test]

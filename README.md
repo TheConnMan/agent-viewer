@@ -362,10 +362,8 @@ takes a second or two. Conversation state lives in each backend's own store, so 
 by closing. Resolving an attach can take those seconds, so if you have moved on by the time it
 lands the viewer drops it rather than yanking you into a session you left: the footer reads
 `attach cancelled: <title> is no longer in focus` and nothing was spawned.
-New attached PTYs use the active viewer theme's text and background as their terminal defaults;
-explicit indexed and RGB child colors are preserved. The built in terminal match theme instead
-uses the captured host foreground and background. Because a session reconnects when you open it,
-a theme change applies to the next session you open.
+Attached PTYs keep their own terminal defaults and explicit colors; viewer themes apply only to
+the viewer chrome.
 Codex and Claude attached transcripts scroll immediately: Codex scrolls the viewer's retained
 transcript, while Claude receives the wheel in its attached terminal. Their capture behavior
 follows the `Ctrl+T` controls above.

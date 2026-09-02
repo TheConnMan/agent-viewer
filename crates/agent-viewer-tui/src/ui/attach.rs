@@ -2,7 +2,6 @@ use super::{AttachView, fg, logo_marks, mark_for, mark_width, status_glyph, trun
 use crate::logos::LogoMarks;
 use crate::ui::list;
 use crate::ui::theme::Theme;
-use agent_viewer_core::pty::TerminalPalette;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -60,52 +59,18 @@ pub(super) fn draw(
 /// exactly `area` or it wraps its own output at the wrong column.
 pub(super) fn render_screen(frame: &mut Frame, area: Rect, av: &AttachView<'_>) {
     av.pty.with_screen(|screen| {
-        frame.render_widget(
-            ThemedPseudoTerminal {
-                screen,
-                palette: av.pty.palette(),
-            },
-            area,
-        );
+        frame.render_widget(ThemedPseudoTerminal { screen }, area);
     });
 }
 
-/// Shared with the tail pane and the video wall, which both render an already-attached PTY
-/// the same themed way.
+/// Shared with the tail pane and the video wall, which both render an already-attached PTY.
 pub(super) struct ThemedPseudoTerminal<'a> {
     pub(super) screen: &'a vt100::Screen,
-    pub(super) palette: Option<TerminalPalette>,
 }
 
 impl Widget for ThemedPseudoTerminal<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         PseudoTerminal::new(self.screen).render(area, buf);
-        let Some(palette) = self.palette else {
-            return;
-        };
-
-        for row in 0..area.height {
-            for col in 0..area.width {
-                let Some(screen_cell) = self.screen.cell(row, col) else {
-                    continue;
-                };
-                let cell = &mut buf[(area.x + col, area.y + row)];
-                if screen_cell.fgcolor() == vt100::Color::Default {
-                    cell.set_fg(Color::Rgb(
-                        palette.foreground[0],
-                        palette.foreground[1],
-                        palette.foreground[2],
-                    ));
-                }
-                if screen_cell.bgcolor() == vt100::Color::Default {
-                    cell.set_bg(Color::Rgb(
-                        palette.background[0],
-                        palette.background[1],
-                        palette.background[2],
-                    ));
-                }
-            }
-        }
 
         if !self.screen.hide_cursor() {
             let (row, col) = Screen::cursor_position(self.screen);

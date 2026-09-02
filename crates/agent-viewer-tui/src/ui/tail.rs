@@ -121,13 +121,7 @@ pub(super) fn draw(frame: &mut Frame, view: &TailView, theme: &Theme, area: Rect
     // already running and already parsed.
     if let Some(pty) = view.live {
         pty.with_screen(|screen| {
-            frame.render_widget(
-                ThemedPseudoTerminal {
-                    screen,
-                    palette: pty.palette(),
-                },
-                body,
-            );
+            frame.render_widget(ThemedPseudoTerminal { screen }, body);
         });
         return;
     }

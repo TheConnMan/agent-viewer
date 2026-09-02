@@ -1979,7 +1979,6 @@ pub(crate) mod tests {
             pending_reply: None,
             pending_copy: None,
             attached: HashMap::new(),
-            terminal_palette: None,
             focused: None,
             focused_session: None,
             focused_exited: false,

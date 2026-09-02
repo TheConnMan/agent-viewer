@@ -1,4 +1,3 @@
-use agent_viewer_core::pty::TerminalPalette;
 use agent_viewer_core::state::ViewerDb;
 use ratatui::style::Color;
 use std::fs;
@@ -52,20 +51,6 @@ impl Theme {
     /// drives the footer notice, the hard gate is per-color inside `ui::age::ramp`.
     pub fn supports_age_ramp(&self) -> bool {
         matches!(self.faint, Color::Rgb(..))
-    }
-
-    pub fn terminal_palette(&self) -> Option<TerminalPalette> {
-        let (
-            Color::Rgb(foreground_red, foreground_green, foreground_blue),
-            Color::Rgb(background_red, background_green, background_blue),
-        ) = (self.text, self.bg)
-        else {
-            return None;
-        };
-        Some(TerminalPalette {
-            foreground: [foreground_red, foreground_green, foreground_blue],
-            background: [background_red, background_green, background_blue],
-        })
     }
 }
 

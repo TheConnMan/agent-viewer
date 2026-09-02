@@ -31,7 +31,6 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 # unicode-bidi/script/vo, and the system-font scan) plus raster-image decoding. Every SVG in
 # assets/logos is svg/g/path/title only, so none of it is reachable.
 resvg = { version = "0.45", default-features = false }
-termina = "0.3.3"
 tui-term = "0.3.4"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2"

@@ -39,7 +39,6 @@ dependencies = [
  "ratatui-image",
  "resvg",
  "tempfile",
- "termina",
  "tui-term",
  "unicode-segmentation",
  "unicode-width",

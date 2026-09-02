@@ -540,13 +540,7 @@ fn draw_tile(
         return;
     };
     pty.with_screen(|screen| {
-        frame.render_widget(
-            super::attach::ThemedPseudoTerminal {
-                screen,
-                palette: pty.palette(),
-            },
-            content,
-        );
+        frame.render_widget(super::attach::ThemedPseudoTerminal { screen }, content);
     });
 }
 

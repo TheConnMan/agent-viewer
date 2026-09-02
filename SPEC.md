@@ -674,13 +674,9 @@ tested without a daemon):
   `thread/read` + `includeTurns`, since `TurnInterruptParams` requires both ids; no live turn is
   a no-op success); else a pid -> SIGTERM as before; else unsupported.
 
-**Attached terminal palette.** The TUI captures the host terminal foreground and background
-once. Concrete RGB themes choose their text and background first; the terminal match theme falls
-back to the captured host colors. The chosen palette is mutable on `PtySession` and refreshes
-when the user reenters a retained session after changing theme. OSC 10, OSC 11, and default cell
-rendering use that same current palette. Explicit indexed and RGB child colors remain untouched.
-When no palette is available, OSC queries receive no reply and default cells use Reset rendering.
-Never fabricate unavailable host colors.
+**Attached terminal colors.** Attached PTYs retain their own terminal defaults and explicit
+colors. Viewer themes apply only to the viewer chrome: the TUI neither recolors default cells nor
+answers OSC 10/11 palette queries on behalf of Codex, Claude, or Grok.
 
 Transport: the control socket is a Unix socket that upgrades to RFC6455 WebSocket at `/rpc`
 (handshake URL `ws://localhost/rpc`), driven by blocking `tungstenite` over
