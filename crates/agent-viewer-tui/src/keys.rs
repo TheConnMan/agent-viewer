@@ -1194,7 +1194,7 @@ fn palette_action_items(
         action_item(
             PaletteAction::Triage,
             "Triage sessions needing attention",
-            "walk needs-input, then completed sessions",
+            "walk needs-input, then idle and done sessions",
             Some("⌃N"),
             // Not gated on the selected row: triage is a queue over every session, so the
             // only thing that can disable it is an empty queue, which the action reports

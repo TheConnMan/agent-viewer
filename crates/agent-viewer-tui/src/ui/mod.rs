@@ -206,7 +206,7 @@ pub enum Mode {
     Filter,
     Rename(RenameModal),
     Reply(ReplyModal),
-    /// The Ctrl+N triage inbox: a modal walk over needs-input then completed sessions.
+    /// The Ctrl+N triage inbox: a modal walk over needs-input, then idle and done sessions.
     Triage(TriageState),
     Help,
     Attached,
