@@ -4,10 +4,18 @@ use crate::backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, Session, SessionOrigin, SpawnResult,
     Status, TailEvent,
 };
+#[cfg(target_os = "linux")]
+use crate::codex::registry::{FileKey, file_key};
 use crate::error::{AttachRefusal, Error, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::time::SystemTime;
 
 const GROK_METHODS: &[&str] = &[
     "initialize",
@@ -30,10 +38,26 @@ pub struct GrokDiagnostics {
     pub methods: Vec<String>,
 }
 
+/// Cached `pr_refs` and durable status for one session, keyed by the (mtime, len)
+/// of `chat_history.jsonl` and `updates.jsonl`. Either key changing, shrinking,
+/// or vanishing is a miss.
+#[cfg(target_os = "linux")]
+struct DurableCacheEntry {
+    history_key: FileKey,
+    updates_key: FileKey,
+    pr_refs: Vec<PrRef>,
+    status: Status,
+}
+
 /// The only public entry point for Grok storage and lifecycle operations.
 pub struct GrokLifecycle {
     binary: PathBuf,
     home: PathBuf,
+    /// Per-session durable parse results. `list` takes `&self`, so this is a
+    /// `RefCell` the same way `CodexBackend.registry` is; `Send` is enough
+    /// because backends move to a worker thread.
+    #[cfg(target_os = "linux")]
+    durable_cache: RefCell<HashMap<String, DurableCacheEntry>>,
 }
 
 impl GrokLifecycle {
@@ -41,6 +65,8 @@ impl GrokLifecycle {
         GrokLifecycle {
             binary: binary.into(),
             home: home.into(),
+            #[cfg(target_os = "linux")]
+            durable_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -88,7 +114,7 @@ impl GrokLifecycle {
         }
         #[cfg(target_os = "linux")]
         {
-            let mut sessions = read_durable_sessions(&self.home)?;
+            let mut sessions = read_durable_sessions(self)?;
             if let Ok((_, mut clients)) = self.connect_existing(None, true) {
                 let mut roster_statuses = std::collections::HashMap::new();
                 for client in &mut clients {
@@ -511,9 +537,9 @@ const GROK_DURABLE_STATUS_MAX_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const GROK_PR_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Aggregate chat-history bytes the listing may scan for PR refs in one pass,
-/// matching the durable summary and status ceilings. Grok fleets are small enough
-/// that a bounded full parse per refresh is cheaper than Codex's per-file offset
-/// scanner; skipping a session's refs when the budget is gone is the safe fallback.
+/// matching the durable summary and status ceilings. A cache miss still does a
+/// bounded full parse; a hit skips the read. Skipping a session's refs when the
+/// budget is gone is the safe fallback.
 #[cfg(target_os = "linux")]
 const GROK_PR_SCAN_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Most successfully created PRs kept per session. Each ref costs a live `gh`
@@ -522,7 +548,45 @@ const GROK_PR_SCAN_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const GROK_MAX_PR_REFS: usize = 4;
 
 #[cfg(target_os = "linux")]
-fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
+fn missing_file_key() -> FileKey {
+    (SystemTime::UNIX_EPOCH, 0)
+}
+
+/// Apply the per-pass PR-scan budget to a cached parse without re-reading.
+#[cfg(target_os = "linux")]
+fn budgeted_pr_refs(file_len: u64, remaining_bytes: u64, cached: &[PrRef]) -> (Vec<PrRef>, u64) {
+    if remaining_bytes == 0 {
+        return (Vec::new(), 0);
+    }
+    if file_len == 0 || file_len > GROK_PR_SCAN_MAX_BYTES || file_len > remaining_bytes {
+        return (Vec::new(), 0);
+    }
+    (cached.to_vec(), file_len)
+}
+
+/// Apply the per-pass status-tail budget to a cached parse without re-reading.
+#[cfg(target_os = "linux")]
+fn budgeted_status(
+    file_len: u64,
+    remaining_bytes: u64,
+    cached: Status,
+    missing: bool,
+) -> (Status, u64) {
+    if remaining_bytes == 0 || missing {
+        return (Status::Unknown, 0);
+    }
+    let read_len = file_len
+        .min(GROK_STATUS_TAIL_MAX_BYTES)
+        .min(remaining_bytes);
+    if read_len == 0 {
+        return (Status::Unknown, 0);
+    }
+    (cached, read_len)
+}
+
+#[cfg(target_os = "linux")]
+fn read_durable_sessions(lifecycle: &GrokLifecycle) -> Result<Vec<Session>> {
+    let home = lifecycle.home.as_path();
     let home_directory = match SecureDirectory::open_root(home) {
         Ok(directory) => directory,
         Err(Error::Io(error))
@@ -548,6 +612,7 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
     let mut bytes_read = 0_u64;
     let mut status_bytes_read = 0_u64;
     let mut pr_bytes_read = 0_u64;
+    let mut seen_ids = HashSet::new();
     for cwd_name in cwd_names {
         let Ok(cwd_directory) = sessions_directory.open_directory(&cwd_name) else {
             continue;
@@ -625,30 +690,81 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
                     .filter(|text| !text.trim().is_empty())
                     .unwrap_or(&summary.session_summary),
             );
-            let (history, pr_refs) =
-                match session_directory.open_regular(std::ffi::OsStr::new("chat_history.jsonl")) {
-                    Ok(file) => {
-                        let remaining = GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read);
-                        let (refs, used) = read_durable_pr_refs(file, remaining);
-                        pr_bytes_read = pr_bytes_read.saturating_add(used);
-                        (
-                            Some(
-                                home.join("sessions")
-                                    .join(&cwd_name)
-                                    .join(&session_name)
-                                    .join("chat_history.jsonl"),
-                            ),
-                            refs,
-                        )
+            let history_path = home
+                .join("sessions")
+                .join(&cwd_name)
+                .join(&session_name)
+                .join("chat_history.jsonl");
+            let updates_path = home
+                .join("sessions")
+                .join(&cwd_name)
+                .join(&session_name)
+                .join("updates.jsonl");
+            let history_key = file_key(&history_path);
+            let updates_key = file_key(&updates_path);
+            let cache_hit = {
+                let cache = lifecycle.durable_cache.borrow();
+                cache.get(&summary.info.id).and_then(|entry| {
+                    (entry.history_key == history_key && entry.updates_key == updates_key)
+                        .then(|| (entry.pr_refs.clone(), entry.status.clone()))
+                })
+            };
+            let (history, pr_refs, status, pr_used, status_used) =
+                if let Some((cached_refs, cached_status)) = cache_hit {
+                    let (pr_refs, pr_used) = budgeted_pr_refs(
+                        history_key.1,
+                        GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read),
+                        &cached_refs,
+                    );
+                    let (status, status_used) = budgeted_status(
+                        updates_key.1,
+                        GROK_DURABLE_STATUS_MAX_BYTES.saturating_sub(status_bytes_read),
+                        cached_status,
+                        updates_key == missing_file_key(),
+                    );
+                    let history = if history_key == missing_file_key() {
+                        None
+                    } else {
+                        Some(history_path)
+                    };
+                    (history, pr_refs, status, pr_used, status_used)
+                } else {
+                    let remaining = GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read);
+                    let (history, pr_refs, pr_used) = match session_directory
+                        .open_regular(std::ffi::OsStr::new("chat_history.jsonl"))
+                    {
+                        Ok(file) => {
+                            let (refs, used) = read_durable_pr_refs(file, remaining);
+                            (Some(history_path), refs, used)
+                        }
+                        Err(_) => (None, Vec::new(), 0),
+                    };
+                    let (status, status_used) = read_durable_status(
+                        &session_directory,
+                        &summary.info.id,
+                        GROK_DURABLE_STATUS_MAX_BYTES.saturating_sub(status_bytes_read),
+                    );
+                    // A budget skip is not a parse: caching empty/Unknown under the real
+                    // file key would stick after earlier sessions shrink and free budget.
+                    let history_skipped = history.is_some() && history_key.1 > 0 && pr_used == 0;
+                    let status_skipped =
+                        updates_key != missing_file_key() && updates_key.1 > 0 && status_used == 0;
+                    if !history_skipped && !status_skipped {
+                        lifecycle.durable_cache.borrow_mut().insert(
+                            summary.info.id.clone(),
+                            DurableCacheEntry {
+                                history_key,
+                                updates_key,
+                                pr_refs: pr_refs.clone(),
+                                status: status.clone(),
+                            },
+                        );
                     }
-                    Err(_) => (None, Vec::new()),
+                    (history, pr_refs, status, pr_used, status_used)
                 };
-            let (status, status_bytes) = read_durable_status(
-                &session_directory,
-                &summary.info.id,
-                GROK_DURABLE_STATUS_MAX_BYTES.saturating_sub(status_bytes_read),
-            );
-            status_bytes_read = status_bytes_read.saturating_add(status_bytes);
+            pr_bytes_read = pr_bytes_read.saturating_add(pr_used);
+            status_bytes_read = status_bytes_read.saturating_add(status_used);
+            seen_ids.insert(summary.info.id.clone());
             sessions.push(Session {
                 backend: BackendKind::Grok,
                 id: summary.info.id.clone(),
@@ -675,6 +791,10 @@ fn read_durable_sessions(home: &Path) -> Result<Vec<Session>> {
             });
         }
     }
+    lifecycle
+        .durable_cache
+        .borrow_mut()
+        .retain(|id, _| seen_ids.contains(id));
     Ok(sessions)
 }
 

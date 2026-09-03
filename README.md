@@ -87,8 +87,8 @@ summary and any pull request badge. Elapsed time alone sits flush right. Session
 associated pull requests show `#315` for one PR or `2 PRs` for several. Claude jobs take those
 from the job record; Codex and Grok sessions take them from successful PR-creation tool calls
 in their own transcripts, so those sessions badge only PRs they successfully opened. A fresh
-viewer fills Codex badges in over its first few seconds (Grok parses each chat history on the
-listing refresh). The badge is
+viewer fills Codex badges in over its first few seconds (Grok parses each chat history on
+listing and reuses the result until that file changes). The badge is
 colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or
