@@ -1112,9 +1112,10 @@ pub fn format_elapsed(delta_ms: i64) -> String {
 
 /// Case-insensitive substring match. `needle` is already lowercased by the caller.
 /// ASCII haystacks match without allocating (one-byte needles via `slice::contains`,
-/// longer needles via windowed `eq_ignore_ascii_case`). Non-ASCII haystacks or
-/// needles fall back to `to_lowercase().contains` so Unicode case folding stays
-/// identical to the previous matcher.
+/// longer needles by skipping to the next first-byte candidate then
+/// `eq_ignore_ascii_case`). Non-ASCII haystacks or needles fall back to
+/// `to_lowercase().contains` so Unicode case folding stays identical to the
+/// previous matcher.
 pub(crate) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -1130,16 +1131,28 @@ fn ascii_contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
     }
-    // One-byte needles are the per-keystroke case. `[u8]::contains` lowers to memchr
-    // so a miss does not allocate a lowercased copy of a 2 KB title.
-    if let [byte] = needle {
-        let lo = byte.to_ascii_lowercase();
-        let up = byte.to_ascii_uppercase();
+    let lo = needle[0].to_ascii_lowercase();
+    let up = needle[0].to_ascii_uppercase();
+    // One-byte needles are the first keystroke. `[u8]::contains` lowers to memchr.
+    if needle.len() == 1 {
         return haystack.contains(&lo) || (up != lo && haystack.contains(&up));
     }
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+    // Later keystrokes: skip to the next first-byte candidate instead of comparing
+    // every window (a 2 KB title times a multi-byte needle is a keystroke stall).
+    let mut pos = 0;
+    let last = haystack.len() - needle.len();
+    while pos <= last {
+        let rest = &haystack[pos..=last];
+        let Some(rel) = rest.iter().position(|&b| b == lo || b == up) else {
+            return false;
+        };
+        pos += rel;
+        if haystack[pos..pos + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        pos += 1;
+    }
+    false
 }
 
 #[cfg(test)]
