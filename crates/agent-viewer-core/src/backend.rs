@@ -341,10 +341,91 @@ pub(crate) fn squash(text: &str) -> String {
 /// filter. Matching characters are dropped, not mapped to space: existing title tests
 /// pin concatenation of `\n`/`\r`. Grok's `is_terminal_safe` identity rejection is a
 /// separate check and is not relaxed into this strip.
+///
+/// ASCII input uses a byte-level predicate (`b >= 0x20 && b != 0x7f`). That matches
+/// [`is_display_safe`] on ASCII because every listed Unicode format/bidi code point is
+/// at least U+00AD, so the only ASCII drops are C0 and DEL.
 pub fn sanitize_display_text(text: &str) -> String {
+    if text.is_ascii() {
+        sanitize_display_text_ascii(text)
+    } else {
+        sanitize_display_text_chars(text)
+    }
+}
+
+/// In-place variant of [`sanitize_display_text`]. ASCII titles reuse their existing
+/// allocation; the TUI snapshot path calls this instead of allocating a replacement
+/// String for every row.
+pub fn sanitize_display_text_in_place(text: &mut String) {
+    if text.is_ascii() {
+        if !contains_ascii_control(text.as_bytes()) {
+            return;
+        }
+        // SAFETY: `text` is ASCII, so dropping C0/DEL bytes leaves valid UTF-8.
+        unsafe {
+            text.as_mut_vec()
+                .retain(|&byte| is_ascii_display_safe(byte));
+        }
+    } else {
+        text.retain(is_display_safe);
+    }
+}
+
+fn sanitize_display_text_ascii(text: &str) -> String {
+    debug_assert!(text.is_ascii());
+    let bytes = text.as_bytes();
+    if !contains_ascii_control(bytes) {
+        return text.to_owned();
+    }
+    let mut filtered = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && is_ascii_display_safe(bytes[index]) {
+            index += 1;
+        }
+        if index > start {
+            filtered.extend_from_slice(&bytes[start..index]);
+        }
+        while index < bytes.len() && !is_ascii_display_safe(bytes[index]) {
+            index += 1;
+        }
+    }
+    // SAFETY: `text` is ASCII and we only copied a subset of those bytes.
+    unsafe { String::from_utf8_unchecked(filtered) }
+}
+
+fn contains_ascii_control(bytes: &[u8]) -> bool {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        if swar_has_ascii_control(u64::from_ne_bytes(*chunk)) {
+            return true;
+        }
+    }
+    remainder.iter().any(|&byte| !is_ascii_display_safe(byte))
+}
+
+/// True when any byte in `n` is C0 (`< 0x20`) or DEL (`0x7f`).
+///
+/// Bit-parallel `hasless` / `haszero` from Sean Anderson's bit twiddling hacks:
+/// https://graphics.stanford.edu/~seander/bithacks.html#HasLessInWord
+#[inline]
+fn swar_has_ascii_control(n: u64) -> bool {
+    let less_than_32 = n.wrapping_sub(0x2020_2020_2020_2020) & !n & 0x8080_8080_8080_8080;
+    let xor_del = n ^ 0x7f7f_7f7f_7f7f_7f7f;
+    let is_del = xor_del.wrapping_sub(0x0101_0101_0101_0101) & !xor_del & 0x8080_8080_8080_8080;
+    (less_than_32 | is_del) != 0
+}
+
+fn sanitize_display_text_chars(text: &str) -> String {
     text.chars()
         .filter(|character| is_display_safe(*character))
         .collect()
+}
+
+#[inline]
+const fn is_ascii_display_safe(byte: u8) -> bool {
+    byte >= 0x20 && byte != 0x7f
 }
 
 fn is_display_safe(character: char) -> bool {
@@ -637,5 +718,70 @@ mod tests {
             sanitize_display_text("Grok leader peer is not owned by the current user"),
             "Grok leader peer is not owned by the current user"
         );
+    }
+
+    #[test]
+    fn sanitize_display_text_fast_path_matches_char_path() {
+        let corpus = [
+            "hello world",
+            "Grok leader peer is not owned by the current user",
+            "",
+            " ",
+            "line\ncarriage\rdelete\u{7f} c0\x01\x1b[31m",
+            "\x00\x1f\x7f",
+            "\t",
+            "safe\u{1b}[31m",
+            "Café 東京 🦀 Deploy",
+            "safe\u{202e}bidi\u{200b}zwsp\u{00AD}soft",
+            "line\ncarriage\rdelete\u{7f} c1\u{80}\u{9b}31m",
+            "\u{202e}\u{200b}\u{2066}\u{feff}",
+        ];
+        let mut dirty_ascii_changed = false;
+        for sample in corpus {
+            let fast = sanitize_display_text(sample);
+            let general = sanitize_display_text_chars(sample);
+            assert_eq!(
+                fast, general,
+                "fast path drifted from char path on {sample:?}"
+            );
+            let mut in_place = sample.to_string();
+            let capacity = in_place.capacity();
+            sanitize_display_text_in_place(&mut in_place);
+            assert_eq!(
+                in_place, general,
+                "in-place drifted from char path on {sample:?}"
+            );
+            assert_eq!(
+                in_place.capacity(),
+                capacity,
+                "in-place must reuse the existing allocation"
+            );
+            if sample.is_ascii() && fast != sample {
+                dirty_ascii_changed = true;
+            }
+        }
+        assert!(
+            dirty_ascii_changed,
+            "ASCII fast path must drop C0/DEL, not return its input unchanged"
+        );
+        assert_ne!(
+            sanitize_display_text("a\x1bb"),
+            "a\x1bb",
+            "stubbing the fast path as identity would still pass a clean-ASCII-only corpus"
+        );
+        for byte in 0u8..=127 {
+            for position in 0..8 {
+                let mut block = [b'x'; 8];
+                block[position] = byte;
+                let swar = swar_has_ascii_control(u64::from_ne_bytes(block));
+                let scalar = block
+                    .iter()
+                    .any(|&candidate| !is_ascii_display_safe(candidate));
+                assert_eq!(
+                    swar, scalar,
+                    "SWAR control detector drifted at byte {byte:#04x} position {position}"
+                );
+            }
+        }
     }
 }

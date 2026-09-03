@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "scan_codex_processes"
 harness = false
+
+[[bench]]
+name = "sanitize_display_text"
+harness = false

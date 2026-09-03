@@ -14,6 +14,7 @@ pub mod state;
 pub use backend::{
     ArchiveMode, Backend, BackendKind, Capabilities, ListingCacheScope, PrRef, Session,
     SessionOrigin, SpawnResult, Status, TailEvent, sanitize_display_text,
+    sanitize_display_text_in_place,
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use grok::{GrokBackend, GrokDiagnostics, GrokLifecycle};
