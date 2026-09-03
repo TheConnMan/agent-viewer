@@ -46,3 +46,7 @@ tempfile = "3.27.0"
 [[bench]]
 name = "row_rebuild"
 harness = false
+
+[[bench]]
+name = "draw_list"
+harness = false

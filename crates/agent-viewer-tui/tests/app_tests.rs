@@ -1,7 +1,7 @@
 use agent_viewer_core::{BackendKind, PrRef, Session, SessionOrigin, Status};
 use agent_viewer_tui::app::{
     App, Composer, DetachTracker, GroupKey, GroupMode, KillStage, Row, Section, format_elapsed,
-    row_layout,
+    row_layout, title_capacity,
 };
 use agent_viewer_tui::composer::CommandEntry;
 use agent_viewer_tui::pr_cache::PrStatusCache;
@@ -1539,6 +1539,121 @@ fn row_layout_always_separates_elapsed_from_preceding_content() {
 
     assert!(rendered.ends_with("#9 3m"));
     assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 30);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_visible_title_width_equals_title_capacity(
+    width: usize,
+    mark_width: usize,
+    title: &str,
+    desired_title_width: usize,
+    status: &str,
+    pr: &str,
+    summary: &str,
+    elapsed_width: usize,
+) {
+    let (visible_title, _, _, _, _) = row_layout(
+        width,
+        mark_width,
+        title,
+        desired_title_width,
+        status,
+        pr,
+        summary,
+        elapsed_width,
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(visible_title.as_str()),
+        title_capacity(
+            width,
+            mark_width,
+            desired_title_width,
+            status,
+            pr,
+            summary,
+            elapsed_width,
+        )
+    );
+}
+
+#[test]
+fn row_layout_visible_title_width_equals_title_capacity() {
+    assert_visible_title_width_equals_title_capacity(
+        80,
+        1,
+        "ship",
+        14,
+        "Working",
+        "",
+        "build package",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(
+        80,
+        1,
+        "release notes",
+        14,
+        "Needs input",
+        "",
+        "approve release",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(
+        34,
+        1,
+        "a title that must shrink",
+        40,
+        "Done",
+        "#315",
+        "concise summary",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(
+        50,
+        1,
+        "ship",
+        14,
+        "Done",
+        "",
+        "a secondary message much wider than the available space",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(
+        50,
+        1,
+        "release notes",
+        14,
+        "Needs input",
+        "",
+        "",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(
+        32,
+        1,
+        "abcdefghijklmnopqrst",
+        20,
+        "Done",
+        "",
+        "e\u{301}clair",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(19, 1, "task", 4, "Done", "#315", "", 2);
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+    assert_visible_title_width_equals_title_capacity(
+        20,
+        1,
+        &format!("{family} deploy"),
+        2,
+        "Working",
+        "",
+        "",
+        2,
+    );
+    assert_visible_title_width_equals_title_capacity(30, 1, "release", 7, "Done", "#9", "ready", 2);
+    assert_visible_title_width_equals_title_capacity(
+        4, 4, "title", 40, "Working", "#1", "summary", 8,
+    );
 }
 
 #[test]
