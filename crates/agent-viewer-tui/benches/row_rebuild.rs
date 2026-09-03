@@ -29,8 +29,10 @@
 //! `set_filter_one_char_5000` is the per-keystroke budget. It is not cheaper than a full
 //! refresh even though it looks like less work, because a non-empty filter lifts the
 //! hidden/companion exclusion (so the rebuild spans the FULL set, not the visible one). The
-//! needle is lowercased once per rebuild; the per-session cost is lowercasing each row's
-//! title and cwd for the case-insensitive match.
+//! needle is lowercased once per rebuild; ASCII titles and cwds match without allocating, and
+//! non-ASCII haystacks still lowercase. Short synthetic titles hide that cost, so
+//! `set_filter_one_char_5000_long_title` uses 2 KB ASCII titles at the same 5,000-session
+//! fleet size.
 //!
 //! Deterministic (fixed LCG seed). Project dirs are created in a temp dir so `project_root`
 //! does real work without touching the user's home.
@@ -47,6 +49,9 @@ const SESSIONS: usize = 5_000;
 
 /// Distinct project roots the sessions fan out across.
 const PROJECTS: usize = 120;
+
+/// Fleet-shaped title length on this box (Codex titles average ~1.9 KB).
+const LONG_TITLE_BYTES: usize = 2048;
 
 struct Lcg(u64);
 
@@ -117,7 +122,23 @@ fn project_dirs(root: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn long_ascii_title(rng: &mut Lcg, bytes: usize) -> String {
+    let mut text = String::with_capacity(bytes);
+    while text.len() < bytes {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(WORDS[rng.range(0, WORDS.len())]);
+    }
+    text.truncate(bytes);
+    text
+}
+
 fn synthetic_sessions(dirs: &[PathBuf]) -> Vec<Session> {
+    synthetic_sessions_with_titles(dirs, None)
+}
+
+fn synthetic_sessions_with_titles(dirs: &[PathBuf], title_bytes: Option<usize>) -> Vec<Session> {
     let mut rng = Lcg::new(0x701_5EED);
     (0..SESSIONS)
         .map(|index| Session {
@@ -128,7 +149,10 @@ fn synthetic_sessions(dirs: &[PathBuf]) -> Vec<Session> {
             id: format!("019f4dda-fecb-7b71-adba-{index:012}"),
             short_id: None,
             origin: SessionOrigin::Background,
-            title: paragraph(&mut rng, 3, 12),
+            title: match title_bytes {
+                Some(n) => long_ascii_title(&mut rng, n),
+                None => paragraph(&mut rng, 3, 12),
+            },
             cwd: dirs[index % dirs.len()].clone(),
             git_branch: Some(format!("task/bench-{index:04}")),
             status: match index % 5 {
@@ -205,6 +229,18 @@ fn bench_rows(criterion: &mut Criterion) {
         bencher.iter(|| {
             by_state.set_filter(black_box("s".to_string()));
             black_box(by_state.visible().len())
+        });
+    });
+
+    // Same keystroke path as `set_filter_one_char_5000`, but with 2 KB ASCII titles so
+    // the matcher allocation cost is visible at fleet-shaped title length. Existing
+    // short-title benches stay unchanged.
+    let long_sessions = synthetic_sessions_with_titles(&dirs, Some(LONG_TITLE_BYTES));
+    let mut filtered_long = App::new(long_sessions);
+    group.bench_function("set_filter_one_char_5000_long_title", |bencher| {
+        bencher.iter(|| {
+            filtered_long.set_filter(black_box("s".to_string()));
+            black_box(filtered_long.visible().len())
         });
     });
 
