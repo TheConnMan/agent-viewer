@@ -128,7 +128,7 @@ const KILL_ARM_WINDOW_MS: i64 = 2_000;
 
 fn sanitize_session_titles(sessions: &mut [Session]) {
     for session in sessions {
-        session.title = agent_viewer_core::sanitize_display_text(&session.title);
+        agent_viewer_core::sanitize_display_text_in_place(&mut session.title);
     }
 }
 
