@@ -89,8 +89,9 @@ Grok home is a nonempty `GROK_HOME` value verbatim, otherwise `~/.grok`. Durable
 under its `sessions` child in a working directory bucket and then a session identity directory.
 Agent Viewer reads `summary.json` for identity, title, working directory, timestamps, and
 summary, reads `chat_history.jsonl` for PR refs, and reads `updates.jsonl` for durable turn
-status. Per-session PR refs and durable status are cached keyed by each file's (mtime, len)
-and re-read only when either key changes, shrinks, or vanishes. It never writes a durable
+status. Per-session PR refs and durable status are cached independently, each keyed by that
+file's (mtime, len) taken from an `openat2` handle, and re-read only when that key
+changes, shrinks, or vanishes. It never writes a durable
 Grok file. Missing files, torn final JSONL records, malformed objects, directories that vanish
 during refresh, and unknown fields are skipped without failing the other rows.
 
@@ -357,9 +358,10 @@ An unpaired or failed command does not badge a PR, and URLs in messages, `gh pr 
 research output, grep/read of other files, or other calls are incidental and are excluded.
 Grok fleets are tens of sessions and a few megabytes of history, so a cache miss does a
 bounded full parse of each `chat_history.jsonl` (2 MiB per file, 32 MiB aggregate, complete
-lines only) rather than Codex's per-file offset scanner. A warm listing with unchanged file
-keys skips the read. `MAX_REFS` is 4, keeping the most recent successful refs. Roster-only
-rows with no durable history keep empty `pr_refs`.
+lines only) rather than Codex's per-file offset scanner. A warm listing with an unchanged
+history file key skips that read; an updates-file change does not re-parse history.
+`MAX_REFS` is 4, keeping the most recent successful refs. Roster-only rows with no durable
+history keep empty `pr_refs`.
 
 ## Status detection — TWO signals, both required
 

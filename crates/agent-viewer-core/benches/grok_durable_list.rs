@@ -11,10 +11,10 @@
 //!
 //! | bench | median |
 //! | --- | --- |
-//! | `list_cold_84` (fresh `GrokLifecycle`, every entry a miss) | **39.693 ms** |
-//! | `list_warm_84` (cache hit on every session) | **0.919 ms** |
+//! | `list_cold_84` (fresh `GrokLifecycle`, every entry a miss) | **39.678 ms** |
+//! | `list_warm_84` (cache hit on every session) | **0.983 ms** |
 //!
-//! The cache is worth **~43x** here. Absolute times move under agent load on
+//! The cache is worth **~40x** here. Absolute times move under agent load on
 //! this box; the ratio is the durable signal.
 //!
 //! Deterministic (fixed filler), temp dir only, no Grok home and no leader.

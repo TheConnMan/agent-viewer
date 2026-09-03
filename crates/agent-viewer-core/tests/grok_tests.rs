@@ -1171,6 +1171,46 @@ fn durable_cache_invalidates_when_history_or_updates_change() {
     );
 }
 
+/// A warm cache must not treat a later symlink as the previous regular file.
+/// Path-based (mtime, len) follows the target; openat2 must reject it and drop
+/// the cached refs and rollout path.
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_cache_does_not_follow_a_history_symlink_after_a_warm_hit() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-cache-symlink";
+    write_cache_session(
+        home.path(),
+        session_id,
+        &grok_pr_create_history(42),
+        &[grok_turn_completed(session_id, "prompt-one", "end_turn")],
+    );
+    let lifecycle = GrokLifecycle::new("missing-grok", home.path());
+    let first = listed_row(&lifecycle, session_id);
+    assert_eq!(pr_numbers(&first), vec!["42".to_string()]);
+    assert!(first.rollout_path.is_some());
+
+    let session_dir = home.path().join("sessions/project").join(session_id);
+    let history_path = session_dir.join("chat_history.jsonl");
+    let external = home.path().join("external-history.jsonl");
+    std::fs::copy(&history_path, &external).expect("copy history aside");
+    std::fs::remove_file(&history_path).expect("remove regular history");
+    symlink(&external, &history_path).expect("history symlink");
+
+    let after_symlink = listed_row(&lifecycle, session_id);
+    assert!(
+        after_symlink.pr_refs.is_empty(),
+        "a symlinked chat_history.jsonl must not keep cached PR refs"
+    );
+    assert_eq!(
+        after_symlink.rollout_path, None,
+        "a symlinked chat_history.jsonl is not a rollout path"
+    );
+    assert_eq!(after_symlink.status, Status::Done);
+}
+
 #[cfg(unix)]
 mod protocol {
     use super::*;
