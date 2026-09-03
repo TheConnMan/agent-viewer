@@ -364,8 +364,9 @@ The file signal alone is insufficient: during research 66/383 rollouts lacked `t
 yet **zero** `codex` processes were running, i.e. those are crashed/abandoned, not live.
 
 Resolve per thread on Linux. The fd signal is three-valued, not a boolean: `Held(owner)` when a
-live `codex`/`codex exec` PID holds this thread's `rollout_path` open (enumerate PIDs with
-`sysinfo`, read `/proc/<pid>/fd/*`, match an open path to `threads.rollout_path`), `Closed` when
+live `codex`/`codex exec` PID holds this thread's `rollout_path` open (enumerate `/proc`,
+read `/proc/<pid>/comm` for every pid and cmdline plus `/proc/<pid>/fd/*` only for comm
+starting with `codex`, match an open path to `threads.rollout_path`), `Closed` when
 the scan ran and nobody holds it, and `Unavailable` when the scan could not run at all. Crossed
 with the tail, `status_from` produces six outcomes for a row the daemon does not host:
 
@@ -610,7 +611,7 @@ Rows the daemon does not host keep the fd rules unchanged, and `attached` never 
 **"A client is attached" is read from argv in the same process sweep.** A TUI that joined a
 daemon-hosted thread runs `codex resume --remote unix://<sock> <thread-id>`, so the thread id
 appears in a codex process's argv. `scan_codex_processes` returns both the open-rollout map and
-that set of thread ids from ONE sysinfo pass, because this runs every refresh tick over thousands
+that set of thread ids from ONE `/proc` walk, because this runs every refresh tick over thousands
 of threads: no second sweep, and no per-row daemon query on the render path. Detection is
 shape-based (a 36-char UUID token), and a false positive costs one tick of Idle instead of Done.
 
