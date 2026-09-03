@@ -1319,11 +1319,10 @@ fn merge_roster(
         }
         let status = match entry.activity.as_str() {
             "working" => Status::Working,
-            "idle" => Status::Idle,
+            "idle" | "dormant" => Status::Idle,
             "needs_input" => Status::NeedsInput { reason: None },
             "completed" => Status::Done,
             "dead" => Status::Error,
-            "dormant" => Status::Unknown,
             _ => Status::Unknown,
         };
         let (status, roster_conflict) = match roster_statuses.get(&entry.session_id) {
