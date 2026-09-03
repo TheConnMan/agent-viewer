@@ -655,13 +655,13 @@ impl App {
     /// Substring filter over title + cwd, case-insensitive, with the needle ALREADY
     /// lowercased so a whole-list pass lowercases the filter once instead of once per session.
     /// An empty needle matches everything, which is what keeps an unfiltered rebuild from
-    /// lowercasing a title at all.
+    /// scanning a title at all.
     fn matches_needle(needle: &str, s: &Session) -> bool {
         if needle.is_empty() {
             return true;
         }
-        s.title.to_lowercase().contains(needle)
-            || s.cwd.to_string_lossy().to_lowercase().contains(needle)
+        contains_ignore_case(&s.title, needle)
+            || contains_ignore_case(&s.cwd.to_string_lossy(), needle)
     }
 
     /// Memoized project_root(cwd).
@@ -1110,9 +1110,54 @@ pub fn format_elapsed(delta_ms: i64) -> String {
     format!("{}d", hours / 24)
 }
 
+/// Case-insensitive substring match. `needle` is already lowercased by the caller.
+/// ASCII haystacks match without allocating (one-byte needles via `slice::contains`,
+/// longer needles by skipping to the next first-byte candidate then
+/// `eq_ignore_ascii_case`). Non-ASCII haystacks or needles fall back to
+/// `to_lowercase().contains` so Unicode case folding stays identical to the
+/// previous matcher.
+pub(crate) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        ascii_contains_ignore_case(haystack.as_bytes(), needle.as_bytes())
+    } else {
+        haystack.to_lowercase().contains(needle)
+    }
+}
+
+fn ascii_contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let lo = needle[0].to_ascii_lowercase();
+    let up = needle[0].to_ascii_uppercase();
+    // One-byte needles are the first keystroke. `[u8]::contains` lowers to memchr.
+    if needle.len() == 1 {
+        return haystack.contains(&lo) || (up != lo && haystack.contains(&up));
+    }
+    // Later keystrokes: skip to the next first-byte candidate instead of comparing
+    // every window (a 2 KB title times a multi-byte needle is a keystroke stall).
+    let mut pos = 0;
+    let last = haystack.len() - needle.len();
+    while pos <= last {
+        let rest = &haystack[pos..=last];
+        let Some(rel) = rest.iter().position(|&b| b == lo || b == up) else {
+            return false;
+        };
+        pos += rel;
+        if haystack[pos..pos + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        pos += 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CodexReply, codex_reply_keystroke};
+    use super::{CodexReply, codex_reply_keystroke, contains_ignore_case};
 
     #[test]
     fn codex_reply_keystroke_maps_yes_no_and_freeform() {
@@ -1125,5 +1170,60 @@ mod tests {
         for f in ["", "maybe", "do it later"] {
             assert_eq!(codex_reply_keystroke(f), CodexReply::Freeform);
         }
+    }
+
+    #[test]
+    fn contains_ignore_case_matches_to_lowercase_contains() {
+        // Needles are already lowercased, matching `rebuild_rows`. Mixed true/false
+        // cases fail if the fast path is stubbed to a constant.
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("", "a"),
+            ("abc", ""),
+            ("Hello World", "hello"),
+            ("Hello World", "world"),
+            ("Hello World", "lo wo"),
+            ("Hello World", "xyz"),
+            ("ABC", "bc"),
+            ("abc", "abcd"),
+            ("Café", "café"),
+            ("Café", "cafe"),
+            ("CAFÉ", "café"),
+            ("Straße", "straße"),
+            ("Straße", "strasse"),
+            ("İstanbul", "i"),
+            ("😀cat", "cat"),
+            ("cat😀", "cat"),
+            ("😀", "xyz"),
+            (" /Home/User/Project ", "user"),
+            ("aaaaNeedlexxxx", "needle"),
+        ];
+        let mut saw_match = false;
+        let mut saw_miss = false;
+        for &(haystack, needle) in cases {
+            let expected = haystack.to_lowercase().contains(needle);
+            saw_match |= expected;
+            saw_miss |= !expected;
+            assert_eq!(
+                contains_ignore_case(haystack, needle),
+                expected,
+                "haystack={haystack:?} needle={needle:?}"
+            );
+        }
+        let long = "a".repeat(2048);
+        for needle in ["xyz", "aaa"] {
+            let expected = long.to_lowercase().contains(needle);
+            saw_match |= expected;
+            saw_miss |= !expected;
+            assert_eq!(
+                contains_ignore_case(&long, needle),
+                expected,
+                "haystack=2048*'a' needle={needle:?}"
+            );
+        }
+        assert!(saw_match, "table must include a matching case");
+        assert!(saw_miss, "table must include a non-matching case");
+        assert!(contains_ignore_case("Hello", "hello"));
+        assert!(!contains_ignore_case("Hello", "xyz"));
     }
 }
