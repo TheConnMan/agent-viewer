@@ -1473,7 +1473,7 @@ mod protocol {
     }
 
     #[test]
-    fn roster_precedence_maps_dead_to_error_and_dormant_to_unknown() {
+    fn roster_precedence_maps_dead_to_error_and_dormant_to_idle() {
         let (home, leader) = leader_home();
         let rows = GrokLifecycle::new("/bin/true", home.path())
             .list()
@@ -1497,7 +1497,7 @@ mod protocol {
                 .find(|row| row.id == "session-dormant")
                 .unwrap()
                 .status,
-            Status::Unknown
+            Status::Idle
         );
         assert_eq!(
             rows.iter()
@@ -1562,6 +1562,38 @@ mod protocol {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].status, Status::Working);
         assert!(matches[0].daemon_hosted);
+    }
+
+    #[test]
+    fn dormant_roster_without_a_durable_terminal_is_idle() {
+        let home = tempfile::tempdir().expect("temporary Grok home");
+        write_durable_grok_session(home.path(), "session-status", &[]);
+        let _leader = ScriptedLeader::start_named(
+            home.path(),
+            "",
+            json!({"sessions":[{
+                "sessionId":"session-status",
+                "title":"Unloaded after triage",
+                "cwd":"/home/user/project",
+                "activity":"dormant",
+                "resident":false,
+                "lastChangeUnixMs":1787330131000_i64
+            }]}),
+            false,
+            false,
+            false,
+        );
+
+        let rows = GrokLifecycle::new("/bin/true", home.path())
+            .list()
+            .expect("merged Grok listing");
+        let matches = rows
+            .iter()
+            .filter(|row| row.id == "session-status")
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, Status::Idle);
+        assert!(!matches[0].daemon_hosted);
     }
 
     #[test]

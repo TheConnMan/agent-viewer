@@ -46,7 +46,9 @@ the session joins the shared leader instead of replacing it. Grok has no reversi
 flag: archive stops an active session and deletes it, and unarchive is unsupported. Durable
 `updates.jsonl` records identify unambiguous completed and
 failed turns. Live active roster state wins; idle or dormant roster state preserves an
-unambiguous durable terminal result. Ambiguous or later activity remains unknown. A shared
+unambiguous durable terminal result, and otherwise reads idle. Dormant is an
+unloaded row (Grok's Inactive), including a session that triage attached and then
+released. Ambiguous or later activity remains unknown. A shared
 leader never becomes row process ownership, and Agent Viewer never stops or restarts it.
 Grok lifecycle actions require the persistent `grok-agent-leader.service` described under
 Install; Agent Viewer reports an actionable error instead of starting a competing leader.

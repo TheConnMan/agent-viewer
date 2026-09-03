@@ -100,8 +100,9 @@ terminal result. A `turn_completed` event with `end_turn` or `cancelled` maps to
 `Unknown`. When a reachable leader reports the same identity, its resident roster fields
 replace stale durable title, working directory, summary, and timestamp. Active roster activity
 wins for status. Idle or dormant roster activity preserves an unambiguous durable terminal
-result; otherwise supported roster activity maps to working, needs input, idle, done, or error,
-and unknown evidence maps to `Unknown`.
+result; otherwise both map to idle. Supported live activity maps to working, needs input, idle,
+done, or error, and unknown evidence maps to `Unknown`. Dormant is Grok's unloaded Inactive
+row: a triage attach that is then released leaves the session dormant, not unknown.
 
 Leader discovery examines the official `leader*.lock` and `leader*.sock` entries below Grok
 home, connects only to a discovered socket, registers as a client, and probes leader identity
