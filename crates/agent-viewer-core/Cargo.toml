@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "sanitize_display_text"
 harness = false
+
+[[bench]]
+name = "grok_durable_list"
+harness = false

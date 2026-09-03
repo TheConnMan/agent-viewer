@@ -923,6 +923,294 @@ fn durable_listing_has_an_aggregate_byte_budget_and_deterministic_selection() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn grok_pr_create_history(number: u64) -> String {
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "content": "Creating the pull request.",
+        "tool_calls": [{
+            "id": "call-create-1",
+            "name": "run_terminal_command",
+            "arguments": "{\"command\": \"gh pr create --title t --body b\", \"description\": \"Create GitHub pull request\"}"
+        }]
+    });
+    let result = serde_json::json!({
+        "type": "tool_result",
+        "tool_call_id": "call-create-1",
+        "content": format!("exit: 0\nhttps://github.com/TheConnMan/agent-viewer/pull/{number}\n")
+    });
+    format!("{assistant}\n{result}\n")
+}
+
+#[cfg(target_os = "linux")]
+fn grok_pr_create_history_line(call_id: &str, number: u64) -> String {
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "content": "Creating another pull request.",
+        "tool_calls": [{
+            "id": call_id,
+            "name": "run_terminal_command",
+            "arguments": "{\"command\": \"gh pr create --title t --body b\", \"description\": \"Create GitHub pull request\"}"
+        }]
+    });
+    let result = serde_json::json!({
+        "type": "tool_result",
+        "tool_call_id": call_id,
+        "content": format!("exit: 0\nhttps://github.com/TheConnMan/agent-viewer/pull/{number}\n")
+    });
+    format!("{assistant}\n{result}\n")
+}
+
+#[cfg(target_os = "linux")]
+fn write_cache_session(home: &Path, session_id: &str, history: &str, updates: &[String]) {
+    write_durable_grok_session(home, session_id, updates);
+    std::fs::write(
+        home.join("sessions/project")
+            .join(session_id)
+            .join("chat_history.jsonl"),
+        history,
+    )
+    .expect("durable chat history");
+}
+
+#[cfg(target_os = "linux")]
+fn listed_row(lifecycle: &GrokLifecycle, session_id: &str) -> Session {
+    lifecycle
+        .list()
+        .expect("durable listing")
+        .into_iter()
+        .find(|row| row.id == session_id)
+        .unwrap_or_else(|| panic!("missing session {session_id}"))
+}
+
+#[cfg(target_os = "linux")]
+fn pr_numbers(row: &Session) -> Vec<String> {
+    row.pr_refs.iter().map(|r| r.id.clone()).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn restore_mtime(path: &Path, mtime: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("reopen for mtime restore")
+        .set_modified(mtime)
+        .expect("restore mtime");
+}
+
+/// Same (mtime, len) after a content swap is a cache hit: list must not re-read
+/// chat_history.jsonl or updates.jsonl. Swapping PR 42 for 99 (same encoded
+/// length) and restoring mtime fails this test if the cache is absent.
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_cache_skips_reread_when_file_keys_are_unchanged() {
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-cache-hit";
+    let history_42 = grok_pr_create_history(42);
+    let history_99 = grok_pr_create_history(99);
+    assert_eq!(
+        history_42.len(),
+        history_99.len(),
+        "same-key swap needs equal encoded length"
+    );
+    let done_update = padded_grok_turn_completed(session_id, "prompt-one", "end_turn", 512);
+    let error_update = padded_grok_turn_completed(session_id, "prompt-two", "error", 512);
+    write_cache_session(home.path(), session_id, &history_42, &[done_update]);
+    let lifecycle = GrokLifecycle::new("missing-grok", home.path());
+    let first = listed_row(&lifecycle, session_id);
+    assert_eq!(pr_numbers(&first), vec!["42".to_string()]);
+    assert_eq!(first.status, Status::Done);
+
+    let history_path = home
+        .path()
+        .join("sessions/project")
+        .join(session_id)
+        .join("chat_history.jsonl");
+    let updates_path = home
+        .path()
+        .join("sessions/project")
+        .join(session_id)
+        .join("updates.jsonl");
+    let history_meta = std::fs::metadata(&history_path).expect("history metadata");
+    let updates_meta = std::fs::metadata(&updates_path).expect("updates metadata");
+    let history_mtime = history_meta.modified().expect("history mtime");
+    let updates_mtime = updates_meta.modified().expect("updates mtime");
+
+    std::fs::write(&history_path, history_99).expect("swap history content");
+    restore_mtime(&history_path, history_mtime);
+    let swapped_history = std::fs::metadata(&history_path).expect("swapped history metadata");
+    assert_eq!(swapped_history.len(), history_meta.len());
+    assert_eq!(
+        swapped_history.modified().expect("swapped history mtime"),
+        history_mtime
+    );
+
+    let original_updates = std::fs::read_to_string(&updates_path).expect("original updates");
+    assert_eq!(
+        original_updates.len(),
+        error_update.len(),
+        "same-key status swap needs equal encoded length"
+    );
+    std::fs::write(&updates_path, error_update).expect("swap updates content");
+    restore_mtime(&updates_path, updates_mtime);
+    let swapped_updates = std::fs::metadata(&updates_path).expect("swapped updates metadata");
+    assert_eq!(swapped_updates.len(), updates_meta.len());
+    assert_eq!(
+        swapped_updates.modified().expect("swapped updates mtime"),
+        updates_mtime
+    );
+
+    let cached = listed_row(&lifecycle, session_id);
+    assert_eq!(
+        pr_numbers(&cached),
+        vec!["42".to_string()],
+        "unchanged (mtime, len) must not re-parse chat_history.jsonl"
+    );
+    assert_eq!(
+        cached.status,
+        Status::Done,
+        "unchanged (mtime, len) must not re-parse updates.jsonl"
+    );
+}
+
+/// Append, truncate, or delete of either durable file must miss the cache.
+/// A cache keyed only on session id (no invalidation) fails every assertion
+/// after the first list().
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_cache_invalidates_when_history_or_updates_change() {
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-cache-invalidate";
+    write_cache_session(
+        home.path(),
+        session_id,
+        &grok_pr_create_history(42),
+        &[grok_turn_completed(session_id, "prompt-one", "end_turn")],
+    );
+    let lifecycle = GrokLifecycle::new("missing-grok", home.path());
+    let first = listed_row(&lifecycle, session_id);
+    assert_eq!(pr_numbers(&first), vec!["42".to_string()]);
+    assert_eq!(first.status, Status::Done);
+
+    let session_dir = home.path().join("sessions/project").join(session_id);
+    let history_path = session_dir.join("chat_history.jsonl");
+    let updates_path = session_dir.join("updates.jsonl");
+
+    let mut appended = std::fs::read_to_string(&history_path).expect("history before append");
+    appended.push_str(&grok_pr_create_history_line("call-create-2", 77));
+    std::fs::write(&history_path, appended).expect("append chat history");
+    let after_append = listed_row(&lifecycle, session_id);
+    assert_eq!(
+        pr_numbers(&after_append),
+        vec!["42".to_string(), "77".to_string()],
+        "appending chat_history.jsonl must miss the cache"
+    );
+
+    std::fs::write(&history_path, "").expect("truncate chat history");
+    let after_truncate_history = listed_row(&lifecycle, session_id);
+    assert!(
+        after_truncate_history.pr_refs.is_empty(),
+        "truncating chat_history.jsonl must miss the cache"
+    );
+    assert!(
+        after_truncate_history.rollout_path.is_some(),
+        "an empty history file is still a rollout path"
+    );
+
+    std::fs::write(&history_path, grok_pr_create_history(42)).expect("restore chat history");
+    assert_eq!(
+        pr_numbers(&listed_row(&lifecycle, session_id)),
+        vec!["42".to_string()]
+    );
+    std::fs::remove_file(&history_path).expect("delete chat history");
+    let after_delete_history = listed_row(&lifecycle, session_id);
+    assert!(
+        after_delete_history.pr_refs.is_empty(),
+        "deleting chat_history.jsonl must miss the cache"
+    );
+    assert_eq!(
+        after_delete_history.rollout_path, None,
+        "a vanished history file is not a rollout path"
+    );
+
+    std::fs::write(&history_path, grok_pr_create_history(42)).expect("restore chat history");
+    let mut updates = std::fs::read_to_string(&updates_path).expect("updates before append");
+    if !updates.ends_with('\n') {
+        updates.push('\n');
+    }
+    updates.push_str(&grok_turn_completed(session_id, "prompt-two", "error"));
+    updates.push('\n');
+    std::fs::write(&updates_path, updates).expect("append updates");
+    let after_append_updates = listed_row(&lifecycle, session_id);
+    assert_eq!(
+        after_append_updates.status,
+        Status::Error,
+        "appending updates.jsonl must miss the cache"
+    );
+
+    std::fs::write(&updates_path, "").expect("truncate updates");
+    let after_truncate_updates = listed_row(&lifecycle, session_id);
+    assert_eq!(
+        after_truncate_updates.status,
+        Status::Unknown,
+        "truncating updates.jsonl must miss the cache"
+    );
+
+    std::fs::write(
+        &updates_path,
+        grok_turn_completed(session_id, "prompt-one", "end_turn"),
+    )
+    .expect("restore updates");
+    assert_eq!(listed_row(&lifecycle, session_id).status, Status::Done);
+    std::fs::remove_file(&updates_path).expect("delete updates");
+    let after_delete_updates = listed_row(&lifecycle, session_id);
+    assert_eq!(
+        after_delete_updates.status,
+        Status::Unknown,
+        "deleting updates.jsonl must miss the cache"
+    );
+}
+
+/// A warm cache must not treat a later symlink as the previous regular file.
+/// Path-based (mtime, len) follows the target; openat2 must reject it and drop
+/// the cached refs and rollout path.
+#[cfg(target_os = "linux")]
+#[test]
+fn durable_cache_does_not_follow_a_history_symlink_after_a_warm_hit() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().expect("temporary Grok home");
+    let session_id = "session-cache-symlink";
+    write_cache_session(
+        home.path(),
+        session_id,
+        &grok_pr_create_history(42),
+        &[grok_turn_completed(session_id, "prompt-one", "end_turn")],
+    );
+    let lifecycle = GrokLifecycle::new("missing-grok", home.path());
+    let first = listed_row(&lifecycle, session_id);
+    assert_eq!(pr_numbers(&first), vec!["42".to_string()]);
+    assert!(first.rollout_path.is_some());
+
+    let session_dir = home.path().join("sessions/project").join(session_id);
+    let history_path = session_dir.join("chat_history.jsonl");
+    let external = home.path().join("external-history.jsonl");
+    std::fs::copy(&history_path, &external).expect("copy history aside");
+    std::fs::remove_file(&history_path).expect("remove regular history");
+    symlink(&external, &history_path).expect("history symlink");
+
+    let after_symlink = listed_row(&lifecycle, session_id);
+    assert!(
+        after_symlink.pr_refs.is_empty(),
+        "a symlinked chat_history.jsonl must not keep cached PR refs"
+    );
+    assert_eq!(
+        after_symlink.rollout_path, None,
+        "a symlinked chat_history.jsonl is not a rollout path"
+    );
+    assert_eq!(after_symlink.status, Status::Done);
+}
+
 #[cfg(unix)]
 mod protocol {
     use super::*;
