@@ -66,24 +66,15 @@ impl CodexProcessScan {
     }
 }
 
-/// IMPURE scanner (live-e2e-verified only, no unit tests): enumerate processes via
-/// sysinfo whose name starts with "codex", read /proc/<pid>/fd/* via
-/// std::fs::read_link, collect target paths -> owning codex process. Strip a trailing
-/// " (deleted)" suffix. Unreadable /proc entries are skipped silently. The same pass collects
-/// the attached thread ids from argv, because this runs every refresh tick over thousands of
-/// threads and a second sweep (or a per-row daemon query) would land on the render path.
+/// IMPURE scanner (live-e2e-verified only, no unit tests): enumerate `/proc`, read
+/// `/proc/<pid>/comm` for every pid, and for processes whose comm starts with "codex"
+/// read cmdline and `/proc/<pid>/fd/*` via std::fs::read_link, collect target paths ->
+/// owning codex process. Strip a trailing " (deleted)" suffix. Unreadable /proc entries
+/// are skipped silently. The same pass collects the attached thread ids from argv, because
+/// this runs every refresh tick over thousands of threads and a second sweep (or a per-row
+/// daemon query) would land on the render path.
 #[cfg(target_os = "linux")]
 pub fn scan_codex_processes() -> CodexProcessScan {
-    let mut sys = sysinfo::System::new();
-    // The command line must be requested explicitly: `refresh_processes` refreshes memory,
-    // cpu, disk usage, exe and tasks but NOT `cmd`, so `process.cmd()` comes back EMPTY under
-    // it and every process reads as "not the daemon" (caught by the live e2e). Ask for the one
-    // field this scan actually reads beyond the name.
-    sys.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::All,
-        true,
-        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
-    );
     let mut scan = CodexProcessScan::from_evidence(HashMap::new(), HashSet::new(), true);
     // The two host signals are a UNION, not a fallback chain. Neither is complete on its own:
     // the socket table misses an app-server on the `stdio://` transport (it holds no socket at
@@ -93,22 +84,42 @@ pub fn scan_codex_processes() -> CodexProcessScan {
     let listening = std::fs::read_to_string("/proc/net/unix")
         .map(|table| listening_socket_inodes(&table))
         .unwrap_or_default();
-    for (pid, process) in sys.processes() {
-        if !process.name().to_string_lossy().starts_with("codex") {
+    let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+        return scan;
+    };
+    for entry in proc_entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let proc_dir = entry.path();
+        let Ok(comm) = std::fs::read(proc_dir.join("comm")) else {
+            continue;
+        };
+        // sysinfo `name()` on Linux is the kernel comm field; `/proc/<pid>/comm` is that field
+        // plus a trailing newline.
+        if !comm.trim_ascii().starts_with(b"codex") {
             continue;
         }
-        let args: Vec<_> = process
-            .cmd()
-            .iter()
-            .map(|arg| arg.to_string_lossy())
+        // sysinfo `cmd()` is `/proc/<pid>/cmdline` split on NUL, ASCII-trimmed, empties dropped.
+        let cmdline = std::fs::read(proc_dir.join("cmdline")).unwrap_or_default();
+        let args: Vec<_> = cmdline
+            .split(|byte| *byte == 0)
+            .filter_map(|part| {
+                let trimmed = part.trim_ascii();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(trimmed))
+                }
+            })
             .collect();
         for arg in &args {
             if looks_like_thread_id(arg) {
                 scan.attached_threads.insert(arg.to_string());
             }
         }
-        let fd_dir = format!("/proc/{}/fd", pid.as_u32());
-        let Ok(entries) = std::fs::read_dir(&fd_dir) else {
+        let Ok(fd_entries) = std::fs::read_dir(proc_dir.join("fd")) else {
             continue;
         };
         // A set, not a list: the shared daemon holds the rollout fd of EVERY thread it hosts,
@@ -116,8 +127,8 @@ pub fn scan_codex_processes() -> CodexProcessScan {
         // count on exactly the process that has the most of them.
         let mut held: HashSet<PathBuf> = HashSet::new();
         let mut holds_a_listening_socket = false;
-        for entry in entries.flatten() {
-            let Ok(target) = std::fs::read_link(entry.path()) else {
+        for fd_entry in fd_entries.flatten() {
+            let Ok(target) = std::fs::read_link(fd_entry.path()) else {
                 continue;
             };
             let display = target.to_string_lossy();
@@ -129,7 +140,7 @@ pub fn scan_codex_processes() -> CodexProcessScan {
             held.insert(PathBuf::from(stripped));
         }
         let owner = RolloutOwner {
-            pid: pid.as_u32(),
+            pid,
             daemon: holds_a_listening_socket || is_daemon_process(&args),
         };
         for path in held {
@@ -487,7 +498,7 @@ mod tests {
             argv(&["codex", "app-server", "daemon", "start"]),
             // argv[0] alone is the binary path, never evidence of anything.
             argv(&["/opt/app-server/codex", "exec", "do a thing"]),
-            // sysinfo returns an empty argv for a process it could not read.
+            // An unreadable cmdline yields an empty argv.
             argv(&[]),
         ];
         for args in &not_daemons {
