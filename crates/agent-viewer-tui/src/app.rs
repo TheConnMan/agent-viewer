@@ -947,23 +947,21 @@ fn truncate_to(s: &str, width: usize) -> String {
     out
 }
 
-/// Width math for one session row, kept pure so it is unit-testable.
+/// Shared title-column width for one session row.
 ///
-/// The row is
-/// `<glyph><mark><title><space><status><2sp><summary><summary_gap><pad><pr><space><elapsed>`.
-/// The title keeps the supplied shared width whenever that column fits. Narrow rows may
-/// reduce it enough to retain complete secondary fields. The PR badge is always atomic.
-#[allow(clippy::too_many_arguments)]
-pub fn row_layout(
+/// `row_layout` always pads or truncates the title to this width, so it equals
+/// `display_width` of the visible title. It depends on the viewport, mark, status
+/// word, PR badge, the summary's first grapheme, and the desired column — never on
+/// the title or the rest of the summary text.
+pub fn title_capacity(
     width: usize,
     mark_width: usize,
-    title: &str,
-    title_width: usize,
+    desired_title_width: usize,
     status: &str,
     pr: &str,
     summary: &str,
     elapsed_width: usize,
-) -> (String, String, String, String, usize) {
+) -> usize {
     // Fixed left decorations before the title: glyph + mark.
     let left_fixed = 1 + mark_width;
     let status_width = UnicodeWidthStr::width(status);
@@ -976,7 +974,7 @@ pub fn row_layout(
     // One space separates title from status and one always separates elapsed when it fits.
     let required_without_secondary = left_fixed + 1 + status_width + 1 + elapsed_width;
     let unconstrained_title_capacity =
-        title_width.min(width.saturating_sub(required_without_secondary));
+        desired_title_width.min(width.saturating_sub(required_without_secondary));
 
     // Keep the full shared column whenever it fits. If the viewport itself forces that
     // column narrower, also reserve a complete PR and one summary grapheme where possible.
@@ -1001,6 +999,39 @@ pub fn row_layout(
         title_capacity = title_capacity
             .min(width.saturating_sub(required_without_secondary + minimum_secondary));
     }
+    title_capacity
+}
+
+/// Width math for one session row, kept pure so it is unit-testable.
+///
+/// The row is
+/// `<glyph><mark><title><space><status><2sp><summary><summary_gap><pad><pr><space><elapsed>`.
+/// The title keeps the supplied shared width whenever that column fits. Narrow rows may
+/// reduce it enough to retain complete secondary fields. The PR badge is always atomic.
+#[allow(clippy::too_many_arguments)]
+pub fn row_layout(
+    width: usize,
+    mark_width: usize,
+    title: &str,
+    title_width: usize,
+    status: &str,
+    pr: &str,
+    summary: &str,
+    elapsed_width: usize,
+) -> (String, String, String, String, usize) {
+    let title_capacity = title_capacity(
+        width,
+        mark_width,
+        title_width,
+        status,
+        pr,
+        summary,
+        elapsed_width,
+    );
+    let left_fixed = 1 + mark_width;
+    let status_width = UnicodeWidthStr::width(status);
+    let pr_width = UnicodeWidthStr::width(pr);
+    let required_without_secondary = left_fixed + 1 + status_width + 1 + elapsed_width;
 
     let mut title_out = truncate_to(title, title_capacity);
     title_out.push_str(

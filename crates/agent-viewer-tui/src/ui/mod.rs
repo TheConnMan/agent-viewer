@@ -125,6 +125,26 @@ fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// Display width capped at `cap` columns. The list title column is capped at 40, so the
+/// desired-width scan only needs to know whether a title is already wider than 41.
+fn display_width_capped(s: &str, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    if s.is_ascii() {
+        return s.len().min(cap);
+    }
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut width = 0;
+    for grapheme in s.graphemes(true) {
+        width += display_width(grapheme);
+        if width >= cap {
+            return cap;
+        }
+    }
+    width
+}
+
 /// Display width of a mark glyph, floored at 1 so a zero-width glyph still reserves a column.
 fn mark_width(mark: &str) -> usize {
     display_width(mark).max(1)
@@ -435,6 +455,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
     };
     // The wall replaces the list region and nothing else, so it publishes that region for the
     // run loop's resize pass and leaves the list's mouse geometry empty (no rows to hit).
+    let prev_list_offset = d.list_hit.borrow().offset;
     let mut hit = match &d.wall {
         Some(view) => {
             *d.wall_rects.borrow_mut() = wall::draw(
@@ -460,6 +481,7 @@ pub fn draw(frame: &mut Frame, d: Draw) {
                 d.logos,
                 theme,
                 d.age_ramp,
+                prev_list_offset,
                 list_area,
             )
         }
@@ -603,24 +625,29 @@ struct ListDeco<'a> {
 
 // --- Main list ------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn draw_list(
-    frame: &mut Frame,
-    app: &App,
-    pulses: &Pulses,
-    now_ms: i64,
-    pr_status: &crate::pr_cache::PrStatusCache,
-    deco: ListDeco,
-    logos: Option<&LogoMarks>,
-    theme: &Theme,
-    age_ramp: bool,
-    area: Rect,
-) -> ListHit {
+/// Ratatui List offset for unit-height items: keep the selection visible starting from
+/// the previous frame's offset. A list that fits in the area always starts at 0.
+fn list_window_offset(prev: usize, selected: usize, len: usize, height: usize) -> usize {
+    if len == 0 || height == 0 || len <= height {
+        return 0;
+    }
+    let min_offset = selected.saturating_add(1).saturating_sub(height);
+    prev.clamp(min_offset, selected)
+}
+
+struct ListMetrics {
+    show_activity: bool,
+    project_width: usize,
+    width: usize,
+    title_width: usize,
+    elapsed_width: usize,
+}
+
+fn list_metrics(rows: &[Row], now_ms: i64, theme: &Theme, area: Rect) -> ListMetrics {
     let width = area.width as usize;
     let show_activity = width >= 126;
     let project_width = 0;
     let layout_width = width.saturating_sub(project_width + usize::from(show_activity) * 10);
-    let rows = app.visible();
     let elapsed_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -642,144 +669,145 @@ fn draw_list(
         })
         .max()
         .unwrap_or(0);
-    let desired_title_width = rows
-        .iter()
-        .filter_map(|row| match row {
-            Row::Session { title, .. } => Some(display_width(title)),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-        .min(40);
+    let mut desired_title_width = 0;
+    for row in rows {
+        if desired_title_width >= 40 {
+            break;
+        }
+        if let Row::Session { title, .. } = row {
+            desired_title_width = desired_title_width.max(display_width_capped(title, 41));
+        }
+    }
+    let desired_title_width = desired_title_width.min(40);
     let title_width = rows
         .iter()
         .filter_map(|row| match row {
             Row::Session {
                 backend,
-                title,
                 summary,
                 status,
                 pr_refs,
                 ..
             } => {
                 let pr = list::pr_badge(pr_refs);
-                let (visible_title, _, _, _, _) = crate::app::row_layout(
+                Some(crate::app::title_capacity(
                     layout_width,
                     mark_width(backend_mark(*backend, theme)),
-                    title,
                     desired_title_width,
                     list::status_display_word(status),
                     &pr,
                     summary,
                     elapsed_width,
-                );
-                Some(display_width(&visible_title))
+                ))
             }
             _ => None,
         })
         .min()
         .unwrap_or(desired_title_width);
-    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
-    // Parallel to `items`: the backend of each pushed session row (None for headers/spacers).
-    // Renamed sessions retain their backend so the logo overlay can find its rows by item index
-    // after the List has laid them out.
-    let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
-    // Also parallel to `items`, in lockstep draw order: each rendered line's selectable row
-    // target (Some(visible-row index) for a header/session line, None for a Spacer). This is
-    // the map the mouse handler reverses to pick a row from a cell.
-    let mut item_to_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
-    let rename_shown = deco
-        .rename
-        .map(|(backend, _, buffer)| rename_buffer(backend, buffer, width, theme));
-    for (row_idx, row) in rows.iter().enumerate() {
-        // A Spacer renders a blank line but is never selectable, so it maps to no row.
-        let target = if matches!(row, Row::Spacer) {
-            None
-        } else {
-            Some(row_idx)
-        };
-        match row {
-            Row::Session { backend, id, .. } => {
-                // In-place rename edit field replaces the row while renaming it. Its compact
-                // prefix uses the normal mark slot, so logo mode overlays that slot as usual.
-                if let Some((rb, rid, _)) = deco.rename
-                    && *backend == rb
-                    && id == rid
-                {
-                    items.push(rename_row_item(
-                        *backend,
-                        rename_shown.as_deref().unwrap_or_default(),
-                        theme,
-                    ));
-                    item_backends.push(Some(*backend));
-                } else {
-                    items.push(row_to_item(
+    ListMetrics {
+        show_activity,
+        project_width,
+        width,
+        title_width,
+        elapsed_width,
+    }
+}
+
+fn list_item_to_row(rows: &[Row]) -> Vec<Option<usize>> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
+            if matches!(row, Row::Spacer) {
+                None
+            } else {
+                Some(row_idx)
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn list_item_for_row(
+    row: &Row,
+    deco: &ListDeco,
+    rename_shown: Option<&str>,
+    pulses: &Pulses,
+    now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    metrics: &ListMetrics,
+    theme: &Theme,
+    age_ramp: bool,
+) -> (ListItem<'static>, Option<BackendKind>) {
+    match row {
+        Row::Session { backend, id, .. } => {
+            // In-place rename edit field replaces the row while renaming it. Its compact
+            // prefix uses the normal mark slot, so logo mode overlays that slot as usual.
+            if let Some((rb, rid, _)) = deco.rename
+                && *backend == rb
+                && id == rid
+            {
+                (
+                    rename_row_item(*backend, rename_shown.unwrap_or_default(), theme),
+                    Some(*backend),
+                )
+            } else {
+                (
+                    row_to_item(
                         row,
                         pulses,
                         now_ms,
                         pr_status,
-                        show_activity,
-                        project_width,
-                        width,
-                        title_width,
-                        elapsed_width,
+                        metrics.show_activity,
+                        metrics.project_width,
+                        metrics.width,
+                        metrics.title_width,
+                        metrics.elapsed_width,
                         theme,
                         age_ramp,
-                    ));
-                    item_backends.push(Some(*backend));
-                }
-                item_to_row.push(target);
-            }
-            _ => {
-                items.push(row_to_item(
-                    row,
-                    pulses,
-                    now_ms,
-                    pr_status,
-                    show_activity,
-                    project_width,
-                    width,
-                    title_width,
-                    elapsed_width,
-                    theme,
-                    age_ramp,
-                ));
-                item_backends.push(None);
-                item_to_row.push(target);
+                    ),
+                    Some(*backend),
+                )
             }
         }
+        _ => (
+            row_to_item(
+                row,
+                pulses,
+                now_ms,
+                pr_status,
+                metrics.show_activity,
+                metrics.project_width,
+                metrics.width,
+                metrics.title_width,
+                metrics.elapsed_width,
+                theme,
+                age_ramp,
+            ),
+            None,
+        ),
     }
-    let list = List::new(items).highlight_style(Style::default().bg(theme.selbg));
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        let sel = app.selected_index().min(rows.len() - 1);
-        state.select(Some(sel));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
-    // Capture the final scroll offset AFTER render (the widget computes it from the selection),
-    // together with the area and the item->row map, so the event loop can hit-test the mouse.
-    let hit = ListHit {
-        area,
-        offset: state.offset(),
-        item_to_row,
-        // The caller (`draw`) fills this in once the slash popup area is known.
-        blocked: None,
-    };
+}
 
+#[allow(clippy::too_many_arguments)]
+fn draw_list_overlays(
+    frame: &mut Frame,
+    rows: &[Row],
+    deco: &ListDeco,
+    rename_shown: Option<&str>,
+    item_backends: &[Option<BackendKind>],
+    logos: Option<&LogoMarks>,
+    theme: &Theme,
+    offset: usize,
+    area: Rect,
+) {
     // Logo overlay: for each on-screen session item, draw its brand image over the middle two
-    // mark columns. Only the visible
-    // window [offset, offset+height) is drawn; y is clamped inside the list area.
+    // mark columns. `item_backends` is the on-screen window, so `j` is already viewport-relative.
     if let Some(logos) = logos
         && logo_marks()
     {
-        let offset = state.offset();
-        let height = area.height as usize;
         for (j, backend) in item_backends.iter().enumerate() {
             let Some(backend) = backend else { continue };
-            if j < offset || j >= offset + height {
-                continue;
-            }
-            let y = area.y + (j - offset) as u16;
+            let y = area.y + j as u16;
             if y >= area.y + area.height || area.width < 4 {
                 continue;
             }
@@ -802,17 +830,170 @@ fn draw_list(
             |r| matches!(r, Row::Session { backend, id, .. } if *backend == rb && *id == rid),
         )
     {
-        let offset = state.offset();
         let y = area.y + idx.saturating_sub(offset) as u16;
         if idx >= offset && y < area.y + area.height {
             let prefix_width = display_width("✎") + mark_width(backend_mark(rb, theme));
-            let shown = rename_shown.as_deref().unwrap_or_default();
+            let shown = rename_shown.unwrap_or_default();
             let col = prefix_width + display_width(shown);
             let x = area.x + (col as u16).min(area.width.saturating_sub(1));
             frame.set_cursor_position((x, y));
         }
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn draw_list(
+    frame: &mut Frame,
+    app: &App,
+    pulses: &Pulses,
+    now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    deco: ListDeco,
+    logos: Option<&LogoMarks>,
+    theme: &Theme,
+    age_ramp: bool,
+    prev_offset: usize,
+    area: Rect,
+) -> ListHit {
+    let rows = app.visible();
+    let metrics = list_metrics(rows, now_ms, theme, area);
+    let height = area.height as usize;
+    let sel = if rows.is_empty() {
+        0
+    } else {
+        app.selected_index().min(rows.len() - 1)
+    };
+    let offset = list_window_offset(prev_offset, sel, rows.len(), height);
+    let end = offset.saturating_add(height).min(rows.len());
+    let mut items: Vec<ListItem> = Vec::with_capacity(end.saturating_sub(offset));
+    // Parallel to `items`: the backend of each pushed session row (None for headers/spacers).
+    // Renamed sessions retain their backend so the logo overlay can find its rows by item index
+    // after the List has laid them out.
+    let mut item_backends: Vec<Option<BackendKind>> =
+        Vec::with_capacity(end.saturating_sub(offset));
+    let rename_shown = deco
+        .rename
+        .map(|(backend, _, buffer)| rename_buffer(backend, buffer, metrics.width, theme));
+    for row in rows.iter().take(end).skip(offset) {
+        let (item, backend) = list_item_for_row(
+            row,
+            &deco,
+            rename_shown.as_deref(),
+            pulses,
+            now_ms,
+            pr_status,
+            &metrics,
+            theme,
+            age_ramp,
+        );
+        items.push(item);
+        item_backends.push(backend);
+    }
+    // Full-list map so `row_at` still indexes as `offset + line` the way the existing
+    // hit-tests pin. Cheap `Option<usize>` entries; the expensive `ListItem`s are windowed.
+    let item_to_row = list_item_to_row(rows);
+    let list = List::new(items).highlight_style(Style::default().bg(theme.selbg));
+    let mut state = ListState::default();
+    if !rows.is_empty() && height > 0 {
+        state.select(Some(sel.saturating_sub(offset)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+    let hit = ListHit {
+        area,
+        offset,
+        item_to_row,
+        // The caller (`draw`) fills this in once the slash popup area is known.
+        blocked: None,
+    };
+
+    draw_list_overlays(
+        frame,
+        rows,
+        &deco,
+        rename_shown.as_deref(),
+        &item_backends,
+        logos,
+        theme,
+        offset,
+        area,
+    );
+
+    hit
+}
+
+/// Reference renderer: build every `ListItem` and let ratatui List scroll from `prev_offset`.
+/// Used to prove the windowed path is pixel-identical.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn draw_list_full_reference(
+    frame: &mut Frame,
+    app: &App,
+    pulses: &Pulses,
+    now_ms: i64,
+    pr_status: &crate::pr_cache::PrStatusCache,
+    deco: ListDeco,
+    logos: Option<&LogoMarks>,
+    theme: &Theme,
+    age_ramp: bool,
+    prev_offset: usize,
+    area: Rect,
+) -> ListHit {
+    let rows = app.visible();
+    let metrics = list_metrics(rows, now_ms, theme, area);
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    let mut item_backends: Vec<Option<BackendKind>> = Vec::with_capacity(rows.len());
+    let rename_shown = deco
+        .rename
+        .map(|(backend, _, buffer)| rename_buffer(backend, buffer, metrics.width, theme));
+    for row in rows {
+        let (item, backend) = list_item_for_row(
+            row,
+            &deco,
+            rename_shown.as_deref(),
+            pulses,
+            now_ms,
+            pr_status,
+            &metrics,
+            theme,
+            age_ramp,
+        );
+        items.push(item);
+        item_backends.push(backend);
+    }
+    let item_to_row = list_item_to_row(rows);
+    let list = List::new(items).highlight_style(Style::default().bg(theme.selbg));
+    let mut state = ListState::default();
+    *state.offset_mut() = prev_offset;
+    if !rows.is_empty() {
+        let sel = app.selected_index().min(rows.len() - 1);
+        state.select(Some(sel));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+    let offset = state.offset();
+    let height = area.height as usize;
+    let window_backends: Vec<Option<BackendKind>> = item_backends
+        .iter()
+        .copied()
+        .skip(offset)
+        .take(height)
+        .collect();
+    let hit = ListHit {
+        area,
+        offset,
+        item_to_row,
+        blocked: None,
+    };
+    draw_list_overlays(
+        frame,
+        rows,
+        &deco,
+        rename_shown.as_deref(),
+        &window_backends,
+        logos,
+        theme,
+        offset,
+        area,
+    );
     hit
 }
 
@@ -1122,6 +1303,7 @@ mod tests {
                     logos,
                     &theme,
                     false,
+                    0,
                     Rect::new(0, 0, width, 1),
                 );
             })
@@ -1242,6 +1424,7 @@ mod tests {
                     None,
                     &theme,
                     false,
+                    0,
                     area,
                 );
             })
@@ -1313,6 +1496,7 @@ mod tests {
                     None,
                     &theme,
                     false,
+                    0,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1372,6 +1556,7 @@ mod tests {
                     None,
                     &theme,
                     false,
+                    0,
                     Rect::new(0, 0, width, height),
                 );
             })
@@ -1472,6 +1657,7 @@ mod tests {
                         None,
                         &theme,
                         false,
+                        0,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -1551,6 +1737,7 @@ mod tests {
                         None,
                         &theme,
                         false,
+                        0,
                         Rect::new(0, 0, 80, 2),
                     );
                 })
@@ -2623,5 +2810,336 @@ mod tests {
         let (rows, cursor) = render_input_box(12, 3, "> ", 2, "hi");
         assert_eq!(&rows[1], "│> hi      │");
         assert_eq!(cursor, (5, 1));
+    }
+
+    #[test]
+    fn display_width_capped_matches_display_width_until_the_cap() {
+        assert_eq!(display_width_capped("", 41), 0);
+        assert_eq!(display_width_capped("short", 41), display_width("short"));
+        assert_eq!(display_width_capped(&"a".repeat(41), 41), 41);
+        assert_eq!(display_width_capped(&"a".repeat(2_000), 41), 41);
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        assert_eq!(display_width_capped(family, 41), display_width(family));
+        assert_eq!(display_width_capped(&family.repeat(30), 41), 41);
+    }
+
+    #[test]
+    fn list_window_offset_keeps_selection_visible_from_previous_offset() {
+        let height = 10;
+        let len = 100;
+        assert_eq!(list_window_offset(0, 0, len, height), 0);
+        assert_eq!(list_window_offset(0, 9, len, height), 0);
+        assert_eq!(list_window_offset(0, 15, len, height), 6);
+        // Moving up inside the current window must not jump the offset.
+        assert_eq!(list_window_offset(6, 14, len, height), 6);
+        assert_eq!(list_window_offset(6, 6, len, height), 6);
+        assert_eq!(list_window_offset(6, 5, len, height), 5);
+        assert_eq!(list_window_offset(6, 99, len, height), 90);
+        assert_eq!(list_window_offset(50, 3, 8, 10), 0);
+        assert_eq!(list_window_offset(3, 0, 0, 10), 0);
+        assert_eq!(list_window_offset(3, 5, 20, 0), 0);
+        // From-zero would yield 5 here (14+1-10). The persisted window stays at 6.
+        assert_ne!(list_window_offset(6, 14, len, height), 14 + 1 - height);
+    }
+
+    fn synthetic_draw_list_session(index: usize, cwd: &str, title: String) -> Session {
+        Session {
+            backend: if index.is_multiple_of(2) {
+                BackendKind::Codex
+            } else {
+                BackendKind::Claude
+            },
+            id: format!("draw-list-{index}"),
+            short_id: None,
+            origin: agent_viewer_core::SessionOrigin::Interactive,
+            title,
+            cwd: cwd.into(),
+            git_branch: None,
+            status: match index % 5 {
+                0 => Status::Working,
+                1 => Status::needs_input(),
+                2 => Status::Idle,
+                3 => Status::Done,
+                _ => Status::Error,
+            },
+            created_at_ms: 1_000 + index as i64,
+            updated_at_ms: 2_000 + index as i64,
+            hidden: false,
+            companion: false,
+            subagent: false,
+            summary: if index.is_multiple_of(7) {
+                "a summary that occupies the secondary column".into()
+            } else {
+                String::new()
+            },
+            pid: None,
+            rollout_path: None,
+            pr_refs: if index.is_multiple_of(11) {
+                vec![agent_viewer_core::PrRef {
+                    id: format!("{}", 400 + index % 50),
+                    href: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            daemon_hosted: false,
+        }
+    }
+
+    fn synthetic_draw_list_app() -> App {
+        use crate::app::GroupKey;
+        use std::collections::HashSet;
+
+        let mut sessions = Vec::new();
+        let mut index = 0;
+        for project in 0..7 {
+            let cwd = format!("/tmp/agent-viewer-draw-list-p{project}");
+            for n in 0..90 {
+                let title = if n == 0 {
+                    "a very long title that must share the forty-column cap with every other row in the list view".into()
+                } else {
+                    format!("task {index} in project {project}")
+                };
+                sessions.push(synthetic_draw_list_session(index, &cwd, title));
+                index += 1;
+            }
+        }
+        let mut app = App::new(sessions);
+        let key = app
+            .visible()
+            .iter()
+            .find_map(|row| match row {
+                Row::ProjectHeader { root, .. } => Some(GroupKey::Project(root.clone())),
+                _ => None,
+            })
+            .expect("project header");
+        app.set_collapsed(HashSet::from([key]));
+        assert!(
+            app.visible().len() >= 500,
+            "synthetic list must have at least 500 rows, got {}",
+            app.visible().len()
+        );
+        app
+    }
+
+    fn render_draw_list_pair(
+        app: &App,
+        prev_offset: usize,
+        area: Rect,
+        deco: ListDeco,
+        now_ms: i64,
+    ) -> (
+        ratatui::buffer::Buffer,
+        ratatui::buffer::Buffer,
+        ListHit,
+        ListHit,
+    ) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let pulses = Pulses::new();
+        let pr_status = crate::pr_cache::PrStatusCache::default();
+        let theme = theme::amber(false);
+        let rename = deco
+            .rename
+            .map(|(b, id, buf)| (b, id.to_string(), buf.to_string()));
+
+        let mut windowed = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let windowed_deco = ListDeco {
+            rename: rename
+                .as_ref()
+                .map(|(b, id, buf)| (*b, id.as_str(), buf.as_str())),
+        };
+        let mut windowed_hit = ListHit::default();
+        windowed
+            .draw(|frame| {
+                windowed_hit = draw_list(
+                    frame,
+                    app,
+                    &pulses,
+                    now_ms,
+                    &pr_status,
+                    windowed_deco,
+                    None,
+                    &theme,
+                    false,
+                    prev_offset,
+                    area,
+                );
+            })
+            .unwrap();
+
+        let mut reference = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let reference_deco = ListDeco {
+            rename: rename
+                .as_ref()
+                .map(|(b, id, buf)| (*b, id.as_str(), buf.as_str())),
+        };
+        let mut reference_hit = ListHit::default();
+        reference
+            .draw(|frame| {
+                reference_hit = draw_list_full_reference(
+                    frame,
+                    app,
+                    &pulses,
+                    now_ms,
+                    &pr_status,
+                    reference_deco,
+                    None,
+                    &theme,
+                    false,
+                    prev_offset,
+                    area,
+                );
+            })
+            .unwrap();
+
+        (
+            windowed.backend().buffer().clone(),
+            reference.backend().buffer().clone(),
+            windowed_hit,
+            reference_hit,
+        )
+    }
+
+    fn first_last_selectable(app: &App) -> (usize, usize) {
+        let rows = app.visible();
+        let first = rows
+            .iter()
+            .position(|row| !matches!(row, Row::Spacer))
+            .expect("selectable row");
+        let last = rows
+            .iter()
+            .rposition(|row| !matches!(row, Row::Spacer))
+            .expect("selectable row");
+        (first, last)
+    }
+
+    #[test]
+    fn draw_list_window_matches_full_list_reference_across_selections() {
+        let mut app = synthetic_draw_list_app();
+        let area = Rect::new(0, 0, 100, 16);
+        let (first, last) = first_last_selectable(&app);
+        let middle = app
+            .visible()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !matches!(row, Row::Spacer))
+            .map(|(idx, _)| idx)
+            .find(|&idx| idx >= (first + last) / 2)
+            .expect("middle selectable row");
+
+        let mut prev = 0;
+        let mut steps = Vec::new();
+        for sel in [first, middle, last] {
+            assert!(
+                app.select_visible_index(sel),
+                "selection {sel} must be selectable"
+            );
+            let (windowed, reference, windowed_hit, reference_hit) =
+                render_draw_list_pair(&app, prev, area, ListDeco { rename: None }, 50_000);
+            assert_eq!(
+                windowed, reference,
+                "windowed draw must match the full-list reference at selection {sel}"
+            );
+            assert_eq!(windowed_hit.offset, reference_hit.offset);
+            assert_eq!(windowed_hit.item_to_row, reference_hit.item_to_row);
+            steps.push((sel, windowed_hit.offset));
+            prev = windowed_hit.offset;
+        }
+
+        assert_eq!(steps[0].1, 0, "first row stays at offset 0");
+        assert!(
+            steps[1].1 > 0,
+            "window offset rule: middle selection must scroll the list, got offset {}",
+            steps[1].1
+        );
+        assert!(
+            steps[2].1 > steps[1].1,
+            "window offset rule: last selection must scroll past the middle window, got {} then {}",
+            steps[1].1,
+            steps[2].1
+        );
+
+        // Move up to a selectable row that is still inside the last scrolled window.
+        let height = area.height as usize;
+        let last_offset = steps[2].1;
+        let up = (last_offset..last)
+            .rev()
+            .find(|&idx| {
+                idx != last
+                    && app
+                        .visible()
+                        .get(idx)
+                        .is_some_and(|row| !matches!(row, Row::Spacer))
+                    && idx >= last_offset
+                    && idx < last_offset + height
+            })
+            .expect("selectable row inside the scrolled window");
+        assert!(app.select_visible_index(up));
+        let (windowed, reference, windowed_hit, reference_hit) =
+            render_draw_list_pair(&app, prev, area, ListDeco { rename: None }, 50_000);
+        assert_eq!(
+            windowed, reference,
+            "windowed draw must match after scrolling up"
+        );
+        assert_eq!(windowed_hit.offset, reference_hit.offset);
+        assert_eq!(
+            windowed_hit.offset, last_offset,
+            "window offset rule: moving up into the current window must keep offset {last_offset}"
+        );
+        prev = windowed_hit.offset;
+
+        assert!(app.select_visible_index(first));
+        let (windowed, reference, windowed_hit, reference_hit) =
+            render_draw_list_pair(&app, prev, area, ListDeco { rename: None }, 50_000);
+        assert_eq!(
+            windowed, reference,
+            "windowed draw must match after scrolling to first"
+        );
+        assert_eq!(windowed_hit.offset, reference_hit.offset);
+        assert_eq!(
+            windowed_hit.offset, 0,
+            "returning to the first row scrolls back to 0"
+        );
+
+        // Rename the selected middle-of-window row and compare again at the scrolled offset.
+        app.select_visible_index(last);
+        let (windowed, reference, windowed_hit, _) =
+            render_draw_list_pair(&app, 0, area, ListDeco { rename: None }, 50_000);
+        assert_eq!(windowed, reference);
+        let scrolled = windowed_hit.offset;
+        let session = app
+            .visible()
+            .iter()
+            .find_map(|row| match row {
+                Row::Session { backend, id, .. } => Some((*backend, id.clone())),
+                _ => None,
+            })
+            .expect("session row");
+        app.select_by_key(&session);
+        let (windowed, reference, _, _) = render_draw_list_pair(
+            &app,
+            scrolled,
+            area,
+            ListDeco {
+                rename: Some((session.0, session.1.as_str(), "renamed title")),
+            },
+            50_000,
+        );
+        assert_eq!(windowed, reference);
+
+        app.toggle_group_mode();
+        assert!(app.visible().len() >= 500);
+        let (first, last) = first_last_selectable(&app);
+        app.select_visible_index(first);
+        let (windowed, reference, _, _) =
+            render_draw_list_pair(&app, 0, area, ListDeco { rename: None }, 50_000);
+        assert_eq!(windowed, reference);
+        app.select_visible_index(last);
+        let (windowed, reference, hit, _) =
+            render_draw_list_pair(&app, 0, area, ListDeco { rename: None }, 50_000);
+        assert_eq!(windowed, reference);
+        assert!(hit.offset > 0);
     }
 }
