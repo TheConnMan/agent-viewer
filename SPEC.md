@@ -29,7 +29,9 @@ rejected unless Tailscale supplied the `Tailscale-User-Login` header. One refres
 the listing backends and publishes a two second snapshot behind an `RwLock`, so HTTP handlers
 never list a backend per request. State changing handlers run blocking work against separate
 action backends and delegate mutations to the existing `Backend` methods. The Codex registry
-remains read only.
+remains read only. The terminal surface it serves — the wire protocol, the core output tap it
+reads through, the disconnect grace rule, and the Termux emulator vendored into the app — is
+specified in "Phone companion".
 
 ## Enumeration — the source of truth (requirements 2, 3-read, 4)
 
@@ -969,7 +971,8 @@ Cargo workspace, three crates plus one vendored dependency. Live-refresh the reg
 - `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
   badge color.
 - `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the
-  bounded scrollback and the palette replies.
+  bounded scrollback, the palette replies, and the optional output tap the companion server
+  streams from.
 - `spawn.rs` owns detached spawn, the reaper, and the shell-out wrappers (`run_checked`,
   `run_with_timeout`).
 - `state.rs` is the viewer-owned SQLite (the only database this tool writes) plus the pure
@@ -988,8 +991,9 @@ the tab title. Rendering lives under `ui/`: `list.rs`, `header.rs`, `composer.rs
 `palette.rs`, `wall.rs`, `triage.rs`, `tail.rs`, `theme.rs`, `sprite.rs`, `age.rs`.
 
 `agent-viewer-server` (bin plus lib): `axum` over `-core`. The library owns the authenticated
-route surface, the published session snapshot, and blocking action dispatch. The binary binds
-the loopback listener on `127.0.0.1:8477`.
+route surface, the published session snapshot, blocking action dispatch, and the terminal hub:
+one owner thread per attached session, bridging the core PTY output tap onto a WebSocket. The
+binary binds the loopback listener on `127.0.0.1:8477`.
 
 `vendor/vt100` is a patched fork of the published crate; see "Vendored vt100".
 
@@ -1020,6 +1024,123 @@ patch did not simply disable the check. The exit condition is an upstream releas
 restricted-region scrolling, at which point the `[patch.crates-io]` entry and the whole
 `vendor/` tree can be dropped. Until then a source build pulls the repo rather than the
 published crate, which is why `cargo install` targets the git URL.
+
+## Phone companion — the v2 terminal surface
+
+`agent-viewer-server` (axum, bin plus lib) shares `-core` with the TUI, binds only
+`127.0.0.1:8477`, and reaches the phone through `tailscale serve` on 8443.
+`require_tailscale_user` rejects anything without a `Tailscale-User-Login` header with 401;
+the terminal route additionally demands `Origin: https://appassets.androidplatform.net`
+(`ANDROID_ORIGIN`) and answers 403 to every other origin. The route is
+`GET /sessions/{id}/terminal?backend=<Codex|Claude>`, upgraded to a WebSocket. The child comes
+from the same `Backend::attach_command` the TUI uses, so a Codex attach still joins the
+app-server daemon — read "Codex attach/resume" before touching it — and a backend whose
+`Capabilities::attach` is false refuses with the usual unsupported error instead of opening a
+socket. `TERMINAL_LIMIT = 4` owners plus reservations exist at once, and one session has one
+connection: a second attach adopts the existing PTY only after the first socket drops.
+
+### Wire protocol
+
+Binary frames are PTY bytes in both directions. Text frames are JSON control only. There are no
+acks, no ids, and no readiness.
+
+Server to client:
+
+- text `{"type":"hello","cols":80,"rows":24,"running":true}`, sent on every attach, reattach
+  included.
+- binary: one redraw frame — `state_formatted()` then `contents_formatted()` off the owner's
+  vt100 screen — followed by live PTY output, unmodified.
+- text `{"type":"exit","status":null}` when the child's output ends; the server then closes.
+  `status` is **always** null, because `PtySession` reaps the child without surfacing its wait
+  status and widening that was out of scope for the companion.
+- text `{"type":"error","message":"..."}` (bounded to 256 chars) on a protocol error; the
+  server then closes.
+
+Client to server:
+
+- binary: raw input bytes for the PTY, capped at `TERMINAL_INPUT_BYTES` (4,096) per frame and
+  **never inspected**. They carry the view's own answers to the CLI's DA/DSR queries, mouse
+  reports, and bracketed paste; a server that parsed them would be v1 again. Over the cap is an
+  error frame and a close.
+- text `{"type":"resize","rows":N,"cols":N}`, clamped to 4..=200 rows and 10..=300 cols; out of
+  range is an error frame and a close.
+- text `{"type":"close"}`, which kills the child immediately instead of leaving it in grace.
+
+Reconnect restores the current screen, not scrollback. That is deliberate: the screen is what
+the phone was looking at, and both CLIs repaint their own composer.
+
+### The output tap, and why it publishes inside the parser lock
+
+`PtySpec` carries `output_tap: Option<std::sync::mpsc::Sender<Vec<u8>>>`. `spec_from_command`
+sets it to `None` and the TUI never sets it, so this is the whole core change the phone needed.
+The reader thread in `crates/agent-viewer-core/src/pty.rs` sends `buf[..n].to_vec()` on the tap
+**while still holding the parser lock it just used for `p.process(&buf[..n])`**.
+
+That ordering is the correctness argument, not a detail. The server builds its redraw inside
+`pty.with_screen(...)`, which takes the same parser lock, and drains queued `Output` events
+before reading the screen. Process-then-publish under one lock makes the pair atomic against
+that snapshot: a chunk is either already rendered into the snapshot and then drained, or still
+on the tap and streamed after it — never both, which would print it twice on the phone. Publish
+the chunk after releasing the lock and that double-print is a live race on every reconnect.
+
+`PtySpec` gives up `PartialEq` for the tap (a channel handle has no meaningful equality);
+nothing used it. A dropped receiver disables the tap silently and permanently. The closed tap
+is also the exit signal: the bridge thread turns the end of the channel into `TapClosed`, which
+kills the PTY and emits the `exit` frame.
+
+### Grace after disconnect
+
+A dropped socket does not kill the child. The owner thread arms `TERMINAL_GRACE = 10 min` and
+goes on reading the PTY into its vt100; a reconnect inside that window adopts the same process
+and gets a redraw of its current screen. On expiry the owner re-takes the hub lock and
+re-checks for a reconnect before killing, and drops its own hub entry when it does kill, so a
+connect racing the deadline either adopts the live owner or spawns a fresh PTY — never adopts
+one that is about to die. This is what makes backgrounding the app free: Android closes the
+socket, the session keeps working.
+
+### Why screen scraping (v1) was rejected
+
+v1 shipped server-rendered vt100 screens as plain-text JSON every 25 ms and drove a separate
+composer with a `submit` command, gated on server-side detection of prompt glyphs, startup
+banners, and settle timers. It could not converge: three of the seven v1 commits (`b6a03c5`,
+`aa94d5f`, `d390dd8`) were race fixes to that readiness gate, each adding another heuristic for
+"is the CLI ready for a keystroke". The gate is unwinnable because the question is wrong — the
+phone was not a terminal, so the server had to guess what a terminal would simply have known.
+v2 makes the phone a terminal and the wire dumb. **Do not reintroduce screen JSON, a submit
+command, readiness detection, or any scraping of CLI output.**
+
+### Vendored Termux emulator, and the GPLv3 line
+
+`android/termux-terminal/` is termux-app's `terminal-emulator` and `terminal-view` vendored as
+Java source; the vendored upstream version is recorded next to the module in
+`LICENSE.termux.md`, and a re-vendor onto a newer point release moves that record and nothing
+else. The JitPack AAR is unusable: `TerminalSession` is `public final` and its
+`initializeEmulator()` spawns a local subprocess over JNI, and there is no local process on the
+phone. The vendoring deletes `JNI.java`, drops `final`, strips the JNI calls out of the session
+base class, and adds exactly two files in package `com.termux.terminal`:
+`RemoteTerminalTransport` (`send(bytes,off,len)`, `resize(cols,rows)`, `close()`) and
+`RemoteTerminalSession` (`receive(bytes,len)`, `remoteExited(status)`). Every other upstream
+file is byte-for-byte upstream, so a Termux fix re-vendors by diff.
+
+**License.** termux-app is released GPLv3-only. `LICENSE.termux.md` records an Apache-2.0
+ancestry for these two libraries, but the vendored files carry no per-file relicensing header,
+so the module is treated as GPLv3. GPL obligations attach to **conveying** a work, and a
+debug-signed sideload to Brian's own phone over his own tailnet conveys nothing to anybody.
+Distributing the APK publicly would: the Android app would then be GPLv3 as a whole, source
+offer included. That is the decision point, not a reason to avoid the vendoring now. If the app
+is ever published, the swap candidate is ConnectBot's Apache-2.0 terminal library, which is the
+only other maintained Android VT emulator with a comparable emulator/view split.
+
+**Gboard, and why not xterm.js in a WebView.** Termux's `onCreateInputConnection` sets
+`outAttrs.inputType = InputType.TYPE_NULL`, telling the IME this is not a text field. Gboard
+responds by disabling autocorrect, suggestions, and glide typing and delivering plain key
+events, which is exactly what a terminal wants and is why this stack sidesteps the Android
+composition corruption documented against xterm.js (xterm.js issues 3600, 675, and 4345 — IME
+composition duplicating, dropping, or reordering characters on Android soft keyboards).
+Measured on Brian's phone 2026-09-04 with the v0.2 test APK: Gboard came up, typed text arrived
+clean, and Enter arrived as `\r`. Robolectric coverage in the module holds the rest of the
+input path — `commitText`, Enter, arrows, Del, Esc, Tab, hardware and sticky ctrl-C, bracketed
+paste, and a full IME composition cycle each reach the transport as the right bytes.
 
 ## Runtime mechanics
 

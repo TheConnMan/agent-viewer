@@ -652,17 +652,43 @@ paths.
 ## Phone companion
 
 The Android companion has a session list, a triage inbox, a new session composer, and a
-session detail screen. Session detail includes a read only recent tail, and Jump In opens a live
-terminal. Leaving the screen closes only the attach client, and sessions remain resumable. The
-four shipped themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
+session detail screen. Session detail includes a read only recent tail, and **jump in** opens
+the session in a real terminal on the phone: the same PTY the TUI would attach to, rendered by
+an embedded VT emulator, with the CLI's own composer doing the composing. The four shipped
+themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
 
-Start the local HTTP server:
+### Terminal behaviour
+
+- **Tap the screen** to focus the terminal and raise the keyboard. Typed characters, Enter,
+  arrows, Del, Esc, Tab, and hardware ctrl chords all go straight to the session as bytes.
+- **The key row** under the terminal covers what a soft keyboard lacks: enter, esc, tab, ctrl,
+  the four arrows, ctrl c, paste, and keyboard. It scrolls horizontally on a narrow screen.
+- **`ctrl` is sticky**, not held. Tapping it shows `[ctrl]` and the next character typed from
+  the key row or the keyboard is sent as a control byte; it then clears itself.
+- **Backgrounding the app closes the socket, not the terminal.** The attached process keeps
+  running on the box for ten minutes, and returning to the screen reconnects and repaints its
+  current screen (not scrollback). A reconnect retries at 750 ms, doubling to a six second
+  ceiling, so a server that is down is not hammered. Past the ten minutes the terminal is
+  killed, and jumping back in attaches to the same agent session again.
+- **close console** ends the attached terminal immediately instead of leaving it in that
+  window. As in the TUI, closing a terminal never ends the agent session; it stays resumable.
+- **`session ended`** in the status line means the attached process exited. The terminal stays
+  on screen and readable; input is disabled.
+- Screen size follows the phone: rotating or opening the keyboard resizes the session, and the
+  CLI repaints. About 67 columns fit in portrait at the default text size, 146 in landscape.
+
+### Running it
+
+Start the local HTTP server. It binds `127.0.0.1:8477` only, and never listens on the tailnet
+itself:
 
 ```
-cargo run -p agent-viewer-server
+cargo run --release -p agent-viewer-server
 ```
 
-Publish that API on tailnet HTTPS port 8443:
+Publish that API on tailnet HTTPS port 8443. Every request is rejected with 401 unless
+Tailscale injected a `Tailscale-User-Login` header, which is what this proxy does, so the
+server is unreachable without it:
 
 ```
 tailscale serve --bg --https=8443 http://127.0.0.1:8477
@@ -672,12 +698,28 @@ Build the debug APK with the generated debug keystore:
 
 ```
 cd android
-./gradlew assembleDebug
+ANDROID_HOME=$HOME/android-sdk ./gradlew --no-daemon :app:assembleDebug
 ```
+
+Serve the APK to the phone over the same tailnet:
+
+```
+tailscale serve --bg --https=8446 --set-path=/agent-viewer-1.apk \
+  android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+**Bump `versionCode` in `android/app/build.gradle.kts` and use a new served filename on every
+rebuild.** Android refuses to install an APK whose `versionCode` did not advance, and the phone
+serves the cached download when the URL is unchanged, so reusing either one silently installs
+the old build.
 
 The editable API base URL is `ApiConfig.DEFAULT_BASE_URL` in
 `android/app/src/main/java/com/theconnman/agentviewer/Api.kt`. It defaults to
 `https://remote-dev.tail26e2ce.ts.net:8443`.
+
+To exercise the app without a phone, the Google emulator recipe for this box (no KVM, so it
+runs under software emulation and takes about 13 minutes to cold boot) is in
+`.projects/mobile-app-design/spike-terminal-view/README.md`.
 
 ## Test
 
