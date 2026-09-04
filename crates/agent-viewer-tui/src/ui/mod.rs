@@ -1152,6 +1152,7 @@ mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("attached child")
     }

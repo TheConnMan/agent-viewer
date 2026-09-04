@@ -16,7 +16,9 @@ pub struct TerminalPalette {
     pub background: [u8; 3],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// No `PartialEq`: the output tap is a channel handle with no meaningful equality, and
+/// nothing compares two specs.
+#[derive(Debug, Clone)]
 pub struct PtySpec {
     pub program: String,
     pub args: Vec<String>,
@@ -29,6 +31,11 @@ pub struct PtySpec {
     pub palette: Option<TerminalPalette>,
     /// Normal grid history capacity. Zero disables retained history.
     pub scrollback_rows: usize,
+    /// Raw PTY output tap. Every chunk the reader thread feeds to the vt100 parser is also
+    /// published here, so a remote surface can relay the byte stream instead of scraping the
+    /// screen. `None` (the default everywhere but the companion server) costs nothing, and a
+    /// dropped receiver silently disables the tap for the rest of the session.
+    pub output_tap: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 /// Retained normal grid rows for a locally scrollable attached viewport.
@@ -36,7 +43,8 @@ pub const VIEWPORT_SCROLLBACK_ROWS: usize = 2_000;
 
 /// Read program/args/cwd/envs off a built `Command` via the stable getters
 /// (get_program/get_args/get_current_dir/get_envs). rows/cols clamped to >= 1. Env entries
-/// with a None value (an explicit unset) are dropped. Retained history starts disabled.
+/// with a None value (an explicit unset) are dropped. Retained history starts disabled and
+/// the output tap starts detached; a caller that wants the byte stream sets it itself.
 pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> PtySpec {
     PtySpec {
         program: cmd.get_program().to_string_lossy().into_owned(),
@@ -60,6 +68,7 @@ pub fn spec_from_command(cmd: &std::process::Command, rows: u16, cols: u16) -> P
         cols: cols.max(1),
         palette: None,
         scrollback_rows: 0,
+        output_tap: None,
     }
 }
 
@@ -142,7 +151,8 @@ impl PtySession {
     /// nothing; see memory pty-tui-testing-needs-winsize), spawn the command on the
     /// slave, detach a reader thread feeding a parser with bounded normal grid history. The
     /// child gets the pty as its controlling terminal (portable-pty default).
-    pub fn spawn(spec: PtySpec) -> Result<PtySession> {
+    pub fn spawn(mut spec: PtySpec) -> Result<PtySession> {
+        let mut output_tap = spec.output_tap.take();
         let rows = spec.rows.max(1);
         let cols = spec.cols.max(1);
 
@@ -213,6 +223,17 @@ impl PtySession {
                     Ok(n) => {
                         if let Ok(mut p) = reader_parser.lock() {
                             p.process(&buf[..n]);
+                            // Publish the same chunk WHILE STILL HOLDING the parser lock. A
+                            // tap consumer that snapshots the screen through with_screen()
+                            // takes this same lock, so process-then-publish is atomic against
+                            // it: a chunk can never appear both inside a snapshot and again
+                            // afterwards on the tap, which would print it twice on the remote
+                            // screen. A dropped receiver disables the tap for good.
+                            if let Some(tap) = &output_tap
+                                && tap.send(buf[..n].to_vec()).is_err()
+                            {
+                                output_tap = None;
+                            }
                         }
                         if palette_replies_enabled {
                             for slot in palette_queries.feed(&buf[..n]) {

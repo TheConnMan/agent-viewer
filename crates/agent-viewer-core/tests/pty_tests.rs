@@ -17,6 +17,7 @@ fn spec(program: &str, args: &[&str], rows: u16, cols: u16) -> PtySpec {
         rows,
         cols,
         scrollback_rows: 0,
+        output_tap: None,
         palette: None,
     }
 }
@@ -149,6 +150,7 @@ fn pty_viewport_follows_live_output_and_preserves_a_scrolled_view() {
     "#;
     let mut session = PtySession::spawn(PtySpec {
         scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        output_tap: None,
         envs: vec![(
             "VIEWPORT_SYNC_FILE".to_string(),
             sync_file.to_string_lossy().into_owned(),
@@ -240,6 +242,7 @@ fn pty_codex_top_anchored_scroll_region_preserves_global_history() {
     "#;
     let mut session = PtySession::spawn(PtySpec {
         scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        output_tap: None,
         envs: vec![(
             "VIEWPORT_SYNC_FILE".to_string(),
             sync_file.to_string_lossy().into_owned(),
@@ -287,6 +290,7 @@ fn pty_scroll_region_below_top_does_not_create_global_history() {
     "#;
     let mut session = PtySession::spawn(PtySpec {
         scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        output_tap: None,
         envs: vec![(
             "VIEWPORT_SYNC_FILE".to_string(),
             sync_file.to_string_lossy().into_owned(),
@@ -335,6 +339,7 @@ fn pty_viewport_retains_exactly_two_thousand_history_rows() {
     "#;
     let mut session = PtySession::spawn(PtySpec {
         scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+        output_tap: None,
         envs: vec![(
             "VIEWPORT_SYNC_FILE".to_string(),
             sync_file.to_string_lossy().into_owned(),
@@ -578,6 +583,7 @@ fn pty_answers_fragmented_palette_queries_with_configured_colors() {
     "#;
     let mut session = PtySession::spawn(PtySpec {
         scrollback_rows: 0,
+        output_tap: None,
         palette: Some(palette([0x12, 0x34, 0x56], [0xab, 0xcd, 0xef])),
         envs: vec![(
             ("PALETTE_SYNC_FILE").to_string(),
@@ -756,6 +762,7 @@ fn pty_keeps_palette_replies_and_concurrent_input_frames_intact() {
     let session = Arc::new(Mutex::new(
         PtySession::spawn(PtySpec {
             scrollback_rows: 0,
+            output_tap: None,
             palette: Some(palette([0x01, 0x23, 0x45], [0x67, 0x89, 0xab])),
             envs: vec![(
                 ("PALETTE_SYNC_FILE").to_string(),
@@ -813,4 +820,79 @@ fn pty_keeps_palette_replies_and_concurrent_input_frames_intact() {
     );
     session.lock().expect("lock concurrent pty session").kill();
     std::fs::remove_file(sync_file).expect("remove concurrent palette synchronization file");
+}
+
+/// The output tap is the whole reason the phone companion can be a real terminal: it must
+/// carry the SAME bytes the parser consumed, not a rendering of them.
+#[test]
+fn pty_output_tap_publishes_the_bytes_the_parser_processed() {
+    let (tap, tapped) = mpsc::channel::<Vec<u8>>();
+    let mut spec = spec("sh", &["-c", "printf 'abc\\r\\n'; sleep 30"], 24, 80);
+    spec.output_tap = Some(tap);
+    let mut session = PtySession::spawn(spec).expect("spawn tapped pty");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut bytes = Vec::new();
+    while Instant::now() < deadline && !bytes.windows(3).any(|window| window == b"abc") {
+        match tapped.recv_timeout(Duration::from_millis(250)) {
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert!(
+        bytes.windows(3).any(|window| window == b"abc"),
+        "the tap must carry the raw PTY bytes, got {bytes:?}"
+    );
+    assert!(
+        bytes.windows(2).any(|window| window == b"\r\n"),
+        "the tap must carry control bytes verbatim, got {bytes:?}"
+    );
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "abc"),
+        "a tapped session must still render through the vt100 parser"
+    );
+    session.kill();
+}
+
+/// A spec with no tap is the default everywhere else in the workspace, so it must behave
+/// exactly as it did before the tap existed.
+#[test]
+fn pty_without_an_output_tap_still_renders() {
+    let mut session = PtySession::spawn(spec("sh", &["-c", "printf 'untapped'; sleep 30"], 24, 80))
+        .expect("spawn untapped pty");
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "untapped"),
+        "an untapped session must render exactly as before"
+    );
+    session.kill();
+}
+
+/// A dropped receiver must not kill the reader thread: the session keeps rendering.
+#[test]
+fn pty_output_tap_with_a_dropped_receiver_keeps_the_session_alive() {
+    let (tap, tapped) = mpsc::channel::<Vec<u8>>();
+    let mut spec = spec(
+        "sh",
+        &[
+            "-c",
+            "printf 'first\\r\\n'; sleep 0.4; printf 'second'; sleep 30",
+        ],
+        24,
+        80,
+    );
+    spec.output_tap = Some(tap);
+    let mut session = PtySession::spawn(spec).expect("spawn tapped pty");
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "first"),
+        "the first write must render before the receiver goes away"
+    );
+    drop(tapped);
+
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "second"),
+        "a closed tap receiver must silently disable the tap, not stop the reader"
+    );
+    session.kill();
 }
