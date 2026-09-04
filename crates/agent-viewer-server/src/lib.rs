@@ -190,6 +190,7 @@ impl TerminalReadiness {
             BackendKind::Claude => lines
                 .iter()
                 .any(|line| line.contains("Waking session") || line.contains("Attaching")),
+            BackendKind::Grok => false,
         };
         if startup_visible {
             self.saw_startup = true;
@@ -208,6 +209,7 @@ impl TerminalReadiness {
                         .get(usize::from(cursor_row))
                         .is_some_and(|line| line.trim() == "❯")
             }
+            BackendKind::Grok => cursor_visible,
         };
         if !prompt_visible {
             self.candidate_since = None;
@@ -1353,8 +1355,8 @@ async fn mutate_session(
         let capabilities = backend.capabilities_for(&session);
         let result = match mutation {
             MutationKind::Stop if capabilities.stop => backend.stop(&session),
-            MutationKind::Hide if capabilities.archive => backend.hide(&session.id),
-            MutationKind::Unhide if capabilities.archive => backend.unhide(&session.id),
+            MutationKind::Hide if capabilities.archive.is_some() => backend.archive(&session),
+            MutationKind::Unhide if capabilities.archive.is_some() => backend.unarchive(&session),
             MutationKind::Stop => {
                 return Err(ApiError::unsupported(format!(
                     "{} does not support stop",

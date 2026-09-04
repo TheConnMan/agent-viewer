@@ -149,7 +149,7 @@ pub enum SessionOrigin {
     Exec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ArchiveMode {
     /// The provider keeps the thread and can restore it later.
     Reversible,

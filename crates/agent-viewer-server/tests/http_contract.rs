@@ -7,8 +7,8 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_viewer_core::{
-    AttachRefusal, Backend, BackendKind, Capabilities, Error, Session, SessionOrigin, SpawnResult,
-    Status, TailEvent,
+    ArchiveMode, AttachRefusal, Backend, BackendKind, Capabilities, Error, Session, SessionOrigin,
+    SpawnResult, Status, TailEvent,
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header::CONTENT_TYPE};
@@ -92,7 +92,7 @@ impl Backend for FakeBackend {
             spawn: true,
             attach: self.attach_script.is_some(),
             rename: true,
-            archive: true,
+            archive: Some(ArchiveMode::Reversible),
             delete: false,
             stop: true,
         }
@@ -146,12 +146,12 @@ impl Backend for FakeBackend {
         vec!["default".to_string(), "gpt-5.6-sol".to_string()]
     }
 
-    fn hide(&self, _id: &str) -> agent_viewer_core::Result<()> {
+    fn archive(&mut self, _session: &Session) -> agent_viewer_core::Result<()> {
         self.calls.hide.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn unhide(&self, _id: &str) -> agent_viewer_core::Result<()> {
+    fn unarchive(&mut self, _session: &Session) -> agent_viewer_core::Result<()> {
         self.calls.unhide.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -463,7 +463,7 @@ fn tail_events_and_capabilities_have_json_contracts() {
             "spawn": false,
             "attach": false,
             "rename": false,
-            "archive": false,
+            "archive": null,
             "delete": false,
             "stop": false
         })
@@ -538,7 +538,7 @@ async fn router_exposes_authenticated_backend_contracts() {
             "spawn": true,
             "attach": false,
             "rename": true,
-            "archive": true,
+            "archive": "Reversible",
             "delete": false,
             "stop": true
         })
