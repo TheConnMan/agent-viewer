@@ -1,6 +1,6 @@
 //! HTTP companion server for agent-viewer.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 
@@ -37,12 +37,15 @@ const TERMINAL_MIN_COLS: u64 = 10;
 const TERMINAL_MAX_COLS: u64 = 300;
 const TERMINAL_INPUT_BYTES: usize = 4_096;
 const TERMINAL_MESSAGE_BYTES: usize = TERMINAL_INPUT_BYTES * 6 + 512;
-const TERMINAL_COMMAND_CAPACITY: usize = 32;
 const TERMINAL_LIMIT: usize = 4;
-const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const TERMINAL_RESIZE_SETTLE: Duration = Duration::from_millis(1_100);
-const TERMINAL_PLAIN_SUBMIT_DELAY: Duration = Duration::from_millis(150);
-const TERMINAL_READY_SETTLE: Duration = Duration::from_millis(600);
+/// How long an attached PTY outlives its socket. A phone that goes to sleep, loses the
+/// tailnet, or is backgrounded must find its session exactly where it left it; only after
+/// this window with nobody attached is the child killed.
+const TERMINAL_GRACE: Duration = Duration::from_secs(10 * 60);
+/// The owner thread has nothing to poll for while a client is attached — output, input and
+/// the child's EOF all arrive as events — so this bound only keeps a wait from being
+/// unbounded.
+const TERMINAL_IDLE_WAIT: Duration = Duration::from_secs(3_600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TerminalKey {
@@ -50,9 +53,17 @@ struct TerminalKey {
     id: String,
 }
 
-#[derive(Debug, Clone)]
+/// The channel the owner thread listens on. It is a std channel on purpose: the async socket
+/// task only ever does a non-blocking unbounded `send`, and the owner thread needs a blocking
+/// receive with a deadline for the disconnect grace window.
+type TerminalEvents = std::sync::mpsc::Sender<OwnerEvent>;
+
+/// One live attach: an owner thread, its PTY, and whether a socket is currently on it.
 struct TerminalOwner {
     generation: u64,
+    events: TerminalEvents,
+    connected: bool,
+    connection: u64,
 }
 
 #[derive(Default)]
@@ -62,17 +73,35 @@ struct TerminalHubState {
     next_generation: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TerminalHub {
     inner: Arc<Mutex<TerminalHubState>>,
+    grace: Duration,
 }
 
+impl TerminalHub {
+    fn new(grace: Duration) -> Self {
+        Self {
+            inner: Arc::default(),
+            grace,
+        }
+    }
+}
+
+/// A client's handle on an owner thread. `connection` distinguishes successive sockets on the
+/// same PTY so a late detach from an old socket cannot expire a newly reconnected one.
 #[derive(Clone)]
 struct TerminalLease {
     key: TerminalKey,
     generation: u64,
-    commands: mpsc::Sender<TerminalCommand>,
-    screen: watch::Receiver<TerminalScreen>,
+    connection: u64,
+    events: TerminalEvents,
+}
+
+/// Connecting either adopts the PTY still sitting in its grace window or spawns a new one.
+enum TerminalAcquire {
+    Fresh(TerminalReservation),
+    Reattach(TerminalLease),
 }
 
 struct TerminalReservation {
@@ -90,222 +119,64 @@ impl Drop for TerminalReservation {
     }
 }
 
-enum TerminalCommand {
-    Input {
-        bytes: Vec<u8>,
-        result: oneshot::Sender<Result<(), String>>,
+/// A frame bound for the attached client: JSON control as text, raw PTY bytes as binary.
+enum ServerFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// Everything the owner thread reacts to. Output and the child's EOF come from the PTY tap
+/// bridge; the rest comes from the socket task.
+enum OwnerEvent {
+    /// Raw PTY output, already applied to this session's vt100 screen.
+    Output(Vec<u8>),
+    /// The PTY reader hit EOF: the child's terminal is gone.
+    TapClosed,
+    Attach {
+        connection: u64,
+        sink: mpsc::UnboundedSender<ServerFrame>,
     },
-    Submit {
-        text: String,
-        result: oneshot::Sender<Result<(), String>>,
+    Detach {
+        connection: u64,
     },
+    Input(Vec<u8>),
     Resize {
         rows: u16,
         cols: u16,
-        result: oneshot::Sender<Result<(), String>>,
     },
     Close {
         complete: oneshot::Sender<()>,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TerminalScreen {
+struct TerminalOwnerContext {
+    hub: Weak<Mutex<TerminalHubState>>,
+    key: TerminalKey,
+    generation: u64,
+    grace: Duration,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalHello {
     #[serde(rename = "type")]
     kind: &'static str,
-    seq: u64,
-    rows: u16,
     cols: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-    lines: Vec<String>,
-    running: bool,
-    ready: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TerminalScreenState {
     rows: u16,
-    cols: u16,
-    cursor_row: u16,
-    cursor_col: u16,
-    lines: Vec<String>,
     running: bool,
-    ready: bool,
 }
 
-struct TerminalReadiness {
-    backend: BackendKind,
-    saw_startup: bool,
-    candidate_since: Option<std::time::Instant>,
-    ready: bool,
-}
-
-impl TerminalReadiness {
-    fn new(backend: BackendKind) -> Self {
-        Self {
-            backend,
-            saw_startup: false,
-            candidate_since: None,
-            ready: false,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        lines: &[String],
-        cursor_row: u16,
-        cursor_visible: bool,
-        running: bool,
-    ) -> bool {
-        self.observe_at(
-            lines,
-            cursor_row,
-            cursor_visible,
-            running,
-            std::time::Instant::now(),
-        )
-    }
-
-    fn observe_at(
-        &mut self,
-        lines: &[String],
-        cursor_row: u16,
-        cursor_visible: bool,
-        running: bool,
-        now: std::time::Instant,
-    ) -> bool {
-        if !running {
-            self.candidate_since = None;
-            self.ready = false;
-            return false;
-        }
-        if self.ready {
-            return true;
-        }
-        let startup_visible = match self.backend {
-            BackendKind::Codex => lines.iter().any(|line| {
-                line.contains("Resuming session") || line.contains("direct input is disabled")
-            }),
-            BackendKind::Claude => lines
-                .iter()
-                .any(|line| line.contains("Waking session") || line.contains("Attaching")),
-            BackendKind::Grok => false,
-        };
-        if startup_visible {
-            self.saw_startup = true;
-            self.candidate_since = None;
-            self.ready = false;
-            return false;
-        }
-        if matches!(self.backend, BackendKind::Codex) && !self.saw_startup {
-            return false;
-        }
-        let prompt_visible = match self.backend {
-            BackendKind::Codex => lines.iter().any(|line| line.trim_start().starts_with("› ")),
-            BackendKind::Claude => {
-                cursor_visible
-                    && lines
-                        .get(usize::from(cursor_row))
-                        .is_some_and(|line| line.trim() == "❯")
-            }
-            BackendKind::Grok => cursor_visible,
-        };
-        if !prompt_visible {
-            self.candidate_since = None;
-            self.ready = false;
-            return false;
-        }
-        let since = self.candidate_since.get_or_insert(now);
-        self.ready = now.saturating_duration_since(*since) >= TERMINAL_READY_SETTLE;
-        self.ready
-    }
-}
-
-#[cfg(test)]
-mod terminal_readiness_tests {
-    use super::{BackendKind, TERMINAL_READY_SETTLE, TerminalReadiness};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn claude_prompt_on_cursor_row_settles_without_observed_startup_marker() {
-        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
-        let lines = vec!["❯".to_owned()];
-        let started = Instant::now();
-
-        assert!(!readiness.observe_at(&lines, 0, true, true, started));
-        assert!(!readiness.observe_at(
-            &lines,
-            0,
-            true,
-            true,
-            started + TERMINAL_READY_SETTLE - Duration::from_millis(1)
-        ));
-        assert!(readiness.observe_at(&lines, 0, true, true, started + TERMINAL_READY_SETTLE));
-    }
-
-    #[test]
-    fn claude_prompt_off_cursor_row_never_starts_readiness_settle() {
-        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
-        let lines = vec!["❯".to_owned(), "assistant transcript".to_owned()];
-        let started = Instant::now();
-
-        assert!(!readiness.observe_at(&lines, 1, true, true, started));
-        assert!(!readiness.observe_at(
-            &lines,
-            1,
-            true,
-            true,
-            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn codex_prompt_without_startup_marker_never_starts_readiness_settle() {
-        let mut readiness = TerminalReadiness::new(BackendKind::Codex);
-        let lines = vec!["› ready".to_owned()];
-        let started = Instant::now();
-
-        assert!(!readiness.observe_at(&lines, 0, true, true, started));
-        assert!(!readiness.observe_at(
-            &lines,
-            0,
-            true,
-            true,
-            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn claude_prompt_with_hidden_cursor_never_starts_readiness_settle() {
-        let mut readiness = TerminalReadiness::new(BackendKind::Claude);
-        let lines = vec!["❯".to_owned()];
-        let started = Instant::now();
-
-        assert!(!readiness.observe_at(&lines, 0, false, true, started));
-        assert!(!readiness.observe_at(
-            &lines,
-            0,
-            false,
-            true,
-            started + TERMINAL_READY_SETTLE + Duration::from_secs(1)
-        ));
-    }
+#[derive(Debug, Serialize)]
+struct TerminalExit {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    status: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
 struct TerminalError<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    error: &'a str,
     message: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct TerminalAck {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,11 +184,10 @@ struct TerminalQuery {
     backend: BackendKind,
 }
 
+/// Text frames are control only. Keystrokes are binary and are never inspected.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum TerminalClientMessage {
-    Input { text: String },
-    Submit { id: u64, text: String },
     Resize { rows: u64, cols: u64 },
     Close,
 }
@@ -363,22 +233,34 @@ impl BackendPool {
 }
 
 impl TerminalHub {
-    fn reserve(&self, key: TerminalKey) -> ApiResult<TerminalReservation> {
+    /// A connect either adopts the PTY still in its grace window (same child, same screen) or
+    /// reserves the key for a fresh one. A key with a live socket on it is refused.
+    fn acquire(&self, key: TerminalKey) -> ApiResult<TerminalAcquire> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| ApiError::internal("terminal hub lock failed"))?;
-        if state.owners.contains_key(&key) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "terminal is already connected",
-            ));
-        }
         if state.reservations.contains_key(&key) {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "terminal is already connecting",
             ));
+        }
+        if let Some(owner) = state.owners.get_mut(&key) {
+            if owner.connected {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "terminal is already connected",
+                ));
+            }
+            owner.connected = true;
+            owner.connection = owner.connection.wrapping_add(1).max(1);
+            return Ok(TerminalAcquire::Reattach(TerminalLease {
+                key,
+                generation: owner.generation,
+                connection: owner.connection,
+                events: owner.events.clone(),
+            }));
         }
         if state.owners.len() + state.reservations.len() >= TERMINAL_LIMIT {
             return Err(ApiError::new(
@@ -390,19 +272,18 @@ impl TerminalHub {
         let generation = state.next_generation;
         state.reservations.insert(key.clone(), generation);
         drop(state);
-        Ok(TerminalReservation {
+        Ok(TerminalAcquire::Fresh(TerminalReservation {
             hub: self.clone(),
             key,
             generation,
             armed: true,
-        })
+        }))
     }
 
     fn finish_reservation(
         &self,
         reservation: &mut TerminalReservation,
-        commands: mpsc::Sender<TerminalCommand>,
-        screen: watch::Receiver<TerminalScreen>,
+        events: TerminalEvents,
     ) -> ApiResult<TerminalLease> {
         let mut state = self
             .inner
@@ -416,14 +297,17 @@ impl TerminalHub {
             reservation.key.clone(),
             TerminalOwner {
                 generation: reservation.generation,
+                events: events.clone(),
+                connected: true,
+                connection: 1,
             },
         );
         reservation.armed = false;
         Ok(TerminalLease {
             key: reservation.key.clone(),
             generation: reservation.generation,
-            commands,
-            screen,
+            connection: 1,
+            events,
         })
     }
 
@@ -452,6 +336,57 @@ fn remove_terminal_owner(hub: &Weak<Mutex<TerminalHubState>>, key: &TerminalKey,
     {
         state.owners.remove(key);
     }
+}
+
+/// The socket for this lease is gone. Clearing the flag opens the grace window; the owner
+/// thread reads the same flag when the window closes, so the two cannot race past each other.
+fn detach_terminal(hub: &TerminalHub, lease: &TerminalLease) {
+    if let Ok(mut state) = hub.inner.lock()
+        && let Some(owner) = state.owners.get_mut(&lease.key)
+        && owner.generation == lease.generation
+        && owner.connection == lease.connection
+    {
+        owner.connected = false;
+    }
+    let _ = lease.events.send(OwnerEvent::Detach {
+        connection: lease.connection,
+    });
+}
+
+/// Kill now, no grace. The owner thread drops its own hub entry as it dies; only a dead owner
+/// needs the entry removed here.
+fn close_terminal_owner(hub: &TerminalHub, lease: &TerminalLease) {
+    let (complete, _abandoned) = oneshot::channel();
+    if lease.events.send(OwnerEvent::Close { complete }).is_err() {
+        remove_terminal_owner(&hub.downgrade(), &lease.key, lease.generation);
+    }
+}
+
+/// Under the hub lock: has the grace window closed with nobody attached? Drops our own entry
+/// when it has, so a connect arriving after this point spawns a fresh PTY instead of adopting
+/// one that is about to be killed.
+fn terminal_grace_expired(
+    hub: &Weak<Mutex<TerminalHubState>>,
+    key: &TerminalKey,
+    generation: u64,
+) -> bool {
+    let Some(hub) = hub.upgrade() else {
+        return true;
+    };
+    let Ok(mut state) = hub.lock() else {
+        return true;
+    };
+    let reconnected = state
+        .owners
+        .get(key)
+        .is_some_and(|owner| owner.generation == generation && owner.connected);
+    if reconnected {
+        return false;
+    }
+    state
+        .owners
+        .retain(|owned, owner| owned != key || owner.generation != generation);
+    true
 }
 
 #[derive(Clone)]
@@ -557,12 +492,22 @@ pub fn router() -> Router {
         snapshot,
         backends: BackendPool::new(all_backends()),
         router_available: agent_viewer_core::router::available(),
-        terminals: TerminalHub::default(),
+        terminals: TerminalHub::new(TERMINAL_GRACE),
     })
 }
 
 /// Constructs a deterministic test router whose initial backend snapshot is ready on return.
-pub fn router_with_backends(mut backends: Vec<Box<dyn Backend>>) -> Router {
+pub fn router_with_backends(backends: Vec<Box<dyn Backend>>) -> Router {
+    router_with_backends_and_grace(backends, TERMINAL_GRACE)
+}
+
+/// The same test router with an explicit post-disconnect grace window, so a test can prove
+/// both halves of the rule (a reconnect inside it adopts the same child, expiry kills it)
+/// without waiting out the production ten minutes.
+pub fn router_with_backends_and_grace(
+    mut backends: Vec<Box<dyn Backend>>,
+    terminal_grace: Duration,
+) -> Router {
     let mut last = vec![Vec::new(); backends.len()];
     let snapshot = Arc::new(RwLock::new(refresh_snapshot(
         &mut backends,
@@ -573,7 +518,7 @@ pub fn router_with_backends(mut backends: Vec<Box<dyn Backend>>) -> Router {
         snapshot,
         backends: BackendPool::new(backends),
         router_available: false,
-        terminals: TerminalHub::default(),
+        terminals: TerminalHub::new(terminal_grace),
     })
 }
 
@@ -771,8 +716,13 @@ async fn session_terminal(
         backend: query.backend,
         id,
     };
-    let reservation = state.terminals.reserve(key)?;
-    let lease = create_terminal_owner(&state, session, reservation).await?;
+    let (lease, reattached) = match state.terminals.acquire(key)? {
+        TerminalAcquire::Reattach(lease) => (lease, true),
+        TerminalAcquire::Fresh(reservation) => (
+            create_terminal_owner(&state, session, reservation).await?,
+            false,
+        ),
+    };
 
     let failed_hub = state.terminals.clone();
     let failed_lease = lease.clone();
@@ -781,7 +731,13 @@ async fn session_terminal(
         .max_message_size(TERMINAL_MESSAGE_BYTES)
         .max_frame_size(TERMINAL_MESSAGE_BYTES)
         .on_failed_upgrade(move |_| {
-            tokio::spawn(close_terminal_owner(failed_hub, failed_lease));
+            // A reattach that never completed leaves the existing session in its grace
+            // window; a fresh one has nobody to hand the child to, so it goes now.
+            if reattached {
+                detach_terminal(&failed_hub, &failed_lease);
+            } else {
+                close_terminal_owner(&failed_hub, &failed_lease);
+            }
         })
         .on_upgrade(move |socket| terminal_socket(socket, socket_hub, lease)))
 }
@@ -804,23 +760,26 @@ async fn create_terminal_owner(
             .map_err(|refusal| ApiError::unsupported(refusal.to_string()))
     })
     .await?;
-    let spec = agent_viewer_core::pty::spec_from_command(&command, TERMINAL_ROWS, TERMINAL_COLS);
-    let initial = terminal_screen(blank_terminal_state(), 0);
-    let (screen_tx, screen_rx) = watch::channel(initial);
-    let (command_tx, command_rx) = mpsc::channel(TERMINAL_COMMAND_CAPACITY);
+
+    let (tap, tapped) = std::sync::mpsc::channel::<Vec<u8>>();
+    let mut spec =
+        agent_viewer_core::pty::spec_from_command(&command, TERMINAL_ROWS, TERMINAL_COLS);
+    spec.output_tap = Some(tap);
+    let (events_tx, events_rx) = std::sync::mpsc::channel::<OwnerEvent>();
+    spawn_terminal_tap_bridge(tapped, events_tx.clone())?;
     let (startup_tx, startup_rx) = oneshot::channel();
     let (activate_tx, activate_rx) = oneshot::channel();
     spawn_terminal_owner_thread(
         spec,
-        command_rx,
-        screen_tx,
+        events_rx,
         startup_tx,
         activate_rx,
-        (
-            state.terminals.downgrade(),
-            reservation.key.clone(),
-            reservation.generation,
-        ),
+        TerminalOwnerContext {
+            hub: state.terminals.downgrade(),
+            key: reservation.key.clone(),
+            generation: reservation.generation,
+            grace: state.terminals.grace,
+        },
     )?;
     startup_rx
         .await
@@ -828,7 +787,7 @@ async fn create_terminal_owner(
         .map_err(|error| ApiError::internal(format!("terminal attach failed: {error}")))?;
     let lease = state
         .terminals
-        .finish_reservation(&mut reservation, command_tx, screen_rx)?;
+        .finish_reservation(&mut reservation, events_tx)?;
     if activate_tx.send(()).is_err() {
         remove_terminal_owner(&state.terminals.downgrade(), &lease.key, lease.generation);
         return Err(ApiError::internal("terminal attach worker stopped"));
@@ -836,17 +795,37 @@ async fn create_terminal_owner(
     Ok(lease)
 }
 
+/// Bridge the core PTY tap onto the owner's event channel, so output, input and the child's
+/// EOF all arrive in one ordered stream. The tap sender lives in the PTY reader thread, so its
+/// drop IS the child's terminal closing — that is what makes exit detection an event rather
+/// than a poll.
+fn spawn_terminal_tap_bridge(
+    tapped: std::sync::mpsc::Receiver<Vec<u8>>,
+    events: TerminalEvents,
+) -> ApiResult<()> {
+    std::thread::Builder::new()
+        .name("agent_viewer_terminal_tap".to_string())
+        .spawn(move || {
+            while let Ok(chunk) = tapped.recv() {
+                if events.send(OwnerEvent::Output(chunk)).is_err() {
+                    return;
+                }
+            }
+            let _ = events.send(OwnerEvent::TapClosed);
+        })
+        .map(|_| ())
+        .map_err(|error| ApiError::internal(format!("terminal tap bridge failed: {error}")))
+}
+
 fn spawn_terminal_owner_thread(
     spec: agent_viewer_core::pty::PtySpec,
-    mut commands: mpsc::Receiver<TerminalCommand>,
-    screen: watch::Sender<TerminalScreen>,
+    events: std::sync::mpsc::Receiver<OwnerEvent>,
     startup: oneshot::Sender<Result<(), String>>,
     activate: oneshot::Receiver<()>,
-    owner: (Weak<Mutex<TerminalHubState>>, TerminalKey, u64),
+    context: TerminalOwnerContext,
 ) -> ApiResult<()> {
-    let (hub, key, generation) = owner;
     std::thread::Builder::new()
-        .name(format!("agent_viewer_terminal_{}", key.id))
+        .name(format!("agent_viewer_terminal_{}", context.key.id))
         .spawn(move || {
             let mut pty = match agent_viewer_core::pty::PtySession::spawn(spec) {
                 Ok(pty) => pty,
@@ -855,264 +834,322 @@ fn spawn_terminal_owner_thread(
                     return;
                 }
             };
-            let mut readiness = TerminalReadiness::new(key.backend);
-            let mut last_state = terminal_screen_state(&pty, true, &mut readiness);
-            screen.send_replace(terminal_screen(last_state.clone(), 0));
             if startup.send(Ok(())).is_err() || activate.blocking_recv().is_err() {
                 pty.kill();
+                remove_terminal_owner(&context.hub, &context.key, context.generation);
                 return;
             }
-            let mut sequence = 0_u64;
-            loop {
-                match commands.try_recv() {
-                    Ok(TerminalCommand::Input { bytes, result }) => {
-                        let outcome = pty
-                            .write_input(&bytes)
-                            .map_err(|error| bounded_terminal_error(&error.to_string()));
-                        let _ = result.send(outcome);
-                    }
-                    Ok(TerminalCommand::Submit { text, result }) => {
-                        let before_submit = terminal_screen_state(&pty, true, &mut readiness);
-                        let outcome = if !before_submit.ready {
-                            Err("terminal is not ready for input".to_owned())
-                        } else if !terminal_accepts_input(&pty) {
-                            Err("terminal input is no longer connected".to_owned())
-                        } else {
-                            let bracketed_paste =
-                                pty.with_screen(|screen| screen.bracketed_paste());
-                            let write_outcome = if bracketed_paste {
-                                pty.write_input(b"\x1b[200~")
-                                    .and_then(|()| pty.write_input(text.as_bytes()))
-                                    .and_then(|()| pty.write_input(b"\x1b[201~"))
-                                    .and_then(|()| pty.write_input(b"\r"))
-                            } else {
-                                pty.write_input(text.as_bytes()).and_then(|()| {
-                                    std::thread::sleep(TERMINAL_PLAIN_SUBMIT_DELAY);
-                                    pty.write_input(b"\r")
-                                })
-                            }
-                            .map_err(|error| bounded_terminal_error(&error.to_string()));
-                            write_outcome.and_then(|()| {
-                                terminal_accepts_input(&pty).then_some(()).ok_or_else(|| {
-                                    "terminal input is no longer connected".to_owned()
-                                })
-                            })
-                        };
-                        let _ = result.send(outcome);
-                    }
-                    Ok(TerminalCommand::Resize { rows, cols, result }) => {
-                        let previous_text = terminal_visible_text(&last_state.lines);
-                        let outcome = pty
-                            .resize(rows, cols)
-                            .map_err(|error| bounded_terminal_error(&error.to_string()));
-                        if outcome.is_ok() {
-                            let deadline = std::time::Instant::now() + TERMINAL_RESIZE_SETTLE;
-                            loop {
-                                std::thread::sleep(TERMINAL_POLL_INTERVAL);
-                                let next_state = terminal_screen_state(&pty, true, &mut readiness);
-                                let changed_text =
-                                    terminal_visible_text(&next_state.lines) != previous_text;
-                                if changed_text || std::time::Instant::now() >= deadline {
-                                    publish_terminal_state(
-                                        next_state,
-                                        &screen,
-                                        &mut last_state,
-                                        &mut sequence,
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = result.send(outcome);
-                    }
-                    Ok(TerminalCommand::Close { complete }) => {
-                        pty.kill();
-                        remove_terminal_owner(&hub, &key, generation);
-                        let _ = complete.send(());
-                        break;
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        pty.kill();
-                        remove_terminal_owner(&hub, &key, generation);
-                        break;
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                }
-
-                let running = !pty.is_exited();
-                if !running {
-                    pty.kill();
-                }
-                publish_terminal_screen(
-                    &pty,
-                    running,
-                    &mut readiness,
-                    &screen,
-                    &mut last_state,
-                    &mut sequence,
-                );
-                if !running {
-                    remove_terminal_owner(&hub, &key, generation);
-                    break;
-                }
-                std::thread::sleep(TERMINAL_POLL_INTERVAL);
-            }
+            run_terminal_owner(pty, &events, &context);
         })
         .map(|_| ())
         .map_err(|error| ApiError::internal(format!("terminal owner thread failed: {error}")))
 }
 
-fn blank_terminal_state() -> TerminalScreenState {
-    TerminalScreenState {
-        rows: TERMINAL_ROWS,
-        cols: TERMINAL_COLS,
-        cursor_row: 0,
-        cursor_col: 0,
-        lines: vec![String::new(); usize::from(TERMINAL_ROWS)],
-        running: true,
-        ready: false,
-    }
-}
+/// The owner thread. It owns the PTY outright: every read of the screen and every write to the
+/// child happens here, and the socket task only ever exchanges events with it.
+fn run_terminal_owner(
+    mut pty: agent_viewer_core::pty::PtySession,
+    events: &std::sync::mpsc::Receiver<OwnerEvent>,
+    context: &TerminalOwnerContext,
+) {
+    let mut sink: Option<mpsc::UnboundedSender<ServerFrame>> = None;
+    let mut connection = 0_u64;
+    // Nobody is attached until the upgraded socket says so, so the grace clock starts now: an
+    // upgrade that never lands must not strand a real CLI process forever.
+    let mut deadline = Some(std::time::Instant::now() + context.grace);
+    let mut pending: VecDeque<OwnerEvent> = VecDeque::new();
 
-fn terminal_screen_state(
-    pty: &agent_viewer_core::pty::PtySession,
-    running: bool,
-    readiness: &mut TerminalReadiness,
-) -> TerminalScreenState {
-    pty.with_screen(|screen| {
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let lines = screen.rows(0, cols).collect::<Vec<_>>();
-        let ready = readiness.observe(&lines, cursor_row, !screen.hide_cursor(), running);
-        TerminalScreenState {
-            rows,
-            cols,
-            cursor_row,
-            cursor_col,
-            lines,
-            running,
-            ready,
+    loop {
+        let event = match pending.pop_front() {
+            Some(event) => event,
+            None => {
+                let wait = deadline.map_or(TERMINAL_IDLE_WAIT, |at| {
+                    at.saturating_duration_since(std::time::Instant::now())
+                });
+                match events.recv_timeout(wait) {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if deadline.is_some() {
+                            if terminal_grace_expired(
+                                &context.hub,
+                                &context.key,
+                                context.generation,
+                            ) {
+                                pty.kill();
+                                return;
+                            }
+                            // Somebody reconnected while we were waiting; their Attach is
+                            // already queued behind us.
+                            deadline = None;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        pty.kill();
+                        remove_terminal_owner(&context.hub, &context.key, context.generation);
+                        return;
+                    }
+                }
+            }
+        };
+
+        match event {
+            OwnerEvent::Output(bytes) => {
+                if let Some(active) = &sink
+                    && active.send(ServerFrame::Binary(bytes)).is_err()
+                {
+                    sink = None;
+                }
+            }
+            OwnerEvent::TapClosed => {
+                pty.kill();
+                if let Some(active) = &sink {
+                    let _ = active.send(ServerFrame::Text(terminal_exit_frame()));
+                }
+                remove_terminal_owner(&context.hub, &context.key, context.generation);
+                // Dropping the sink closes the socket, but only after it has forwarded the
+                // exit frame already queued ahead of the close.
+                return;
+            }
+            OwnerEvent::Attach {
+                connection: attached,
+                sink: next,
+            } => {
+                connection = attached;
+                deadline = None;
+                let (rows, cols) = pty.with_screen(|screen| screen.size());
+                let running = !pty.is_exited();
+                let _ = next.send(ServerFrame::Text(terminal_hello_frame(cols, rows, running)));
+                let redraw = pty.with_screen(|screen| {
+                    // Under the parser lock, which the PTY reader also holds while it applies
+                    // a chunk AND publishes it on the tap. Draining here therefore drops
+                    // exactly the chunks this snapshot already contains, and no chunk can slip
+                    // into both the snapshot and the live stream and print twice.
+                    while let Ok(queued) = events.try_recv() {
+                        match queued {
+                            OwnerEvent::Output(_) => {}
+                            other => pending.push_back(other),
+                        }
+                    }
+                    let mut bytes = screen.state_formatted();
+                    bytes.extend_from_slice(&screen.contents_formatted());
+                    bytes
+                });
+                let _ = next.send(ServerFrame::Binary(redraw));
+                sink = Some(next);
+            }
+            OwnerEvent::Detach {
+                connection: detached,
+            } => {
+                if detached == connection {
+                    sink = None;
+                    deadline = Some(std::time::Instant::now() + context.grace);
+                }
+            }
+            OwnerEvent::Input(bytes) => {
+                if let Err(error) = pty.write_input(&bytes)
+                    && let Some(active) = &sink
+                {
+                    let _ =
+                        active.send(ServerFrame::Text(terminal_error_frame(&error.to_string())));
+                }
+            }
+            OwnerEvent::Resize { rows, cols } => {
+                if let Err(error) = pty.resize(rows, cols)
+                    && let Some(active) = &sink
+                {
+                    let _ =
+                        active.send(ServerFrame::Text(terminal_error_frame(&error.to_string())));
+                }
+            }
+            OwnerEvent::Close { complete } => {
+                pty.kill();
+                remove_terminal_owner(&context.hub, &context.key, context.generation);
+                let _ = complete.send(());
+                return;
+            }
         }
-    })
-}
-
-fn terminal_screen(state: TerminalScreenState, seq: u64) -> TerminalScreen {
-    TerminalScreen {
-        kind: "screen",
-        seq,
-        rows: state.rows,
-        cols: state.cols,
-        cursor_row: state.cursor_row,
-        cursor_col: state.cursor_col,
-        lines: state.lines,
-        running: state.running,
-        ready: state.ready,
     }
 }
 
-fn publish_terminal_screen(
-    pty: &agent_viewer_core::pty::PtySession,
-    running: bool,
-    readiness: &mut TerminalReadiness,
-    screen: &watch::Sender<TerminalScreen>,
-    last_state: &mut TerminalScreenState,
-    sequence: &mut u64,
-) {
-    let next_state = terminal_screen_state(pty, running, readiness);
-    publish_terminal_state(next_state, screen, last_state, sequence);
+/// How the socket task finished, and therefore what the PTY behind it is owed.
+enum TerminalOutcome {
+    /// The socket is gone but the child is not: open the grace window.
+    Detach,
+    /// The owner thread is already tearing itself down.
+    Done,
 }
 
-fn publish_terminal_state(
-    next_state: TerminalScreenState,
-    screen: &watch::Sender<TerminalScreen>,
-    last_state: &mut TerminalScreenState,
-    sequence: &mut u64,
-) {
-    if *last_state == next_state {
+async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, lease: TerminalLease) {
+    let (sink, mut frames) = mpsc::unbounded_channel::<ServerFrame>();
+    if lease
+        .events
+        .send(OwnerEvent::Attach {
+            connection: lease.connection,
+            sink,
+        })
+        .is_err()
+    {
+        let _ = send_terminal_error(&mut socket, "terminal is no longer running").await;
+        let _ = socket.send(Message::Close(None)).await;
+        remove_terminal_owner(&hub.downgrade(), &lease.key, lease.generation);
         return;
     }
-    *sequence = sequence.wrapping_add(1);
-    *last_state = next_state.clone();
-    screen.send_replace(terminal_screen(next_state, *sequence));
-}
 
-fn terminal_visible_text(lines: &[String]) -> String {
-    lines
-        .iter()
-        .map(|line| line.trim_end())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn terminal_accepts_input(pty: &agent_viewer_core::pty::PtySession) -> bool {
-    let Some(pid) = pty.pid() else {
-        return false;
-    };
-    std::fs::read_link(format!("/proc/{pid}/fd/0"))
-        .is_ok_and(|target| target.starts_with("/dev/pts/"))
-}
-
-fn terminal_submit_has_control(text: &str) -> bool {
-    text.contains("\x1b[201~")
-        || text
-            .chars()
-            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
-}
-
-async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, mut lease: TerminalLease) {
-    let initial = lease.screen.borrow_and_update().clone();
-    if send_terminal_screen(&mut socket, &initial).await.is_ok() {
-        loop {
-            tokio::select! {
-                changed = lease.screen.changed() => {
-                    if changed.is_err() {
-                        let screen = lease.screen.borrow().clone();
-                        if !screen.running {
-                            let _ = send_terminal_screen(&mut socket, &screen).await;
+    let mut outcome = TerminalOutcome::Detach;
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                match frame {
+                    Some(ServerFrame::Text(text)) => {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
                         }
-                        let _ = socket.send(Message::Close(None)).await;
-                        break;
                     }
-                    let screen = lease.screen.borrow().clone();
-                    if send_terminal_screen(&mut socket, &screen).await.is_err() {
+                    Some(ServerFrame::Binary(bytes)) => {
+                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        outcome = TerminalOutcome::Done;
                         break;
                     }
                 }
-                incoming = socket.recv() => {
-                    match incoming {
-                        Some(Ok(Message::Text(text))) => {
-                            if handle_terminal_client_message(&mut socket, &mut lease, text.as_str()).await {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Binary(_))) => {
-                            if send_terminal_error(&mut socket, "terminal commands must be JSON text").await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Ping(bytes))) => {
-                            if socket.send(Message::Pong(bytes)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Pong(_))) => {}
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Err(error)) => {
-                            if websocket_message_too_large(error) {
-                                let _ = socket.send(Message::Close(Some(CloseFrame {
-                                    code: close_code::SIZE,
-                                    reason: "terminal message is too large".into(),
-                                }))).await;
-                            }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if bytes.len() > TERMINAL_INPUT_BYTES {
+                            let _ = send_terminal_error(&mut socket, "terminal input is too large").await;
+                            let _ = socket.send(Message::Close(None)).await;
                             break;
                         }
+                        // Verbatim, never inspected: this carries the view's own answers to
+                        // the CLI's DA/DSR queries, mouse reports and bracketed paste.
+                        if lease.events.send(OwnerEvent::Input(bytes.into())).is_err() {
+                            let _ = socket.send(Message::Close(None)).await;
+                            outcome = TerminalOutcome::Done;
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        match handle_terminal_client_message(&mut socket, &lease, text.as_str()).await {
+                            TerminalControl::Continue => {}
+                            TerminalControl::Detach => break,
+                            TerminalControl::Done => {
+                                outcome = TerminalOutcome::Done;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if socket.send(Message::Pong(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(error)) => {
+                        if websocket_message_too_large(error) {
+                            let _ = socket.send(Message::Close(Some(CloseFrame {
+                                code: close_code::SIZE,
+                                reason: "terminal message is too large".into(),
+                            }))).await;
+                        }
+                        break;
                     }
                 }
             }
         }
     }
-    close_terminal_owner(hub, lease).await;
+
+    match outcome {
+        TerminalOutcome::Detach => detach_terminal(&hub, &lease),
+        TerminalOutcome::Done => {}
+    }
+}
+
+enum TerminalControl {
+    Continue,
+    /// Stop reading this socket, but leave the child in its grace window.
+    Detach,
+    /// Stop reading this socket; the owner thread is finished with the child.
+    Done,
+}
+
+async fn handle_terminal_client_message(
+    socket: &mut WebSocket,
+    lease: &TerminalLease,
+    text: &str,
+) -> TerminalControl {
+    let Ok(message) = serde_json::from_str::<TerminalClientMessage>(text) else {
+        let _ = send_terminal_error(socket, "invalid terminal command").await;
+        let _ = socket.send(Message::Close(None)).await;
+        return TerminalControl::Detach;
+    };
+    match message {
+        TerminalClientMessage::Resize { rows, cols } => {
+            if !(TERMINAL_MIN_ROWS..=TERMINAL_MAX_ROWS).contains(&rows)
+                || !(TERMINAL_MIN_COLS..=TERMINAL_MAX_COLS).contains(&cols)
+            {
+                let _ = send_terminal_error(socket, "terminal dimensions are out of range").await;
+                let _ = socket.send(Message::Close(None)).await;
+                return TerminalControl::Detach;
+            }
+            if lease
+                .events
+                .send(OwnerEvent::Resize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                })
+                .is_err()
+            {
+                let _ = send_terminal_error(socket, "terminal is no longer running").await;
+                let _ = socket.send(Message::Close(None)).await;
+                return TerminalControl::Done;
+            }
+            TerminalControl::Continue
+        }
+        TerminalClientMessage::Close => {
+            let (complete, completed) = oneshot::channel();
+            if lease.events.send(OwnerEvent::Close { complete }).is_ok() {
+                let _ = completed.await;
+            }
+            let _ = socket.send(Message::Close(None)).await;
+            TerminalControl::Done
+        }
+    }
+}
+
+fn terminal_hello_frame(cols: u16, rows: u16, running: bool) -> String {
+    serde_json::to_string(&TerminalHello {
+        kind: "hello",
+        cols,
+        rows,
+        running,
+    })
+    .expect("terminal hello serialization cannot fail")
+}
+
+/// PtySession reaps the child without surfacing its wait status, and widening that is out of
+/// scope for the companion server, so the status is reported as unknown.
+fn terminal_exit_frame() -> String {
+    serde_json::to_string(&TerminalExit {
+        kind: "exit",
+        status: None,
+    })
+    .expect("terminal exit serialization cannot fail")
+}
+
+fn terminal_error_frame(message: &str) -> String {
+    let message = bounded_terminal_error(message);
+    serde_json::to_string(&TerminalError {
+        kind: "error",
+        message: &message,
+    })
+    .expect("terminal error serialization cannot fail")
 }
 
 fn websocket_message_too_large(error: axum::Error) -> bool {
@@ -1127,169 +1164,10 @@ fn websocket_message_too_large(error: axum::Error) -> bool {
         })
 }
 
-async fn close_terminal_owner(hub: TerminalHub, lease: TerminalLease) {
-    let (complete_tx, complete_rx) = oneshot::channel();
-    if lease
-        .commands
-        .send(TerminalCommand::Close {
-            complete: complete_tx,
-        })
-        .await
-        .is_ok()
-    {
-        let _ = complete_rx.await;
-    }
-    remove_terminal_owner(&hub.downgrade(), &lease.key, lease.generation);
-}
-
-async fn handle_terminal_client_message(
-    socket: &mut WebSocket,
-    lease: &mut TerminalLease,
-    text: &str,
-) -> bool {
-    if text.len() > TERMINAL_MESSAGE_BYTES {
-        return send_terminal_error(socket, "terminal command is too large")
-            .await
-            .is_err();
-    }
-    let command = match serde_json::from_str::<TerminalClientMessage>(text) {
-        Ok(command) => command,
-        Err(_) => {
-            return send_terminal_error(socket, "invalid terminal command")
-                .await
-                .is_err();
-        }
-    };
-    match command {
-        TerminalClientMessage::Input { text } => {
-            if text.len() > TERMINAL_INPUT_BYTES {
-                return send_terminal_error(socket, "terminal input is too large")
-                    .await
-                    .is_err();
-            }
-            let (result_tx, result_rx) = oneshot::channel();
-            if lease
-                .commands
-                .send(TerminalCommand::Input {
-                    bytes: text.into_bytes(),
-                    result: result_tx,
-                })
-                .await
-                .is_err()
-            {
-                return send_terminal_error(socket, "terminal is no longer running")
-                    .await
-                    .is_err();
-            }
-            if let Ok(Err(error)) = result_rx.await {
-                return send_terminal_error(socket, &error).await.is_err();
-            }
-        }
-        TerminalClientMessage::Submit { id, text } => {
-            if text.len() > TERMINAL_INPUT_BYTES {
-                return send_terminal_error(socket, "terminal input is too large")
-                    .await
-                    .is_err();
-            }
-            if terminal_submit_has_control(&text) {
-                return send_terminal_error(socket, "terminal input contains control characters")
-                    .await
-                    .is_err();
-            }
-            let (result_tx, result_rx) = oneshot::channel();
-            if lease
-                .commands
-                .send(TerminalCommand::Submit {
-                    text,
-                    result: result_tx,
-                })
-                .await
-                .is_err()
-            {
-                return send_terminal_error(socket, "terminal is no longer running")
-                    .await
-                    .is_err();
-            }
-            match result_rx.await {
-                Ok(Ok(())) => {
-                    if lease.screen.has_changed().is_ok_and(|changed| changed) {
-                        let screen = lease.screen.borrow_and_update().clone();
-                        if send_terminal_screen(socket, &screen).await.is_err() {
-                            return true;
-                        }
-                    }
-                    if send_terminal_ack(socket, id).await.is_err() {
-                        return true;
-                    }
-                }
-                Ok(Err(error)) => {
-                    return send_terminal_error(socket, &error).await.is_err();
-                }
-                Err(_) => {
-                    return send_terminal_error(socket, "terminal is no longer running")
-                        .await
-                        .is_err();
-                }
-            }
-        }
-        TerminalClientMessage::Resize { rows, cols } => {
-            if !(TERMINAL_MIN_ROWS..=TERMINAL_MAX_ROWS).contains(&rows)
-                || !(TERMINAL_MIN_COLS..=TERMINAL_MAX_COLS).contains(&cols)
-            {
-                return send_terminal_error(socket, "terminal dimensions are out of range")
-                    .await
-                    .is_err();
-            }
-            let (result_tx, result_rx) = oneshot::channel();
-            if lease
-                .commands
-                .send(TerminalCommand::Resize {
-                    rows: rows as u16,
-                    cols: cols as u16,
-                    result: result_tx,
-                })
-                .await
-                .is_err()
-            {
-                return send_terminal_error(socket, "terminal is no longer running")
-                    .await
-                    .is_err();
-            }
-            if let Ok(Err(error)) = result_rx.await {
-                return send_terminal_error(socket, &error).await.is_err();
-            }
-        }
-        TerminalClientMessage::Close => {
-            let _ = socket.send(Message::Close(None)).await;
-            return true;
-        }
-    }
-    false
-}
-
-async fn send_terminal_screen(
-    socket: &mut WebSocket,
-    screen: &TerminalScreen,
-) -> Result<(), axum::Error> {
-    let text = serde_json::to_string(screen).expect("terminal screen serialization cannot fail");
-    socket.send(Message::Text(text.into())).await
-}
-
 async fn send_terminal_error(socket: &mut WebSocket, error: &str) -> Result<(), axum::Error> {
-    let error = bounded_terminal_error(error);
-    let frame = TerminalError {
-        kind: "error",
-        error: &error,
-        message: &error,
-    };
-    let text = serde_json::to_string(&frame).expect("terminal error serialization cannot fail");
-    socket.send(Message::Text(text.into())).await
-}
-
-async fn send_terminal_ack(socket: &mut WebSocket, id: u64) -> Result<(), axum::Error> {
-    let frame = TerminalAck { kind: "ack", id };
-    let text = serde_json::to_string(&frame).expect("terminal ack serialization cannot fail");
-    socket.send(Message::Text(text.into())).await
+    socket
+        .send(Message::Text(terminal_error_frame(error).into()))
+        .await
 }
 
 fn bounded_terminal_error(error: &str) -> String {
