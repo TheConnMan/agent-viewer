@@ -14,7 +14,7 @@ import java.util.UUID;
  * A terminal session, consisting of a process coupled to a terminal interface.
  * <p>
  * The subprocess will be executed by the constructor, and when the size is made known by a call to
- * {@link #updateSize(int, int)} terminal emulation will begin and threads will be spawned to handle the subprocess I/O.
+ * {@link #updateSize(int, int, int, int)} terminal emulation will begin and threads will be spawned to handle the subprocess I/O.
  * All terminal emulation and callback methods will be performed on the main thread.
  * <p>
  * The child process may be exited forcefully by using the {@link #finishIfRunning()} method.
@@ -52,11 +52,6 @@ public class TerminalSession extends TerminalOutput {
     /** The exit status of the shell process. Only valid if ${@link #mShellPid} is -1. */
     int mShellExitStatus;
 
-    /**
-     * The file descriptor referencing the master half of a pseudo-terminal pair, resulting from calling
-     * {@link JNI#createSubprocess(String, String, String[], String[], int[], int, int)}.
-     */
-
     /** Set by the application for user identification of session, not by terminal. */
     public String mSessionName;
 
@@ -92,11 +87,11 @@ public class TerminalSession extends TerminalOutput {
     }
 
     /** Inform the attached pty of the new size and reflow or initialize the emulator. */
-    public void updateSize(int columns, int rows) {
+    public void updateSize(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
         if (mEmulator == null) {
-            initializeEmulator(columns, rows);
+            initializeEmulator(columns, rows, cellWidthPixels, cellHeightPixels);
         } else {
-            mEmulator.resize(columns, rows);
+            mEmulator.resize(columns, rows, cellWidthPixels, cellHeightPixels);
         }
     }
 
@@ -111,7 +106,7 @@ public class TerminalSession extends TerminalOutput {
      * @param columns The number of columns in the terminal window.
      * @param rows    The number of rows in the terminal window.
      */
-    public void initializeEmulator(int columns, int rows) {
+    public void initializeEmulator(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
         throw new UnsupportedOperationException("local process sessions were removed from this vendored copy; use RemoteTerminalSession");
     }
 
@@ -243,7 +238,7 @@ public class TerminalSession extends TerminalOutput {
                 return outputPath;
             }
         } catch (IOException | SecurityException e) {
-            mClient.logStackTraceWithMessage(LOG_TAG, "Error getting current directory", e);
+            Logger.logStackTraceWithMessage(mClient, LOG_TAG, "Error getting current directory", e);
         }
         return null;
     }

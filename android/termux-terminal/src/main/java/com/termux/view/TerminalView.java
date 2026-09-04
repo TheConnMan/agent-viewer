@@ -2,6 +2,7 @@ package com.termux.view;
 
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
+import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -10,6 +11,7 @@ import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -19,17 +21,20 @@ import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
+import android.view.Menu;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewTreeObserver;
 import android.view.accessibility.AccessibilityManager;
+import android.view.autofill.AutofillManager;
 import android.view.autofill.AutofillValue;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.widget.Scroller;
 
+import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 
 import com.termux.terminal.KeyHandler;
@@ -80,6 +85,43 @@ public final class TerminalView extends View {
 
     /** If non-zero, this is the last unicode code point received if that was a combining character. */
     int mCombiningAccent;
+
+    /**
+     * The current AutoFill type returned for {@link View#getAutofillType()} by {@link #getAutofillType()}.
+     *
+     * The default is {@link #AUTOFILL_TYPE_NONE} so that AutoFill UI, like toolbar above keyboard
+     * is not shown automatically, like on Activity starts/View create. This value should be updated
+     * to required value, like {@link #AUTOFILL_TYPE_TEXT} before calling
+     * {@link AutofillManager#requestAutofill(View)} so that AutoFill UI shows. The updated value
+     * set will automatically be restored to {@link #AUTOFILL_TYPE_NONE} in
+     * {@link #autofill(AutofillValue)} so that AutoFill UI isn't shown anymore by calling
+     * {@link #resetAutoFill()}.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    private int mAutoFillType = AUTOFILL_TYPE_NONE;
+
+    /**
+     * The current AutoFill type returned for {@link View#getImportantForAutofill()} by
+     * {@link #getImportantForAutofill()}.
+     *
+     * The default is {@link #IMPORTANT_FOR_AUTOFILL_NO} so that view is not considered important
+     * for AutoFill. This value should be updated to required value, like
+     * {@link #IMPORTANT_FOR_AUTOFILL_YES} before calling {@link AutofillManager#requestAutofill(View)}
+     * so that Android and apps consider the view as important for AutoFill to process the request.
+     * The updated value set will automatically be restored to {@link #IMPORTANT_FOR_AUTOFILL_NO} in
+     * {@link #autofill(AutofillValue)} by calling {@link #resetAutoFill()}.
+     */
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    private int mAutoFillImportance = IMPORTANT_FOR_AUTOFILL_NO;
+
+    /**
+     * The current AutoFill hints returned for {@link View#getAutofillHints()} ()} by {@link #getAutofillHints()} ()}.
+     *
+     * The default is an empty `string[]`. This value should be updated to required value. The
+     * updated value set will automatically be restored an empty `string[]` in
+     * {@link #autofill(AutofillValue)} by calling {@link #resetAutoFill()}.
+     */
+    private String[] mAutoFillHints = new String[0];
 
     private final boolean mAccessibilityEnabled;
 
@@ -440,6 +482,14 @@ public final class TerminalView extends View {
         if (mAccessibilityEnabled) setContentDescription(getText());
     }
 
+    /** This must be called by the hosting activity in {@link Activity#onContextMenuClosed(Menu)}
+     * when context menu for the {@link TerminalView} is started by
+     * {@link TextSelectionCursorController#ACTION_MORE} is closed. */
+    public void onContextMenuClosed(Menu menu) {
+        // Unset the stored text since it shouldn't be used anymore and should be cleared from memory
+        unsetStoredSelectedText();
+    }
+
     /**
      * Sets the text size, which in turn sets the number of rows and columns.
      *
@@ -550,11 +600,14 @@ public final class TerminalView extends View {
                 if (action == MotionEvent.ACTION_DOWN) showContextMenu();
                 return true;
             } else if (event.isButtonPressed(MotionEvent.BUTTON_TERTIARY)) {
-                ClipboardManager clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
-                ClipData clipData = clipboard.getPrimaryClip();
+                ClipboardManager clipboardManager = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                ClipData clipData = clipboardManager.getPrimaryClip();
                 if (clipData != null) {
-                    CharSequence paste = clipData.getItemAt(0).coerceToText(getContext());
-                    if (!TextUtils.isEmpty(paste)) mEmulator.paste(paste.toString());
+                    ClipData.Item clipItem = clipData.getItemAt(0);
+                    if (clipItem != null) {
+                        CharSequence text = clipItem.coerceToText(getContext());
+                        if (!TextUtils.isEmpty(text)) mEmulator.paste(text.toString());
+                    }
                 }
             } else if (mEmulator.isMouseTrackingActive()) { // BUTTON_PRIMARY.
                 switch (event.getAction()) {
@@ -578,6 +631,7 @@ public final class TerminalView extends View {
         if (TERMINAL_VIEW_KEY_LOGGING_ENABLED)
             mClient.logInfo(LOG_TAG, "onKeyPreIme(keyCode=" + keyCode + ", event=" + event + ")");
         if (keyCode == KeyEvent.KEYCODE_BACK) {
+            cancelRequestAutoFill();
             if (isSelectingText()) {
                 stopTextSelectionMode();
                 return true;
@@ -839,11 +893,34 @@ public final class TerminalView extends View {
         if (mEmulator != null)
             mEmulator.setCursorBlinkState(true);
 
+        if (handleKeyCodeAction(keyCode, keyMod))
+            return true;
+
         TerminalEmulator term = mTermSession.getEmulator();
         String code = KeyHandler.getCode(keyCode, keyMod, term.isCursorKeysApplicationMode(), term.isKeypadApplicationMode());
         if (code == null) return false;
         mTermSession.write(code);
         return true;
+    }
+
+    public boolean handleKeyCodeAction(int keyCode, int keyMod) {
+        boolean shiftDown = (keyMod & KeyHandler.KEYMOD_SHIFT) != 0;
+
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_PAGE_UP:
+            case KeyEvent.KEYCODE_PAGE_DOWN:
+                // shift+page_up and shift+page_down should scroll scrollback history instead of
+                // scrolling command history or changing pages
+                if (shiftDown) {
+                    long time = SystemClock.uptimeMillis();
+                    MotionEvent motionEvent = MotionEvent.obtain(time, time, MotionEvent.ACTION_DOWN, 0, 0, 0);
+                    doScroll(motionEvent, keyCode == KeyEvent.KEYCODE_PAGE_UP ? -mEmulator.mRows : mEmulator.mRows);
+                    motionEvent.recycle();
+                    return true;
+                }
+        }
+
+       return false;
     }
 
     /**
@@ -893,7 +970,7 @@ public final class TerminalView extends View {
         int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
 
         if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
-            mTermSession.updateSize(newColumns, newRows);
+            mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
             mEmulator = mTermSession.getEmulator();
             mClient.onEmulatorSet();
 
@@ -971,12 +1048,20 @@ public final class TerminalView extends View {
         if (value.isText()) {
             mTermSession.write(value.getTextValue().toString());
         }
+
+        resetAutoFill();
     }
 
     @RequiresApi(api = Build.VERSION_CODES.O)
     @Override
     public int getAutofillType() {
-        return AUTOFILL_TYPE_TEXT;
+        return mAutoFillType;
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    @Override
+    public String[] getAutofillHints() {
+        return mAutoFillHints;
     }
 
     @RequiresApi(api = Build.VERSION_CODES.O)
@@ -984,6 +1069,95 @@ public final class TerminalView extends View {
     public AutofillValue getAutofillValue() {
         return AutofillValue.forText("");
     }
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    @Override
+    public int getImportantForAutofill() {
+        return mAutoFillImportance;
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    private synchronized void resetAutoFill() {
+        // Restore none type so that AutoFill UI isn't shown anymore.
+        mAutoFillType = AUTOFILL_TYPE_NONE;
+        mAutoFillImportance = IMPORTANT_FOR_AUTOFILL_NO;
+        mAutoFillHints = new String[0];
+    }
+
+    public AutofillManager getAutoFillManagerService() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null;
+
+        try {
+            Context context = getContext();
+            if (context == null) return null;
+            return context.getSystemService(AutofillManager.class);
+        } catch (Exception e) {
+            mClient.logStackTraceWithMessage(LOG_TAG, "Failed to get AutofillManager service", e);
+            return null;
+        }
+    }
+
+    public boolean isAutoFillEnabled() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false;
+
+        try {
+            AutofillManager autofillManager = getAutoFillManagerService();
+            return autofillManager != null && autofillManager.isEnabled();
+        } catch (Exception e) {
+            mClient.logStackTraceWithMessage(LOG_TAG, "Failed to check if Autofill is enabled", e);
+            return false;
+        }
+    }
+
+    public synchronized void requestAutoFillUsername() {
+        requestAutoFill(
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new String[]{View.AUTOFILL_HINT_USERNAME} :
+                null);
+    }
+
+    public synchronized void requestAutoFillPassword() {
+        requestAutoFill(
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new String[]{View.AUTOFILL_HINT_PASSWORD} :
+            null);
+    }
+
+    public synchronized void requestAutoFill(String[] autoFillHints) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        if (autoFillHints == null || autoFillHints.length < 1) return;
+
+        try {
+            AutofillManager autofillManager = getAutoFillManagerService();
+            if (autofillManager != null && autofillManager.isEnabled()) {
+                // Update type that will be returned by `getAutofillType()` so that AutoFill UI is shown.
+                mAutoFillType = AUTOFILL_TYPE_TEXT;
+                // Update importance that will be returned by `getImportantForAutofill()` so that
+                // AutoFill considers the view as important.
+                mAutoFillImportance = IMPORTANT_FOR_AUTOFILL_YES;
+                // Update hints that will be returned by `getAutofillHints()` for which to show AutoFill UI.
+                mAutoFillHints = autoFillHints;
+                autofillManager.requestAutofill(this);
+            }
+        } catch (Exception e) {
+            mClient.logStackTraceWithMessage(LOG_TAG, "Failed to request Autofill", e);
+        }
+    }
+
+    public synchronized void cancelRequestAutoFill() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        if (mAutoFillType == AUTOFILL_TYPE_NONE) return;
+
+        try {
+            AutofillManager autofillManager = getAutoFillManagerService();
+            if (autofillManager != null && autofillManager.isEnabled()) {
+                resetAutoFill();
+                autofillManager.cancel();
+            }
+        } catch (Exception e) {
+            mClient.logStackTraceWithMessage(LOG_TAG, "Failed to cancel Autofill request", e);
+        }
+    }
+
+
 
 
 
@@ -1182,6 +1356,25 @@ public final class TerminalView extends View {
         } else {
             return false;
         }
+    }
+
+    /** Get the currently selected text if selecting. */
+    public String getSelectedText() {
+        if (isSelectingText() && mTextSelectionCursorController != null)
+            return mTextSelectionCursorController.getSelectedText();
+        else
+            return null;
+    }
+
+    /** Get the selected text stored before "MORE" button was pressed on the context menu. */
+    @Nullable
+    public String getStoredSelectedText() {
+        return mTextSelectionCursorController != null ? mTextSelectionCursorController.getStoredSelectedText() : null;
+    }
+
+    /** Unset the selected text stored before "MORE" button was pressed on the context menu. */
+    public void unsetStoredSelectedText() {
+        if (mTextSelectionCursorController != null) mTextSelectionCursorController.unsetStoredSelectedText();
     }
 
     private ActionMode getTextSelectionActionMode() {
