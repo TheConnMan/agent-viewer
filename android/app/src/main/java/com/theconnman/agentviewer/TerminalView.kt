@@ -1,5 +1,10 @@
 package com.theconnman.agentviewer
 
+import android.content.Context
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -8,20 +13,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -32,150 +29,283 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.launch
+import androidx.compose.ui.viewinterop.AndroidView
+import com.termux.terminal.RemoteTerminalSession
+import com.termux.terminal.RemoteTerminalTransport
+import com.termux.terminal.TerminalEmulator
+import com.termux.terminal.TerminalSession
+import com.termux.terminal.TerminalSessionClient
+import com.termux.view.TerminalViewClient
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.delay
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.jsonObject
+import kotlinx.coroutines.launch
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import java.util.concurrent.TimeUnit
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
 
-private const val TERMINAL_ORIGIN = "https://appassets.androidplatform.net"
-private const val TERMINAL_ROWS = 32
-private const val TERMINAL_COLS = 56
-private const val TERMINAL_INPUT_LIMIT = 4_096
-private val TERMINAL_CELL_WIDTH = 6.7.dp
-private val TERMINAL_CELL_HEIGHT = 15.dp
+internal const val TERMINAL_ORIGIN = "https://appassets.androidplatform.net"
+
+/** Server cap on a single inbound PTY write; the transport chunks anything larger. */
+internal const val TERMINAL_INPUT_BYTES = 4_096
+
+/** Rows of scrollback the phone-side emulator keeps. */
+internal const val TERMINAL_TRANSCRIPT_ROWS = 2_000
+
+/** Text size in pixels; 26 px is 67 columns at 1080 px portrait, measured in the spike. */
+internal const val TERMINAL_TEXT_SIZE_PX = 26
+
+internal const val TERMINAL_RECONNECT_DELAY_MS = 750L
+internal const val TERMINAL_RECONNECT_MAX_DELAY_MS = 6_000L
+
 private val terminalHttpClient = OkHttpClient.Builder()
     .pingInterval(15, TimeUnit.SECONDS)
     .build()
 
-internal data class TerminalInputState(
-    val draft: String = "",
-    val pendingId: Long? = null,
-) {
-    fun enqueued(id: Long): TerminalInputState = copy(pendingId = id)
-
-    fun acknowledged(id: Long): TerminalInputState =
-        if (pendingId == id) TerminalInputState() else this
-
-    fun failed(): TerminalInputState = copy(pendingId = null)
-}
-
-internal data class TerminalConnectionState(
-    val generation: Long = 0L,
-    val inputState: TerminalInputState = TerminalInputState(),
-    val screenSequence: Long? = null,
-    val reconnectScheduled: Boolean = false,
+// No default values: kotlinx.serialization drops defaults on encode, and the server keys
+// every control frame off its type tag.
+@Serializable
+private data class TerminalResizeFrame(
+    val type: String,
+    val cols: Int,
+    val rows: Int,
 )
 
-internal enum class TerminalSocketEnd {
-    SPONTANEOUS_CLOSE,
-    FAILURE,
-    INTENTIONAL_CLOSE,
-    DISPOSE,
-}
+@Serializable
+private data class TerminalCloseFrame(val type: String)
 
-internal fun terminalConnectionEnded(
-    state: TerminalConnectionState,
-    callbackGeneration: Long,
-    ending: TerminalSocketEnd,
-    screenRunning: Boolean?,
-): TerminalConnectionState {
-    if (callbackGeneration != state.generation) return state
-    return state.copy(
-        inputState = state.inputState.failed(),
-        reconnectScheduled = screenRunning != false &&
-            (ending == TerminalSocketEnd.SPONTANEOUS_CLOSE || ending == TerminalSocketEnd.FAILURE),
+/** `{"type":"resize","cols":N,"rows":N}` exactly as the server's wire protocol spells it. */
+internal fun terminalResizeFrame(columns: Int, rows: Int): String =
+    ApiJson.json.encodeToString(
+        TerminalResizeFrame.serializer(),
+        TerminalResizeFrame(type = "resize", cols = columns, rows = rows),
     )
+
+/** `{"type":"close"}`: kill the remote PTY now instead of leaving it in its grace window. */
+internal fun terminalCloseFrame(): String =
+    ApiJson.json.encodeToString(TerminalCloseFrame.serializer(), TerminalCloseFrame("close"))
+
+/** The text (JSON control) frames the server can send. Binary frames are raw PTY output. */
+internal sealed interface TerminalControl {
+    data class Hello(val cols: Int, val rows: Int, val running: Boolean) : TerminalControl
+    data class Exit(val status: Int?) : TerminalControl
+    data class Failure(val message: String) : TerminalControl
+    data class Unreadable(val reason: String) : TerminalControl
 }
 
-internal data class TerminalSocketAttempt(
-    val connectionState: TerminalConnectionState,
-    val clearScreen: Boolean,
+@Serializable
+private data class TerminalHelloFrame(
+    // The default Json is strict about unknown keys, so the tag is part of the shape.
+    val type: String,
+    val cols: Int,
+    val rows: Int,
+    val running: Boolean = true,
 )
 
-internal fun terminalSocketAttemptStarted(state: TerminalConnectionState): TerminalSocketAttempt =
-    TerminalSocketAttempt(
-        connectionState = state.copy(
-            generation = state.generation + 1L,
-            screenSequence = null,
-            reconnectScheduled = false,
-        ),
-        clearScreen = true,
-    )
+@Serializable
+private data class TerminalExitFrame(
+    val type: String,
+    @SerialName("status") val status: Int? = null,
+)
 
-internal fun terminalScreenFrameIsCurrent(
-    state: TerminalConnectionState,
-    callbackGeneration: Long,
-    sequence: Long,
-): Boolean = callbackGeneration == state.generation &&
-    sequence >= (state.screenSequence ?: Long.MIN_VALUE)
+internal fun parseTerminalControl(text: String): TerminalControl = runCatching {
+    val element = ApiJson.json.parseToJsonElement(text) as? JsonObject
+        ?: return@runCatching TerminalControl.Unreadable("Terminal frame was not an object")
+    val type = (element["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        ?: return@runCatching TerminalControl.Unreadable("Terminal frame had no type")
+    when (type) {
+        "hello" -> ApiJson.json.decodeFromString(TerminalHelloFrame.serializer(), text)
+            .let { TerminalControl.Hello(it.cols, it.rows, it.running) }
 
-internal fun terminalInputAfterServerFrame(
-    state: TerminalInputState,
-    frame: String,
-): TerminalInputState = runCatching {
-    when (
-        ApiJson.json.parseToJsonElement(frame)
-            .jsonObject.getValue("type").jsonPrimitive.content
-    ) {
-        "ack" -> state.acknowledged(ApiJson.json.decodeFromString<TerminalAck>(frame).id)
-        "screen" -> ApiJson.json.decodeFromString<TerminalScreen>(frame).let { state }
-        else -> state.failed()
+        "exit" -> ApiJson.json.decodeFromString(TerminalExitFrame.serializer(), text)
+            .let { TerminalControl.Exit(it.status) }
+
+        "error" -> TerminalControl.Failure(
+            element["message"]?.jsonPrimitive?.content ?: "Terminal protocol error",
+        )
+
+        else -> TerminalControl.Unreadable("Unknown terminal frame: $type")
     }
-}.getOrElse { state.failed() }
+}.getOrElse { TerminalControl.Unreadable(it.message ?: "Could not read terminal frame") }
 
-internal fun terminalLineCommand(id: Long, draft: String): TerminalCommand.Submit? {
-    if (draft.isEmpty()) return null
-    return draft.takeIf { it.toByteArray(Charsets.UTF_8).size <= TERMINAL_INPUT_LIMIT }
-        ?.let { TerminalCommand.Submit(id, it) }
+/**
+ * Everything the view wants to put on the PTY leaves as a binary WebSocket frame; geometry and
+ * shutdown leave as the two JSON control frames. Nothing is inspected on the way out - the CLI's
+ * replies to its own DA/DSR queries and mouse reports have to arrive verbatim.
+ */
+internal class WebSocketTerminalTransport(
+    private val currentSocket: () -> WebSocket?,
+) : RemoteTerminalTransport {
+
+    override fun send(data: ByteArray, offset: Int, count: Int) {
+        val socket = currentSocket() ?: return
+        var start = offset
+        var remaining = count
+        while (remaining > 0) {
+            val chunk = minOf(remaining, TERMINAL_INPUT_BYTES)
+            socket.send(data.toByteString(start, chunk))
+            start += chunk
+            remaining -= chunk
+        }
+    }
+
+    override fun resize(columns: Int, rows: Int) {
+        currentSocket()?.send(terminalResizeFrame(columns, rows))
+    }
+
+    override fun close() {
+        currentSocket()?.send(terminalCloseFrame())
+    }
 }
 
-internal fun terminalSubmitEnabled(
-    connectionState: String,
-    screen: TerminalScreen?,
-    pendingId: Long?,
-    closeRequested: Boolean,
-): Boolean = connectionState == "connected" &&
-    screen?.running == true &&
-    screen.ready &&
-    pendingId == null &&
-    !closeRequested
+/**
+ * Owns the Termux [com.termux.view.TerminalView] and its [RemoteTerminalSession] for the life of
+ * one attached session. Sockets come and go underneath it; the emulator and its screen do not.
+ */
+internal class RemoteTerminalController(
+    context: Context,
+    private val transport: RemoteTerminalTransport,
+    private val onExited: () -> Unit,
+) {
+    /** Sticky CTRL from the key row, consumed by the next key or IME character. */
+    var stickyControl: Boolean = false
 
-internal data class TerminalRenderFrame(
-    val text: String,
-    val cursorRow: Int,
-    val cursorCol: Int,
-)
+    private var announcedOnce = false
 
-internal fun terminalRenderFrame(screen: TerminalScreen): TerminalRenderFrame = TerminalRenderFrame(
-    text = screen.lines.joinToString("\n"),
-    cursorRow = screen.cursorRow,
-    cursorCol = screen.cursorCol,
-)
+    val view: com.termux.view.TerminalView = com.termux.view.TerminalView(context, null)
+    val session: RemoteTerminalSession
 
-internal enum class TerminalExit { BACK, DISPOSE, CLOSE }
+    private val sessionClient = object : TerminalSessionClient {
+        override fun onTextChanged(changedSession: TerminalSession) = view.onScreenUpdated()
+        override fun onTitleChanged(changedSession: TerminalSession) = Unit
+        override fun onSessionFinished(finishedSession: TerminalSession) = onExited()
+        override fun onCopyTextToClipboard(s: TerminalSession, text: String) = Unit
+        override fun onPasteTextFromClipboard(s: TerminalSession?) = Unit
+        override fun onBell(s: TerminalSession) = Unit
+        override fun onColorsChanged(s: TerminalSession) = Unit
+        override fun onTerminalCursorStateChange(state: Boolean) = Unit
+        override fun getTerminalCursorStyle(): Int = TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK
+        override fun logError(tag: String, message: String) = Unit
+        override fun logWarn(tag: String, message: String) = Unit
+        override fun logInfo(tag: String, message: String) = Unit
+        override fun logDebug(tag: String, message: String) = Unit
+        override fun logVerbose(tag: String, message: String) = Unit
+        override fun logStackTraceWithMessage(t: String, m: String, e: Exception) = Unit
+        override fun logStackTrace(tag: String, e: Exception) = Unit
+    }
 
-internal fun terminalExitCommand(exit: TerminalExit): TerminalCommand? = when (exit) {
-    TerminalExit.BACK, TerminalExit.DISPOSE -> null
-    TerminalExit.CLOSE -> TerminalCommand.Close
+    private val viewClient = object : TerminalViewClient {
+        override fun onScale(scale: Float): Float = scale
+        override fun onSingleTapUp(event: MotionEvent) = focusAndShowKeyboard()
+        override fun shouldBackButtonBeMappedToEscape(): Boolean = false
+        override fun shouldEnforceCharBasedInput(): Boolean = true
+        override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
+        override fun isTerminalViewSelected(): Boolean = true
+        override fun copyModeChanged(copyMode: Boolean) = Unit
+        override fun onKeyDown(code: Int, e: KeyEvent, s: TerminalSession): Boolean = false
+        override fun onKeyUp(code: Int, e: KeyEvent): Boolean = false
+        override fun onLongPress(event: MotionEvent): Boolean = false
+
+        override fun readControlKey(): Boolean {
+            val pressed = stickyControl
+            stickyControl = false
+            return pressed
+        }
+
+        override fun readAltKey(): Boolean = false
+        override fun readShiftKey(): Boolean = false
+        override fun readFnKey(): Boolean = false
+        override fun onCodePoint(point: Int, ctrlDown: Boolean, s: TerminalSession): Boolean = false
+
+        override fun onEmulatorSet() {
+            // Fires on every resize (keyboard show/hide); the first-attach announce runs once,
+            // because every later size change already announces itself through updateSize.
+            if (announcedOnce) return
+            announcedOnce = true
+            announceSize()
+        }
+
+        override fun logError(tag: String, message: String) = Unit
+        override fun logWarn(tag: String, message: String) = Unit
+        override fun logInfo(tag: String, message: String) = Unit
+        override fun logDebug(tag: String, message: String) = Unit
+        override fun logVerbose(tag: String, message: String) = Unit
+        override fun logStackTraceWithMessage(t: String, m: String, e: Exception) = Unit
+        override fun logStackTrace(tag: String, e: Exception) = Unit
+    }
+
+    init {
+        // Termux sets these in its layout XML; a programmatic view is not focusable by default,
+        // and an unfocusable view never receives key events or an IME connection.
+        view.setFocusable(true)
+        view.setFocusableInTouchMode(true)
+        view.setTextSize(TERMINAL_TEXT_SIZE_PX)
+        view.setTerminalViewClient(viewClient)
+        view.layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        session = RemoteTerminalSession(transport, TERMINAL_TRANSCRIPT_ROWS, sessionClient)
+        view.attachSession(session)
+        view.requestFocus()
+    }
+
+    /** Feed PTY output. Main thread only: it touches the emulator and the view. */
+    fun receive(bytes: ByteArray) {
+        session.receive(bytes, bytes.size)
+    }
+
+    /** Send bytes to the PTY; a no-op once the remote process is gone. */
+    fun write(text: String) {
+        session.write(text)
+    }
+
+    fun paste(text: String) {
+        view.mEmulator?.paste(text)
+    }
+
+    /** Re-announce the current geometry to a freshly opened socket. */
+    fun announceSize() {
+        val emulator = view.mEmulator ?: return
+        transport.resize(emulator.mColumns, emulator.mRows)
+    }
+
+    fun remoteExited(status: Int) {
+        session.remoteExited(status)
+    }
+
+    fun focusAndShowKeyboard() {
+        view.requestFocus()
+        val ime = view.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        ime?.showSoftInput(view, 0)
+    }
+
+    fun detachFromParent() {
+        (view.parent as? ViewGroup)?.removeView(view)
+    }
+}
+
+/** 750 ms, doubling to a ceiling, so a server that stays down is not hammered. */
+internal fun terminalReconnectDelayMs(consecutiveFailures: Int): Long {
+    if (consecutiveFailures <= 1) return TERMINAL_RECONNECT_DELAY_MS
+    val scaled = TERMINAL_RECONNECT_DELAY_MS shl (consecutiveFailures - 1).coerceAtMost(8)
+    return scaled.coerceAtMost(TERMINAL_RECONNECT_MAX_DELAY_MS)
 }
 
 @Composable
@@ -185,111 +315,83 @@ internal fun TerminalConsole(
     foreground: Boolean,
     onBack: () -> Unit,
 ) {
-    var socket by remember(session.backend, session.id) { mutableStateOf<WebSocket?>(null) }
-    var screen by remember(session.backend, session.id) { mutableStateOf<TerminalScreen?>(null) }
-    var connectionState by remember(session.backend, session.id) { mutableStateOf("connecting") }
-    var error by remember(session.backend, session.id) { mutableStateOf<String?>(null) }
-    var terminalState by remember(session.backend, session.id) { mutableStateOf(TerminalConnectionState()) }
-    var socketAttemptNonce by remember(session.backend, session.id) { mutableStateOf(0L) }
-    var nextSubmitId by remember(session.backend, session.id) { mutableStateOf(1L) }
-    var closeRequested by remember(session.backend, session.id) { mutableStateOf(false) }
+    val context = LocalContext.current
+    val sessionKey = arrayOf(session.backend, session.id)
+    // Only ever holds a socket that is open, and only the main thread writes it.
+    val socketRef = remember(*sessionKey) { AtomicReference<WebSocket?>(null) }
+
+    // Identifies the connection attempt a callback belongs to, so a socket that outlives its
+    // effect cannot write into the screen state of the one that replaced it.
+    val liveAttempt = remember(*sessionKey) { AtomicReference<Any?>(null) }
+    val transport = remember(*sessionKey) { WebSocketTerminalTransport { socketRef.get() } }
+    var ended by remember(*sessionKey) { mutableStateOf(false) }
+    val controller = remember(*sessionKey) {
+        RemoteTerminalController(context, transport) { ended = true }
+    }
+    var connectionState by remember(*sessionKey) { mutableStateOf("connecting") }
+    var geometry by remember(*sessionKey) { mutableStateOf<String?>(null) }
+    var error by remember(*sessionKey) { mutableStateOf<String?>(null) }
+    var stickyControl by remember(*sessionKey) { mutableStateOf(false) }
+    var attempt by remember(*sessionKey) { mutableStateOf(0L) }
+    var failures by remember(*sessionKey) { mutableStateOf(0) }
+    var reconnectScheduled by remember(*sessionKey) { mutableStateOf(false) }
+    var closeRequested by remember(*sessionKey) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val verticalScroll = rememberScrollState()
-    val horizontalScroll = rememberScrollState()
 
-    fun send(command: TerminalCommand): Boolean {
-        val encoded = ApiJson.json.encodeToString<TerminalCommand>(command)
-        val sent = socket?.send(encoded) == true
-        if (!sent) error = "Terminal is not connected"
-        return sent
-    }
+    BackHandler { onBack() }
 
-    fun sendLine() {
-        val inputState = terminalState.inputState
-        if (!terminalSubmitEnabled(connectionState, screen, inputState.pendingId, closeRequested)) return
-        val command = terminalLineCommand(nextSubmitId, inputState.draft)
-        if (command == null) {
-            if (inputState.draft.isNotEmpty()) error = "Input exceeds the 4096 byte limit"
-            return
-        }
-        if (send(command)) {
-            terminalState = terminalState.copy(inputState = inputState.enqueued(command.id))
-            nextSubmitId += 1
-            error = null
-        }
-    }
-
-    BackHandler {
-        terminalExitCommand(TerminalExit.BACK)?.let(::send)
-        onBack()
-    }
-
-    DisposableEffect(session.backend, session.id, foreground, socketAttemptNonce) {
-        if (!foreground) {
-            val callbackGeneration = terminalState.generation
-            connectionState = "paused"
-            socket = null
-            terminalState = terminalConnectionEnded(
-                terminalState,
-                callbackGeneration,
-                TerminalSocketEnd.DISPOSE,
-                screen?.running,
-            )
+    DisposableEffect(session.backend, session.id, foreground, attempt) {
+        if (!foreground || ended) {
+            // Backgrounded: the socket goes, the session and its emulator stay. The server holds
+            // the PTY for its grace window and repaints from its own screen on reconnect.
+            connectionState = if (ended) "session ended" else "paused"
             onDispose { }
         } else {
-            val attempt = terminalSocketAttemptStarted(terminalState)
-            terminalState = attempt.connectionState
-            if (attempt.clearScreen) screen = null
-            val callbackGeneration = attempt.connectionState.generation
-            connectionState = "connecting"
+            connectionState = if (attempt == 0L) "connecting" else "reconnecting"
+            reconnectScheduled = false
             error = null
+            val token = Any()
+            liveAttempt.set(token)
             val request = Request.Builder()
                 .url(terminalWebSocketUrl(ApiConfig.DEFAULT_BASE_URL, session.id, session.backend))
                 .header("Origin", TERMINAL_ORIGIN)
                 .build()
-            lateinit var openedSocket: WebSocket
             val listener = object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    scope.launch {
-                        if (socket === openedSocket && terminalState.generation == callbackGeneration) {
-                            connectionState = if (screen?.running == false) "session ended" else "connected"
-                            error = null
-                            send(TerminalCommand.Resize(TERMINAL_ROWS, TERMINAL_COLS))
-                        }
-                    }
+                /** Hops to the main thread, then drops anything from a superseded attempt. */
+                private fun ifCurrent(action: () -> Unit) {
+                    scope.launch { if (liveAttempt.get() === token) action() }
                 }
 
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    scope.launch {
-                        if (socket !== openedSocket || terminalState.generation != callbackGeneration) {
-                            return@launch
-                        }
-                        terminalState = terminalState.copy(
-                            inputState = terminalInputAfterServerFrame(terminalState.inputState, text),
-                        )
-                        runCatching {
-                            val messageType = ApiJson.json.parseToJsonElement(text)
-                                .jsonObject.getValue("type").jsonPrimitive.content
-                            when (messageType) {
-                                "screen" -> {
-                                    val next = ApiJson.json.decodeFromString<TerminalScreen>(text)
-                                    if (terminalScreenFrameIsCurrent(terminalState, callbackGeneration, next.seq)) {
-                                        screen = next
-                                        terminalState = terminalState.copy(screenSequence = next.seq)
-                                        connectionState = if (next.running) "connected" else "session ended"
-                                    }
-                                }
-                                "ack" -> ApiJson.json.decodeFromString<TerminalAck>(text)
-                                "error" -> {
-                                    error = ApiJson.json.parseToJsonElement(text)
-                                        .jsonObject["message"]?.jsonPrimitive?.content
-                                        ?: "Terminal protocol error"
-                                }
-                                else -> error = "Unknown terminal message"
+                override fun onOpen(webSocket: WebSocket, response: Response) = ifCurrent {
+                    socketRef.set(webSocket)
+                    failures = 0
+                    connectionState = "connected"
+                    error = null
+                    controller.announceSize()
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) = ifCurrent {
+                    controller.receive(bytes.toByteArray())
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) = ifCurrent {
+                    when (val control = parseTerminalControl(text)) {
+                        is TerminalControl.Hello -> {
+                            geometry = "${control.cols}x${control.rows}"
+                            if (!control.running) {
+                                ended = true
+                                connectionState = "session ended"
                             }
-                        }.onFailure { failure ->
-                            error = failure.message ?: "Could not read terminal message"
                         }
+
+                        is TerminalControl.Exit -> {
+                            ended = true
+                            connectionState = "session ended"
+                            controller.remoteExited(control.status ?: 0)
+                        }
+
+                        is TerminalControl.Failure -> error = control.message
+                        is TerminalControl.Unreadable -> error = control.reason
                     }
                 }
 
@@ -297,96 +399,48 @@ internal fun TerminalConsole(
                     webSocket.close(code, reason)
                 }
 
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    scope.launch {
-                        if (socket === openedSocket) {
-                            terminalState = terminalConnectionEnded(
-                                terminalState,
-                                callbackGeneration,
-                                if (closeRequested) {
-                                    TerminalSocketEnd.INTENTIONAL_CLOSE
-                                } else {
-                                    TerminalSocketEnd.SPONTANEOUS_CLOSE
-                                },
-                                screen?.running,
-                            )
-                            if (closeRequested) {
-                                onBack()
-                            } else if (screen?.running != false) {
-                                connectionState = "disconnected"
-                            }
-                        }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = ifCurrent {
+                    socketRef.set(null)
+                    if (closeRequested) {
+                        onBack()
+                    } else if (!ended) {
+                        connectionState = "disconnected"
+                        failures += 1
+                        reconnectScheduled = true
                     }
                 }
 
-                override fun onFailure(webSocket: WebSocket, failure: Throwable, response: Response?) {
-                    scope.launch {
-                        if (socket === openedSocket) {
-                            terminalState = terminalConnectionEnded(
-                                terminalState,
-                                callbackGeneration,
-                                if (closeRequested) {
-                                    TerminalSocketEnd.INTENTIONAL_CLOSE
-                                } else {
-                                    TerminalSocketEnd.FAILURE
-                                },
-                                screen?.running,
-                            )
-                            if (screen?.running != false) connectionState = "connection failed"
-                            error = failure.message ?: "Could not connect to terminal"
+                override fun onFailure(socket: WebSocket, cause: Throwable, response: Response?) =
+                    ifCurrent {
+                        socketRef.set(null)
+                        if (!ended) {
+                            connectionState = "connection failed"
+                            error = cause.message ?: "Could not connect to terminal"
+                            failures += 1
+                            reconnectScheduled = true
                         }
                     }
-                }
             }
-            openedSocket = terminalHttpClient.newWebSocket(request, listener)
-            socket = openedSocket
+            val openedSocket = terminalHttpClient.newWebSocket(request, listener)
             onDispose {
-                if (socket === openedSocket) socket = null
-                terminalState = terminalConnectionEnded(
-                    terminalState,
-                    callbackGeneration,
-                    TerminalSocketEnd.DISPOSE,
-                    screen?.running,
-                )
-                terminalExitCommand(TerminalExit.DISPOSE)?.let { command ->
-                    openedSocket.send(ApiJson.json.encodeToString<TerminalCommand>(command))
-                }
-                openedSocket.close(1000, "console left")
+                if (liveAttempt.compareAndSet(token, null)) socketRef.set(null)
+                openedSocket.close(1000, "console detached")
             }
         }
     }
 
-    LaunchedEffect(foreground, terminalState.reconnectScheduled) {
-        if (foreground && terminalState.reconnectScheduled) {
-            val scheduledGeneration = terminalState.generation
-            delay(750)
-            if (
-                foreground &&
-                terminalState.reconnectScheduled &&
-                terminalState.generation == scheduledGeneration
-            ) {
-                connectionState = "reconnecting"
-                socketAttemptNonce += 1L
-            }
+    LaunchedEffect(foreground, reconnectScheduled, ended) {
+        if (foreground && reconnectScheduled && !ended) {
+            delay(terminalReconnectDelayMs(failures))
+            if (foreground && reconnectScheduled && !ended) attempt += 1L
         }
     }
 
-    LaunchedEffect(screen?.seq) {
-        if (screen != null) {
-            withFrameNanos { }
-            verticalScroll.scrollTo(verticalScroll.maxValue)
-        }
+    DisposableEffect(controller) {
+        onDispose { controller.detachFromParent() }
     }
 
-    val activeScreen = screen
-    val inputState = terminalState.inputState
-    val inputEnabled = activeScreen?.running == true && connectionState == "connected" && !closeRequested
-    val submitEnabled = terminalSubmitEnabled(
-        connectionState,
-        activeScreen,
-        inputState.pendingId,
-        closeRequested,
-    )
+    val liveInput = !ended && !closeRequested
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -403,7 +457,11 @@ internal fun TerminalConsole(
                     maxLines = 1,
                 )
                 Text(
-                    "${terminalBackendTag(session.backend)} terminal  $connectionState",
+                    listOfNotNull(
+                        "${terminalBackendTag(session.backend)} terminal",
+                        connectionState,
+                        geometry,
+                    ).joinToString("  "),
                     color = if (connectionState == "connected") colors.ok else colors.faint,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 10.sp,
@@ -411,16 +469,14 @@ internal fun TerminalConsole(
             }
             TextButton(
                 onClick = {
-                    val closeCommand = terminalExitCommand(TerminalExit.CLOSE)
                     closeRequested = true
-                    if (closeCommand == null || !send(closeCommand)) {
+                    connectionState = "closing"
+                    if (socketRef.get()?.send(terminalCloseFrame()) != true) {
                         closeRequested = false
                         error = "Could not request console close"
-                    } else {
-                        connectionState = "closing"
                     }
                 },
-                enabled = !closeRequested,
+                enabled = liveInput,
             ) { Text("close console", color = colors.err) }
         }
 
@@ -434,50 +490,14 @@ internal fun TerminalConsole(
             )
         }
 
-        Box(
-            modifier = Modifier.fillMaxWidth().weight(1f).background(colors.surface)
-                .padding(horizontal = 10.dp, vertical = 8.dp)
-                .horizontalScroll(horizontalScroll)
-                .verticalScroll(verticalScroll),
-        ) {
-            if (activeScreen == null) {
-                Text(
-                    text = "Waiting for terminal screen",
-                    color = colors.text,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                )
-            } else {
-                TerminalFrame(terminalRenderFrame(activeScreen), activeScreen, colors)
-            }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
-                value = inputState.draft,
-                onValueChange = {
-                    terminalState = terminalState.copy(inputState = inputState.copy(draft = it))
+        Box(modifier = Modifier.fillMaxWidth().weight(1f).background(colors.surface)) {
+            AndroidView(
+                factory = {
+                    controller.detachFromParent()
+                    controller.view
                 },
-                modifier = Modifier.weight(1f),
-                enabled = submitEnabled,
-                singleLine = true,
-                placeholder = { Text("type into session", color = colors.faint) },
-                textStyle = androidx.compose.ui.text.TextStyle(
-                    color = colors.text,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                ),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { sendLine() }),
+                modifier = Modifier.fillMaxSize(),
             )
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = { sendLine() },
-                enabled = submitEnabled && inputState.draft.isNotEmpty(),
-            ) { Text("send") }
         }
 
         Row(
@@ -485,17 +505,39 @@ internal fun TerminalConsole(
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            TerminalKey("enter", colors, inputEnabled) { send(TerminalCommand.Input("\r")) }
-            TerminalKey("backspace", colors, inputEnabled) { send(TerminalCommand.Input("\u007f")) }
-            TerminalKey("tab", colors, inputEnabled) { send(TerminalCommand.Input("\t")) }
-            TerminalKey("escape", colors, inputEnabled) { send(TerminalCommand.Input("\u001b")) }
-            TerminalKey("up", colors, inputEnabled) { send(TerminalCommand.Input("\u001b[A")) }
-            TerminalKey("down", colors, inputEnabled) { send(TerminalCommand.Input("\u001b[B")) }
-            TerminalKey("left", colors, inputEnabled) { send(TerminalCommand.Input("\u001b[D")) }
-            TerminalKey("right", colors, inputEnabled) { send(TerminalCommand.Input("\u001b[C")) }
-            TerminalKey("ctrl c", colors, inputEnabled) { send(TerminalCommand.Input("\u0003")) }
+            TerminalKey("enter", colors, liveInput) { controller.write("\r") }
+            TerminalKey("esc", colors, liveInput) { controller.write("\u001b") }
+            TerminalKey("tab", colors, liveInput) { controller.write("\t") }
+            TerminalKey(
+                label = if (stickyControl) "[ctrl]" else "ctrl",
+                colors = colors,
+                enabled = liveInput,
+            ) {
+                stickyControl = !stickyControl
+                controller.stickyControl = stickyControl
+            }
+            TerminalKey("up", colors, liveInput) { controller.write("\u001b[A") }
+            TerminalKey("down", colors, liveInput) { controller.write("\u001b[B") }
+            TerminalKey("left", colors, liveInput) { controller.write("\u001b[D") }
+            TerminalKey("right", colors, liveInput) { controller.write("\u001b[C") }
+            TerminalKey("ctrl c", colors, liveInput) { controller.write("\u0003") }
+            TerminalKey("paste", colors, liveInput) {
+                terminalClipboardText(context)?.let(controller::paste)
+            }
+            TerminalKey("keyboard", colors, liveInput) { controller.focusAndShowKeyboard() }
         }
     }
+}
+
+private fun terminalClipboardText(context: Context): String? {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+        as? android.content.ClipboardManager ?: return null
+    return clipboard.primaryClip
+        ?.takeIf { it.itemCount > 0 }
+        ?.getItemAt(0)
+        ?.coerceToText(context)
+        ?.toString()
+        ?.takeIf { it.isNotEmpty() }
 }
 
 @Composable
@@ -513,41 +555,6 @@ private fun TerminalKey(label: String, colors: ViewerColors, enabled: Boolean, o
         )
     }
 }
-
-@Composable
-private fun TerminalFrame(frame: TerminalRenderFrame, screen: TerminalScreen, colors: ViewerColors) {
-    Box(
-        modifier = Modifier
-            .width(terminalExtent(screen.cols, TERMINAL_CELL_WIDTH))
-            .height(terminalExtent(screen.rows, TERMINAL_CELL_HEIGHT)),
-    ) {
-        Text(
-            text = frame.text,
-            color = colors.text,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            lineHeight = 15.sp,
-            softWrap = false,
-        )
-        if (frame.cursorRow in 0 until screen.rows && frame.cursorCol in 0 until screen.cols) {
-            Text(
-                text = "█",
-                color = colors.accent,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                lineHeight = 15.sp,
-                modifier = Modifier.alpha(0.75f).offset {
-                    IntOffset(
-                        x = (frame.cursorCol * TERMINAL_CELL_WIDTH.toPx()).toInt(),
-                        y = (frame.cursorRow * TERMINAL_CELL_HEIGHT.toPx()).toInt(),
-                    )
-                },
-            )
-        }
-    }
-}
-
-private fun terminalExtent(cells: Int, cellSize: Dp): Dp = cellSize * cells.coerceAtLeast(1)
 
 private fun terminalBackendTag(backend: BackendKind): String = when (backend) {
     BackendKind.CODEX -> "CX"

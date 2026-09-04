@@ -1049,7 +1049,7 @@ private fun SessionDetailScreen(
                     }
                 }) { StopGlyph(colors.err) }
             }
-            if (capabilities?.archive == true) {
+            if (capabilities?.canArchive == true) {
                 IconControl(colors.muted, if (session.hidden) "unhide" else "hide", Modifier.size(48.dp), {
                     scope.launch {
                         runCatching { api.hide(session.id, session.hidden) }

@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "agent-viewer-mobile"
-include(":app")
+include(":app", ":termux-terminal")
