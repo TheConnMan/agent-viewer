@@ -764,6 +764,9 @@ model list and safely retains its built in `default` entry when that request is 
 - **The composer overlays automatic selection, not the catalog.** Raw backend catalogs and the
   persistent cache remain provider supplied. When routing is available, the composer prepends
   one `auto` choice for each concrete provider; it never stores that choice in the cache.
+- **The model palette preserves backend ranking.** Codex's numeric catalog priority and Claude's
+  configured-first order reach the picker unchanged; the palette does not alphabetize models
+  and push a newly preferred model below older version names.
 - **A failed probe is not cached.** `available_models()` always seeds the backend's default
   first, so a one-entry result means discovery failed; it is dropped rather than written,
   which would otherwise pin an empty picker for the whole TTL.

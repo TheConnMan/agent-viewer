@@ -1081,8 +1081,11 @@ fn palette_items(backends: &[Box<dyn Backend>], ui: &Ui) -> Vec<PaletteItem> {
                     && !(backend == BackendKind::Codex && model == backend.default_model())
             });
         }
-        models.sort();
-        models.dedup();
+        // Backend catalogs are already ranked: Codex uses its numeric priority and Claude
+        // places the configured cache entries first. Preserve that order in the palette so a
+        // newly preferred model does not get pushed below older names alphabetically.
+        let mut seen_models = HashSet::new();
+        models.retain(|model| seen_models.insert(model.clone()));
         if ui.composer.router_available() {
             models.insert(0, AUTO_MODEL.to_string());
         }
@@ -4575,6 +4578,38 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(model_names, vec![AUTO_MODEL.to_string(), "gpt".to_string()]);
+    }
+
+    #[test]
+    fn codex_palette_preserves_catalog_priority_order() {
+        let mut ui = test_ui_with(Vec::new());
+        ui.composer.set_available_backends(vec![BackendKind::Codex]);
+        ui.models.seed(
+            BackendKind::Codex,
+            vec![
+                "default".to_string(),
+                "gpt-6-astra".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.5".to_string(),
+            ],
+            true,
+        );
+
+        let model_names = palette_items(&[], &ui)
+            .into_iter()
+            .filter_map(|item| match item.target {
+                PaletteTarget::Model {
+                    backend: BackendKind::Codex,
+                    name,
+                } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            model_names,
+            vec!["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.5"]
+        );
     }
 
     #[test]
