@@ -18,18 +18,18 @@ public class RemoteTerminalSession extends TerminalSession {
     }
 
     @Override
-    public void initializeEmulator(int columns, int rows) {
-        mEmulator = new TerminalEmulator(this, columns, rows, mRemoteTranscriptRows, mClient);
+    public void initializeEmulator(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
+        mEmulator = new TerminalEmulator(this, columns, rows, cellWidthPixels, cellHeightPixels, mRemoteTranscriptRows, mClient);
         mShellPid = 1;
         mTransport.resize(columns, rows);
     }
 
     @Override
-    public void updateSize(int columns, int rows) {
+    public void updateSize(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
         if (mEmulator == null) {
-            initializeEmulator(columns, rows);
+            initializeEmulator(columns, rows, cellWidthPixels, cellHeightPixels);
         } else {
-            mEmulator.resize(columns, rows);
+            mEmulator.resize(columns, rows, cellWidthPixels, cellHeightPixels);
             mTransport.resize(columns, rows);
         }
     }

@@ -138,6 +138,11 @@ public class RemoteTerminalViewTest {
             }
         }
 
+        void feedBytes(String s) {
+            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            session.receive(bytes, bytes.length);
+        }
+
         void key(int keyCode, int meta) {
             view.onKeyDown(keyCode, new KeyEvent(0, 0, KeyEvent.ACTION_DOWN, keyCode, 0, meta));
         }
@@ -277,6 +282,38 @@ public class RemoteTerminalViewTest {
         // The alternate screen has no reflow by design: the CLI repaints after SIGWINCH,
         // which is what the announced resize triggers on the server's PTY.
         assertEquals(rig.view.mEmulator.mRows, last[1]);
+    }
+
+    /**
+     * Colon separated CSI sub parameters (ITU T.416 / ISO-8613-3 style SGR), which upstream
+     * termux-app only learned to parse after v0.118.0 (commit 8be53336, "Implement colon
+     * separated CSI parameters", shipped in v0.118.3). On v0.118.0 {@code parseArg} routes ':'
+     * straight to {@code unknownSequence(b)}, so the whole SGR is dropped and the cell keeps the
+     * default foreground.
+     *
+     * <p>Note the second half: v0.118.3 still does NOT skip the empty colour-space-id slot of the
+     * fully spelled out {@code 38:2::R:G:B} form - it reads the empty slot as red=0 and shifts the
+     * channels along, so pure red arrives as pure green. That is an upstream gap, asserted here so
+     * a future re-vendor notices when it is fixed.
+     */
+    @Test
+    public void colonSeparatedTruecolorSgrPaintsTheCellRed() {
+        Rig rig = new Rig(26, PHONE_W, PHONE_H);
+        rig.feedBytes(ESC + "[38:2:255:0:0m" + "X");
+        TerminalEmulator emulator = rig.view.mEmulator;
+        assertEquals("cell holds the written character", "X",
+            emulator.getScreen().getSelectedText(0, 0, 0, 0));
+        assertEquals("foreground is 24-bit red", argb(0xffff0000),
+            argb(TextStyle.decodeForeColor(emulator.getScreen().getStyleAt(0, 0))));
+
+        // Upstream gap: the empty colour-space-id slot is not skipped, so R/G/B shift by one.
+        rig.feedBytes(ESC + "[38:2::255:0:0m" + "Y");
+        assertEquals("empty colour-space slot still shifts the channels", argb(0xff00ff00),
+            argb(TextStyle.decodeForeColor(emulator.getScreen().getStyleAt(0, 1))));
+    }
+
+    private static String argb(int color) {
+        return String.format("#%08x", color);
     }
 
     private static boolean pasteIsBracketed(Rig rig) {
