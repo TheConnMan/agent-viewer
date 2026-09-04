@@ -277,7 +277,7 @@ fn codex_spawn_command(dir: &Path, task: &str, model: Option<&str>) -> std::proc
 fn codex_catalog_via_cli() -> Vec<String> {
     let mut cmd = std::process::Command::new("codex");
     cmd.arg("debug").arg("models");
-    match crate::spawn::run_with_timeout(cmd, crate::spawn::MODEL_PROBE_TIMEOUT) {
+    match crate::spawn::run_with_timeout_large_stdout(cmd, crate::spawn::MODEL_PROBE_TIMEOUT) {
         Some(stdout) => parse_codex_catalog(&stdout),
         None => Vec::new(),
     }

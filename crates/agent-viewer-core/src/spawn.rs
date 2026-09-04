@@ -55,6 +55,16 @@ pub(crate) fn run_with_timeout(
     run_reporting_failure(cmd, timeout).ok()
 }
 
+/// Model catalogs include verbose model-specific instructions, so their valid JSON can exceed
+/// the generic shell-out ceiling. Keep this larger allowance scoped to discovery; callers such
+/// as the router rely on the generic cap to reject oversized responses.
+pub(crate) fn run_with_timeout_large_stdout(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    run_reporting_failure_with_stdout_cap(cmd, timeout, MODEL_CATALOG_STDOUT_CAP).ok()
+}
+
 /// How long a failed command's stderr may take to arrive once the child is gone. The pipe is
 /// at EOF by then, so this is slack for the reader thread to finish, not a real wait; a
 /// descendant still holding the pipe open must cost the caller this and no more.
@@ -64,9 +74,12 @@ const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// never shown and only serves to let a chatty descendant grow the buffer unboundedly.
 const STDERR_CAP: usize = 8 * 1024;
 
-/// Ceiling on captured stdout. Model catalogs can exceed the OS pipe buffer, so the reader
-/// continues draining after this limit while retaining at most 384 KiB in memory.
+/// Ceiling on captured stdout for ordinary shell-outs. The reader continues draining after
+/// this limit so an oversized child cannot deadlock on a full pipe.
 const STDOUT_CAP: usize = 384 * 1024;
+
+/// Model catalogs can be hundreds of KiB because they include model-specific instructions.
+const MODEL_CATALOG_STDOUT_CAP: usize = 2 * 1024 * 1024;
 
 /// `run_with_timeout` for callers that must TELL THE USER why it failed, returning the
 /// failure as a one-line diagnostic naming the command.
@@ -76,8 +89,16 @@ const STDOUT_CAP: usize = 384 * 1024;
 /// the user must act on has to say whether codex was missing, exited non-zero (with its
 /// stderr), or hung, not just that something did not work.
 pub(crate) fn run_reporting_failure(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, String> {
+    run_reporting_failure_with_stdout_cap(cmd, timeout, STDOUT_CAP)
+}
+
+fn run_reporting_failure_with_stdout_cap(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    stdout_cap: usize,
 ) -> std::result::Result<String, String> {
     use std::io::Read;
     let described = describe(&cmd);
@@ -105,7 +126,7 @@ pub(crate) fn run_reporting_failure(
             match stdout.read(&mut chunk) {
                 Ok(0) => break true,
                 Ok(n) => {
-                    let retained = n.min(STDOUT_CAP.saturating_sub(buf.len()));
+                    let retained = n.min(stdout_cap.saturating_sub(buf.len()));
                     buf.extend_from_slice(&chunk[..retained]);
                     truncated |= retained < n;
                 }
@@ -177,7 +198,7 @@ pub(crate) fn run_reporting_failure(
                     .ok_or_else(|| format!("`{described}` stdout was unreadable"))?;
                 if truncated {
                     return Err(format!(
-                        "`{described}` stdout was truncated after {STDOUT_CAP} bytes"
+                        "`{described}` stdout was truncated after {stdout_cap} bytes"
                     ));
                 }
                 return String::from_utf8(buf)
@@ -334,7 +355,7 @@ pub fn terminate(_pid: u32, _expected_comm_prefix: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_reporting_failure, run_with_timeout};
+    use super::{run_reporting_failure, run_with_timeout, run_with_timeout_large_stdout};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -483,15 +504,16 @@ mod tests {
 
     #[test]
     fn run_with_timeout_captures_output_larger_than_the_pipe_buffer() {
-        // A model catalog can exceed the OS pipe buffer (64KB on Linux). Draining stdout
-        // only after the child exits deadlocks: the child blocks writing, never exits, and
-        // the deadline kills it, so a big catalog would silently discover nothing.
+        // A model catalog can exceed both the OS pipe buffer (64KB on Linux) and 384 KiB once
+        // model-specific instructions are included. Draining or retaining too little makes a
+        // valid catalog silently fall back to registry history.
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("yes provider/model | head -n 20000");
+        cmd.arg("-c").arg("yes provider/model | head -n 40000");
         let start = Instant::now();
-        let out = run_with_timeout(cmd, Duration::from_secs(10)).expect("captured stdout");
-        assert_eq!(out.lines().count(), 20_000);
-        assert!(out.len() > 256 * 1024, "expected >256KB, got {}", out.len());
+        let out =
+            run_with_timeout_large_stdout(cmd, Duration::from_secs(10)).expect("captured stdout");
+        assert_eq!(out.lines().count(), 40_000);
+        assert!(out.len() > 512 * 1024, "expected >512KB, got {}", out.len());
         // Success must come from the child exiting, not from riding the deadline out.
         assert!(start.elapsed() < Duration::from_secs(5), "took too long");
     }

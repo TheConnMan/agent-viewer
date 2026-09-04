@@ -770,9 +770,10 @@ model list and safely retains its built in `default` entry when that request is 
 - **A failed probe is not cached.** `available_models()` always seeds the backend's default
   first, so a one-entry result means discovery failed; it is dropped rather than written,
   which would otherwise pin an empty picker for the whole TTL.
-- **`run_with_timeout` drains stdout on a reader thread.** Reading after the wait deadlocks
-  against the 64KB pipe buffer for any catalog bigger than that, which presents identically to
-  a timeout (empty picker, no error).
+- **`run_with_timeout` drains stdout on a reader thread and retains up to 2 MiB.** Reading after
+  the wait deadlocks against the 64KB pipe buffer, while the former 384 KiB retention cap
+  truncated the 445 KiB Astra catalog and silently forced registry-history fallback. Both
+  failures present as a stale picker with no error.
 
 ## Claude mutations — CLI subcommands, plus one deliberate state-file write
 
