@@ -160,47 +160,12 @@ data class Capabilities(
     val spawn: Boolean = false,
     val attach: Boolean = false,
     val rename: Boolean = false,
-    val archive: Boolean = false,
+    /** `null`, `"Reversible"` or `"Deletes"`: any non-null value means the action is offered. */
+    val archive: String? = null,
     val delete: Boolean = false,
     val stop: Boolean = false,
-)
-
-@Serializable
-data class TerminalScreen(
-    val type: String,
-    val seq: Long,
-    val rows: Int,
-    val cols: Int,
-    @SerialName("cursor_row") val cursorRow: Int,
-    @SerialName("cursor_col") val cursorCol: Int,
-    val lines: List<String>,
-    val running: Boolean,
-    val ready: Boolean,
-)
-
-@Serializable
-data class TerminalAck(
-    val type: String,
-    val id: Long,
-)
-
-@Serializable
-sealed interface TerminalCommand {
-    @Serializable
-    @SerialName("input")
-    data class Input(val text: String) : TerminalCommand
-
-    @Serializable
-    @SerialName("submit")
-    data class Submit(val id: Long, val text: String) : TerminalCommand
-
-    @Serializable
-    @SerialName("resize")
-    data class Resize(val rows: Int, val cols: Int) : TerminalCommand
-
-    @Serializable
-    @SerialName("close")
-    data object Close : TerminalCommand
+) {
+    val canArchive: Boolean get() = archive != null
 }
 
 internal fun terminalWebSocketUrl(
