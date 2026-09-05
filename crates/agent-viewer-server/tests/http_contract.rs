@@ -54,6 +54,15 @@ impl FakeBackend {
         }
     }
 
+    fn with_sessions(sessions: Vec<Session>, calls: Arc<FakeCalls>) -> Self {
+        Self {
+            kind: BackendKind::Codex,
+            sessions,
+            calls,
+            attach_script: None,
+        }
+    }
+
     fn attachable(session: Session, calls: Arc<FakeCalls>, script: impl Into<String>) -> Self {
         Self::attachable_kind(BackendKind::Codex, session, calls, script)
     }
@@ -585,6 +594,115 @@ fn tail_events_and_capabilities_have_json_contracts() {
             "stop": false
         })
     );
+}
+
+/// The phone OOMed on the unfiltered list, and it has no surface for archived rows, so the
+/// list serves the visible fleet only. There is no parameter that asks for the rest: a stray
+/// query string is ignored like any other unknown one.
+#[tokio::test]
+async fn sessions_serve_visible_rows_only() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+
+    let visible = session(fixture.cwd.clone());
+    let mut hidden = session(fixture.cwd.clone());
+    hidden.id = "hidden-row".to_string();
+    hidden.hidden = true;
+    let mut companion = session(fixture.cwd.clone());
+    companion.id = "companion-row".to_string();
+    companion.companion = true;
+    let mut subagent = session(fixture.cwd.clone());
+    subagent.id = "subagent-row".to_string();
+    subagent.subagent = true;
+
+    let app =
+        agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::with_sessions(
+            vec![visible, hidden, companion, subagent],
+            Arc::clone(&calls),
+        ))]);
+
+    for uri in ["/sessions", "/sessions?scope=all"] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, uri, true))
+            .await
+            .expect("sessions response");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            session_ids(json_body(response).await),
+            vec!["session-1"],
+            "{uri}"
+        );
+    }
+
+    drop(fixture);
+}
+
+/// A Codex title is the thread's whole first prompt, so the list bounds it. The bound counts
+/// CHARS: a byte cut would split a multi-byte title into invalid UTF-8.
+#[tokio::test]
+async fn sessions_bound_title_and_summary_text() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+
+    let mut huge = session(fixture.cwd.clone());
+    huge.title = "x".repeat(300 * 1024);
+    huge.summary = "y".repeat(300 * 1024);
+    let mut short = session(fixture.cwd.clone());
+    short.id = "short-row".to_string();
+    short.title = "Mobile companion".to_string();
+    short.summary = "Building the server".to_string();
+    let mut wide = session(fixture.cwd.clone());
+    wide.id = "wide-row".to_string();
+    wide.title = "\u{1f600}".repeat(400);
+    wide.summary = "\u{6f22}\u{5b57}".repeat(400);
+
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(
+        FakeBackend::with_sessions(vec![huge, short, wide], Arc::clone(&calls)),
+    )]);
+
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/sessions", true))
+        .await
+        .expect("sessions response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = json_body(response).await;
+
+    let huge_title = sessions[0]["title"].as_str().expect("title string");
+    assert_eq!(huge_title, format!("{}\u{2026}", "x".repeat(240)));
+    assert_eq!(huge_title.chars().count(), 241);
+    assert_eq!(
+        sessions[0]["summary"].as_str().expect("summary string"),
+        format!("{}\u{2026}", "y".repeat(240))
+    );
+
+    assert_eq!(sessions[1]["title"], "Mobile companion");
+    assert_eq!(sessions[1]["summary"], "Building the server");
+
+    let wide_title = sessions[2]["title"].as_str().expect("title string");
+    assert_eq!(wide_title, format!("{}\u{2026}", "\u{1f600}".repeat(240)));
+    assert_eq!(wide_title.chars().count(), 241);
+    assert_eq!(
+        sessions[2]["summary"].as_str().expect("summary string"),
+        format!("{}\u{2026}", "\u{6f22}\u{5b57}".repeat(120))
+    );
+
+    drop(fixture);
+}
+
+fn session_ids(sessions: Value) -> Vec<String> {
+    sessions
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .map(|session| {
+            session["id"]
+                .as_str()
+                .expect("session id string")
+                .to_string()
+        })
+        .collect()
 }
 
 #[tokio::test]

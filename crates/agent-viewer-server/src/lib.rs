@@ -27,6 +27,15 @@ use tokio_tungstenite::tungstenite::error::CapacityError;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SPAWN_ABANDON_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_TAIL_EVENTS: usize = 12;
+/// Longest `title` or `summary` the LIST response carries, in chars.
+///
+/// Codex uses a thread's whole first prompt as its title, so one row can carry hundreds of
+/// KB of it: measured live on this box, `GET /sessions` was 56.9 MB over 11,968 rows, of
+/// which 22.9 MB was titles and 26.7 MB summaries, and the largest single title was 288,687
+/// chars. The phone decodes the whole body into its Java heap and dies with an allocation
+/// failure, so the list bounds both fields here, at the view layer only - the snapshot and
+/// `-core` keep the full text for every other surface.
+const SESSION_TEXT_LIMIT: usize = 240;
 const PULSE_WINDOW: Duration = Duration::from_secs(60 * 60);
 const ANDROID_ORIGIN: &str = "https://appassets.androidplatform.net";
 const TERMINAL_ROWS: u16 = 24;
@@ -271,6 +280,28 @@ impl SessionView {
             session,
             project_root,
         }
+    }
+
+    /// The list copy of a row: same JSON shape and same fields, with `title` and `summary`
+    /// bounded to `SESSION_TEXT_LIMIT`. Paths are left whole; they are short.
+    fn bounded(&self) -> Self {
+        let mut view = self.clone();
+        view.session.title = bound_text(&view.session.title);
+        view.session.summary = bound_text(&view.session.summary);
+        view
+    }
+}
+
+/// Cut `text` to `SESSION_TEXT_LIMIT` CHARS on a char boundary, marking a cut with a single
+/// ellipsis. Counting chars, not bytes, is what keeps a CJK or emoji title from being sliced
+/// mid-codepoint into invalid UTF-8.
+fn bound_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(SESSION_TEXT_LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{bounded}\u{2026}")
+    } else {
+        bounded
     }
 }
 
@@ -758,12 +789,28 @@ async fn health() -> Json<StatusBody> {
     Json(StatusBody { status: "ok" })
 }
 
+/// The list is the VISIBLE fleet and nothing else: hidden, companion, and subagent rows are
+/// never served, and there is no query parameter that asks for them.
+///
+/// Measured live on this box, only 33 of 11,968 rows are visible; the other 11,935 are rows
+/// the phone has no surface for and would only decode on its way to an OOM.
 async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionView>> {
-    let sessions = match state.snapshot.read() {
-        Ok(snapshot) => snapshot.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+    let snapshot = match state.snapshot.read() {
+        Ok(snapshot) => snapshot,
+        Err(poisoned) => poisoned.into_inner(),
     };
+    let sessions = snapshot
+        .iter()
+        .filter(|view| is_visible(&view.session))
+        .map(SessionView::bounded)
+        .collect();
     Json(sessions)
+}
+
+/// A row a person actually looks at on the phone: not archived, not a second view of a
+/// session already listed, not a child thread of one.
+fn is_visible(session: &Session) -> bool {
+    !session.hidden && !session.companion && !session.subagent
 }
 
 async fn session_tail(

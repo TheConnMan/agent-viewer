@@ -1044,6 +1044,22 @@ id, so a replaced socket can no longer type, resize, kill, or open grace. The se
 every 10 s and closes a socket that has sent nothing for 30 s, which is what starts grace after
 an unclean drop (a phone that lost radio sends no FIN).
 
+`GET /sessions` serves the VISIBLE fleet only — every row that is not `hidden`, not
+`companion`, and not `subagent` — with `title` and `summary` each bounded to
+`SESSION_TEXT_LIMIT` (240 chars, cut on a char boundary with a trailing `…`). Archived rows are
+not served at all and there is no parameter that asks for them: a stray query string is ignored
+like any other unknown one. This is a phone OOM fix, not a preference. Measured live on this
+box 2026-09-05, the unfiltered response was 56,899,399 bytes over 11,968 rows — 22.9 MB of it
+titles and 26.7 MB summaries, the largest single title 288,687 chars, because Codex uses a
+thread's whole first prompt as its title — and the Android client decodes the whole body into
+its Java heap and died with `Failed to allocate a … byte allocation`. Of those 11,968 rows,
+9,043 were hidden, 10,488 companion, 6,882 subagent, and just 33 visible; filtering and
+bounding together take the response to a few KB. Both happen in the view layer only
+(`SessionView::bounded`, `is_visible`): the snapshot and `-core` keep the full text and the
+full row set, so the TUI, the terminal route, and every `/sessions/{id}/…` lookup are
+unchanged — those resolve against the unfiltered snapshot and can still reach a hidden row by
+id. The JSON shape is untouched, so an older phone build keeps decoding it.
+
 ### Wire protocol
 
 Binary frames are PTY bytes in both directions. Text frames are JSON control only. There are no
