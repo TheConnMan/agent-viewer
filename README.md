@@ -713,6 +713,11 @@ tailscale serve --bg --https=8446 --set-path=/agent-viewer-1.apk \
   android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+Debug builds install as `com.theconnman.agentviewer.debug` (an `applicationIdSuffix` on the
+debug build type), so a sideloaded debug APK never collides with an install signed by a
+different debug keystore; the box's keystore was regenerated on 2026-09-04 and the phone
+answered the mismatched update with a bare "App not installed".
+
 **Bump `versionCode` in `android/app/build.gradle.kts` and use a new served filename on every
 rebuild.** Android refuses to install an APK whose `versionCode` did not advance, and the phone
 serves the cached download when the URL is unchanged, so reusing either one silently installs

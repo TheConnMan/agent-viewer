@@ -13,8 +13,18 @@ android {
         applicationId = "com.theconnman.agentviewer"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
+    }
+
+    buildTypes {
+        // Debug builds get their own application id so a sideloaded debug APK never collides
+        // with an install signed by a different debug keystore (the box's keystore was
+        // regenerated on 2026-09-04 and the phone rejected the update as "App not installed").
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
     }
 
     buildFeatures {
