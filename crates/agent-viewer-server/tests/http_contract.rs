@@ -386,7 +386,10 @@ async fn next_terminal_binary(socket: &mut ClientSocket) -> Vec<u8> {
 
 /// Accumulate raw PTY frames onto `seen` until `needle` shows up in the stream. Seeding with
 /// the redraw matters: whether a marker lands in the repaint or in the live stream depends on
-/// how far the child got before the socket attached, and both are correct.
+/// how far the child got before the socket attached, and either side is correct. What is NOT
+/// correct is landing on both, so this helper only ever answers "did it arrive"; exactly-once
+/// is asserted by `terminal_prints_each_chunk_exactly_once_across_redraw_and_live` and
+/// `terminal_never_duplicates_output_when_attaching_mid_flood`.
 async fn terminal_bytes_containing(
     socket: &mut ClientSocket,
     seed: Vec<u8>,
@@ -421,6 +424,16 @@ async fn terminal_bytes_containing(
     seen
 }
 
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack.len() >= needle.len()
@@ -449,6 +462,52 @@ async fn expect_terminal_close(socket: &mut ClientSocket) {
     })
     .await
     .expect("terminal close timeout");
+}
+
+/// The close frame itself, so a test can assert the code and reason the client acts on. PTY
+/// frames already queued ahead of the close are drained on the way.
+async fn expect_terminal_close_frame(
+    socket: &mut ClientSocket,
+) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => return frame,
+                Some(Ok(Message::Close(None))) => panic!("expected a close frame with a code"),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("terminal close failed: {error}"),
+                None => panic!("the socket ended without a close frame"),
+            }
+        }
+    })
+    .await
+    .expect("terminal close frame timeout")
+}
+
+/// Every `M<six digits>` marker in a byte stream, in order.
+fn markers(bytes: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, window) in bytes.windows(7).enumerate() {
+        if window[0] == b'M' && window[1..].iter().all(u8::is_ascii_digit) {
+            // Skip a match that is really the tail of a longer digit run.
+            if index + 7 < bytes.len() && bytes[index + 7].is_ascii_digit() {
+                continue;
+            }
+            found.push(String::from_utf8_lossy(window).into_owned());
+        }
+    }
+    found
+}
+
+fn duplicated(markers: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut twice = Vec::new();
+    for marker in markers {
+        if !seen.insert(marker.clone()) {
+            twice.push(marker.clone());
+        }
+    }
+    twice
 }
 
 async fn wait_for_pid_exit(pid: u32) {
@@ -822,6 +881,102 @@ async fn terminal_sends_hello_then_one_redraw_then_live_pty_bytes() {
     socket.close(None).await.expect("close terminal");
 }
 
+/// The redraw and the live stream must partition the child's output, not overlap it: every
+/// chunk lands in exactly one of them. The PTY only exists once somebody has attached, so
+/// "printed before this client connected" is a reconnect — which is the case the phone lives
+/// in anyway, every time it comes back from the background.
+#[tokio::test]
+async fn terminal_prints_each_chunk_exactly_once_across_redraw_and_live() {
+    let fixture = project_fixture();
+    let gate = fixture.root.join("print-marker-two");
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
+    let calls = Arc::new(FakeCalls::default());
+    let app = agent_viewer_server::router_with_backends_and_grace(
+        vec![Box::new(FakeBackend::attachable(
+            attachable_session,
+            Arc::clone(&calls),
+            format!(
+                "printf 'MARKER-ONE\\r\\n'; while [ ! -f '{}' ]; do sleep 0.05; done; printf 'MARKER-TWO\\r\\n'; sleep 30",
+                gate.display()
+            ),
+        ))],
+        Duration::from_secs(30),
+    );
+    let server = start_server(app).await;
+
+    let mut first = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("first terminal attach");
+    let (_, redraw) = terminal_handshake(&mut first).await;
+    terminal_bytes_containing(&mut first, redraw, b"MARKER-ONE").await;
+    first.close(None).await.expect("close first terminal");
+    drop(first);
+    sleep(Duration::from_millis(200)).await;
+
+    let mut second = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("reconnect within the grace window");
+    let (_, redraw) = terminal_handshake(&mut second).await;
+    // Only now does the child print the second marker, so it cannot be in the snapshot.
+    std::fs::write(&gate, b"go").expect("open the marker gate");
+    let stream = terminal_bytes_containing(&mut second, redraw, b"MARKER-TWO").await;
+
+    assert_eq!(
+        count(&stream, b"MARKER-ONE"),
+        1,
+        "the marker printed before this client connected must appear exactly once across \
+         redraw + live"
+    );
+    assert_eq!(
+        count(&stream, b"MARKER-TWO"),
+        1,
+        "the marker printed after this client connected must appear exactly once"
+    );
+    assert_eq!(calls.attach.load(Ordering::SeqCst), 1);
+    second.close(None).await.expect("close terminal");
+}
+
+/// The same rule under the timing that actually breaks it: a socket attaching while the child
+/// is mid-flood. Anything a forwarding thread were holding at that instant would be inside the
+/// redraw AND forwarded again as live bytes, so every numbered line must be unique.
+#[tokio::test]
+async fn terminal_never_duplicates_output_when_attaching_mid_flood() {
+    let calls = Arc::new(FakeCalls::default());
+    let server = start_server(attachable_app(
+        "i=0; while [ $i -lt 40000 ]; do i=$((i+1)); printf 'M%06d\\r\\n' \"$i\"; done; printf 'FLOOD-DONE\\r\\n'; sleep 30",
+        Arc::clone(&calls),
+    ))
+    .await;
+
+    let mut first = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("first terminal attach");
+    let (_, redraw) = terminal_handshake(&mut first).await;
+    terminal_bytes_containing(&mut first, redraw, b"M000005").await;
+
+    // Take over mid-flood: the second socket's snapshot is taken while chunks are in motion.
+    let mut second = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("mid-flood takeover");
+    let (_, redraw) = terminal_handshake(&mut second).await;
+    let stream = terminal_bytes_containing(&mut second, redraw, b"FLOOD-DONE").await;
+
+    let seen = markers(&stream);
+    assert!(
+        seen.len() > 24,
+        "the takeover must see a real slice of the flood, saw {}",
+        seen.len()
+    );
+    let twice = duplicated(&seen);
+    assert!(
+        twice.is_empty(),
+        "no chunk may be printed twice across redraw + live, duplicated {twice:?}"
+    );
+    drop(first);
+    second.close(None).await.expect("close terminal");
+}
+
 /// Client binary frames are keystrokes for the PTY and must reach the child byte for byte,
 /// UTF-8 and control bytes alike.
 #[tokio::test]
@@ -885,26 +1040,171 @@ async fn terminal_resize_reaches_the_attach_child() {
     expect_terminal_close(&mut socket).await;
 }
 
+/// A phone's `WebSocket.close` is asynchronous and a phone that drops off the tailnet never
+/// closes at all, so a reconnect routinely arrives while the previous socket still counts as
+/// connected. That is a takeover, not a 409: the new socket gets the same child and the same
+/// screen, the old one is closed with 4000 "replaced", and nothing the loser sends afterwards
+/// can reach the child.
 #[tokio::test]
-async fn terminal_allows_one_connection_per_session() {
+async fn terminal_second_connection_takes_over_from_the_first() {
+    let fixture = project_fixture();
+    let pid_file = fixture.root.join("takeover.pids");
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
     let calls = Arc::new(FakeCalls::default());
-    let server = start_server(attachable_app(
-        "printf 'FIRST\\r\\n'; sleep 30",
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::attachable(
+        attachable_session,
         Arc::clone(&calls),
-    ))
-    .await;
+        format!(
+            "printf '%s\\n' $$ >> '{}'; stty raw -echo; printf 'FIRST-SCREEN\\r\\n'; cat",
+            pid_file.display()
+        ),
+    ))]);
+    let server = start_server(app).await;
+
     let mut first = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
         .await
         .expect("first terminal attach");
-    terminal_handshake(&mut first).await;
+    let (_, redraw) = terminal_handshake(&mut first).await;
+    terminal_bytes_containing(&mut first, redraw, b"FIRST-SCREEN").await;
+    let child = wait_for_pids(&pid_file, 1).await[0];
 
-    let duplicate = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+    let mut second = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
         .await
-        .expect_err("duplicate attach must be refused");
-    assert_eq!(websocket_status(duplicate), StatusCode::CONFLICT);
-    assert_eq!(calls.attach.load(Ordering::SeqCst), 1);
+        .expect("a second connection must take over, not be refused");
+    let (hello, redraw) = terminal_handshake(&mut second).await;
+    assert_eq!(hello["running"], true);
+    assert!(
+        contains(&redraw, b"FIRST-SCREEN"),
+        "the taking-over socket must get the redraw of the same child: {:?}",
+        String::from_utf8_lossy(&redraw)
+    );
+    assert_eq!(
+        pid_lines(&pid_file),
+        vec![child],
+        "a takeover must not start a second child"
+    );
+    assert_eq!(
+        calls.attach.load(Ordering::SeqCst),
+        1,
+        "a takeover must not ask the backend to attach again"
+    );
 
-    first.close(None).await.expect("close first terminal");
+    // The replaced socket still holds a lease, so prove its input is ignored rather than
+    // merely late: whatever it sends must never come back out of the child.
+    let _ = first
+        .send(Message::Binary(b"GHOST-INPUT\r\n".to_vec().into()))
+        .await;
+    second
+        .send(Message::Binary(b"TAKEOVER-INPUT\r\n".to_vec().into()))
+        .await
+        .expect("send input from the taking-over socket");
+    let live = terminal_bytes_containing(&mut second, Vec::new(), b"TAKEOVER-INPUT").await;
+    assert!(
+        !contains(&live, b"GHOST-INPUT"),
+        "a replaced socket must not be able to type into the child: {:?}",
+        String::from_utf8_lossy(&live)
+    );
+
+    let close = expect_terminal_close_frame(&mut first).await;
+    assert_eq!(
+        u16::from(close.code),
+        4000,
+        "the replaced socket must be closed with the final code the phone never retries"
+    );
+    assert_eq!(close.reason.as_str(), "replaced");
+
+    second
+        .send(Message::Text(json!({ "type": "close" }).to_string().into()))
+        .await
+        .expect("explicit terminal close");
+    expect_terminal_close(&mut second).await;
+    wait_for_pid_exit(child).await;
+}
+
+/// A client that stops reading must not be allowed to grow the owner's queue without bound:
+/// past the cap it is disconnected with 1013 and reconnects into a fresh redraw.
+#[tokio::test]
+async fn terminal_disconnects_a_client_that_stops_reading() {
+    let calls = Arc::new(FakeCalls::default());
+    let server = start_server(attachable_app(
+        "yes 'FLOOD-LINE' | head -c 16000000; printf 'FLOOD-END\\r\\n'; sleep 30",
+        calls,
+    ))
+    .await;
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    let hello = next_terminal_text(&mut socket).await;
+    assert_eq!(hello["type"], "hello");
+
+    // Stop reading entirely while the child floods.
+    sleep(Duration::from_secs(2)).await;
+
+    let mut received = 0_usize;
+    let close = timeout(Duration::from_secs(10), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => return frame,
+                Some(Ok(Message::Binary(bytes))) => {
+                    assert!(
+                        !contains(&bytes, b"FLOOD-END"),
+                        "a slow consumer must be cut off before the flood finishes"
+                    );
+                    received += bytes.len();
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("expected a slow-consumer close, got {error}"),
+                None => panic!("the socket ended without a slow-consumer close frame"),
+            }
+        }
+    })
+    .await
+    .expect("slow consumer close timeout");
+
+    assert_eq!(u16::from(close.code), 1013);
+    assert_eq!(close.reason.as_str(), "slow consumer");
+    assert!(
+        received < 8_000_000,
+        "the owner must bound what it buffers for a stalled client, queued {received} bytes"
+    );
+}
+
+/// A socket that answers nothing at all never sends a FIN, so only a server-side ping can end
+/// it. Once it is closed the ordinary grace window runs and the child is killed.
+#[tokio::test]
+async fn terminal_closes_a_socket_that_stops_answering() {
+    let fixture = project_fixture();
+    let pid_file = fixture.root.join("liveness.pids");
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
+    let calls = Arc::new(FakeCalls::default());
+    let app = agent_viewer_server::router_with_backends_and_terminal_timing(
+        vec![Box::new(FakeBackend::attachable(
+            attachable_session,
+            Arc::clone(&calls),
+            format!(
+                "printf '%s\\n' $$ >> '{}'; printf 'SILENT\\r\\n'; while :; do sleep 1; done",
+                pid_file.display()
+            ),
+        ))],
+        Duration::from_millis(300),
+        Duration::from_millis(100),
+        Duration::from_millis(400),
+    );
+    let server = start_server(app).await;
+
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    let (_, redraw) = terminal_handshake(&mut socket).await;
+    terminal_bytes_containing(&mut socket, redraw, b"SILENT").await;
+    let child = wait_for_pids(&pid_file, 1).await[0];
+
+    // Never poll the socket again: no pong, no close, nothing. tokio-tungstenite only answers
+    // pings while it is being read, so this is exactly a phone that fell off the tailnet.
+    wait_for_pid_exit(child).await;
+    drop(socket);
 }
 
 #[tokio::test]
@@ -1052,6 +1352,49 @@ async fn terminal_grace_expiry_kills_the_pty() {
         .expect("explicit terminal close");
     expect_terminal_close(&mut fresh).await;
     wait_for_pid_exit(pids[1]).await;
+}
+
+/// The same rule against a child that never goes quiet. The owner's wait is only ever a bound
+/// on how long it sits idle, so the grace deadline has to be tested on every pass: a child that
+/// keeps the event loop busy must still be killed on time, not outlive its window forever.
+#[tokio::test]
+async fn terminal_grace_expiry_kills_a_flooding_pty() {
+    let fixture = project_fixture();
+    let pid_file = fixture.root.join("flood-expiry.pids");
+    let mut attachable_session = session(fixture.cwd.clone());
+    attachable_session.daemon_hosted = true;
+    let calls = Arc::new(FakeCalls::default());
+    let app = agent_viewer_server::router_with_backends_and_grace(
+        vec![Box::new(FakeBackend::attachable(
+            attachable_session,
+            Arc::clone(&calls),
+            format!(
+                "printf '%s\\n' $$ >> '{}'; exec yes 'FLOOD-EXPIRING'",
+                pid_file.display()
+            ),
+        ))],
+        Duration::from_millis(700),
+    );
+    let server = start_server(app).await;
+
+    let mut socket = connect_terminal(&server, Some(LOGIN), Some(ANDROID_ORIGIN))
+        .await
+        .expect("attach terminal");
+    let (_, redraw) = terminal_handshake(&mut socket).await;
+    terminal_bytes_containing(&mut socket, redraw, b"FLOOD-EXPIRING").await;
+    let child = wait_for_pids(&pid_file, 1).await[0];
+
+    socket.close(None).await.expect("close terminal");
+    drop(socket);
+
+    let closed_at = tokio::time::Instant::now();
+    wait_for_pid_exit(child).await;
+    let killed_after = closed_at.elapsed();
+    assert!(
+        killed_after < Duration::from_secs(3),
+        "a flooding child must be killed on its own window, not whenever its output finally \
+         goes quiet; it survived {killed_after:?} of a 700ms window"
+    );
 }
 
 #[tokio::test]

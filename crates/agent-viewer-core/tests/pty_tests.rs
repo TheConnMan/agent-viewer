@@ -896,3 +896,60 @@ fn pty_output_tap_with_a_dropped_receiver_keeps_the_session_alive() {
     );
     session.kill();
 }
+
+/// A panic inside a `with_screen` closure poisons the parser lock. The reader thread must
+/// recover from that exactly like every other reader of the screen does: a poisoned advisory
+/// render lock is not a reason to go deaf and drop every remaining byte of a live CLI.
+#[test]
+fn pty_reader_keeps_processing_after_the_parser_lock_is_poisoned() {
+    let (tap, tapped) = mpsc::channel::<Vec<u8>>();
+    let mut spec = spec(
+        "sh",
+        &[
+            "-c",
+            "printf 'BEFORE-POISON\\r\\n'; sleep 0.5; printf 'AFTER-POISON\\r\\n'; sleep 30",
+        ],
+        24,
+        80,
+    );
+    spec.output_tap = Some(tap);
+    let mut session = PtySession::spawn(spec).expect("spawn tapped pty");
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "BEFORE-POISON"),
+        "the first write must render before the lock is poisoned"
+    );
+
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.with_screen(|_| panic!("poison the parser lock"));
+    }));
+    std::panic::set_hook(hook);
+    assert!(poisoned.is_err(), "the closure must have panicked");
+
+    assert!(
+        wait_for_screen(&session, Duration::from_secs(5), "AFTER-POISON"),
+        "the reader must keep feeding the parser after a poisoned lock"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut bytes = Vec::new();
+    while Instant::now() < deadline
+        && !bytes
+            .windows(b"AFTER-POISON".len())
+            .any(|window| window == b"AFTER-POISON")
+    {
+        match tapped.recv_timeout(Duration::from_millis(250)) {
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        bytes
+            .windows(b"AFTER-POISON".len())
+            .any(|window| window == b"AFTER-POISON"),
+        "the tap must keep publishing after a poisoned lock, got {bytes:?}"
+    );
+    session.kill();
+}

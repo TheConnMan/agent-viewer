@@ -221,14 +221,23 @@ impl PtySession {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: slave closed
                     Ok(n) => {
-                        if let Ok(mut p) = reader_parser.lock() {
+                        {
+                            // Recover from a poisoned lock (a panicked reader of the screen)
+                            // instead of silently going deaf for the rest of the session: the
+                            // vt100 screen is advisory render state, and dropping every
+                            // remaining byte of a live CLI is far worse than reading a screen
+                            // one panic left half-updated. Same recovery as with_screen().
+                            let mut p = reader_parser.lock().unwrap_or_else(|e| e.into_inner());
                             p.process(&buf[..n]);
                             // Publish the same chunk WHILE STILL HOLDING the parser lock. A
                             // tap consumer that snapshots the screen through with_screen()
                             // takes this same lock, so process-then-publish is atomic against
-                            // it: a chunk can never appear both inside a snapshot and again
-                            // afterwards on the tap, which would print it twice on the remote
-                            // screen. A dropped receiver disables the tap for good.
+                            // it: a consumer that drains this channel under the same lock sees
+                            // exactly the chunks its snapshot already contains, and no chunk
+                            // can appear both inside a snapshot and again afterwards on the
+                            // tap, which would print it twice on the remote screen. A dropped
+                            // receiver disables the tap for good; the reader never publishes
+                            // an empty chunk, because read() returning 0 is EOF.
                             if let Some(tap) = &output_tap
                                 && tap.send(buf[..n].to_vec()).is_err()
                             {

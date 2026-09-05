@@ -1,6 +1,6 @@
 //! HTTP companion server for agent-viewer.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -42,10 +42,42 @@ const TERMINAL_LIMIT: usize = 4;
 /// tailnet, or is backgrounded must find its session exactly where it left it; only after
 /// this window with nobody attached is the child killed.
 const TERMINAL_GRACE: Duration = Duration::from_secs(10 * 60);
-/// The owner thread has nothing to poll for while a client is attached — output, input and
-/// the child's EOF all arrive as events — so this bound only keeps a wait from being
-/// unbounded.
-const TERMINAL_IDLE_WAIT: Duration = Duration::from_secs(3_600);
+/// How long the owner thread waits for a socket event before it looks at the PTY tap again.
+///
+/// The owner owns the tap receiver outright and drains it here and inside the redraw snapshot
+/// and NOWHERE else: any forwarding thread between the PTY and that snapshot can be holding a
+/// chunk that the snapshot already contains, and would then print it a second time as live
+/// output. Two std channels cannot be waited on together, so the price of owning the tap is
+/// that output is picked up on this cadence. It is a channel wait, not a screen scrape: no
+/// vt100 read, no serialization, nothing per tick unless bytes actually arrived.
+const TERMINAL_OUTPUT_POLL: Duration = Duration::from_millis(10);
+/// One drain pass is coalesced into frames of at most this size. A line-at-a-time child hands
+/// the PTY reader one tiny read per line, and one WebSocket frame per line is pure overhead.
+const TERMINAL_OUTPUT_FRAME_BYTES: usize = 64 * 1_024;
+/// What the owner may hold for one socket before that client is a slow consumer: the queue is
+/// capped in frames AND in bytes, because coalescing makes a frame count alone meaningless.
+/// Past either cap the socket is closed with 1013 and the phone reconnects into a fresh
+/// redraw, which loses nothing.
+const TERMINAL_SINK_FRAMES: usize = 256;
+const TERMINAL_SINK_BYTES: usize = 1_024 * 1_024;
+/// How often the server pings an attached client.
+const TERMINAL_PING_INTERVAL: Duration = Duration::from_secs(10);
+/// No frame of any kind from a client for this long means the socket is gone even though no
+/// FIN ever arrived (a phone that left the tailnet), so it is closed and the grace clock runs.
+const TERMINAL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The close code a replaced socket gets. The phone treats 4000 as final and never reconnects
+/// on it, so this pair is wire contract: do not change either half.
+const TERMINAL_REPLACED_CODE: u16 = 4000;
+const TERMINAL_REPLACED_REASON: &str = "replaced";
+/// The close code a client that stopped reading gets (RFC 6455 "try again later").
+const TERMINAL_SLOW_CONSUMER_CODE: u16 = 1013;
+const TERMINAL_SLOW_CONSUMER_REASON: &str = "slow consumer";
+
+/// Why the owner let go of a socket. The socket task reads it once its frame queue ends, so
+/// the close code survives a queue that was too full to carry one more frame.
+const DISPOSITION_FINISHED: u8 = 0;
+const DISPOSITION_REPLACED: u8 = 1;
+const DISPOSITION_SLOW_CONSUMER: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TerminalKey {
@@ -125,26 +157,51 @@ enum ServerFrame {
     Binary(Vec<u8>),
 }
 
-/// Everything the owner thread reacts to. Output and the child's EOF come from the PTY tap
-/// bridge; the rest comes from the socket task.
+impl ServerFrame {
+    fn len(&self) -> usize {
+        match self {
+            ServerFrame::Text(text) => text.len(),
+            ServerFrame::Binary(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// The owner's end of one socket. Bounded on purpose: a phone that stops reading must not let
+/// a chatty child grow this queue without limit. `queued` is the byte weight the socket task
+/// has not written yet — the owner adds to it, the socket task subtracts once a frame is on
+/// the wire — because a frame count alone says nothing once frames are coalesced.
+struct TerminalSink {
+    frames: mpsc::Sender<ServerFrame>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    disposition: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Everything the owner thread reacts to. All of it comes from a socket task; PTY output and
+/// the child's EOF are read straight off the tap by the owner itself.
+///
+/// Every variant carries the connection it came from. A socket that has been replaced keeps
+/// its lease and can still send, so the owner compares that id against the connection it is
+/// serving and ignores anything stale: a replaced client cannot type into the child, resize
+/// it, close it, or open its grace window.
 enum OwnerEvent {
-    /// Raw PTY output, already applied to this session's vt100 screen.
-    Output(Vec<u8>),
-    /// The PTY reader hit EOF: the child's terminal is gone.
-    TapClosed,
     Attach {
         connection: u64,
-        sink: mpsc::UnboundedSender<ServerFrame>,
+        sink: TerminalSink,
     },
     Detach {
         connection: u64,
     },
-    Input(Vec<u8>),
+    Input {
+        connection: u64,
+        bytes: Vec<u8>,
+    },
     Resize {
+        connection: u64,
         rows: u16,
         cols: u16,
     },
     Close {
+        connection: u64,
         complete: oneshot::Sender<()>,
     },
 }
@@ -154,6 +211,14 @@ struct TerminalOwnerContext {
     key: TerminalKey,
     generation: u64,
     grace: Duration,
+}
+
+/// Ping cadence and idle deadline for an attached socket, configurable so a test can prove the
+/// liveness rule in a second instead of half a minute.
+#[derive(Debug, Clone, Copy)]
+struct TerminalLiveness {
+    ping: Duration,
+    idle: Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,7 +299,14 @@ impl BackendPool {
 
 impl TerminalHub {
     /// A connect either adopts the PTY still in its grace window (same child, same screen) or
-    /// reserves the key for a fresh one. A key with a live socket on it is refused.
+    /// reserves the key for a fresh one.
+    ///
+    /// A key that still has a live socket on it is a TAKEOVER, not a conflict: a phone's
+    /// `WebSocket.close` is asynchronous and an unclean drop never sends a FIN at all, so the
+    /// old socket is routinely still `connected` when the new one arrives. Refusing the new
+    /// connection would strand the user behind a 409 for as long as the stale socket lasts.
+    /// The new connection wins, the old one is closed with 4000, and the bumped connection id
+    /// is what stops the loser from speaking for this PTY afterwards.
     fn acquire(&self, key: TerminalKey) -> ApiResult<TerminalAcquire> {
         let mut state = self
             .inner
@@ -247,12 +319,6 @@ impl TerminalHub {
             ));
         }
         if let Some(owner) = state.owners.get_mut(&key) {
-            if owner.connected {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "terminal is already connected",
-                ));
-            }
             owner.connected = true;
             owner.connection = owner.connection.wrapping_add(1).max(1);
             return Ok(TerminalAcquire::Reattach(TerminalLease {
@@ -341,23 +407,51 @@ fn remove_terminal_owner(hub: &Weak<Mutex<TerminalHubState>>, key: &TerminalKey,
 /// The socket for this lease is gone. Clearing the flag opens the grace window; the owner
 /// thread reads the same flag when the window closes, so the two cannot race past each other.
 fn detach_terminal(hub: &TerminalHub, lease: &TerminalLease) {
-    if let Ok(mut state) = hub.inner.lock()
-        && let Some(owner) = state.owners.get_mut(&lease.key)
-        && owner.generation == lease.generation
-        && owner.connection == lease.connection
-    {
-        owner.connected = false;
-    }
+    mark_terminal_detached(
+        &hub.downgrade(),
+        &lease.key,
+        lease.generation,
+        lease.connection,
+    );
     let _ = lease.events.send(OwnerEvent::Detach {
         connection: lease.connection,
     });
+}
+
+/// Clear the hub's `connected` flag for exactly this connection. The owner calls it directly
+/// when it drops a slow consumer, because a socket wedged behind an unread TCP window may not
+/// get to say so for a long time — and a stale `connected` would tell `terminal_grace_expired`
+/// somebody is still attached and keep the child alive forever.
+fn mark_terminal_detached(
+    hub: &Weak<Mutex<TerminalHubState>>,
+    key: &TerminalKey,
+    generation: u64,
+    connection: u64,
+) {
+    let Some(hub) = hub.upgrade() else {
+        return;
+    };
+    if let Ok(mut state) = hub.lock()
+        && let Some(owner) = state.owners.get_mut(key)
+        && owner.generation == generation
+        && owner.connection == connection
+    {
+        owner.connected = false;
+    }
 }
 
 /// Kill now, no grace. The owner thread drops its own hub entry as it dies; only a dead owner
 /// needs the entry removed here.
 fn close_terminal_owner(hub: &TerminalHub, lease: &TerminalLease) {
     let (complete, _abandoned) = oneshot::channel();
-    if lease.events.send(OwnerEvent::Close { complete }).is_err() {
+    if lease
+        .events
+        .send(OwnerEvent::Close {
+            connection: lease.connection,
+            complete,
+        })
+        .is_err()
+    {
         remove_terminal_owner(&hub.downgrade(), &lease.key, lease.generation);
     }
 }
@@ -395,6 +489,7 @@ struct AppState {
     backends: BackendPool,
     router_available: bool,
     terminals: TerminalHub,
+    terminal_liveness: TerminalLiveness,
 }
 
 #[derive(Debug, Serialize)]
@@ -493,6 +588,10 @@ pub fn router() -> Router {
         backends: BackendPool::new(all_backends()),
         router_available: agent_viewer_core::router::available(),
         terminals: TerminalHub::new(TERMINAL_GRACE),
+        terminal_liveness: TerminalLiveness {
+            ping: TERMINAL_PING_INTERVAL,
+            idle: TERMINAL_IDLE_TIMEOUT,
+        },
     })
 }
 
@@ -505,8 +604,25 @@ pub fn router_with_backends(backends: Vec<Box<dyn Backend>>) -> Router {
 /// both halves of the rule (a reconnect inside it adopts the same child, expiry kills it)
 /// without waiting out the production ten minutes.
 pub fn router_with_backends_and_grace(
+    backends: Vec<Box<dyn Backend>>,
+    terminal_grace: Duration,
+) -> Router {
+    router_with_backends_and_terminal_timing(
+        backends,
+        terminal_grace,
+        TERMINAL_PING_INTERVAL,
+        TERMINAL_IDLE_TIMEOUT,
+    )
+}
+
+/// The same test router with every terminal timer explicit, so the liveness rule (ping every
+/// `ping_interval`, close a socket that has answered nothing for `idle_timeout`) is provable
+/// in a second instead of half a minute.
+pub fn router_with_backends_and_terminal_timing(
     mut backends: Vec<Box<dyn Backend>>,
     terminal_grace: Duration,
+    ping_interval: Duration,
+    idle_timeout: Duration,
 ) -> Router {
     let mut last = vec![Vec::new(); backends.len()];
     let snapshot = Arc::new(RwLock::new(refresh_snapshot(
@@ -519,6 +635,10 @@ pub fn router_with_backends_and_grace(
         backends: BackendPool::new(backends),
         router_available: false,
         terminals: TerminalHub::new(terminal_grace),
+        terminal_liveness: TerminalLiveness {
+            ping: ping_interval,
+            idle: idle_timeout,
+        },
     })
 }
 
@@ -727,6 +847,7 @@ async fn session_terminal(
     let failed_hub = state.terminals.clone();
     let failed_lease = lease.clone();
     let socket_hub = state.terminals.clone();
+    let liveness = state.terminal_liveness;
     Ok(ws
         .max_message_size(TERMINAL_MESSAGE_BYTES)
         .max_frame_size(TERMINAL_MESSAGE_BYTES)
@@ -739,7 +860,7 @@ async fn session_terminal(
                 close_terminal_owner(&failed_hub, &failed_lease);
             }
         })
-        .on_upgrade(move |socket| terminal_socket(socket, socket_hub, lease)))
+        .on_upgrade(move |socket| terminal_socket(socket, socket_hub, lease, liveness)))
 }
 
 async fn create_terminal_owner(
@@ -761,17 +882,20 @@ async fn create_terminal_owner(
     })
     .await?;
 
+    // The tap receiver goes STRAIGHT to the owner thread. Nothing forwards for it: a
+    // forwarding thread can be holding a chunk that the redraw snapshot already contains,
+    // and that chunk would then be printed a second time as live output.
     let (tap, tapped) = std::sync::mpsc::channel::<Vec<u8>>();
     let mut spec =
         agent_viewer_core::pty::spec_from_command(&command, TERMINAL_ROWS, TERMINAL_COLS);
     spec.output_tap = Some(tap);
     let (events_tx, events_rx) = std::sync::mpsc::channel::<OwnerEvent>();
-    spawn_terminal_tap_bridge(tapped, events_tx.clone())?;
     let (startup_tx, startup_rx) = oneshot::channel();
     let (activate_tx, activate_rx) = oneshot::channel();
     spawn_terminal_owner_thread(
         spec,
         events_rx,
+        tapped,
         startup_tx,
         activate_rx,
         TerminalOwnerContext {
@@ -795,31 +919,10 @@ async fn create_terminal_owner(
     Ok(lease)
 }
 
-/// Bridge the core PTY tap onto the owner's event channel, so output, input and the child's
-/// EOF all arrive in one ordered stream. The tap sender lives in the PTY reader thread, so its
-/// drop IS the child's terminal closing — that is what makes exit detection an event rather
-/// than a poll.
-fn spawn_terminal_tap_bridge(
-    tapped: std::sync::mpsc::Receiver<Vec<u8>>,
-    events: TerminalEvents,
-) -> ApiResult<()> {
-    std::thread::Builder::new()
-        .name("agent_viewer_terminal_tap".to_string())
-        .spawn(move || {
-            while let Ok(chunk) = tapped.recv() {
-                if events.send(OwnerEvent::Output(chunk)).is_err() {
-                    return;
-                }
-            }
-            let _ = events.send(OwnerEvent::TapClosed);
-        })
-        .map(|_| ())
-        .map_err(|error| ApiError::internal(format!("terminal tap bridge failed: {error}")))
-}
-
 fn spawn_terminal_owner_thread(
     spec: agent_viewer_core::pty::PtySpec,
     events: std::sync::mpsc::Receiver<OwnerEvent>,
+    tapped: std::sync::mpsc::Receiver<Vec<u8>>,
     startup: oneshot::Sender<Result<(), String>>,
     activate: oneshot::Receiver<()>,
     context: TerminalOwnerContext,
@@ -839,130 +942,241 @@ fn spawn_terminal_owner_thread(
                 remove_terminal_owner(&context.hub, &context.key, context.generation);
                 return;
             }
-            run_terminal_owner(pty, &events, &context);
+            run_terminal_owner(pty, &events, &tapped, &context);
         })
         .map(|_| ())
         .map_err(|error| ApiError::internal(format!("terminal owner thread failed: {error}")))
 }
 
-/// The owner thread. It owns the PTY outright: every read of the screen and every write to the
-/// child happens here, and the socket task only ever exchanges events with it.
+/// The owner thread's view of the socket it is serving.
+struct TerminalOwnerState {
+    sink: Option<TerminalSink>,
+    connection: u64,
+    /// When the child must be killed for want of a client. `None` means somebody is attached.
+    deadline: Option<std::time::Instant>,
+}
+
+impl TerminalOwnerState {
+    /// Queue one frame for the attached socket. A full queue is a client that has stopped
+    /// reading: it is released with 1013 rather than allowed to grow without bound. Nothing is
+    /// lost by that — the phone reconnects and the redraw repaints the whole screen.
+    fn queue(&mut self, context: &TerminalOwnerContext, frame: ServerFrame) {
+        let Some(active) = self.sink.as_ref() else {
+            return;
+        };
+        let weight = frame.len();
+        let queued = active.queued.load(std::sync::atomic::Ordering::SeqCst);
+        let overflowed = if queued.saturating_add(weight) > TERMINAL_SINK_BYTES {
+            true
+        } else {
+            active
+                .queued
+                .fetch_add(weight, std::sync::atomic::Ordering::SeqCst);
+            match active.frames.try_send(frame) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        };
+        if overflowed {
+            active.disposition.store(
+                DISPOSITION_SLOW_CONSUMER,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        self.release(context);
+    }
+
+    /// Nobody is on this PTY any more: drop the sink (which is what wakes the socket task to
+    /// send its close frame) and start the grace clock.
+    fn release(&mut self, context: &TerminalOwnerContext) {
+        self.sink = None;
+        mark_terminal_detached(
+            &context.hub,
+            &context.key,
+            context.generation,
+            self.connection,
+        );
+        self.deadline = Some(std::time::Instant::now() + context.grace);
+    }
+
+    /// Forward everything the PTY has published since the last pass, coalesced: a shell
+    /// printing a line at a time hands the reader one tiny read per line, and one WebSocket
+    /// frame per line is all overhead. Returns true once the tap is closed, which is the PTY
+    /// reader hitting EOF: the child's terminal is gone.
+    fn forward_output(
+        &mut self,
+        context: &TerminalOwnerContext,
+        tapped: &std::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> bool {
+        let mut batch: Vec<u8> = Vec::new();
+        let closed = loop {
+            match tapped.try_recv() {
+                Ok(chunk) => {
+                    batch.extend_from_slice(&chunk);
+                    if batch.len() >= TERMINAL_OUTPUT_FRAME_BYTES {
+                        self.queue(context, ServerFrame::Binary(std::mem::take(&mut batch)));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if !batch.is_empty() {
+            self.queue(context, ServerFrame::Binary(batch));
+        }
+        closed
+    }
+}
+
+/// The owner thread. It owns the PTY outright — every read of the screen, every write to the
+/// child, and the receiving end of the PTY output tap all live here — and the socket task only
+/// ever exchanges events with it.
 fn run_terminal_owner(
     mut pty: agent_viewer_core::pty::PtySession,
     events: &std::sync::mpsc::Receiver<OwnerEvent>,
+    tapped: &std::sync::mpsc::Receiver<Vec<u8>>,
     context: &TerminalOwnerContext,
 ) {
-    let mut sink: Option<mpsc::UnboundedSender<ServerFrame>> = None;
-    let mut connection = 0_u64;
     // Nobody is attached until the upgraded socket says so, so the grace clock starts now: an
     // upgrade that never lands must not strand a real CLI process forever.
-    let mut deadline = Some(std::time::Instant::now() + context.grace);
-    let mut pending: VecDeque<OwnerEvent> = VecDeque::new();
+    let mut state = TerminalOwnerState {
+        sink: None,
+        connection: 0,
+        deadline: Some(std::time::Instant::now() + context.grace),
+    };
 
     loop {
-        let event = match pending.pop_front() {
-            Some(event) => event,
-            None => {
-                let wait = deadline.map_or(TERMINAL_IDLE_WAIT, |at| {
-                    at.saturating_duration_since(std::time::Instant::now())
-                });
-                match events.recv_timeout(wait) {
-                    Ok(event) => event,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if deadline.is_some() {
-                            if terminal_grace_expired(
-                                &context.hub,
-                                &context.key,
-                                context.generation,
-                            ) {
-                                pty.kill();
-                                return;
-                            }
-                            // Somebody reconnected while we were waiting; their Attach is
-                            // already queued behind us.
-                            deadline = None;
-                        }
-                        continue;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        pty.kill();
-                        remove_terminal_owner(&context.hub, &context.key, context.generation);
-                        return;
-                    }
-                }
+        if state.forward_output(context, tapped) {
+            finish_exited_terminal(&mut pty, &mut state, context);
+            return;
+        }
+
+        // Checked EVERY iteration, not only in the timeout arm below. Output no longer travels
+        // on the event channel at all — it comes straight off the tap above — so a child that
+        // never stops printing can no longer keep this loop from reaching its deadline, and
+        // the deadline is read on every pass whatever woke it.
+        if let Some(at) = state.deadline
+            && std::time::Instant::now() >= at
+        {
+            if terminal_grace_expired(&context.hub, &context.key, context.generation) {
+                pty.kill();
+                return;
+            }
+            // Somebody reconnected while we were waiting; their Attach is already queued.
+            state.deadline = None;
+        }
+
+        let wait = match state.deadline {
+            Some(at) => at
+                .saturating_duration_since(std::time::Instant::now())
+                .min(TERMINAL_OUTPUT_POLL),
+            None => TERMINAL_OUTPUT_POLL,
+        };
+        let event = match events.recv_timeout(wait) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                pty.kill();
+                remove_terminal_owner(&context.hub, &context.key, context.generation);
+                return;
             }
         };
 
         match event {
-            OwnerEvent::Output(bytes) => {
-                if let Some(active) = &sink
-                    && active.send(ServerFrame::Binary(bytes)).is_err()
-                {
-                    sink = None;
-                }
-            }
-            OwnerEvent::TapClosed => {
-                pty.kill();
-                if let Some(active) = &sink {
-                    let _ = active.send(ServerFrame::Text(terminal_exit_frame()));
-                }
-                remove_terminal_owner(&context.hub, &context.key, context.generation);
-                // Dropping the sink closes the socket, but only after it has forwarded the
-                // exit frame already queued ahead of the close.
-                return;
-            }
             OwnerEvent::Attach {
                 connection: attached,
                 sink: next,
             } => {
-                connection = attached;
-                deadline = None;
-                let (rows, cols) = pty.with_screen(|screen| screen.size());
+                // Takeover. The socket that was here is told it was replaced, and from this
+                // point everything it sends carries a stale connection id and is ignored.
+                if let Some(previous) = state.sink.take() {
+                    previous
+                        .disposition
+                        .store(DISPOSITION_REPLACED, std::sync::atomic::Ordering::SeqCst);
+                }
+                state.connection = attached;
+                state.deadline = None;
                 let running = !pty.is_exited();
-                let _ = next.send(ServerFrame::Text(terminal_hello_frame(cols, rows, running)));
+                let (rows, cols) = pty.with_screen(|screen| screen.size());
+                state.sink = Some(next);
+                state.queue(
+                    context,
+                    ServerFrame::Text(terminal_hello_frame(cols, rows, running)),
+                );
+
+                let mut exited = false;
                 let redraw = pty.with_screen(|screen| {
                     // Under the parser lock, which the PTY reader also holds while it applies
-                    // a chunk AND publishes it on the tap. Draining here therefore drops
-                    // exactly the chunks this snapshot already contains, and no chunk can slip
-                    // into both the snapshot and the live stream and print twice.
-                    while let Ok(queued) = events.try_recv() {
-                        match queued {
-                            OwnerEvent::Output(_) => {}
-                            other => pending.push_back(other),
+                    // a chunk AND publishes it on the tap. This thread owns that receiver, so
+                    // draining it here drops exactly the chunks this snapshot already
+                    // contains: nothing is in flight anywhere else, and no chunk can land in
+                    // both the redraw and the live stream and print twice.
+                    loop {
+                        match tapped.try_recv() {
+                            Ok(_) => {}
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                exited = true;
+                                break;
+                            }
                         }
                     }
-                    let mut bytes = screen.state_formatted();
-                    bytes.extend_from_slice(&screen.contents_formatted());
-                    bytes
+                    // state_formatted() is contents_formatted() plus the input modes — see
+                    // vendor/vt100/src/screen.rs — so appending contents_formatted() to it
+                    // paints the whole screen a second time, which is the same double print
+                    // this drain exists to prevent.
+                    screen.state_formatted()
                 });
-                let _ = next.send(ServerFrame::Binary(redraw));
-                sink = Some(next);
+                state.queue(context, ServerFrame::Binary(redraw));
+                if exited {
+                    finish_exited_terminal(&mut pty, &mut state, context);
+                    return;
+                }
             }
             OwnerEvent::Detach {
                 connection: detached,
             } => {
-                if detached == connection {
-                    sink = None;
-                    deadline = Some(std::time::Instant::now() + context.grace);
+                if detached == state.connection {
+                    state.sink = None;
+                    state.deadline = Some(std::time::Instant::now() + context.grace);
                 }
             }
-            OwnerEvent::Input(bytes) => {
-                if let Err(error) = pty.write_input(&bytes)
-                    && let Some(active) = &sink
-                {
-                    let _ =
-                        active.send(ServerFrame::Text(terminal_error_frame(&error.to_string())));
+            OwnerEvent::Input { connection, bytes } => {
+                if connection != state.connection {
+                    continue;
+                }
+                if let Err(error) = pty.write_input(&bytes) {
+                    state.queue(
+                        context,
+                        ServerFrame::Text(terminal_error_frame(&error.to_string())),
+                    );
                 }
             }
-            OwnerEvent::Resize { rows, cols } => {
-                if let Err(error) = pty.resize(rows, cols)
-                    && let Some(active) = &sink
-                {
-                    let _ =
-                        active.send(ServerFrame::Text(terminal_error_frame(&error.to_string())));
+            OwnerEvent::Resize {
+                connection,
+                rows,
+                cols,
+            } => {
+                if connection != state.connection {
+                    continue;
+                }
+                if let Err(error) = pty.resize(rows, cols) {
+                    state.queue(
+                        context,
+                        ServerFrame::Text(terminal_error_frame(&error.to_string())),
+                    );
                 }
             }
-            OwnerEvent::Close { complete } => {
+            OwnerEvent::Close {
+                connection,
+                complete,
+            } => {
+                if connection != state.connection {
+                    // A replaced socket cannot kill the child the new one is using. Dropping
+                    // the sender is the answer its own task is waiting for.
+                    continue;
+                }
                 pty.kill();
                 remove_terminal_owner(&context.hub, &context.key, context.generation);
                 let _ = complete.send(());
@@ -972,21 +1186,46 @@ fn run_terminal_owner(
     }
 }
 
+/// The PTY reader hit EOF: the child's terminal is gone. Tell whoever is attached, then go.
+fn finish_exited_terminal(
+    pty: &mut agent_viewer_core::pty::PtySession,
+    state: &mut TerminalOwnerState,
+    context: &TerminalOwnerContext,
+) {
+    pty.kill();
+    state.queue(context, ServerFrame::Text(terminal_exit_frame()));
+    remove_terminal_owner(&context.hub, &context.key, context.generation);
+    // Dropping the sink closes the socket, but only after it has forwarded the exit frame
+    // already queued ahead of the close.
+}
+
 /// How the socket task finished, and therefore what the PTY behind it is owed.
 enum TerminalOutcome {
     /// The socket is gone but the child is not: open the grace window.
     Detach,
-    /// The owner thread is already tearing itself down.
+    /// The owner thread is already tearing itself down, or this socket has been replaced and
+    /// no longer speaks for the child.
     Done,
 }
 
-async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, lease: TerminalLease) {
-    let (sink, mut frames) = mpsc::unbounded_channel::<ServerFrame>();
+async fn terminal_socket(
+    mut socket: WebSocket,
+    hub: TerminalHub,
+    lease: TerminalLease,
+    liveness: TerminalLiveness,
+) {
+    let (frames_tx, mut frames) = mpsc::channel::<ServerFrame>(TERMINAL_SINK_FRAMES);
+    let disposition = Arc::new(std::sync::atomic::AtomicU8::new(DISPOSITION_FINISHED));
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if lease
         .events
         .send(OwnerEvent::Attach {
             connection: lease.connection,
-            sink,
+            sink: TerminalSink {
+                frames: frames_tx,
+                queued: Arc::clone(&queued),
+                disposition: Arc::clone(&disposition),
+            },
         })
         .is_err()
     {
@@ -997,28 +1236,54 @@ async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, lease: Termina
     }
 
     let mut outcome = TerminalOutcome::Detach;
+    // A phone that loses the tailnet or is killed sends no FIN at all, so without this the CLI
+    // would stay attached long past its grace window with nothing to end it. Any frame from
+    // the client — pong, binary, text — counts as alive.
+    let mut last_frame = tokio::time::Instant::now();
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + liveness.ping, liveness.ping);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if last_frame.elapsed() >= liveness.idle {
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             frame = frames.recv() => {
                 match frame {
                     Some(ServerFrame::Text(text)) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        let weight = text.len();
+                        let sent = socket.send(Message::Text(text.into())).await;
+                        queued.fetch_sub(weight, std::sync::atomic::Ordering::SeqCst);
+                        if sent.is_err() {
                             break;
                         }
                     }
                     Some(ServerFrame::Binary(bytes)) => {
-                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        let weight = bytes.len();
+                        let sent = socket.send(Message::Binary(bytes.into())).await;
+                        queued.fetch_sub(weight, std::sync::atomic::Ordering::SeqCst);
+                        if sent.is_err() {
                             break;
                         }
                     }
                     None => {
-                        let _ = socket.send(Message::Close(None)).await;
-                        outcome = TerminalOutcome::Done;
+                        outcome = close_released_terminal(
+                            &mut socket,
+                            disposition.load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                        .await;
                         break;
                     }
                 }
             }
             incoming = socket.recv() => {
+                last_frame = tokio::time::Instant::now();
                 match incoming {
                     Some(Ok(Message::Binary(bytes))) => {
                         if bytes.len() > TERMINAL_INPUT_BYTES {
@@ -1028,7 +1293,10 @@ async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, lease: Termina
                         }
                         // Verbatim, never inspected: this carries the view's own answers to
                         // the CLI's DA/DSR queries, mouse reports and bracketed paste.
-                        if lease.events.send(OwnerEvent::Input(bytes.into())).is_err() {
+                        if lease.events.send(OwnerEvent::Input {
+                            connection: lease.connection,
+                            bytes: bytes.into(),
+                        }).is_err() {
                             let _ = socket.send(Message::Close(None)).await;
                             outcome = TerminalOutcome::Done;
                             break;
@@ -1071,6 +1339,37 @@ async fn terminal_socket(mut socket: WebSocket, hub: TerminalHub, lease: Termina
     }
 }
 
+/// The owner let go of this socket. Which close code the client gets decides what it does next:
+/// 4000 is final and the phone must never reconnect on it, 1013 says come back and take the
+/// redraw again. Both codes travel in the close frame rather than an application frame, so a
+/// queue too full to carry one more frame still delivers the verdict.
+async fn close_released_terminal(socket: &mut WebSocket, disposition: u8) -> TerminalOutcome {
+    match disposition {
+        DISPOSITION_REPLACED => {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: TERMINAL_REPLACED_CODE,
+                    reason: TERMINAL_REPLACED_REASON.into(),
+                })))
+                .await;
+            TerminalOutcome::Done
+        }
+        DISPOSITION_SLOW_CONSUMER => {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: TERMINAL_SLOW_CONSUMER_CODE,
+                    reason: TERMINAL_SLOW_CONSUMER_REASON.into(),
+                })))
+                .await;
+            TerminalOutcome::Detach
+        }
+        _ => {
+            let _ = socket.send(Message::Close(None)).await;
+            TerminalOutcome::Done
+        }
+    }
+}
+
 enum TerminalControl {
     Continue,
     /// Stop reading this socket, but leave the child in its grace window.
@@ -1101,6 +1400,7 @@ async fn handle_terminal_client_message(
             if lease
                 .events
                 .send(OwnerEvent::Resize {
+                    connection: lease.connection,
                     rows: rows as u16,
                     cols: cols as u16,
                 })
@@ -1114,7 +1414,14 @@ async fn handle_terminal_client_message(
         }
         TerminalClientMessage::Close => {
             let (complete, completed) = oneshot::channel();
-            if lease.events.send(OwnerEvent::Close { complete }).is_ok() {
+            if lease
+                .events
+                .send(OwnerEvent::Close {
+                    connection: lease.connection,
+                    complete,
+                })
+                .is_ok()
+            {
                 let _ = completed.await;
             }
             let _ = socket.send(Message::Close(None)).await;
