@@ -1037,7 +1037,12 @@ from the same `Backend::attach_command` the TUI uses, so a Codex attach still jo
 app-server daemon — read "Codex attach/resume" before touching it — and a backend whose
 `Capabilities::attach` is false refuses with the usual unsupported error instead of opening a
 socket. `TERMINAL_LIMIT = 4` owners plus reservations exist at once, and one session has one
-connection: a second attach adopts the existing PTY only after the first socket drops.
+connection: a second attach takes over the existing PTY. The displaced socket is closed with
+code 4000 `replaced` (the phone treats that code as final and never reconnects on it), and the
+new socket gets hello plus a redraw of the same child; every owner event carries the connection
+id, so a replaced socket can no longer type, resize, kill, or open grace. The server also pings
+every 10 s and closes a socket that has sent nothing for 30 s, which is what starts grace after
+an unclean drop (a phone that lost radio sends no FIN).
 
 ### Wire protocol
 
@@ -1048,13 +1053,18 @@ Server to client:
 
 - text `{"type":"hello","cols":80,"rows":24,"running":true}`, sent on every attach, reattach
   included.
-- binary: one redraw frame — `state_formatted()` then `contents_formatted()` off the owner's
-  vt100 screen — followed by live PTY output, unmodified.
+- binary: one redraw frame, `state_formatted()` off the owner's vt100 screen (that call already
+  includes the full contents plus the input modes; sending `contents_formatted()` as well painted
+  the screen twice), followed by live PTY output, unmodified, coalesced into frames of at most
+  64 KiB.
 - text `{"type":"exit","status":null}` when the child's output ends; the server then closes.
   `status` is **always** null, because `PtySession` reaps the child without surfacing its wait
   status and widening that was out of scope for the companion.
 - text `{"type":"error","message":"..."}` (bounded to 256 chars) on a protocol error; the
   server then closes.
+- close 1013 `slow consumer` when the client stops reading: the owner-to-socket queue is
+  bounded (256 frames, 1 MiB) and overflow cuts the client off rather than growing without
+  limit. The phone reconnects and the redraw restores the screen.
 
 Client to server:
 
@@ -1077,16 +1087,19 @@ The reader thread in `crates/agent-viewer-core/src/pty.rs` sends `buf[..n].to_ve
 **while still holding the parser lock it just used for `p.process(&buf[..n])`**.
 
 That ordering is the correctness argument, not a detail. The server builds its redraw inside
-`pty.with_screen(...)`, which takes the same parser lock, and drains queued `Output` events
-before reading the screen. Process-then-publish under one lock makes the pair atomic against
+`pty.with_screen(...)`, which takes the same parser lock, and drains the tap receiver itself
+inside that closure (the owner owns the receiver; there is no thread between the tap and the
+drain, because a bridge thread's in-flight chunk was already in the snapshot and printed twice). Process-then-publish under one lock makes the pair atomic against
 that snapshot: a chunk is either already rendered into the snapshot and then drained, or still
 on the tap and streamed after it — never both, which would print it twice on the phone. Publish
 the chunk after releasing the lock and that double-print is a live race on every reconnect.
 
 `PtySpec` gives up `PartialEq` for the tap (a channel handle has no meaningful equality);
 nothing used it. A dropped receiver disables the tap silently and permanently. The closed tap
-is also the exit signal: the bridge thread turns the end of the channel into `TapClosed`, which
-kills the PTY and emits the `exit` frame.
+is also the exit signal: the owner sees the tap disconnect, kills the PTY, and emits the `exit`
+frame. Output is picked up on a 10 ms channel wait (`TERMINAL_OUTPUT_POLL`) because two std
+channels cannot be waited on together; nothing is read or serialized on a tick unless bytes
+arrived, so this is not the v1 screen scrape.
 
 ### Grace after disconnect
 

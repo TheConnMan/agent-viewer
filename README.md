@@ -674,6 +674,11 @@ themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
   window. As in the TUI, closing a terminal never ends the agent session; it stays resumable.
 - **`session ended`** in the status line means the attached process exited. The terminal stays
   on screen and readable; input is disabled.
+- **`replaced by another connection`** means a second attach to the same session took the
+  terminal over (another device, or the app reopening the screen before the old socket finished
+  closing). The newer connection wins; the older screen stays readable with input disabled. A
+  `disconnected` status reconnects on its own, including when the server cut a client that had
+  stopped reading.
 - Screen size follows the phone: rotating or opening the keyboard resizes the session, and the
   CLI repaints. About 67 columns fit in portrait at the default text size, 146 in landscape.
 
