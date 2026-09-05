@@ -38,6 +38,9 @@ enum class BackendKind {
 
     @SerialName("Claude")
     CLAUDE,
+
+    @SerialName("Grok")
+    GROK,
 }
 
 @Serializable
@@ -181,6 +184,7 @@ internal fun terminalWebSocketUrl(
     val backendName = when (backend) {
         BackendKind.CODEX -> "Codex"
         BackendKind.CLAUDE -> "Claude"
+        BackendKind.GROK -> "Grok"
     }
     return "$socketBase/sessions/${encodePathPart(sessionId)}/terminal?backend=$backendName"
 }
