@@ -313,6 +313,25 @@ class ApiContractTest {
     }
 
     @Test
+    fun `the capability cache key changes with the state that decides the capabilities`() {
+        // Claude advertises stop only while unfinished and the archive kind follows hidden, so a
+        // cache keyed by identity alone would keep serving a stale answer after a status change.
+        val working = session("s", Status.Working)
+        val done = session("s", Status.Done)
+        val hidden = session("s", Status.Done, hidden = true)
+        val later = session("s", Status.Working, updatedAtMs = 9_000)
+
+        assertEquals(working.key(), done.key())
+        assertTrue(working.capabilityCacheKey() != done.capabilityCacheKey())
+        assertTrue(done.capabilityCacheKey() != hidden.capabilityCacheKey())
+        assertEquals(working.capabilityCacheKey(), later.capabilityCacheKey(), "a timestamp alone does not invalidate")
+        assertTrue(
+            working.capabilityCacheKey().startsWith("${BackendKind.CODEX.name}:s:"),
+            "the key is scoped to the backend and id",
+        )
+    }
+
+    @Test
     fun `session row helpers omit hold titles without hiding longer titles`() {
         val visibleHold = session("visibleHold", Status.Working, title = "Hold")
         val visibleMixedHold = session("visibleMixedHold", Status.Working, title = "hOlD")

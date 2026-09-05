@@ -169,6 +169,11 @@ internal fun triageSessionRows(sessions: List<Session>): List<Session> =
 
 internal fun Session.key(): String = "${backend.name}:$id"
 
+/** Capabilities depend on more than identity: Claude advertises `stop` only while the session is
+ * unfinished, and the archive kind follows `hidden`. Caching under the state that decides them
+ * keeps a repeat tap instant and refetches exactly when the answer can have changed. */
+internal fun Session.capabilityCacheKey(): String = "${key()}:${statusLabel(status)}:$hidden"
+
 internal class SessionSubmitter(
     private val create: suspend (NewSessionRequest) -> Unit,
 ) {
@@ -211,8 +216,12 @@ fun AgentViewerApp() {
     // The row whose long-press action sheet is open, if any.
     var actionsKey by remember { mutableStateOf<String?>(null) }
     // Capabilities are backend-advertised per session and fetched on first use, so a tap on a row
-    // that cannot be attached (Grok) is a notice rather than a broken terminal screen.
+    // that cannot be attached (Grok) is a notice rather than a broken terminal screen. Keyed by
+    // `capabilityCacheKey`, so a status change refetches rather than serving a stale `stop`.
     val capabilityCache = remember { mutableStateMapOf<String, Capabilities>() }
+    // The one open-in-flight request; a newer tap cancels an older one so the slower answer
+    // cannot switch a terminal the user has already moved on from.
+    var pendingOpen by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val api = remember { ApiClient() }
     val foreground = rememberForeground()
     val scope = rememberCoroutineScope()
@@ -222,14 +231,18 @@ fun AgentViewerApp() {
     }
     val actionsSession = actionsKey?.let { key -> sessions.firstOrNull { it.key() == key } }
 
+    // An authoritative list is the only thing that may replace `sessions`; a row that is no
+    // longer in it closes its action sheet instead of leaving the sheet armed to reopen later.
+    val applySessions: (List<Session>) -> Unit = { fresh ->
+        sessions = fresh
+        loadError = null
+        if (actionsKey != null && fresh.none { it.key() == actionsKey }) actionsKey = null
+    }
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
         while (isActive) {
             runCatching { api.sessions() }
-                .onSuccess {
-                    sessions = it
-                    loadError = null
-                }
+                .onSuccess(applySessions)
                 .onFailure { loadError = it.message ?: "Could not load sessions" }
             delay(2_000)
         }
@@ -244,34 +257,37 @@ fun AgentViewerApp() {
     val refresh: () -> Unit = {
         scope.launch {
             runCatching { api.sessions() }
-                .onSuccess {
-                    sessions = it
-                    loadError = null
-                }
+                .onSuccess(applySessions)
                 .onFailure { loadError = it.message ?: "Could not load sessions" }
         }
         Unit
     }
     suspend fun capabilitiesFor(session: Session): Capabilities? =
-        capabilityCache[session.key()]
-            ?: runCatching { api.capabilities(session.id) }.getOrNull()?.also { capabilityCache[session.key()] = it }
-    LaunchedEffect(actionsKey) {
+        capabilityCache[session.capabilityCacheKey()]
+            ?: runCatching { api.capabilities(session.id) }.getOrNull()
+                ?.also { capabilityCache[session.capabilityCacheKey()] = it }
+    // The sheet's capabilities follow the row's current state, so a session that finishes or
+    // resumes while the sheet is open gains or loses `stop` on the next poll.
+    LaunchedEffect(actionsSession?.capabilityCacheKey()) {
         actionsSession?.let { capabilitiesFor(it) }
     }
     // A tap on any row goes straight into the session's terminal; there is no detail screen.
     val open: (Session) -> Unit = { session ->
-        scope.launch {
+        pendingOpen?.cancel()
+        pendingOpen = scope.launch {
             val capabilities = capabilitiesFor(session)
             when {
                 capabilities == null -> notice = "could not check the ${session.backend.displayName()} session's capabilities"
                 !capabilities.attach -> notice = "${session.backend.displayName()} sessions cannot be attached from the phone"
+                // The list may have moved on while the request was out; never open a row it no
+                // longer holds.
+                sessions.none { it.key() == session.key() } -> notice = "that session is no longer listed"
                 else -> {
                     selectedBackend = session.backend
                     selectedSessionId = session.id
                 }
             }
         }
-        Unit
     }
     val openActions: (Session) -> Unit = { actionsKey = it.key() }
     val scheme = if (appTheme == AppTheme.PAPER_LIGHT) {
@@ -350,7 +366,7 @@ fun AgentViewerApp() {
             actionsSession?.let { session ->
                 SessionActionsSheet(
                     session = session,
-                    capabilities = capabilityCache[session.key()],
+                    capabilities = capabilityCache[session.capabilityCacheKey()],
                     api = api,
                     colors = colors,
                     onDismiss = { actionsKey = null },

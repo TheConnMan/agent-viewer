@@ -1148,10 +1148,18 @@ moved to a `ModalBottomSheet` on long press (`SessionActionsSheet`): open termin
 archive, rename, each gated on the row's fetched `Capabilities`, with the archive entry
 labelled by its `archive` kind (`Reversible` hides, `Deletes` stops and deletes). The read-only
 tail was dropped rather than moved: the terminal shows the live screen. Capabilities are fetched
-on first use and cached per `(backend, id)` for the life of the process, so a tap costs one
-round trip the first time and none after; a tap on a row whose backend advertises no `attach`
+on first use and cached under `capabilityCacheKey` — `(backend, id, status label, hidden)` —
+because they are not a property of identity alone: Claude advertises `stop` only while the
+session is unfinished and the archive kind follows `hidden`, so a cache keyed by id would keep
+offering (or withholding) stop after a resume or a finish. A repeat tap on an unchanged row
+costs nothing; a status change refetches. A tap on a row whose backend advertises no `attach`
 (Grok) is a footer notice, and a tap while the server is unreachable is a notice too rather than
-a blank terminal. The Android back button pops the terminal to the list through a Compose
+a blank terminal. Two more rules came out of the Codex review of the first cut: only one open is
+ever in flight (a newer tap cancels the older request, so a slow answer for row A cannot switch a
+terminal already opened on row B, and the result is applied only if the list still holds the
+row), and an authoritative list that no longer contains the sheet's session closes the sheet
+rather than leaving it armed to reopen when the row comes back (Claude enumeration returns an
+empty backend on a CLI timeout, so rows do vanish and return). The Android back button pops the terminal to the list through a Compose
 `BackHandler`; `shouldBackButtonBeMappedToEscape()` stays `false`, otherwise the same key would
 type `Esc` into the CLI instead. Leaving closes the socket and not the session, which is the
 grace path below.
