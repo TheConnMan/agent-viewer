@@ -1131,16 +1131,21 @@ offer included. That is the decision point, not a reason to avoid the vendoring 
 is ever published, the swap candidate is ConnectBot's Apache-2.0 terminal library, which is the
 only other maintained Android VT emulator with a comparable emulator/view split.
 
-**Gboard, and why not xterm.js in a WebView.** Termux's `onCreateInputConnection` sets
-`outAttrs.inputType = InputType.TYPE_NULL`, telling the IME this is not a text field. Gboard
-responds by disabling autocorrect, suggestions, and glide typing and delivering plain key
-events, which is exactly what a terminal wants and is why this stack sidesteps the Android
+**Gboard, and why not xterm.js in a WebView.** Termux's `onCreateInputConnection` branches on
+`TerminalViewClient.shouldEnforceCharBasedInput()`, and this app returns `true`, so the IME is
+handed the char-based input type: `TYPE_TEXT_VARIATION_VISIBLE_PASSWORD` or-ed with
+`TYPE_TEXT_FLAG_NO_SUGGESTIONS`. That is what a password field asks for, and Gboard answers it
+by disabling autocorrect, suggestions, and glide typing and delivering plain characters through
+`commitText`, which is exactly what a terminal wants and is why this stack sidesteps the Android
 composition corruption documented against xterm.js (xterm.js issues 3600, 675, and 4345 — IME
 composition duplicating, dropping, or reordering characters on Android soft keyboards).
-Measured on Brian's phone 2026-09-04 with the v0.2 test APK: Gboard came up, typed text arrived
-clean, and Enter arrived as `\r`. Robolectric coverage in the module holds the rest of the
-input path — `commitText`, Enter, arrows, Del, Esc, Tab, hardware and sticky ctrl-C, bracketed
-paste, and a full IME composition cycle each reach the transport as the right bytes.
+`InputType.TYPE_NULL` is the other branch, not the one this app takes: it is the more correct
+value on paper, but some keyboards (Samsung stock) never reset their composing state on it, and
+Gboard answers it with raw key events instead of `commitText`. Measured on Brian's phone
+2026-09-04 with the v0.2 test APK, on the visible-password branch: Gboard came up, typed text
+arrived clean, and Enter arrived as `\r`. Robolectric coverage in the module holds the rest of
+the input path — `commitText`, Enter, arrows, Del, Esc, Tab, hardware and sticky ctrl-C,
+bracketed paste, and a full IME composition cycle each reach the transport as the right bytes.
 
 ## Runtime mechanics
 
