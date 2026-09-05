@@ -13,8 +13,8 @@ android {
         applicationId = "com.theconnman.agentviewer"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
     }
 
     buildTypes {
@@ -24,6 +24,12 @@ android {
         getByName("debug") {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            // Shrink the sideloaded build. Unshrunk Compose dex is 23 MB and the phone's
+            // installer OOMed on it ("Failed to allocate a ... byte allocation"); R8 cuts it to
+            // a fraction. Unit tests run on the unshrunk classes, so they are unaffected.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 
