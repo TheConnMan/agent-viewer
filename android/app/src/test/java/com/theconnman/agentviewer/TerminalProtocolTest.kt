@@ -10,6 +10,7 @@ import kotlinx.serialization.json.jsonObject
 import okhttp3.Request
 import okhttp3.WebSocket
 import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -22,9 +23,16 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
 /**
- * The client half of the terminal wire protocol, driven through the real Termux view and the real
- * WebSocket transport. Stubbing [WebSocketTerminalTransport] out fails every assertion here: the
- * proof is bytes and JSON arriving at a fake socket, not calls being made.
+ * The client half of the terminal wire protocol, driven through the real Termux view, the real
+ * [WebSocketTerminalTransport], and the real socket listener.
+ *
+ * Four tests are transport-proving and fail against a stub, because the proof is exact bytes and
+ * JSON arriving at the fake socket rather than calls being made: the layout resize frame, the
+ * key and IME byte tests, the over-limit input chunking, and the close control frame. The rest
+ * never reach the wire and would pass with any transport - the binary render, the pre-layout
+ * replay, the exit frame, control-frame parsing, the close-code rules, the backoff curve, and
+ * the capability decoding. They cover the other halves of the same client surface: what the
+ * emulator does with server output, and what the client decides when a socket goes away.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], qualifiers = "w411dp-h891dp-xxhdpi")
@@ -58,7 +66,7 @@ class TerminalProtocolTest {
         }
     }
 
-    private class Rig {
+    private class Rig(laidOut: Boolean = true) {
         val socket = FakeWebSocket()
         val transport = WebSocketTerminalTransport { socket }
         var exited = false
@@ -68,12 +76,27 @@ class TerminalProtocolTest {
             val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
             controller = RemoteTerminalController(activity, transport) { exited = true }
             activity.setContentView(controller.view)
+            if (laidOut) layOut()
+        }
+
+        /** The measure and layout pass that gives the view a size and so builds the emulator. */
+        fun layOut() {
             controller.view.measure(
                 View.MeasureSpec.makeMeasureSpec(PHONE_W, View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(PHONE_H, View.MeasureSpec.EXACTLY),
             )
             controller.view.layout(0, 0, PHONE_W, PHONE_H)
         }
+
+        /** The real listener, with the main-thread hop collapsed so a test can drive it inline. */
+        fun listener(connection: TerminalConnection, onLeave: () -> Unit = {}) =
+            terminalSocketListener(
+                connection = connection,
+                controller = controller,
+                onSocket = {},
+                onLeave = onLeave,
+                dispatch = { it() },
+            )
 
         fun key(keyCode: Int, meta: Int = 0) {
             controller.view.onKeyDown(
@@ -113,6 +136,102 @@ class TerminalProtocolTest {
         assertTrue("PTY output on screen:\n$text", text.contains("red ok"))
         assertTrue("escape sequences are consumed, not printed", !text.contains(ESC))
         assertTrue("the red SGR colored a cell", anyColoredCell(rig))
+    }
+
+    @Test
+    fun `output that arrives before the view is laid out is replayed onto the first screen`() {
+        val rig = Rig(laidOut = false)
+        assertNull("an unmeasured view has no emulator yet", rig.controller.view.mEmulator)
+
+        // The console opens its socket as soon as it composes, so the hello and the server's
+        // one-shot redraw both land in this window. Dropping them left the screen blank until
+        // the CLI happened to repaint on its own.
+        rig.controller.receive("${ESC}[31mredraw${ESC}[0m before layout\r\n".toByteArray())
+        rig.controller.receive("second chunk\r\n".toByteArray())
+        rig.layOut()
+
+        val text = rig.screenText()
+        assertTrue("the replayed redraw is on screen:\n$text", text.contains("redraw before layout"))
+        assertTrue("replay keeps arrival order:\n$text", text.indexOf("redraw") < text.indexOf("second chunk"))
+        assertTrue("escape sequences are consumed, not printed", !text.contains(ESC))
+        assertTrue("the replayed SGR colored a cell", anyColoredCell(rig))
+
+        // Later bytes go straight through, and the buffer does not replay a second time on the
+        // resize-driven calls that follow.
+        rig.controller.receive("live after layout\r\n".toByteArray())
+        rig.layOut()
+        val after = rig.screenText()
+        assertEquals("the replay ran once", 1, after.split("redraw before layout").size - 1)
+        assertTrue("live output still lands:\n$after", after.contains("live after layout"))
+    }
+
+    @Test
+    fun `a takeover close is final and stops the client reconnecting`() {
+        val rig = Rig()
+        val connection = TerminalConnection()
+        var left = false
+        val listener = rig.listener(connection) { left = true }
+
+        listener.onClosed(rig.socket, TERMINAL_CLOSE_REPLACED, "replaced")
+
+        assertEquals(4_000, TERMINAL_CLOSE_REPLACED)
+        assertTrue("the takeover is recorded", connection.replaced)
+        assertTrue("and it is terminal for this console", connection.finished)
+        assertEquals("replaced by another connection", connection.status)
+        assertTrue("no reconnect is owed", !connection.reconnectScheduled)
+        assertEquals("a takeover is not a failure to back off from", 0, connection.failures)
+        assertTrue("the console stays up rather than popping back to the list", !left)
+    }
+
+    @Test
+    fun `a slow consumer close reconnects like any other drop`() {
+        val rig = Rig()
+        val connection = TerminalConnection()
+        val listener = rig.listener(connection)
+
+        listener.onClosed(rig.socket, 1_013, "slow consumer")
+
+        assertTrue("1013 is a drop, and the redraw restores the screen", connection.reconnectScheduled)
+        assertEquals("disconnected", connection.status)
+        assertEquals(1, connection.failures)
+        assertTrue("the console is still live", !connection.finished)
+
+        // A takeover arriving after a plain drop still cancels the reconnect that drop scheduled.
+        listener.onClosed(rig.socket, TERMINAL_CLOSE_REPLACED, "replaced")
+        assertTrue(!connection.reconnectScheduled)
+        assertTrue(connection.finished)
+    }
+
+    @Test
+    fun `the close this client asked for hands back to the list`() {
+        val rig = Rig()
+        val connection = TerminalConnection()
+        var left = false
+        val listener = rig.listener(connection) { left = true }
+        connection.closeRequested = true
+
+        listener.onClosed(rig.socket, 1_000, "closed")
+
+        assertTrue("a requested close pops the console", left)
+        assertTrue("and schedules nothing", !connection.reconnectScheduled)
+    }
+
+    @Test
+    fun `the listener renders binary frames and ends the session on an exit frame`() {
+        val rig = Rig()
+        val connection = TerminalConnection()
+        val listener = rig.listener(connection)
+
+        listener.onMessage(rig.socket, """{"type":"hello","cols":80,"rows":24,"running":true}""")
+        listener.onMessage(rig.socket, "from the socket\r\n".toByteArray().toByteString())
+        assertEquals("80x24", connection.geometry)
+        assertTrue(rig.screenText().contains("from the socket"))
+
+        listener.onMessage(rig.socket, """{"type":"exit","status":0}""")
+        assertEquals("session ended", connection.status)
+        assertTrue("an exit stops the reconnect loop", connection.finished)
+        listener.onClosed(rig.socket, 1_000, "done")
+        assertTrue("and the close that follows it schedules nothing", !connection.reconnectScheduled)
     }
 
     @Test

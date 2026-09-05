@@ -74,6 +74,13 @@ internal const val TERMINAL_TEXT_SIZE_PX = 26
 internal const val TERMINAL_RECONNECT_DELAY_MS = 750L
 internal const val TERMINAL_RECONNECT_MAX_DELAY_MS = 6_000L
 
+/**
+ * The server's takeover close code: a newer connection for this session now owns the PTY, and
+ * this socket was closed to hand it over. Final for this console - reconnecting would only take
+ * the session back off whichever device is now driving it.
+ */
+internal const val TERMINAL_CLOSE_REPLACED = 4_000
+
 private val terminalHttpClient = OkHttpClient.Builder()
     .pingInterval(15, TimeUnit.SECONDS)
     .build()
@@ -214,6 +221,10 @@ internal class RemoteTerminalController(
         override fun onScale(scale: Float): Float = scale
         override fun onSingleTapUp(event: MotionEvent) = focusAndShowKeyboard()
         override fun shouldBackButtonBeMappedToEscape(): Boolean = false
+        // Char based input: the vendored view answers the IME with
+        // TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | TYPE_TEXT_FLAG_NO_SUGGESTIONS, which is what
+        // turns off autocorrect, suggestions, and glide typing. TYPE_NULL is the other branch,
+        // and some keyboards do not reset their composing state on it.
         override fun shouldEnforceCharBasedInput(): Boolean = true
         override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
         override fun isTerminalViewSelected(): Boolean = true
@@ -301,6 +312,137 @@ internal class RemoteTerminalController(
     }
 }
 
+/**
+ * Connection state for one console: what the status line shows, whether a reconnect is owed, and
+ * whether input is still live. A plain snapshot backed class rather than a pile of composable
+ * locals, so the close and failure rules can be driven straight from a test.
+ */
+internal class TerminalConnection {
+    var status by mutableStateOf("connecting")
+    var geometry by mutableStateOf<String?>(null)
+    var error by mutableStateOf<String?>(null)
+
+    /** The remote process is gone. The screen stays readable; nothing reconnects. */
+    var ended by mutableStateOf(false)
+        private set
+
+    /** Another connection took this session over, and this one is not getting it back. */
+    var replaced by mutableStateOf(false)
+        private set
+
+    var failures by mutableStateOf(0)
+        private set
+
+    var reconnectScheduled by mutableStateOf(false)
+    var closeRequested by mutableStateOf(false)
+
+    /** No socket is opened again for this console once either terminal state is reached. */
+    val finished: Boolean get() = ended || replaced
+
+    fun opened() {
+        failures = 0
+        status = "connected"
+        error = null
+    }
+
+    fun helloed(cols: Int, rows: Int, running: Boolean) {
+        geometry = "${cols}x$rows"
+        if (!running) sessionFinished()
+    }
+
+    fun sessionFinished() {
+        ended = true
+        status = "session ended"
+    }
+
+    /**
+     * The server closed the socket. Returns true when the console should hand back to the list,
+     * which is only ever the close this client asked for.
+     *
+     * [TERMINAL_CLOSE_REPLACED] is the takeover: another connection owns the PTY now, so a
+     * reconnect would take the session off whatever is driving it. Every other code is a plain
+     * drop and reconnects - including 1013, which the server sends when this client falls too
+     * far behind the PTY, since the redraw on the next connect restores the whole screen.
+     */
+    fun closed(code: Int): Boolean {
+        if (closeRequested) return true
+        when {
+            code == TERMINAL_CLOSE_REPLACED -> {
+                replaced = true
+                status = "replaced by another connection"
+                reconnectScheduled = false
+            }
+
+            !ended -> {
+                status = "disconnected"
+                failures += 1
+                reconnectScheduled = true
+            }
+        }
+        return false
+    }
+
+    fun failed(message: String?) {
+        if (finished) return
+        status = "connection failed"
+        error = message ?: "Could not connect to terminal"
+        failures += 1
+        reconnectScheduled = true
+    }
+}
+
+/**
+ * The socket callbacks for one connection attempt, kept out of the composable so a test can put
+ * real close codes and real frames through them. [dispatch] is what hops to the main thread and
+ * drops anything from an attempt that has already been superseded.
+ */
+internal fun terminalSocketListener(
+    connection: TerminalConnection,
+    controller: RemoteTerminalController,
+    onSocket: (WebSocket?) -> Unit,
+    onLeave: () -> Unit,
+    dispatch: (() -> Unit) -> Unit,
+): WebSocketListener = object : WebSocketListener() {
+
+    override fun onOpen(webSocket: WebSocket, response: Response) = dispatch {
+        onSocket(webSocket)
+        connection.opened()
+        controller.announceSize()
+    }
+
+    override fun onMessage(webSocket: WebSocket, bytes: ByteString) = dispatch {
+        controller.receive(bytes.toByteArray())
+    }
+
+    override fun onMessage(webSocket: WebSocket, text: String) = dispatch {
+        when (val control = parseTerminalControl(text)) {
+            is TerminalControl.Hello -> connection.helloed(control.cols, control.rows, control.running)
+
+            is TerminalControl.Exit -> {
+                connection.sessionFinished()
+                controller.remoteExited(control.status ?: 0)
+            }
+
+            is TerminalControl.Failure -> connection.error = control.message
+            is TerminalControl.Unreadable -> connection.error = control.reason
+        }
+    }
+
+    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+        webSocket.close(code, reason)
+    }
+
+    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = dispatch {
+        onSocket(null)
+        if (connection.closed(code)) onLeave()
+    }
+
+    override fun onFailure(socket: WebSocket, cause: Throwable, response: Response?) = dispatch {
+        onSocket(null)
+        connection.failed(cause.message)
+    }
+}
+
 /** 750 ms, doubling to a ceiling, so a server that stays down is not hammered. */
 internal fun terminalReconnectDelayMs(consecutiveFailures: Int): Long {
     if (consecutiveFailures <= 1) return TERMINAL_RECONNECT_DELAY_MS
@@ -324,103 +466,40 @@ internal fun TerminalConsole(
     // effect cannot write into the screen state of the one that replaced it.
     val liveAttempt = remember(*sessionKey) { AtomicReference<Any?>(null) }
     val transport = remember(*sessionKey) { WebSocketTerminalTransport { socketRef.get() } }
-    var ended by remember(*sessionKey) { mutableStateOf(false) }
+    val connection = remember(*sessionKey) { TerminalConnection() }
     val controller = remember(*sessionKey) {
-        RemoteTerminalController(context, transport) { ended = true }
+        RemoteTerminalController(context, transport) { connection.sessionFinished() }
     }
-    var connectionState by remember(*sessionKey) { mutableStateOf("connecting") }
-    var geometry by remember(*sessionKey) { mutableStateOf<String?>(null) }
-    var error by remember(*sessionKey) { mutableStateOf<String?>(null) }
     var stickyControl by remember(*sessionKey) { mutableStateOf(false) }
     var attempt by remember(*sessionKey) { mutableStateOf(0L) }
-    var failures by remember(*sessionKey) { mutableStateOf(0) }
-    var reconnectScheduled by remember(*sessionKey) { mutableStateOf(false) }
-    var closeRequested by remember(*sessionKey) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     BackHandler { onBack() }
 
     DisposableEffect(session.backend, session.id, foreground, attempt) {
-        if (!foreground || ended) {
+        if (!foreground || connection.finished) {
             // Backgrounded: the socket goes, the session and its emulator stay. The server holds
             // the PTY for its grace window and repaints from its own screen on reconnect.
-            connectionState = if (ended) "session ended" else "paused"
+            if (!connection.finished) connection.status = "paused"
             onDispose { }
         } else {
-            connectionState = if (attempt == 0L) "connecting" else "reconnecting"
-            reconnectScheduled = false
-            error = null
+            connection.status = if (attempt == 0L) "connecting" else "reconnecting"
+            connection.reconnectScheduled = false
+            connection.error = null
             val token = Any()
             liveAttempt.set(token)
             val request = Request.Builder()
                 .url(terminalWebSocketUrl(ApiConfig.DEFAULT_BASE_URL, session.id, session.backend))
                 .header("Origin", TERMINAL_ORIGIN)
                 .build()
-            val listener = object : WebSocketListener() {
-                /** Hops to the main thread, then drops anything from a superseded attempt. */
-                private fun ifCurrent(action: () -> Unit) {
-                    scope.launch { if (liveAttempt.get() === token) action() }
-                }
-
-                override fun onOpen(webSocket: WebSocket, response: Response) = ifCurrent {
-                    socketRef.set(webSocket)
-                    failures = 0
-                    connectionState = "connected"
-                    error = null
-                    controller.announceSize()
-                }
-
-                override fun onMessage(webSocket: WebSocket, bytes: ByteString) = ifCurrent {
-                    controller.receive(bytes.toByteArray())
-                }
-
-                override fun onMessage(webSocket: WebSocket, text: String) = ifCurrent {
-                    when (val control = parseTerminalControl(text)) {
-                        is TerminalControl.Hello -> {
-                            geometry = "${control.cols}x${control.rows}"
-                            if (!control.running) {
-                                ended = true
-                                connectionState = "session ended"
-                            }
-                        }
-
-                        is TerminalControl.Exit -> {
-                            ended = true
-                            connectionState = "session ended"
-                            controller.remoteExited(control.status ?: 0)
-                        }
-
-                        is TerminalControl.Failure -> error = control.message
-                        is TerminalControl.Unreadable -> error = control.reason
-                    }
-                }
-
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    webSocket.close(code, reason)
-                }
-
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = ifCurrent {
-                    socketRef.set(null)
-                    if (closeRequested) {
-                        onBack()
-                    } else if (!ended) {
-                        connectionState = "disconnected"
-                        failures += 1
-                        reconnectScheduled = true
-                    }
-                }
-
-                override fun onFailure(socket: WebSocket, cause: Throwable, response: Response?) =
-                    ifCurrent {
-                        socketRef.set(null)
-                        if (!ended) {
-                            connectionState = "connection failed"
-                            error = cause.message ?: "Could not connect to terminal"
-                            failures += 1
-                            reconnectScheduled = true
-                        }
-                    }
-            }
+            val listener = terminalSocketListener(
+                connection = connection,
+                controller = controller,
+                onSocket = { socketRef.set(it) },
+                onLeave = onBack,
+                // Hops to the main thread, then drops anything from a superseded attempt.
+                dispatch = { action -> scope.launch { if (liveAttempt.get() === token) action() } },
+            )
             val openedSocket = terminalHttpClient.newWebSocket(request, listener)
             onDispose {
                 if (liveAttempt.compareAndSet(token, null)) socketRef.set(null)
@@ -429,10 +508,10 @@ internal fun TerminalConsole(
         }
     }
 
-    LaunchedEffect(foreground, reconnectScheduled, ended) {
-        if (foreground && reconnectScheduled && !ended) {
-            delay(terminalReconnectDelayMs(failures))
-            if (foreground && reconnectScheduled && !ended) attempt += 1L
+    LaunchedEffect(foreground, connection.reconnectScheduled, connection.finished) {
+        if (foreground && connection.reconnectScheduled && !connection.finished) {
+            delay(terminalReconnectDelayMs(connection.failures))
+            if (foreground && connection.reconnectScheduled && !connection.finished) attempt += 1L
         }
     }
 
@@ -440,7 +519,7 @@ internal fun TerminalConsole(
         onDispose { controller.detachFromParent() }
     }
 
-    val liveInput = !ended && !closeRequested
+    val liveInput = !connection.finished && !connection.closeRequested
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -459,28 +538,28 @@ internal fun TerminalConsole(
                 Text(
                     listOfNotNull(
                         "${terminalBackendTag(session.backend)} terminal",
-                        connectionState,
-                        geometry,
+                        connection.status,
+                        connection.geometry,
                     ).joinToString("  "),
-                    color = if (connectionState == "connected") colors.ok else colors.faint,
+                    color = if (connection.status == "connected") colors.ok else colors.faint,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 10.sp,
                 )
             }
             TextButton(
                 onClick = {
-                    closeRequested = true
-                    connectionState = "closing"
+                    connection.closeRequested = true
+                    connection.status = "closing"
                     if (socketRef.get()?.send(terminalCloseFrame()) != true) {
-                        closeRequested = false
-                        error = "Could not request console close"
+                        connection.closeRequested = false
+                        connection.error = "Could not request console close"
                     }
                 },
                 enabled = liveInput,
             ) { Text("close console", color = colors.err) }
         }
 
-        error?.let {
+        connection.error?.let {
             Text(
                 it,
                 color = colors.err,
