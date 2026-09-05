@@ -289,6 +289,30 @@ class ApiContractTest {
     }
 
     @Test
+    fun `triage queues needs input first then done and idle, longest wait first in each group`() {
+        // Mirrors the TUI's `triage_queue`: every needs-input session, then every shown idle or
+        // done session, ascending updated_at within each group. Working, error and unknown rows
+        // are not reviewable and stay out; hidden, companion and hold rows never reach the phone
+        // list in the first place.
+        val sessions = listOf(
+            session("done-old", Status.Done, updatedAtMs = 1_000),
+            session("working", Status.Working, updatedAtMs = 500),
+            session("waiting-new", Status.NeedsInput("Approve it"), updatedAtMs = 9_000),
+            session("idle-new", Status.Idle, updatedAtMs = 8_000),
+            session("error", Status.Error, updatedAtMs = 100),
+            session("waiting-old", Status.NeedsInput(null), updatedAtMs = 3_000),
+            session("unknown", Status.Unknown, updatedAtMs = 200),
+            session("done-hidden", Status.Done, hidden = true, updatedAtMs = 50),
+            session("done-hold", Status.Done, title = "Hold", updatedAtMs = 60),
+        )
+
+        assertEquals(
+            listOf("waiting-old", "waiting-new", "done-old", "idle-new"),
+            triageSessionRows(sessions).map(Session::id),
+        )
+    }
+
+    @Test
     fun `session row helpers omit hold titles without hiding longer titles`() {
         val visibleHold = session("visibleHold", Status.Working, title = "Hold")
         val visibleMixedHold = session("visibleMixedHold", Status.Working, title = "hOlD")
@@ -319,18 +343,6 @@ class ApiContractTest {
             listOf("triageLongerTitle"),
             triageSessionRows(sessions).map(Session::id),
         )
-    }
-
-    @Test
-    fun `tail bottom index selects the sentinel after the newest event and handles an empty tail`() {
-        val tail = listOf(
-            TailEvent.User("First"),
-            TailEvent.Tool("Bash", "pwd"),
-            TailEvent.Agent("Newest"),
-        )
-
-        assertEquals(3, tailBottomIndex(tail))
-        assertNull(tailBottomIndex(emptyList()))
     }
 
     @Test
@@ -374,6 +386,7 @@ class ApiContractTest {
         hidden: Boolean = false,
         companion: Boolean = false,
         title: String = id,
+        updatedAtMs: Long = 2_000,
     ) = Session(
         backend = BackendKind.CODEX,
         id = id,
@@ -382,7 +395,7 @@ class ApiContractTest {
         cwd = "/tmp/project",
         status = status,
         createdAtMs = 1_000,
-        updatedAtMs = 2_000,
+        updatedAtMs = updatedAtMs,
         hidden = hidden,
         companion = companion,
     )

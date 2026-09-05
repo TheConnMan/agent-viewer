@@ -281,6 +281,37 @@ class TerminalProtocolTest {
     }
 
     @Test
+    fun `every way a keyboard can say enter reaches the PTY as a carriage return`() {
+        // Claude Code's composer submits on CR and inserts a line on LF. Hardware and most soft
+        // keyboards send KEYCODE_ENTER (a CR through KeyHandler); the AOSP keyboard family commits
+        // a literal "\n" as text; and dictation keyboards such as Wispr Flow press their own
+        // Enter through performEditorAction, which BaseInputConnection would otherwise swallow.
+        val rig = Rig()
+        rig.socket.binary.clear()
+        val ime = rig.controller.view.onCreateInputConnection(EditorInfo())
+        assertNotNull(ime)
+
+        ime.commitText("hello\n", 1)
+        assertEquals("a committed newline is enter, not a line feed", "hello\r", rig.socket.drainBinary())
+
+        assertTrue(ime.performEditorAction(EditorInfo.IME_ACTION_UNSPECIFIED))
+        assertEquals("\r", rig.socket.drainBinary())
+        assertTrue(ime.performEditorAction(EditorInfo.IME_ACTION_DONE))
+        assertEquals("\r", rig.socket.drainBinary())
+        assertTrue(ime.performEditorAction(EditorInfo.IME_ACTION_SEND))
+        assertEquals("\r", rig.socket.drainBinary())
+
+        rig.key(KeyEvent.KEYCODE_ENTER)
+        assertEquals("\r", rig.socket.drainBinary())
+
+        // Multi-line paste is the emulator's job and keeps its own rules: LF becomes CR there too,
+        // wrapped in brackets once the CLI has asked for them, so a pasted paragraph is one paste.
+        rig.controller.receive("$ESC[?2004h".toByteArray(Charsets.UTF_8))
+        rig.controller.paste("a\nb")
+        assertEquals("$ESC[200~a\rb$ESC[201~", rig.socket.drainBinary())
+    }
+
+    @Test
     fun `an input burst over the server limit is chunked instead of dropped`() {
         val rig = Rig()
         rig.socket.binary.clear()

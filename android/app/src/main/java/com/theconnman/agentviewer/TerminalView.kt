@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -34,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -527,6 +530,8 @@ internal fun TerminalConsole(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TextButton(onClick = onBack) { Text("back", color = colors.muted) }
+            BackendIcon(session.backend, colors, size = 15.dp)
+            Spacer(Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     session.title,
@@ -534,10 +539,11 @@ internal fun TerminalConsole(
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Text(
                     listOfNotNull(
-                        "${terminalBackendTag(session.backend)} terminal",
+                        "terminal",
                         connection.status,
                         connection.geometry,
                     ).joinToString("  "),
@@ -633,10 +639,4 @@ private fun TerminalKey(label: String, colors: ViewerColors, enabled: Boolean, o
             fontSize = 10.sp,
         )
     }
-}
-
-private fun terminalBackendTag(backend: BackendKind): String = when (backend) {
-    BackendKind.CODEX -> "CX"
-    BackendKind.CLAUDE -> "CC"
-    BackendKind.GROK -> "GX"
 }

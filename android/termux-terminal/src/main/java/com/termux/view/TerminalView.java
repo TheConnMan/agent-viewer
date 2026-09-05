@@ -359,6 +359,17 @@ public final class TerminalView extends View {
                 return true;
             }
 
+            // Local modification (agent-viewer): dictation keyboards press their own Enter through
+            // performEditorAction rather than a key event or a committed "\n", and the
+            // BaseInputConnection default discards it. A terminal has exactly one meaning for
+            // Enter, so every editor action is a carriage return.
+            @Override
+            public boolean performEditorAction(int actionCode) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: performEditorAction(" + actionCode + ")");
+                inputCodePoint('\r', false, false);
+                return true;
+            }
+
             @Override
             public boolean deleteSurroundingText(int leftLength, int rightLength) {
                 if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {

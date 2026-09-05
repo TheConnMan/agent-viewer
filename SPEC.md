@@ -1138,6 +1138,53 @@ phone was not a terminal, so the server had to guess what a terminal would simpl
 v2 makes the phone a terminal and the wire dumb. **Do not reintroduce screen JSON, a submit
 command, readiness detection, or any scraping of CLI output.**
 
+### Navigation: no detail screen, actions on long press
+
+The v1 companion had a detail screen between the list and the terminal (status, tail, action
+buttons, and a **jump in** button). Brian's first day with the v2 terminal removed it: "I want
+to jump directly into the session ... I should never see 'Jump in'." A tap on a list row or a
+triage card now opens `TerminalConsole` directly, and every action the detail screen offered
+moved to a `ModalBottomSheet` on long press (`SessionActionsSheet`): open terminal, stop,
+archive, rename, each gated on the row's fetched `Capabilities`, with the archive entry
+labelled by its `archive` kind (`Reversible` hides, `Deletes` stops and deletes). The read-only
+tail was dropped rather than moved: the terminal shows the live screen. Capabilities are fetched
+on first use and cached per `(backend, id)` for the life of the process, so a tap costs one
+round trip the first time and none after; a tap on a row whose backend advertises no `attach`
+(Grok) is a footer notice, and a tap while the server is unreachable is a notice too rather than
+a blank terminal. The Android back button pops the terminal to the list through a Compose
+`BackHandler`; `shouldBackButtonBeMappedToEscape()` stays `false`, otherwise the same key would
+type `Esc` into the CLI instead. Leaving closes the socket and not the session, which is the
+grace path below.
+
+The triage tab is `triageSessionRows`, which mirrors the TUI's `triage_queue` exactly: every
+needs-input session, then every done or idle session, ascending `updated_at_ms` in each group,
+ties broken by `(backend, id)`. The tab badge counts needs-input only, so it says what is
+blocked on Brian rather than how long the review queue is. Rows draw the backend's vendor mark
+(`res/drawable/ic_backend_*.xml`, from lobehub/lobe-icons, MIT) tinted with the backend colour;
+the `[cc]`/`[cx]`/`[gx]` tag survives as the icon's content description. The marks are
+inflated and rasterised in a Robolectric test because a bad vector path fails only at inflate
+time, which on the phone is the first list render.
+
+**The white status bar.** Android 15 (`targetSdk = 35`) draws every app edge to edge, so the
+status bar became a transparent strip over the window background — which was the Material
+Light theme's white — while the content sat below it under `safeDrawingPadding()`, and the bar
+icons were white on white. The fix is three parts: `enableEdgeToEdge()` in the activity so the
+behaviour is the same on every supported API level, the theme `Surface` painting the whole
+window with the content inset inside it rather than the inset outside the `Surface`, and
+`WindowInsetsControllerCompat.isAppearanceLight{Status,Navigation}Bars` following the theme
+(`paper light` is the one light theme). `windowBackground` is the amber background so the frame
+before Compose paints is not a white flash.
+
+**Every Enter.** Claude Code's composer submits on `\r` and inserts a line on `\n`. A keyboard's
+Enter key is `KEYCODE_ENTER`, which Termux's `KeyHandler` turns into `\r`; the AOSP keyboard
+family commits a literal `"\n"` through `commitText`, which upstream `sendTextToTerminal`
+already rewrites to `\r`; but dictation keyboards (Brian uses Wispr Flow) press their own
+Enter through `InputConnection.performEditorAction`, and `BaseInputConnection`'s default drops
+it on the floor, so that Enter never reached the CLI at all. The vendored `TerminalView`
+overrides `performEditorAction` to send `\r` for every action code — a terminal has exactly
+one meaning for Enter — and the Robolectric protocol test drives all three routes plus a
+multi-line paste through the real view and asserts the bytes on the fake socket.
+
 ### Vendored Termux emulator, and the GPLv3 line
 
 `android/termux-terminal/` is termux-app's `terminal-emulator` and `terminal-view` vendored as
@@ -1148,8 +1195,10 @@ else. The JitPack AAR is unusable: `TerminalSession` is `public final` and its
 phone. The vendoring deletes `JNI.java`, drops `final`, strips the JNI calls out of the session
 base class, and adds exactly two files in package `com.termux.terminal`:
 `RemoteTerminalTransport` (`send(bytes,off,len)`, `resize(cols,rows)`, `close()`) and
-`RemoteTerminalSession` (`receive(bytes,len)`, `remoteExited(status)`). Every other upstream
-file is byte-for-byte upstream, so a Termux fix re-vendors by diff.
+`RemoteTerminalSession` (`receive(bytes,len)`, `remoteExited(status)`). One more upstream file
+carries one added method: `TerminalView`'s anonymous `BaseInputConnection` overrides
+`performEditorAction` to send `\r` (see "Every Enter" below). Every other upstream file is
+byte-for-byte upstream, so a Termux fix re-vendors by diff; `LICENSE.termux.md` is the list.
 
 **License.** termux-app is released GPLv3-only. `LICENSE.termux.md` records an Apache-2.0
 ancestry for these two libraries, but the vendored files carry no per-file relicensing header,

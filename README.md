@@ -651,18 +651,33 @@ paths.
 
 ## Phone companion
 
-The Android companion has a session list, a triage inbox, a new session composer, and a
-session detail screen. The list shows visible sessions only; archived, companion, and subagent
-threads are not on the phone, and there is no hidden filter to reach them. Session detail
-includes a read only recent tail, and **jump in** opens
-the session in a real terminal on the phone: the same PTY the TUI would attach to, rendered by
-an embedded VT emulator, with the CLI's own composer doing the composing. The four shipped
-themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
+The Android companion has a session list, a triage inbox, and a new session composer. There is
+no detail screen: **tapping a session opens it** in a real terminal on the phone, the same PTY
+the TUI would attach to, rendered by an embedded VT emulator, with the CLI's own composer doing
+the composing. **Long-pressing a session** opens its action sheet, with status, branch, PR refs
+and age at the top and every action the backend advertises for that row underneath: open
+terminal, stop, archive (Codex hides reversibly; Claude and Grok stop and delete, and the sheet
+says which), and rename. A backend that cannot be attached from the phone (Grok) answers a tap
+with a footer notice, and its long press still works. Android's back button leaves the terminal
+for the list; the session keeps running under its grace window (below). The list shows visible
+sessions only; archived, companion, and subagent threads are not on the phone, and there is no
+hidden filter to reach them. Rows carry the vendor mark of their backend (Claude, OpenAI, xAI),
+tinted in the backend colour, in place of the TUI's `[cc]`/`[cx]`/`[gx]` tags. The four shipped
+themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`, and the status and
+navigation bar icons follow the theme.
+
+The triage tab walks the same queue as the TUI's `Ctrl+N`: every session needing input, then
+every done or idle session, longest wait first within each group. A tap on a card opens the
+terminal, a long press opens the actions, and the badge on the tab counts only the sessions
+that are blocked on you.
 
 ### Terminal behaviour
 
 - **Tap the screen** to focus the terminal and raise the keyboard. Typed characters, Enter,
   arrows, Del, Esc, Tab, and hardware ctrl chords all go straight to the session as bytes.
+  Every kind of Enter submits: a keyboard's Enter key, the newline the AOSP keyboard family
+  commits as text, and the Enter that dictation keyboards such as Wispr Flow press through the
+  IME's editor action all reach the CLI as a carriage return.
 - **The key row** under the terminal covers what a soft keyboard lacks: enter, esc, tab, ctrl,
   the four arrows, ctrl c, paste, and keyboard. It scrolls horizontally on a narrow screen.
 - **`ctrl` is sticky**, not held. Tapping it shows `[ctrl]` and the next character typed from

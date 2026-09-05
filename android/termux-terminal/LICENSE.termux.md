@@ -28,7 +28,7 @@ so the next re-vendor stays a diff, not a rewrite.
 - **`JNI.java` is not vendored.** The phone never forks a local shell; the process lives on the
   dev box and its PTY bytes arrive over a WebSocket. Vendoring the JNI declarations would drag in
   `src/main/jni/termux.c` and an NDK build for code that can never run here.
-- **`TerminalSession.java` is modified** to match, and is the only upstream file with local edits:
+- **`TerminalSession.java` is modified** to match (the other upstream file with local edits):
   - `final` dropped from the class so `RemoteTerminalSession` can extend it.
   - `initializeEmulator` throws `UnsupportedOperationException` instead of calling
     `JNI.createSubprocess` and starting the reader/writer/waiter threads.
@@ -36,6 +36,10 @@ so the next re-vendor stays a diff, not a rewrite.
   - `finishIfRunning` no longer sends `SIGKILL`; `cleanupResources` no longer calls `JNI.close`.
   - `wrapFileDescriptor`, `mTerminalFileDescriptor`, and the now-unused `android.system.*` and
     `java.io.File*` imports are removed.
+- **`TerminalView.java` has one local method added**: `performEditorAction` on the anonymous
+  `BaseInputConnection` in `onCreateInputConnection`, sending a carriage return. Dictation
+  keyboards (Wispr Flow) press Enter through the editor action, which the base class drops, so
+  their Enter never reached the CLI. Nothing else in the file is changed.
 - **`RemoteTerminalSession.java` and `RemoteTerminalTransport.java` are ours**, added in package
   `com.termux.terminal` because `TerminalSession#mEmulator` is package private. They are not
   upstream files and have no upstream counterpart.

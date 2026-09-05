@@ -3,7 +3,19 @@ package com.theconnman.agentviewer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import android.app.Activity
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
+import androidx.core.view.WindowCompat
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,7 +34,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -148,12 +159,15 @@ internal val sessionFilters: List<Pair<SessionFilter, String>> = listOf(
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
     sessions.filter { !it.hidden && !it.companion && !it.title.equals("Hold", ignoreCase = true) }
 
+/** The phone's triage inbox, in the TUI's order (`ui::triage::triage_queue`): every needs-input
+ * session, then every done or idle session, longest wait first within each group. Working, error
+ * and unknown rows have nothing to review yet. The visibility rules are `normalSessionRows`. */
 internal fun triageSessionRows(sessions: List<Session>): List<Session> =
     normalSessionRows(sessions)
-        .filter { it.status is Status.NeedsInput }
-        .sortedBy { it.updatedAtMs }
+        .filter { it.status is Status.NeedsInput || it.status == Status.Done || it.status == Status.Idle }
+        .sortedWith(compareBy({ if (it.status is Status.NeedsInput) 0 else 1 }, { it.updatedAtMs }, { it.backend.name }, { it.id }))
 
-internal fun tailBottomIndex(tail: List<TailEvent>): Int? = tail.size.takeIf { tail.isNotEmpty() }
+internal fun Session.key(): String = "${backend.name}:$id"
 
 internal class SessionSubmitter(
     private val create: suspend (NewSessionRequest) -> Unit,
@@ -184,15 +198,21 @@ internal class SessionSubmitter(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AgentViewerApp() {
     var appTheme by rememberSaveable { mutableStateOf(AppTheme.default) }
     var tab by rememberSaveable { mutableStateOf(BottomTab.SESSIONS) }
     var selectedBackend by rememberSaveable { mutableStateOf<BackendKind?>(null) }
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
-    var terminalOpen by rememberSaveable { mutableStateOf(false) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var loadError by remember { mutableStateOf<String?>(null) }
+    var notice by remember { mutableStateOf<String?>(null) }
+    // The row whose long-press action sheet is open, if any.
+    var actionsKey by remember { mutableStateOf<String?>(null) }
+    // Capabilities are backend-advertised per session and fetched on first use, so a tap on a row
+    // that cannot be attached (Grok) is a notice rather than a broken terminal screen.
+    val capabilityCache = remember { mutableStateMapOf<String, Capabilities>() }
     val api = remember { ApiClient() }
     val foreground = rememberForeground()
     val scope = rememberCoroutineScope()
@@ -200,6 +220,7 @@ fun AgentViewerApp() {
     val selectedSession = selectedBackend?.let { backend ->
         selectedSessionId?.let { id -> sessions.firstOrNull { it.backend == backend && it.id == id } }
     }
+    val actionsSession = actionsKey?.let { key -> sessions.firstOrNull { it.key() == key } }
 
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
@@ -211,6 +232,12 @@ fun AgentViewerApp() {
                 }
                 .onFailure { loadError = it.message ?: "Could not load sessions" }
             delay(2_000)
+        }
+    }
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            delay(3_500)
+            notice = null
         }
     }
 
@@ -225,85 +252,132 @@ fun AgentViewerApp() {
         }
         Unit
     }
+    suspend fun capabilitiesFor(session: Session): Capabilities? =
+        capabilityCache[session.key()]
+            ?: runCatching { api.capabilities(session.id) }.getOrNull()?.also { capabilityCache[session.key()] = it }
+    LaunchedEffect(actionsKey) {
+        actionsSession?.let { capabilitiesFor(it) }
+    }
+    // A tap on any row goes straight into the session's terminal; there is no detail screen.
+    val open: (Session) -> Unit = { session ->
+        scope.launch {
+            val capabilities = capabilitiesFor(session)
+            when {
+                capabilities == null -> notice = "could not check the ${session.backend.displayName()} session's capabilities"
+                !capabilities.attach -> notice = "${session.backend.displayName()} sessions cannot be attached from the phone"
+                else -> {
+                    selectedBackend = session.backend
+                    selectedSessionId = session.id
+                }
+            }
+        }
+        Unit
+    }
+    val openActions: (Session) -> Unit = { actionsKey = it.key() }
     val scheme = if (appTheme == AppTheme.PAPER_LIGHT) {
         lightColorScheme(primary = colors.accent, surface = colors.surface, onSurface = colors.text)
     } else {
         darkColorScheme(primary = colors.accent, surface = colors.surface, onSurface = colors.text)
     }
 
+    // The window is edge to edge, so the status and navigation bars are drawn over our own
+    // background; their icons have to follow the theme or they vanish (white on white).
+    val view = LocalView.current
+    val lightBars = appTheme == AppTheme.PAPER_LIGHT
+    SideEffect {
+        (view.context as? Activity)?.window?.let { window ->
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = lightBars
+            controller.isAppearanceLightNavigationBars = lightBars
+        }
+    }
+
     MaterialTheme(colorScheme = scheme) {
+        // The Surface paints the whole window, bars included; the content is inset from them.
         Surface(
-            modifier = Modifier.fillMaxSize().safeDrawingPadding(),
+            modifier = Modifier.fillMaxSize(),
             color = colors.bg,
             contentColor = colors.text,
         ) {
-            selectedSession?.let { session ->
-                if (terminalOpen) {
+            Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+                selectedSession?.let { session ->
                     TerminalConsole(
                         session = session,
-                        colors = colors,
-                        foreground = foreground,
-                        onBack = { terminalOpen = false },
-                    )
-                } else {
-                    SessionDetailScreen(
-                        session = session,
-                        api = api,
                         colors = colors,
                         foreground = foreground,
                         onBack = {
                             selectedBackend = null
                             selectedSessionId = null
                         },
-                        onJumpIn = { terminalOpen = true },
-                        onMutated = refresh,
                     )
-                }
-            } ?: Column(modifier = Modifier.fillMaxSize()) {
-                Box(modifier = Modifier.weight(1f)) {
-                    when (tab) {
-                        BottomTab.SESSIONS -> SessionListScreen(
-                            sessions = sessions,
-                            error = loadError,
-                            colors = colors,
-                            onTheme = { appTheme = nextTheme(appTheme) },
-                            onSelected = {
-                                terminalOpen = false
-                                selectedBackend = it.backend
-                                selectedSessionId = it.id
-                            },
-                        )
+                } ?: Column(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        when (tab) {
+                            BottomTab.SESSIONS -> SessionListScreen(
+                                sessions = sessions,
+                                error = loadError,
+                                colors = colors,
+                                onTheme = { appTheme = nextTheme(appTheme) },
+                                onOpen = open,
+                                onActions = openActions,
+                            )
 
-                        BottomTab.TRIAGE -> TriageScreen(
-                            sessions = sessions,
-                            api = api,
-                            colors = colors,
-                            onSelected = {
-                                terminalOpen = false
-                                selectedBackend = it.backend
-                                selectedSessionId = it.id
-                            },
-                            onMutated = refresh,
-                            onBack = { tab = BottomTab.SESSIONS },
-                        )
+                            BottomTab.TRIAGE -> TriageScreen(
+                                sessions = sessions,
+                                colors = colors,
+                                onOpen = open,
+                                onActions = openActions,
+                                onBack = { tab = BottomTab.SESSIONS },
+                            )
 
-                        BottomTab.NEW -> ComposerScreen(
-                            api = api,
-                            colors = colors,
-                            onCreated = {
-                                tab = BottomTab.SESSIONS
-                                refresh()
-                            },
-                            onClose = { tab = BottomTab.SESSIONS },
-                        )
+                            BottomTab.NEW -> ComposerScreen(
+                                api = api,
+                                colors = colors,
+                                onCreated = {
+                                    tab = BottomTab.SESSIONS
+                                    refresh()
+                                },
+                                onClose = { tab = BottomTab.SESSIONS },
+                            )
+                        }
+                        notice?.let { FooterNotice(it, colors, Modifier.align(Alignment.BottomCenter)) }
+                    }
+                    if (tab != BottomTab.NEW) {
+                        BottomNavigation(tab = tab, sessions = sessions, colors = colors) { tab = it }
                     }
                 }
-                if (tab != BottomTab.NEW) {
-                    BottomNavigation(tab = tab, sessions = sessions, colors = colors) { tab = it }
-                }
+            }
+            actionsSession?.let { session ->
+                SessionActionsSheet(
+                    session = session,
+                    capabilities = capabilityCache[session.key()],
+                    api = api,
+                    colors = colors,
+                    onDismiss = { actionsKey = null },
+                    onOpen = {
+                        actionsKey = null
+                        open(session)
+                    },
+                    onMutated = refresh,
+                )
             }
         }
     }
+}
+
+/** The phone's footer notice: a short line that fades after a few seconds, never a modal. */
+@Composable
+private fun FooterNotice(text: String, colors: ViewerColors, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        color = colors.text,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+        modifier = modifier.padding(horizontal = 18.dp, vertical = 10.dp)
+            .background(colors.surface, RoundedCornerShape(9.dp))
+            .border(1.dp, colors.border, RoundedCornerShape(9.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    )
 }
 
 @Composable
@@ -328,7 +402,8 @@ private fun SessionListScreen(
     error: String?,
     colors: ViewerColors,
     onTheme: () -> Unit,
-    onSelected: (Session) -> Unit,
+    onOpen: (Session) -> Unit,
+    onActions: (Session) -> Unit,
 ) {
     var filter by remember { mutableStateOf(SessionFilter.ALL) }
     var expandedProjects by remember { mutableStateOf(emptySet<String>()) }
@@ -423,8 +498,8 @@ private fun SessionListScreen(
                     )
                 }
                 if (expanded) {
-                    items(rows, key = { "${it.backend}-${it.id}" }) { session ->
-                        SessionRow(session, colors) { onSelected(session) }
+                    items(rows, key = { it.key() }) { session ->
+                        SessionRow(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
                     }
                 }
             }
@@ -618,11 +693,13 @@ private fun ProjectHeader(
     }
 }
 
+/** One list row. A tap opens the session's terminal; a long press opens its action sheet. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SessionRow(session: Session, colors: ViewerColors, onClick: () -> Unit) {
+private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Unit, onActions: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().background(if (session.status is Status.NeedsInput) colors.selbg else colors.bg)
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onOpen, onLongClick = onActions)
             .drawBehind {
                 drawLine(
                     color = colors.border,
@@ -638,13 +715,7 @@ private fun SessionRow(session: Session, colors: ViewerColors, onClick: () -> Un
         StatusDot(statusColor(session.status, colors), Modifier.padding(top = 5.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    session.backend.tag(),
-                    color = backendColor(session.backend, colors),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                )
+                BackendIcon(session.backend, colors, size = 13.dp)
                 Spacer(Modifier.width(7.dp))
                 Text(
                     session.title,
@@ -686,10 +757,9 @@ private fun SessionRow(session: Session, colors: ViewerColors, onClick: () -> Un
 @Composable
 private fun TriageScreen(
     sessions: List<Session>,
-    api: ApiClient,
     colors: ViewerColors,
-    onSelected: (Session) -> Unit,
-    onMutated: () -> Unit,
+    onOpen: (Session) -> Unit,
+    onActions: (Session) -> Unit,
     onBack: () -> Unit,
 ) {
     val queue = triageSessionRows(sessions)
@@ -700,8 +770,8 @@ private fun TriageScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 6.dp),
         ) {
-            items(queue, key = { "triage-${it.backend}-${it.id}" }) { session ->
-                TriageCard(session, api, colors, onSelected, onMutated)
+            items(queue, key = { "triage-${it.key()}" }) { session ->
+                TriageCard(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
             }
             item {
                 Row(
@@ -727,7 +797,12 @@ private fun TriageHeader(count: Int, colors: ViewerColors, onBack: () -> Unit) {
         HeaderControl(onClick = onBack) { BackGlyph(colors.muted) }
         Column(modifier = Modifier.weight(1f)) {
             Text("triage", color = colors.text, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
-            Text("longest wait first", color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+            Text(
+                "needs input, then done · longest wait first",
+                color = colors.faint,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+            )
         }
         Box(
             modifier = Modifier.height(26.dp).widthIn(min = 26.dp).background(colors.attn, CircleShape).padding(horizontal = 8.dp),
@@ -739,26 +814,30 @@ private fun TriageHeader(count: Int, colors: ViewerColors, onBack: () -> Unit) {
     }
 }
 
+/** One triage item. Like a list row, a tap opens the terminal and a long press opens the actions;
+ * the card itself only says what the session is waiting for. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TriageCard(
     session: Session,
-    api: ApiClient,
     colors: ViewerColors,
-    onSelected: (Session) -> Unit,
-    onMutated: () -> Unit,
+    onOpen: () -> Unit,
+    onActions: () -> Unit,
 ) {
-    var capabilities by remember(session.id) { mutableStateOf<Capabilities?>(null) }
-    var actionError by remember(session.id) { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(session.id) {
-        capabilities = runCatching { api.capabilities(session.id) }.getOrNull()
+    val waiting = session.status is Status.NeedsInput
+    val accent = if (waiting) colors.attn else colors.ok
+    val reason = when (val status = session.status) {
+        is Status.NeedsInput -> status.reason ?: "Waiting for your input"
+        Status.Done -> "Finished; review it or archive it"
+        Status.Idle -> "Idle; review it or archive it"
+        else -> statusLabel(status)
     }
-    val reason = (session.status as? Status.NeedsInput)?.reason ?: "Waiting for your input"
     Column(
-        modifier = Modifier.fillMaxWidth().background(colors.surface, RoundedCornerShape(12.dp))
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(colors.surface)
+            .combinedClickable(onClick = onOpen, onLongClick = onActions)
             .drawBehind {
                 drawLine(
-                    color = colors.attn,
+                    color = accent,
                     start = Offset(1.5.dp.toPx(), 6.dp.toPx()),
                     end = Offset(1.5.dp.toPx(), size.height - 6.dp.toPx()),
                     strokeWidth = 3.dp.toPx(),
@@ -768,9 +847,9 @@ private fun TriageCard(
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(sessionAge(session.updatedAtMs), color = colors.attn, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            Text(sessionAge(session.updatedAtMs), color = accent, fontSize = 19.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.width(9.dp))
-            Text(session.backend.tag(), color = backendColor(session.backend, colors), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+            BackendIcon(session.backend, colors, size = 15.dp)
             Spacer(Modifier.weight(1f))
             Text(
                 session.projectRoot ?: session.cwd,
@@ -784,33 +863,13 @@ private fun TriageCard(
         Text(session.title, color = colors.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
         Text(
             reason,
-            color = colors.warn,
+            color = if (waiting) colors.warn else colors.muted,
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
             lineHeight = 16.sp,
             modifier = Modifier.fillMaxWidth().background(colors.bg, RoundedCornerShape(7.dp)).padding(11.dp),
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            JumpInButton(colors, Modifier.weight(1f)) { onSelected(session) }
-            if (capabilities?.stop == true) {
-                OutlinedButton(
-                    onClick = {
-                        scope.launch {
-                            runCatching { api.stop(session.id) }
-                                .onSuccess {
-                                    actionError = null
-                                    onMutated()
-                                }
-                                .onFailure { actionError = it.message ?: "Could not stop session" }
-                        }
-                    },
-                    modifier = Modifier.height(44.dp),
-                ) { Text("stop", color = colors.err) }
-            }
-        }
-        actionError?.let {
-            Text(it, color = colors.err, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
-        }
+        Text(statusLabel(session.status), color = accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -897,12 +956,7 @@ private fun ComposerScreen(
                         } else {
                             val backend = if (option == ComposerProvider.CLAUDE) BackendKind.CLAUDE else BackendKind.CODEX
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    backend.tag(),
-                                    color = backendColor(backend, colors),
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                )
+                                BackendIcon(backend, colors, size = 14.dp)
                                 Spacer(Modifier.width(6.dp))
                                 Text(
                                     option.wireName,
@@ -983,210 +1037,159 @@ private fun ComposerScreen(
     }
 }
 
+/**
+ * The long-press sheet: what the detail screen used to offer, minus the read-only tail (the
+ * terminal shows the live screen instead). Actions are gated on the session's advertised
+ * capabilities; with none fetched yet the sheet says so rather than guessing.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SessionDetailScreen(
+private fun SessionActionsSheet(
     session: Session,
+    capabilities: Capabilities?,
     api: ApiClient,
     colors: ViewerColors,
-    foreground: Boolean,
-    onBack: () -> Unit,
-    onJumpIn: () -> Unit,
+    onDismiss: () -> Unit,
+    onOpen: () -> Unit,
     onMutated: () -> Unit,
 ) {
-    var capabilities by remember(session.id) { mutableStateOf<Capabilities?>(null) }
-    var tail by remember(session.id) { mutableStateOf<List<TailEvent>>(emptyList()) }
-    var tailError by remember(session.id) { mutableStateOf<String?>(null) }
-    var actionError by remember(session.id) { mutableStateOf<String?>(null) }
-    var editingName by remember(session.id) { mutableStateOf(false) }
-    var name by remember(session.id) { mutableStateOf(session.title) }
-    val tailListState = rememberLazyListState()
+    var actionError by remember(session.key()) { mutableStateOf<String?>(null) }
+    var editingName by remember(session.key()) { mutableStateOf(false) }
+    var name by remember(session.key()) { mutableStateOf(session.title) }
+    var busy by remember(session.key()) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    LaunchedEffect(session.id) {
-        runCatching { api.capabilities(session.id) }.onSuccess { capabilities = it }
-    }
-    LaunchedEffect(session.backend, session.id, foreground) {
-        if (!foreground) return@LaunchedEffect
-        while (isActive) {
-            runCatching { api.tail(session.id) }
+    fun mutate(failure: String, action: suspend () -> Unit) {
+        scope.launch {
+            busy = true
+            runCatching { action() }
                 .onSuccess {
-                    tail = it
-                    tailError = null
+                    actionError = null
+                    onMutated()
+                    onDismiss()
                 }
-                .onFailure { tailError = it.message }
-            delay(2_000)
+                .onFailure { actionError = it.message ?: failure }
+            busy = false
         }
     }
-    LaunchedEffect(tail) {
-        tailBottomIndex(tail)?.let { tailListState.scrollToItem(it) }
-    }
-    Column(modifier = Modifier.fillMaxSize()) {
-        DetailHeader(session, colors, onBack)
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surface,
+        contentColor = colors.text,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp).padding(bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            StatusPill(session.status, colors)
-            session.gitBranch?.let { DetailBadge(it, colors.muted, colors.bg) }
-            session.prRefs.forEach { DetailBadge("#${it.id}", colors.merged, colors.bg) }
-            Text(sessionAge(session.updatedAtMs), color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp, modifier = Modifier.padding(top = 7.dp))
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            if (capabilities?.attach == true) {
-                JumpInButton(colors, Modifier.weight(1f), onJumpIn)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                BackendIcon(session.backend, colors, size = 16.dp)
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    session.title,
+                    color = colors.text,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
             }
-            if (capabilities?.stop == true) {
-                IconControl(colors.err, "stop", Modifier.size(48.dp), {
-                    scope.launch {
-                        runCatching { api.stop(session.id) }
-                            .onSuccess {
-                                actionError = null
-                                onMutated()
-                            }
-                            .onFailure { actionError = it.message ?: "Could not stop session" }
-                    }
-                }) { StopGlyph(colors.err) }
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                StatusPill(session.status, colors)
+                session.gitBranch?.let { DetailBadge(it, colors.muted, colors.bg) }
+                session.prRefs.forEach { DetailBadge("#${it.id}", colors.merged, colors.bg) }
+                Text(sessionAge(session.updatedAtMs), color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
             }
-            if (capabilities?.canArchive == true) {
-                IconControl(colors.muted, if (session.hidden) "unhide" else "hide", Modifier.size(48.dp), {
-                    scope.launch {
-                        runCatching { api.hide(session.id, session.hidden) }
-                            .onSuccess {
-                                actionError = null
-                                onMutated()
-                            }
-                            .onFailure { actionError = it.message ?: "Could not update visibility" }
-                    }
-                }) { ArchiveGlyph(colors.muted) }
-            }
-            if (capabilities?.rename == true) {
-                IconControl(colors.muted, "rename", Modifier.size(48.dp), { editingName = !editingName }) {
-                    PencilGlyph(colors.muted)
-                }
-            }
-        }
-        actionError?.let {
             Text(
-                it,
-                color = colors.err,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.sp,
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 2.dp),
-            )
-        }
-        if (editingName) {
-            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.weight(1f), singleLine = true)
-                Spacer(Modifier.width(8.dp))
-                ActionButton("save", colors.accent, colors.bg, Modifier.height(44.dp)) {
-                    scope.launch {
-                        runCatching { api.rename(session.id, name) }
-                            .onSuccess {
-                                actionError = null
-                                editingName = false
-                                onMutated()
-                            }
-                            .onFailure { actionError = it.message ?: "Could not rename session" }
-                    }
-                }
-            }
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "recent turns",
+                session.projectRoot ?: session.cwd,
                 color = colors.faint,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
-                letterSpacing = 1.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
-            Spacer(Modifier.width(9.dp))
-            Spacer(Modifier.weight(1f).height(1.dp).background(colors.border))
-        }
-        val reason = (session.status as? Status.NeedsInput)?.reason
-        if (reason != null) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp).background(colors.surface, RoundedCornerShape(9.dp))
-                    .drawBehind {
-                        drawLine(
-                            color = colors.attn,
-                            start = Offset(1.5.dp.toPx(), 5.dp.toPx()),
-                            end = Offset(1.5.dp.toPx(), size.height - 5.dp.toPx()),
-                            strokeWidth = 3.dp.toPx(),
-                        )
+            (session.status as? Status.NeedsInput)?.reason?.let { reason ->
+                Text(reason, color = colors.warn, fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 16.sp)
+            }
+            Spacer(Modifier.fillMaxWidth().height(1.dp).background(colors.border))
+            if (capabilities == null) {
+                Text("checking what this session supports", color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+            } else {
+                if (capabilities.attach) {
+                    SheetAction("open terminal", null, colors.accent, colors, !busy, onOpen) { TerminalGlyph(colors.accent) }
+                }
+                if (capabilities.stop) {
+                    SheetAction("stop", "interrupt the running turn", colors.err, colors, !busy, {
+                        mutate("Could not stop session") { api.stop(session.id) }
+                    }) { StopGlyph(colors.err) }
+                }
+                if (capabilities.canArchive) {
+                    val detail = if (capabilities.archive == "Deletes") {
+                        "stops the thread and deletes it"
+                    } else {
+                        "hides it from the list; unhide from the desktop"
                     }
-                    .padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text("waiting on you", color = colors.attn, fontFamily = FontFamily.Monospace, fontSize = 9.sp, letterSpacing = 1.sp)
-                Text(reason, color = colors.text, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    SheetAction("archive", detail, colors.muted, colors, !busy, {
+                        mutate("Could not archive session") { api.hide(session.id, session.hidden) }
+                    }) { ArchiveGlyph(colors.muted) }
+                }
+                if (capabilities.rename) {
+                    SheetAction("rename", null, colors.muted, colors, !busy, { editingName = !editingName }) {
+                        PencilGlyph(colors.muted)
+                    }
+                }
+                if (!capabilities.attach && !capabilities.stop && !capabilities.canArchive && !capabilities.rename) {
+                    Text(
+                        "nothing can be done with this session from the phone",
+                        color = colors.faint,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+            if (editingName) {
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(value = name, onValueChange = { name = it }, modifier = Modifier.weight(1f), singleLine = true)
+                    Spacer(Modifier.width(8.dp))
+                    ActionButton("save", colors.accent, colors.bg, Modifier.height(44.dp), enabled = !busy && name.isNotBlank()) {
+                        mutate("Could not rename session") { api.rename(session.id, name) }
+                    }
+                }
+            }
+            actionError?.let {
+                Text(it, color = colors.err, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
             }
         }
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            state = tailListState,
-            verticalArrangement = Arrangement.spacedBy(11.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 18.dp, vertical = 8.dp),
-        ) {
-            items(tail) { event -> TailRow(event, colors) }
-            if (tail.isNotEmpty()) item(key = "tail bottom") { Spacer(Modifier.height(1.dp)) }
-            if (tail.isEmpty()) item { EmptyState(tailError ?: "no recent turns", colors) }
-        }
     }
 }
 
 @Composable
-private fun TailRow(event: TailEvent, colors: ViewerColors) {
-    when (event) {
-        is TailEvent.Agent -> Text(event.text, color = colors.text, fontSize = 13.sp, lineHeight = 20.sp)
-        is TailEvent.User -> Column(
-            modifier = Modifier.fillMaxWidth().background(colors.selbg, RoundedCornerShape(9.dp)).padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp),
-        ) {
-            Text("you", color = colors.muted, fontFamily = FontFamily.Monospace, fontSize = 9.sp, letterSpacing = 1.sp)
-            Text(event.text, color = colors.text, fontSize = 13.sp, lineHeight = 19.sp)
-        }
-
-        is TailEvent.Tool -> Row {
-            Text("|", color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-            Spacer(Modifier.width(8.dp))
-            Text(event.name, color = colors.cx, fontFamily = FontFamily.Monospace, fontSize = 11.sp, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.width(8.dp))
-            Text(event.detail, color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-    }
-}
-
-@Composable
-private fun DetailHeader(session: Session, colors: ViewerColors, onBack: () -> Unit) {
+private fun SheetAction(
+    label: String,
+    detail: String?,
+    color: Color,
+    colors: ViewerColors,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    glyph: @Composable () -> Unit,
+) {
     Row(
-        modifier = Modifier.fillMaxWidth().height(66.dp).padding(horizontal = 10.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .semantics { contentDescription = label }
+            .padding(horizontal = 6.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        HeaderControl(onClick = onBack) { BackGlyph(colors.faint) }
-        Text(
-            session.backend.tag(),
-            color = backendColor(session.backend, colors),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(Modifier.width(7.dp))
-        Text(
-            session.title,
-            color = colors.text,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        Box(modifier = Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-            OverflowGlyph(colors.muted)
+        Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) { glyph() }
+        Column {
+            Text(label, color = if (enabled) color else colors.faint, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            if (detail != null) {
+                Text(detail, color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+            }
         }
     }
 }
@@ -1218,7 +1221,8 @@ private fun DetailBadge(label: String, color: Color, background: Color) {
 
 @Composable
 private fun BottomNavigation(tab: BottomTab, sessions: List<Session>, colors: ViewerColors, onSelected: (BottomTab) -> Unit) {
-    val waiting = triageSessionRows(sessions).size
+    // The badge is what is blocked on you, not the whole review queue.
+    val waiting = normalSessionRows(sessions).count { it.status is Status.NeedsInput }
     Row(
         modifier = Modifier.fillMaxWidth().background(colors.surface).border(1.dp, colors.border).padding(bottom = 20.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -1282,20 +1286,6 @@ private fun ActionButton(
 }
 
 @Composable
-private fun JumpInButton(colors: ViewerColors, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        modifier = modifier.height(48.dp),
-        shape = RoundedCornerShape(9.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = colors.accent, contentColor = colors.bg),
-    ) {
-        TerminalGlyph(colors.bg)
-        Spacer(Modifier.width(7.dp))
-        Text("jump in", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-@Composable
 private fun LaunchButton(
     colors: ViewerColors,
     modifier: Modifier,
@@ -1317,22 +1307,6 @@ private fun LaunchButton(
         Spacer(Modifier.width(9.dp))
         Text("kick it off", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
     }
-}
-
-@Composable
-private fun IconControl(
-    color: Color,
-    label: String,
-    modifier: Modifier,
-    onClick: () -> Unit,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        modifier = modifier.semantics { contentDescription = label }
-            .border(1.dp, color.copy(alpha = 0.7f), RoundedCornerShape(9.dp))
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) { content() }
 }
 
 @Composable
@@ -1426,15 +1400,6 @@ private fun PencilGlyph(color: Color) {
 }
 
 @Composable
-private fun OverflowGlyph(color: Color) {
-    Canvas(Modifier.size(20.dp)) {
-        listOf(4f, 10f, 16f).forEach { y ->
-            drawCircle(color, 1.2.dp.toPx(), Offset(10.dp.toPx(), y.dp.toPx()))
-        }
-    }
-}
-
-@Composable
 private fun ArrowRightGlyph(color: Color) {
     Canvas(Modifier.size(18.dp)) {
         val stroke = 2.dp.toPx()
@@ -1483,14 +1448,38 @@ private fun EmptyState(text: String, colors: ViewerColors, color: Color = colors
 }
 
 // Exhaustive on purpose: a new backend must not silently inherit another one's mark. Tags and
-// colors match the TUI (`ui::mod::mark_for`), where Grok rides the plain text color.
-private fun BackendKind.tag(): String = when (this) {
+// colors match the TUI (`ui::mod::mark_for`), where Grok rides the plain text color. On the phone
+// the tag is the icon's accessibility text; the drawn mark is the vendor's logo.
+internal fun BackendKind.tag(): String = when (this) {
     BackendKind.CODEX -> "[cx]"
     BackendKind.CLAUDE -> "[cc]"
     BackendKind.GROK -> "[gx]"
 }
 
-private fun backendColor(backend: BackendKind, colors: ViewerColors): Color = when (backend) {
+internal fun BackendKind.displayName(): String = when (this) {
+    BackendKind.CODEX -> "Codex"
+    BackendKind.CLAUDE -> "Claude"
+    BackendKind.GROK -> "Grok"
+}
+
+/** Vendor marks from lobehub/lobe-icons (MIT), see `res/drawable/ic_backend_*.xml`. */
+internal fun BackendKind.iconRes(): Int = when (this) {
+    BackendKind.CODEX -> R.drawable.ic_backend_codex
+    BackendKind.CLAUDE -> R.drawable.ic_backend_claude
+    BackendKind.GROK -> R.drawable.ic_backend_grok
+}
+
+@Composable
+internal fun BackendIcon(backend: BackendKind, colors: ViewerColors, size: Dp, modifier: Modifier = Modifier) {
+    Icon(
+        painter = painterResource(backend.iconRes()),
+        contentDescription = backend.tag(),
+        tint = backendColor(backend, colors),
+        modifier = modifier.size(size),
+    )
+}
+
+internal fun backendColor(backend: BackendKind, colors: ViewerColors): Color = when (backend) {
     BackendKind.CODEX -> colors.cx
     BackendKind.CLAUDE -> colors.cc
     BackendKind.GROK -> colors.text
