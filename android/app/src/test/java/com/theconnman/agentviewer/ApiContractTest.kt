@@ -59,6 +59,72 @@ class ApiContractTest {
     }
 
     @Test
+    fun `decodes a Grok session and lists all three backends`() {
+        val session = ApiJson.json.decodeFromString<Session>(grokSessionJson)
+
+        assertEquals(BackendKind.GROK, session.backend)
+        assertEquals("thread-grok", session.id)
+        assertEquals(
+            listOf(BackendKind.CODEX, BackendKind.CLAUDE, BackendKind.GROK),
+            BackendKind.entries.toList(),
+        )
+    }
+
+    @Test
+    fun `decodes a mixed Codex Claude and Grok listing without throwing`() {
+        val listing = ApiJson.json.decodeFromString<List<Session>>(
+            "[" + listOf(
+                sessionJson("thread-codex", "Codex"),
+                sessionJson("thread-claude", "Claude"),
+                grokSessionJson,
+            ).joinToString(",") + "]",
+        )
+
+        assertEquals(
+            listOf(BackendKind.CODEX, BackendKind.CLAUDE, BackendKind.GROK),
+            listing.map(Session::backend),
+        )
+        assertEquals(
+            listOf("thread-codex", "thread-claude", "thread-grok"),
+            listing.map(Session::id),
+        )
+    }
+
+    @Test
+    fun `terminal websocket URL names the Grok backend`() {
+        assertEquals(
+            "wss://remote-dev.tail26e2ce.ts.net:8443/sessions/thread-grok/terminal?backend=Grok",
+            terminalWebSocketUrl(ApiConfig.DEFAULT_BASE_URL, "thread-grok", BackendKind.GROK),
+        )
+    }
+
+    @Test
+    fun `decodes a server truncated title and summary without losing the ellipsis`() {
+        val title = "t".repeat(239) + "\u2026"
+        val summary = "s".repeat(239) + "\u2026"
+        val session = ApiJson.json.decodeFromString<Session>(
+            """
+            {
+              "backend": "Claude",
+              "id": "thread-truncated",
+              "origin": "Interactive",
+              "title": "$title",
+              "cwd": "/home/brian/git/agent-viewer",
+              "status": "Working",
+              "created_at_ms": 1724150000000,
+              "updated_at_ms": 1724151000000,
+              "summary": "$summary"
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(240, session.title.length)
+        assertEquals(240, session.summary.length)
+        assertTrue(session.title.endsWith("\u2026"))
+        assertTrue(session.summary.endsWith("\u2026"))
+    }
+
+    @Test
     fun `decodes serde externally tagged tail events`() {
         val agent = ApiJson.json.decodeFromString<TailEvent>("{\"Agent\":\"I will inspect the logs\"}")
         val user = ApiJson.json.decodeFromString<TailEvent>("{\"User\":\"Please investigate\"}")
@@ -174,6 +240,30 @@ class ApiContractTest {
     }
 
     @Test
+    fun `the filter row offers all, by project and by state with no hidden chip`() {
+        assertEquals(
+            listOf("all", "by project", "by state"),
+            sessionFilters.map { (_, label) -> label },
+        )
+        assertEquals(
+            listOf(SessionFilter.ALL, SessionFilter.PROJECT, SessionFilter.STATE),
+            SessionFilter.entries.toList(),
+        )
+    }
+
+    @Test
+    fun `sessions requests the bare sessions path with no query parameters`() = withServer(
+        responseBody = "[]",
+    ) { client, requests ->
+        assertEquals(emptyList<Session>(), runBlocking { client.sessions() })
+
+        assertEquals(
+            listOf(CapturedRequest("GET", "/sessions", null, "")),
+            requests,
+        )
+    }
+
+    @Test
     fun `session row helpers enforce companion and visibility boundaries`() {
         val visibleWorking = session("visible-working", Status.Working)
         val visibleWaiting = session("visible-waiting", Status.NeedsInput("Approve it"))
@@ -191,10 +281,6 @@ class ApiContractTest {
         assertEquals(
             listOf("visible-working", "visible-waiting"),
             normalSessionRows(sessions).map(Session::id),
-        )
-        assertEquals(
-            listOf("hidden-waiting", "companion-waiting", "hidden-companion"),
-            hiddenSessionRows(sessions).map(Session::id),
         )
         assertEquals(
             listOf("visible-waiting"),
@@ -228,10 +314,6 @@ class ApiContractTest {
         assertEquals(
             listOf("visibleLongerTitle", "triageLongerTitle"),
             normalSessionRows(sessions).map(Session::id),
-        )
-        assertEquals(
-            listOf("hiddenLongerTitle"),
-            hiddenSessionRows(sessions).map(Session::id),
         )
         assertEquals(
             listOf("triageLongerTitle"),
@@ -270,6 +352,21 @@ class ApiContractTest {
             ),
         )
     }
+
+    private val grokSessionJson = sessionJson("thread-grok", "Grok")
+
+    private fun sessionJson(id: String, backend: String) = """
+        {
+          "backend": "$backend",
+          "id": "$id",
+          "origin": "Background",
+          "title": "Drain the bonus backlog",
+          "cwd": "/home/brian/git/agent-viewer",
+          "status": "Working",
+          "created_at_ms": 1724150000000,
+          "updated_at_ms": 1724151000000
+        }
+    """.trimIndent()
 
     private fun session(
         id: String,
@@ -336,7 +433,7 @@ class ApiContractTest {
             }
             requests += CapturedRequest(
                 method = requestLine[0],
-                path = requestLine[1].substringBefore('?'),
+                path = requestLine[1],
                 contentType = headers["content-type"],
                 body = String(body, UTF_8),
             )

@@ -135,13 +135,18 @@ enum class AppTheme(val displayName: String, val colors: ViewerColors) {
 }
 
 private enum class BottomTab { SESSIONS, TRIAGE, NEW }
-private enum class SessionFilter { ALL, PROJECT, STATE, HIDDEN }
+internal enum class SessionFilter { ALL, PROJECT, STATE }
+
+/** The filter chips, in the order the row draws them. There is no hidden chip: the server only
+ * ever hands the phone visible sessions, so archived and companion threads stay on the desktop. */
+internal val sessionFilters: List<Pair<SessionFilter, String>> = listOf(
+    SessionFilter.ALL to "all",
+    SessionFilter.PROJECT to "by project",
+    SessionFilter.STATE to "by state",
+)
 
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
     sessions.filter { !it.hidden && !it.companion && !it.title.equals("Hold", ignoreCase = true) }
-
-internal fun hiddenSessionRows(sessions: List<Session>): List<Session> =
-    sessions.filter { (it.hidden || it.companion) && !it.title.equals("Hold", ignoreCase = true) }
 
 internal fun triageSessionRows(sessions: List<Session>): List<Session> =
     normalSessionRows(sessions)
@@ -330,7 +335,7 @@ private fun SessionListScreen(
     var searchVisible by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     val normalSessions = normalSessionRows(sessions)
-    val filtered = (if (filter == SessionFilter.HIDDEN) hiddenSessionRows(sessions) else normalSessions)
+    val filtered = normalSessions
         .filter { session ->
             query.isBlank() || listOf(
                 session.title,
@@ -566,12 +571,7 @@ private fun FilterRow(selected: SessionFilter, colors: ViewerColors, onSelected:
         modifier = Modifier.fillMaxWidth().horizontalScroll(scroll).padding(start = 18.dp, end = 18.dp, bottom = 14.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        listOf(
-            SessionFilter.ALL to "all",
-            SessionFilter.PROJECT to "by project",
-            SessionFilter.STATE to "by state",
-            SessionFilter.HIDDEN to "hidden",
-        ).forEach { (filter, label) ->
+        sessionFilters.forEach { (filter, label) ->
             val active = filter == selected
             Text(
                 text = label,
@@ -1482,8 +1482,19 @@ private fun EmptyState(text: String, colors: ViewerColors, color: Color = colors
     )
 }
 
-private fun BackendKind.tag(): String = if (this == BackendKind.CLAUDE) "[cc]" else "[cx]"
-private fun backendColor(backend: BackendKind, colors: ViewerColors): Color = if (backend == BackendKind.CLAUDE) colors.cc else colors.cx
+// Exhaustive on purpose: a new backend must not silently inherit another one's mark. Tags and
+// colors match the TUI (`ui::mod::mark_for`), where Grok rides the plain text color.
+private fun BackendKind.tag(): String = when (this) {
+    BackendKind.CODEX -> "[cx]"
+    BackendKind.CLAUDE -> "[cc]"
+    BackendKind.GROK -> "[gx]"
+}
+
+private fun backendColor(backend: BackendKind, colors: ViewerColors): Color = when (backend) {
+    BackendKind.CODEX -> colors.cx
+    BackendKind.CLAUDE -> colors.cc
+    BackendKind.GROK -> colors.text
+}
 
 private fun statusLabel(status: Status): String = when (status) {
     Status.Working -> "working"

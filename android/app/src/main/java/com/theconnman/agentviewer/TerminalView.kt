@@ -638,4 +638,5 @@ private fun TerminalKey(label: String, colors: ViewerColors, enabled: Boolean, o
 private fun terminalBackendTag(backend: BackendKind): String = when (backend) {
     BackendKind.CODEX -> "CX"
     BackendKind.CLAUDE -> "CC"
+    BackendKind.GROK -> "GX"
 }

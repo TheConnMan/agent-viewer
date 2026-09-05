@@ -652,7 +652,9 @@ paths.
 ## Phone companion
 
 The Android companion has a session list, a triage inbox, a new session composer, and a
-session detail screen. Session detail includes a read only recent tail, and **jump in** opens
+session detail screen. The list shows visible sessions only; archived, companion, and subagent
+threads are not on the phone, and there is no hidden filter to reach them. Session detail
+includes a read only recent tail, and **jump in** opens
 the session in a real terminal on the phone: the same PTY the TUI would attach to, rendered by
 an embedded VT emulator, with the CLI's own composer doing the composing. The four shipped
 themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`.
