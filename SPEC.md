@@ -1185,6 +1185,21 @@ counts the release as a tap and folds the group, which the screenshot test pins.
 the folder's group is forced open so the new row is visible on the next poll, and the footer
 notice names the folder.
 
+The Grok review of the first cut found two state bugs, fixed in the same round. The sheet ran
+its `POST` in a `rememberCoroutineScope`, which a rotation cancels: the request still completed
+on the server, but the success path (dismiss, notice, unfold) never ran and the restored sheet
+offered Start again with the same task, so one tap could make two sessions. `SpawnLauncher` now
+owns the request in a process-lifetime scope, holds `inFlight` and `outcome` as Compose state,
+and admits one request at a time; the sheet reads it and `AgentViewerApp` acts on the outcome
+whether or not the sheet is still open. A sheet restored after process death with its draft
+marked submitted and nothing in flight closes itself: the list is the record of whether the
+spawn landed. And the 2 s poll and the post-spawn `refresh()` were last-write-wins, so a poll
+that left before the spawn could answer after the refresh and hide the new row for a tick;
+`ListSequencer` gives every listing request a generation and a response applies only if
+nothing newer already has. The third finding, that the sheet stays open after its folder's
+last row leaves the list, is by design: the sheet is a place, not a row, and a folder on disk
+is still somewhere to start work.
+
 **Group headers fold on a tap, and the fold survives a relaunch.** Every grouping's headers fold
 (the first cut folded only `by project`), and the fold state plus the active filter live in
 `ListPrefs` (`SharedPreferences` `list`): the filter as a name, the groups as a set of toggles

@@ -239,6 +239,8 @@ fun AgentViewerApp() {
     // cannot switch a terminal the user has already moved on from.
     var pendingOpen by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val api = remember { ApiClient() }
+    val launcher = remember { SpawnLauncher.default }
+    val listSequence = remember { ListSequencer() }
     val foreground = rememberForeground()
     val scope = rememberCoroutineScope()
     val colors = appTheme.colors
@@ -254,12 +256,18 @@ fun AgentViewerApp() {
         loadError = null
         if (actionsKey != null && fresh.none { it.key() == actionsKey }) actionsKey = null
     }
+    // Every listing request takes a generation and a response is applied only if nothing
+    // newer already was, so a poll that left before a spawn cannot undo the refresh after it.
+    val fetchSessions: suspend () -> Unit = {
+        val generation = listSequence.next()
+        runCatching { api.sessions() }
+            .onSuccess { if (listSequence.accept(generation)) applySessions(it) }
+            .onFailure { loadError = it.message ?: "Could not load sessions" }
+    }
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
         while (isActive) {
-            runCatching { api.sessions() }
-                .onSuccess(applySessions)
-                .onFailure { loadError = it.message ?: "Could not load sessions" }
+            fetchSessions()
             delay(2_000)
         }
     }
@@ -271,12 +279,25 @@ fun AgentViewerApp() {
     }
 
     val refresh: () -> Unit = {
-        scope.launch {
-            runCatching { api.sessions() }
-                .onSuccess(applySessions)
-                .onFailure { loadError = it.message ?: "Could not load sessions" }
-        }
+        scope.launch { fetchSessions() }
         Unit
+    }
+    // A finished spawn is handled here, not in the sheet, so it lands whether or not the sheet
+    // is still open (swiped away while starting, or recreated by a rotation).
+    LaunchedEffect(launcher.outcome) {
+        val outcome = launcher.outcome ?: return@LaunchedEffect
+        if (outcome.error == null) {
+            if (spawnFolder == outcome.folder) spawnFolder = null
+            // The new row lands in this folder's group; make sure it can be seen.
+            setToggledGroups(expandGroup(filter, outcome.folder, toggledGroups))
+            notice = "started in ${outcome.folder.substringAfterLast('/')}"
+            launcher.consume(outcome)
+            refresh()
+        } else if (spawnFolder != outcome.folder) {
+            notice = "could not start in ${outcome.folder.substringAfterLast('/')}: ${outcome.error}"
+            launcher.consume(outcome)
+        }
+        // With the sheet open, it shows the error itself and consumes it on dismiss.
     }
     suspend fun capabilitiesFor(session: Session): Capabilities? =
         capabilityCache[session.capabilityCacheKey()]
@@ -375,16 +396,9 @@ fun AgentViewerApp() {
             spawnFolder?.let { folder ->
                 SpawnSheet(
                     folder = folder,
-                    api = api,
+                    launcher = launcher,
                     colors = colors,
                     onDismiss = { spawnFolder = null },
-                    onStarted = {
-                        spawnFolder = null
-                        // The new row lands in this folder's group; make sure it can be seen.
-                        setToggledGroups(expandGroup(filter, folder, toggledGroups))
-                        notice = "started in ${folder.substringAfterLast('/')}"
-                        refresh()
-                    },
                 )
             }
             actionsSession?.let { session ->

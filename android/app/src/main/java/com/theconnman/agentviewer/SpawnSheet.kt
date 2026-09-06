@@ -24,8 +24,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -39,7 +38,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.launch
 
 /**
  * The spawn sheet, opened by a long press on a folder header. The folder is the one pressed and
@@ -50,20 +48,29 @@ import kotlinx.coroutines.launch
 @Composable
 internal fun SpawnSheet(
     folder: String,
-    api: ApiClient,
+    launcher: SpawnLauncher,
     colors: ViewerColors,
     onDismiss: () -> Unit,
-    onStarted: () -> Unit,
 ) {
     var provider by rememberSaveable(folder) { mutableStateOf(ComposerProvider.AUTO) }
     var task by rememberSaveable(folder) { mutableStateOf("") }
-    var submitting by remember(folder) { mutableStateOf(false) }
-    var error by remember(folder) { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-    val submitter = remember(api) { SessionSubmitter { request -> api.create(request) } }
+    // Set when Start is tapped and saved with the draft. A sheet restored after process death
+    // with this set and nothing in flight was sent before the process died: the list is the
+    // record of whether it landed, so the sheet closes rather than offering the same task again.
+    var submitted by rememberSaveable(folder) { mutableStateOf(false) }
+    val submitting = launcher.inFlight == folder
+    val outcome = launcher.outcome?.takeIf { it.folder == folder }
+    val error = outcome?.error
+    LaunchedEffect(folder) {
+        if (submitted && launcher.inFlight == null && launcher.outcome == null) onDismiss()
+    }
+    val dismiss = {
+        outcome?.let(launcher::consume)
+        onDismiss()
+    }
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismiss,
         containerColor = colors.surface,
         contentColor = colors.text,
     ) {
@@ -99,20 +106,10 @@ internal fun SpawnSheet(
             error?.let { Text(it, color = colors.err, fontSize = 11.sp, fontFamily = FontFamily.Monospace) }
             Button(
                 onClick = {
-                    if (submitting) return@Button
-                    submitting = true
-                    error = null
-                    scope.launch {
-                        val request = NewSessionRequest(provider, model = null, folder = folder, task = task)
-                        val result = submitter.submit(request) ?: return@launch
-                        result.onSuccess { onStarted() }
-                            .onFailure { failure ->
-                                submitting = false
-                                error = failure.message ?: "Could not start session"
-                            }
-                    }
+                    val request = NewSessionRequest(provider, model = null, folder = folder, task = task)
+                    if (launcher.launch(request)) submitted = true
                 },
-                enabled = task.isNotBlank() && !submitting,
+                enabled = task.isNotBlank() && launcher.inFlight == null,
                 modifier = Modifier.fillMaxWidth().height(50.dp),
                 shape = RoundedCornerShape(10.dp),
                 colors = ButtonDefaults.buttonColors(

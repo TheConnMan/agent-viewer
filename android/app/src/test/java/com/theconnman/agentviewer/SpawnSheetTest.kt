@@ -10,6 +10,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.jsonObject
@@ -36,14 +37,14 @@ class SpawnSheetTest {
     fun `start posts the pressed folder and the typed task, pinned to the chosen provider`() {
         val folder = "/home/brian/git/theconnman/agent-viewer"
         LoopbackServer("""{"backend":"Claude","session_id":"abc","pid":null}""").use { server ->
-            var started = 0
+            val api = ApiClient(server.baseUrl)
+            val launcher = SpawnLauncher({ api.create(it) }, Dispatchers.Unconfined)
             compose.setContent {
                 SpawnSheet(
                     folder = folder,
-                    api = ApiClient(server.baseUrl),
+                    launcher = launcher,
                     colors = AppTheme.ANALOG_AMBER.colors,
                     onDismiss = {},
-                    onStarted = { started += 1 },
                 )
             }
             compose.waitForIdle()
@@ -54,7 +55,9 @@ class SpawnSheetTest {
             compose.onNode(hasSetTextAction()).performTextInput("Keep the companion server up")
             compose.onNodeWithText("start").assertIsEnabled()
             compose.onNodeWithText("start").performClick()
-            compose.waitUntil(10_000) { started == 1 }
+            compose.waitUntil(10_000) { launcher.outcome != null }
+            assertEquals(SpawnOutcome(folder, error = null), launcher.outcome)
+            assertEquals(null, launcher.inFlight)
 
             val request = server.requests.single()
             assertEquals("POST", request.method)
