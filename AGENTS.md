@@ -62,6 +62,16 @@ CI runs `cargo fmt --all -- --check` first and skips clippy, build, and test ent
 fails, so an unformatted file turns the whole workflow red. Run `cargo fmt --all` before the
 check when it reports hunks.
 
+The phone's companion server is a systemd user unit on this box, `agent-viewer-server.service`,
+running `~/.local/bin/agent-viewer-server` with `Restart=always`. It is NOT the cargo target
+binary: after a server change, `cargo build --release -p agent-viewer-server`, `install` the
+binary to `~/.local/bin`, and `systemctl --user restart agent-viewer-server.service`. Never start
+a second server by hand on 8477 while the unit is active. Android gates run from a script file
+(the `rtk` shell wrapper mangles compound gradle commands):
+`cd android && ANDROID_HOME=$HOME/android-sdk ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug`.
+Use `:app:clean` before a build whose APK you will serve: an incremental package can come out
+at twice the size (a 14.8 MB APK with 7.5 MB of entries was seen 2026-09-06).
+
 The TUI expects a `~/.codex/state_*.sqlite` on the box (the Codex backend's source of truth).
 The Claude backend appears automatically when its CLI and data exist and lists empty
 otherwise, so a missing backend is never an error.

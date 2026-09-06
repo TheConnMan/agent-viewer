@@ -13,8 +13,8 @@ android {
         applicationId = "com.theconnman.agentviewer"
         minSdk = 29
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.7"
+        versionCode = 9
+        versionName = "1.8"
     }
 
     buildTypes {
@@ -68,4 +68,8 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
+    // Compose screenshots under Robolectric NATIVE graphics: the screen tests render the real
+    // list, triage and nav surfaces to PNGs under build/screenshots/ for a visual check.
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

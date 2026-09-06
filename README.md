@@ -651,7 +651,12 @@ paths.
 
 ## Phone companion
 
-The Android companion has a session list, a triage inbox, and a new session composer. There is
+The Android companion has a session list and a triage inbox. There is no new-session screen:
+**long-pressing a folder header** in the list opens a sheet that starts a session in that
+folder (a task, and `auto`, `claude` or `codex` for who does it; the server's routing picks the
+model). **Tapping a group header** folds or unfolds the group, and the folds and the active
+filter chip are remembered across terminal visits and app restarts (`all` and `by state` start
+open, `by project` starts folded). There is
 no detail screen: **tapping a session opens it** in a real terminal on the phone, the same PTY
 the TUI would attach to, rendered by an embedded VT emulator, with the CLI's own composer doing
 the composing. **Long-pressing a session** opens its action sheet, with status, branch, PR refs
@@ -701,8 +706,19 @@ that are blocked on you.
 
 ### Running it
 
-Start the local HTTP server. It binds `127.0.0.1:8477` only, and never listens on the tailnet
-itself:
+The local HTTP server binds `127.0.0.1:8477` only, and never listens on the tailnet itself. On
+`remote-dev` it runs as a systemd user unit (`~/.config/systemd/user/agent-viewer-server.service`,
+`Restart=always`, enabled under `default.target` with linger on) so it survives reboots and
+crashes; a hand-started server dies with the shell or the box and the phone then sees 502 from
+the tailscale proxy. After rebuilding, install the binary and restart the unit:
+
+```
+cargo build --release -p agent-viewer-server
+install -m 755 target/release/agent-viewer-server ~/.local/bin/agent-viewer-server
+systemctl --user restart agent-viewer-server.service
+```
+
+To run one by hand instead (another box, or a scratch instance):
 
 ```
 cargo run --release -p agent-viewer-server

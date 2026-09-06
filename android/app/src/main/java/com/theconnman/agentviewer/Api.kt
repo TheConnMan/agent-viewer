@@ -262,10 +262,11 @@ enum class ComposerProvider(val wireName: String) {
     CODEX("codex"),
 }
 
+/** A spawn. `model` is `null` when the phone leaves the choice to the server's routing. */
 @Serializable
 data class NewSessionRequest(
     val provider: ComposerProvider,
-    val model: String,
+    val model: String?,
     @SerialName("dir") val folder: String,
     val task: String,
 )

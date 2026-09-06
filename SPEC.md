@@ -1032,7 +1032,10 @@ published crate, which is why `cargo install` targets the git URL.
 ## Phone companion — the v2 terminal surface
 
 `agent-viewer-server` (axum, bin plus lib) shares `-core` with the TUI, binds only
-`127.0.0.1:8477`, and reaches the phone through `tailscale serve` on 8443.
+`127.0.0.1:8477`, and reaches the phone through `tailscale serve` on 8443. On this box it is a
+systemd user unit with `Restart=always` (README "Running it"): the first version was started by
+hand and vanished with the 2026-09-06 reboot, and every request from the phone then answered 502
+from the proxy until someone noticed, so "keep it up" is the unit, not a habit.
 `require_tailscale_user` rejects anything without a `Tailscale-User-Login` header with 401;
 the terminal route additionally demands `Origin: https://appassets.androidplatform.net`
 (`ANDROID_ORIGIN`) and answers 403 to every other origin. The route is
@@ -1167,6 +1170,45 @@ empty backend on a CLI timeout, so rows do vanish and return). The Android back 
 `BackHandler`; `shouldBackButtonBeMappedToEscape()` stays `false`, otherwise the same key would
 type `Esc` into the CLI instead. Leaving closes the socket and not the session, which is the
 grace path below.
+
+**Starting work is a long press on a folder, not a tab.** The first companion had a third
+bottom tab, `new`, with a full composer screen (provider segment, folder text field, model chips,
+task field). Brian's verdict on the phone: "the whole new thread interface I don't like, remove
+it. I should be able to long press the folder group header to spawn a new thread there." So the
+tab and `ComposerScreen` are gone. A long press on a group header in the `all` or `by project`
+grouping opens `SpawnSheet` (a `ModalBottomSheet`) with the folder fixed to the header pressed,
+a provider row (`auto`, `claude`, `codex`) and a task field; the request carries `model: null`,
+so the server routes exactly as an `auto` spawn from the TUI does and the phone has no model
+picker to keep in sync with the catalog. State headers (`by state`) are not places, so their
+long press is consumed and does nothing: with `onLongClick` left null, `combinedClickable`
+counts the release as a tap and folds the group, which the screenshot test pins. After a spawn
+the folder's group is forced open so the new row is visible on the next poll, and the footer
+notice names the folder.
+
+**Group headers fold on a tap, and the fold survives a relaunch.** Every grouping's headers fold
+(the first cut folded only `by project`), and the fold state plus the active filter live in
+`ListPrefs` (`SharedPreferences` `list`): the filter as a name, the groups as a set of toggles
+keyed `FILTER|group`. Toggles rather than "collapsed" so the two defaults coexist: `all` and
+`by state` open until tapped, `by project` folded until tapped. The state is held in
+`AgentViewerApp`, above `SessionListScreen`, because the list composable leaves the tree while
+a terminal is open and a `remember` inside it would reset on the way back; preferences cover
+the process being killed. `ListStateTest` covers the rule and the round trip through a fresh
+`ListPrefs` over the same store.
+
+**Glyph placement.** Brian: "review the icon placement, they look off center in a lot of
+places." Four causes, all in `ViewerApp.kt`: the group-header chevrons were the text glyphs
+`⌄` and `›`, which hang off the baseline (now a drawn `GroupChevron`); the bottom bar carried a
+20 dp bottom padding left over from before `safeDrawingPadding`, so its icons sat in the top
+64 dp of an 84 dp strip; the row's status dot was pinned with a top padding against the title
+rather than centred on the title line (the dot, mark and title now share one row and the lines
+below indent past the dot); and the search and pencil glyphs had their ink in one corner of
+their canvas. The header controls are 44 dp targets around 20 dp glyphs, so the header rows now
+end 12 dp short of the text margin and the glyphs land on the same 18 dp line as the title and
+the group counts; the terminal header uses the same `HeaderControl` and `BackGlyph` as triage
+instead of a text button. `ScreenshotTest` renders the list (all, folded, by state) and triage
+surfaces with sample sessions to `android/app/build/screenshots/*.png` under Robolectric NATIVE
+graphics, by software-drawing the decor view: the compose-test `captureToImage` waits on a draw
+callback Robolectric never delivers. Look at the PNGs when touching layout.
 
 The triage tab is `triageSessionRows`, which mirrors the TUI's `triage_queue` exactly: every
 needs-input session, then every done or idle session, ascending `updated_at_ms` in each group,
