@@ -2022,6 +2022,7 @@ mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("wall tile child");
         let pid = pty.pid().expect("child pid");
@@ -2322,6 +2323,7 @@ mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("spawn attached copy child");
         wait_for_screen(&pty, "COPYREADY");
@@ -2404,6 +2406,7 @@ mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("spawn historical viewport child");
         wait_for_screen(&pty, "LIVE-END");
@@ -2467,6 +2470,7 @@ mod tests {
             cols: 20,
             palette: None,
             scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("spawn whitespace transcript child");
         wait_for_screen(&pty, "   ");
@@ -2503,6 +2507,7 @@ mod tests {
             cols: 24,
             palette: None,
             scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("spawn retained transcript child");
         wait_for_screen(&pty, "retained final λ");
@@ -2546,6 +2551,7 @@ mod tests {
             cols: 20,
             palette: None,
             scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("spawn resize transcript child");
         wait_for_screen(&pty, "resize marker");

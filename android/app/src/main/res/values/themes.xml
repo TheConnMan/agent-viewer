@@ -1,0 +1,8 @@
+<resources>
+    <!-- The window background is only ever visible for the frame before Compose paints, and
+         behind the system bars on the way in; it matches the default theme (analog amber). -->
+    <style name="Theme.AgentViewer" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FF16130D</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

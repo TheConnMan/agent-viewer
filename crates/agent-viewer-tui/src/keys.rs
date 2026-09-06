@@ -2180,6 +2180,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("mouse echoing child")
     }
@@ -2206,6 +2207,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("mouse recording child")
     }
@@ -2229,6 +2231,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("mouse forwarding child")
     }
@@ -2252,6 +2255,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("scroll forwarding child")
     }
@@ -2281,6 +2285,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("codex viewport mouse child")
     }
@@ -2309,6 +2314,7 @@ pub(crate) mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: VIEWPORT_SCROLLBACK_ROWS,
+            output_tap: None,
         })
         .expect("Codex restricted viewport child")
     }
@@ -2544,6 +2550,7 @@ pub(crate) mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("wall tile child")
     }
@@ -2562,6 +2569,7 @@ pub(crate) mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("echoing tile child")
     }
@@ -2878,6 +2886,7 @@ pub(crate) mod tests {
                     cols: 40,
                     palette: None,
                     scrollback_rows: agent_viewer_core::pty::VIEWPORT_SCROLLBACK_ROWS,
+                    output_tap: None,
                 })
                 .expect("scrollable tile child"),
             );
@@ -3782,6 +3791,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("spawn real pty");
 
@@ -3850,6 +3860,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("spawn real pty");
 
@@ -3930,6 +3941,7 @@ pub(crate) mod tests {
             cols: 80,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("spawn real pty");
 
@@ -7196,6 +7208,7 @@ pub(crate) mod tests {
             cols: 40,
             palette: None,
             scrollback_rows: 0,
+            output_tap: None,
         })
         .expect("panel child");
         ui.focused = Some(key.clone());

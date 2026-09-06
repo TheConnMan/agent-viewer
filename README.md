@@ -649,6 +649,105 @@ no ops with the existing footer notice. `agent-viewer --version` and `agent-view
 the version before terminal, filesystem, or backend startup, making them safe release smoke
 paths.
 
+## Phone companion
+
+The Android companion has a session list, a triage inbox, and a new session composer. There is
+no detail screen: **tapping a session opens it** in a real terminal on the phone, the same PTY
+the TUI would attach to, rendered by an embedded VT emulator, with the CLI's own composer doing
+the composing. **Long-pressing a session** opens its action sheet, with status, branch, PR refs
+and age at the top and every action the backend advertises for that row underneath: open
+terminal, stop, archive (Codex hides reversibly; Claude and Grok stop and delete, and the sheet
+says which), and rename. A backend that cannot be attached from the phone (Grok) answers a tap
+with a footer notice, and its long press still works. Android's back button leaves the terminal
+for the list; the session keeps running under its grace window (below). The list shows visible
+sessions only; archived, companion, and subagent threads are not on the phone, and there is no
+hidden filter to reach them. Rows carry the vendor mark of their backend (Claude, OpenAI, xAI),
+tinted in the backend colour, in place of the TUI's `[cc]`/`[cx]`/`[gx]` tags. The four shipped
+themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`, and the status and
+navigation bar icons follow the theme.
+
+The triage tab walks the same queue as the TUI's `Ctrl+N`: every session needing input, then
+every done or idle session, longest wait first within each group. A tap on a card opens the
+terminal, a long press opens the actions, and the badge on the tab counts only the sessions
+that are blocked on you.
+
+### Terminal behaviour
+
+- **Tap the screen** to focus the terminal and raise the keyboard. Typed characters, Enter,
+  arrows, Del, Esc, Tab, and hardware ctrl chords all go straight to the session as bytes.
+  Every kind of Enter submits: a keyboard's Enter key, the newline the AOSP keyboard family
+  commits as text, and the Enter that dictation keyboards such as Wispr Flow press through the
+  IME's editor action all reach the CLI as a carriage return.
+- **The key row** under the terminal covers what a soft keyboard lacks: enter, esc, tab, ctrl,
+  the four arrows, ctrl c, paste, and keyboard. It scrolls horizontally on a narrow screen.
+- **`ctrl` is sticky**, not held. Tapping it shows `[ctrl]` and the next character typed from
+  the key row or the keyboard is sent as a control byte; it then clears itself.
+- **Backgrounding the app closes the socket, not the terminal.** The attached process keeps
+  running on the box for ten minutes, and returning to the screen reconnects and repaints its
+  current screen (not scrollback). A reconnect retries at 750 ms, doubling to a six second
+  ceiling, so a server that is down is not hammered. Past the ten minutes the terminal is
+  killed, and jumping back in attaches to the same agent session again.
+- **close console** ends the attached terminal immediately instead of leaving it in that
+  window. As in the TUI, closing a terminal never ends the agent session; it stays resumable.
+- **`session ended`** in the status line means the attached process exited. The terminal stays
+  on screen and readable; input is disabled.
+- **`replaced by another connection`** means a second attach to the same session took the
+  terminal over (another device, or the app reopening the screen before the old socket finished
+  closing). The newer connection wins; the older screen stays readable with input disabled. A
+  `disconnected` status reconnects on its own, including when the server cut a client that had
+  stopped reading.
+- Screen size follows the phone: rotating or opening the keyboard resizes the session, and the
+  CLI repaints. About 67 columns fit in portrait at the default text size, 146 in landscape.
+
+### Running it
+
+Start the local HTTP server. It binds `127.0.0.1:8477` only, and never listens on the tailnet
+itself:
+
+```
+cargo run --release -p agent-viewer-server
+```
+
+Publish that API on tailnet HTTPS port 8443. Every request is rejected with 401 unless
+Tailscale injected a `Tailscale-User-Login` header, which is what this proxy does, so the
+server is unreachable without it:
+
+```
+tailscale serve --bg --https=8443 http://127.0.0.1:8477
+```
+
+Build the debug APK with the generated debug keystore:
+
+```
+cd android
+ANDROID_HOME=$HOME/android-sdk ./gradlew --no-daemon :app:assembleDebug
+```
+
+Serve the APK to the phone over the same tailnet:
+
+```
+tailscale serve --bg --https=8446 --set-path=/agent-viewer-1.apk \
+  android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Debug builds install as `com.theconnman.agentviewer.debug` (an `applicationIdSuffix` on the
+debug build type), so a sideloaded debug APK never collides with an install signed by a
+different debug keystore; the box's keystore was regenerated on 2026-09-04 and the phone
+answered the mismatched update with a bare "App not installed".
+
+**Bump `versionCode` in `android/app/build.gradle.kts` and use a new served filename on every
+rebuild.** Android refuses to install an APK whose `versionCode` did not advance, and the phone
+serves the cached download when the URL is unchanged, so reusing either one silently installs
+the old build.
+
+The editable API base URL is `ApiConfig.DEFAULT_BASE_URL` in
+`android/app/src/main/java/com/theconnman/agentviewer/Api.kt`. It defaults to
+`https://remote-dev.tail26e2ce.ts.net:8443`.
+
+To exercise the app without a phone, the Google emulator recipe for this box (no KVM, so it
+runs under software emulation and takes about 13 minutes to cold boot) is in
+`.projects/mobile-app-design/spike-terminal-view/README.md`.
+
 ## Test
 
 ```

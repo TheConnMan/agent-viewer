@@ -149,7 +149,7 @@ pub enum SessionOrigin {
     Exec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ArchiveMode {
     /// The provider keeps the thread and can restore it later.
     Reversible,
@@ -157,7 +157,7 @@ pub enum ArchiveMode {
     Deletes,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Capabilities {
     pub spawn: bool,
     pub attach: bool,
@@ -279,7 +279,7 @@ pub struct Session {
 ///
 /// Prose is display-sanitized (the caller wraps it); a tool event is the tool's own name
 /// plus the one argument worth showing, already squashed onto a single line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum TailEvent {
     Agent(String),
     User(String),
