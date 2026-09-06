@@ -654,7 +654,10 @@ paths.
 The Android companion has a session list and a triage inbox. There is no new-session screen:
 **long-pressing a folder header** in the list opens a sheet that starts a session in that
 folder (a task, and `auto`, `claude` or `codex` for who does it; the server's routing picks the
-model). **Tapping a group header** folds or unfolds the group, and the folds and the active
+model). The task field stops growing at about ten lines and scrolls inside itself, so Start
+stays on screen however long the prompt runs. A folder whose only session is a `hold` thread
+keeps its header with a count of zero, as on the desktop, so it can still be pressed to start
+work there. **Tapping a group header** folds or unfolds the group, and the folds and the active
 filter chip are remembered across terminal visits and app restarts (`all` and `by state` start
 open, `by project` starts folded). There is
 no detail screen: **tapping a session opens it** in a real terminal on the phone, the same PTY

@@ -60,6 +60,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.font.FontFamily
@@ -157,7 +159,7 @@ internal val sessionFilters: List<Pair<SessionFilter, String>> = listOf(
 )
 
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
-    sessions.filter { !it.hidden && !it.companion && !it.title.equals("Hold", ignoreCase = true) }
+    sessions.filter { !it.hidden && !it.companion && !it.isHold() }
 
 /** The phone's triage inbox, in the TUI's order (`ui::triage::triage_queue`): every needs-input
  * session, then every done or idle session, longest wait first within each group. Working, error
@@ -471,21 +473,25 @@ internal fun SessionListScreen(
     var searchVisible by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     val normalSessions = normalSessionRows(sessions)
-    val filtered = normalSessions
-        .filter { session ->
-            query.isBlank() || listOf(
-                session.title,
-                session.summary,
-                session.cwd,
-                session.projectRoot.orEmpty(),
-            ).any { it.contains(query, ignoreCase = true) }
-        }
+    val matches = { session: Session ->
+        query.isBlank() || listOf(
+            session.title,
+            session.summary,
+            session.cwd,
+            session.projectRoot.orEmpty(),
+        ).any { it.contains(query, ignoreCase = true) }
+    }
     val groups = if (filter == SessionFilter.STATE) {
-        filtered.groupBy { statusLabel(it.status) }
+        normalSessions.filter(matches)
+            .groupBy { statusLabel(it.status) }
             .toList()
             .sortedBy { (_, rows) -> rows.minOf(::statusRank) }
     } else {
-        filtered.groupBy { it.projectRoot ?: it.cwd }.toSortedMap().toList()
+        // Folder groups come from every served session, hold threads included, so a folder
+        // held open by a parked `hold` thread keeps its header (with nothing under it) and
+        // can still be long-pressed; `normalSessionRows` would have dropped the folder with
+        // the row.
+        folderGroups(sessions, matches)
     }
     val waiting = normalSessions.count { it.status is Status.NeedsInput }
     val working = normalSessions.count { it.status == Status.Working }
@@ -1176,9 +1182,29 @@ private fun BottomGlyph(tab: BottomTab, color: Color) {
             BottomTab.SESSIONS -> listOf(5f, 10.5f, 16f).forEach { y ->
                 drawLine(color, Offset(2.dp.toPx(), y.dp.toPx()), Offset(19.dp.toPx(), y.dp.toPx()), stroke)
             }
+            // An inbox tray on the same 2..19 footprint as the list lines beside it. The `!`
+            // it replaces was one thin 18 dp column next to a 17 dp wide list: the pair never
+            // read as level, and the mark said "alert" rather than "queue".
             BottomTab.TRIAGE -> {
-                drawLine(color, Offset(10.5.dp.toPx(), 2.dp.toPx()), Offset(10.5.dp.toPx(), 13.dp.toPx()), stroke)
-                drawCircle(color, 1.2.dp.toPx(), Offset(10.5.dp.toPx(), 18.dp.toPx()))
+                val tray = Path().apply {
+                    moveTo(2.dp.toPx(), 11.dp.toPx())
+                    lineTo(5.dp.toPx(), 4.dp.toPx())
+                    lineTo(16.dp.toPx(), 4.dp.toPx())
+                    lineTo(19.dp.toPx(), 11.dp.toPx())
+                    lineTo(19.dp.toPx(), 17.dp.toPx())
+                    lineTo(2.dp.toPx(), 17.dp.toPx())
+                    close()
+                }
+                drawPath(tray, color, style = Stroke(stroke, join = StrokeJoin.Round))
+                val slot = Path().apply {
+                    moveTo(2.dp.toPx(), 11.dp.toPx())
+                    lineTo(6.5.dp.toPx(), 11.dp.toPx())
+                    lineTo(8.dp.toPx(), 13.5.dp.toPx())
+                    lineTo(13.dp.toPx(), 13.5.dp.toPx())
+                    lineTo(14.5.dp.toPx(), 11.dp.toPx())
+                    lineTo(19.dp.toPx(), 11.dp.toPx())
+                }
+                drawPath(slot, color, style = Stroke(stroke, join = StrokeJoin.Round))
             }
         }
     }

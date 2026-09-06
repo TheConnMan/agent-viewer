@@ -73,6 +73,40 @@ class ListStateTest {
         assertFalse(groupExpanded(SessionFilter.PROJECT, "/somewhere/else", relaunched.toggled()))
     }
 
+    private fun session(title: String, folder: String) = Session(
+        backend = BackendKind.CLAUDE,
+        id = "$folder/$title",
+        origin = SessionOrigin.BACKGROUND,
+        title = title,
+        cwd = folder,
+        status = Status.Done,
+        createdAtMs = 0,
+        updatedAtMs = 0,
+        projectRoot = folder,
+    )
+
+    @Test
+    fun `a folder whose only session is a hold thread keeps its header with nothing under it`() {
+        val wiki = "/home/brian/wiki"
+        val groups = folderGroups(
+            listOf(
+                session("Hold", wiki),
+                session("Route Grok spawns", folder),
+                session("HOLD", folder),
+                session("Stale", "/home/brian/old").copy(hidden = true),
+            ),
+        )
+        assertEquals(listOf(folder, wiki), groups.map { it.first }, "folders sort by path; a hidden row makes no folder")
+        assertEquals(listOf("Route Grok spawns"), groups[0].second.map { it.title }, "hold rows are not drawn or counted")
+        assertEquals(emptyList(), groups[1].second)
+    }
+
+    @Test
+    fun `a search keeps a hold-only folder whose path matches and drops one that does not`() {
+        val groups = folderGroups(listOf(session("Hold", "/home/brian/wiki"), session("Hold", folder))) { "wiki" in it.cwd }
+        assertEquals(listOf("/home/brian/wiki"), groups.map { it.first })
+    }
+
     @Test
     fun `an unknown stored filter falls back to all`() {
         val context = RuntimeEnvironment.getApplication()

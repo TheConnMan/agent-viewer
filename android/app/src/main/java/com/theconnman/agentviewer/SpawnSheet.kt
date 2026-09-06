@@ -12,6 +12,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,6 +23,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -69,13 +73,21 @@ internal fun SpawnSheet(
         onDismiss()
     }
 
+    // Fully open from the start: a half-height sheet leaves Start below the fold once the task
+    // field has a few lines in it, and the drag up to reach it is not obvious on a phone.
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = dismiss,
+        sheetState = sheetState,
         containerColor = colors.surface,
         contentColor = colors.text,
     ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp).padding(bottom = 28.dp),
+            // The task field stops growing at `taskFieldMaxHeight` and scrolls inside itself,
+            // and the column scrolls above the keyboard, so however long the dictated prompt
+            // gets, Start stays on screen.
+            modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).imePadding()
+                .padding(horizontal = 18.dp).padding(bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -98,7 +110,7 @@ internal fun SpawnSheet(
             OutlinedTextField(
                 value = task,
                 onValueChange = { task = it },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 112.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 112.dp, max = taskFieldMaxHeight),
                 enabled = !submitting,
                 placeholder = { Text("what should it do?", color = colors.faint) },
                 textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = colors.text),
@@ -123,6 +135,10 @@ internal fun SpawnSheet(
         }
     }
 }
+
+/** Where the task field stops growing: about ten lines, a third of a phone screen, leaving
+ * room for the provider row and Start above the keyboard. Past this the field scrolls. */
+private val taskFieldMaxHeight = 200.dp
 
 /** Who does the work: the router's choice, or a pinned CLI. Same three entries as the server. */
 @Composable

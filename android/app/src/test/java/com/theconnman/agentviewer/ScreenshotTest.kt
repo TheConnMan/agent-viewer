@@ -72,11 +72,14 @@ class ScreenshotTest {
 
     private val viewer = "/home/brian/git/theconnman/agent-viewer"
     private val router = "/home/brian/git/theconnman/agent-router"
+    private val wiki = "/home/brian/wiki"
     private val sessions = listOf(
         session("a1", "Phone feedback: spawn from folder headers", Status.Working, viewer),
         session("a2", "Keep the companion server up", Status.NeedsInput("Approve the unit file"), viewer, BackendKind.CODEX, 42, pr = "118"),
         session("a3", "Review icon placement", Status.Done, viewer, BackendKind.GROK, 130),
         session("b1", "Route Grok spawns", Status.Idle, router, BackendKind.CODEX, 900),
+        // A parked thread holding the wiki folder open: never a row, but the folder is a place.
+        session("h1", "Hold", Status.Done, wiki, BackendKind.CODEX, 4000),
     )
 
     /** Software-draws the window into a PNG: Robolectric never delivers the draw callback the
@@ -141,7 +144,14 @@ class ScreenshotTest {
         }
         compose.waitForIdle()
         compose.onNodeWithText("Keep the companion server up").assertIsDisplayed()
+        compose.onNodeWithText("Hold").assertDoesNotExist()
+        compose.onNodeWithText(wiki).assertIsDisplayed()
         save("list-all")
+
+        compose.onNodeWithContentDescription("collapse $wiki").performTouchInput { longClick() }
+        compose.waitForIdle()
+        assertEquals(wiki, spawnFolder, "a folder held open by a hold thread still starts work")
+        spawnFolder = null
 
         compose.onNodeWithContentDescription("collapse $viewer").performClick()
         compose.waitForIdle()
@@ -163,6 +173,7 @@ class ScreenshotTest {
         assertNull(spawnFolder, "a state header is not a folder and cannot start work")
         assertEquals(emptySet(), toggled.filter { it.startsWith("STATE|") }.toSet(), "the long press did not fold it either")
         compose.onNodeWithText("Keep the companion server up").assertIsDisplayed()
+        compose.onNodeWithText(wiki).assertDoesNotExist()
         save("list-by-state")
     }
 

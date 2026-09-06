@@ -1,6 +1,7 @@
 package com.theconnman.agentviewer
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasSetTextAction
@@ -67,6 +68,34 @@ class SpawnSheetTest {
             assertEquals(folder, body.getValue("dir").jsonPrimitive.content)
             assertEquals("Keep the companion server up", body.getValue("task").jsonPrimitive.content)
             assertTrue(body.getValue("model") is JsonNull, "no model picker on the phone: $body")
+        }
+    }
+
+    @Test
+    fun `a task longer than the screen leaves start on screen and sends the whole text`() {
+        val folder = "/home/brian/git/theconnman/agent-viewer"
+        val task = (1..80).joinToString("\n") { "line $it of a dictated prompt that runs on and on" }
+        LoopbackServer("""{"backend":"Claude","session_id":"abc","pid":null}""").use { server ->
+            val api = ApiClient(server.baseUrl)
+            val launcher = SpawnLauncher({ api.create(it) }, Dispatchers.Unconfined)
+            compose.setContent {
+                SpawnSheet(
+                    folder = folder,
+                    launcher = launcher,
+                    colors = AppTheme.ANALOG_AMBER.colors,
+                    onDismiss = {},
+                )
+            }
+            compose.waitForIdle()
+            compose.onNode(hasSetTextAction()).performTextInput(task)
+            compose.waitForIdle()
+            compose.onNodeWithText("start").assertIsDisplayed()
+            compose.onNodeWithText("start").performClick()
+            compose.waitUntil(10_000) { launcher.outcome != null }
+            assertEquals(SpawnOutcome(folder, error = null), launcher.outcome)
+
+            val body = Json.parseToJsonElement(server.requests.single().body).jsonObject
+            assertEquals(task, body.getValue("task").jsonPrimitive.content)
         }
     }
 }

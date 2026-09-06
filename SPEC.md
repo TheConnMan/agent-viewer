@@ -1200,6 +1200,22 @@ nothing newer already has. The third finding, that the sheet stays open after it
 last row leaves the list, is by design: the sheet is a place, not a row, and a folder on disk
 is still somewhere to start work.
 
+Round three of the same feedback, after v1.9 was on the phone. "When I type a super long
+prompt, I can't submit it because the input box gets too high": the task field had a minimum
+height and no maximum, the sheet's column did not scroll, and a `ModalBottomSheet` opens
+half-height by default, so a dictated prompt pushed Start off the screen. The field now stops at
+`taskFieldMaxHeight` (200 dp, about ten lines) and scrolls inside itself, the column scrolls and
+carries `imePadding`, and the sheet skips the partially expanded state. `SpawnSheetTest` types
+eighty lines, asserts Start is still displayed, and checks the whole text reaches the wire. "The
+wiki folder doesn't show up in the UI even though it has a hidden Hold thread keeping it open":
+the thread is not archived (the server lists it, `hidden: false`); it is the presentation rule
+from the TUI, where a `hold` title is never a row but its project header stays with count zero.
+The phone's `normalSessionRows` dropped the row and the folder with it, so `folderGroups` in
+`ListState.kt` now builds the `all`/`by project` headers from every served session and strips
+hold rows underneath, matching `app.rs`; by-state sections, counts, triage and the badge still
+exclude them. And the triage tab's `!` glyph, a single 18 dp column beside a 17 dp wide list
+mark, never read as level; it is now an inbox tray on the same 2..19 footprint.
+
 **Group headers fold on a tap, and the fold survives a relaunch.** Every grouping's headers fold
 (the first cut folded only `by project`), and the fold state plus the active filter live in
 `ListPrefs` (`SharedPreferences` `list`): the filter as a name, the groups as a set of toggles

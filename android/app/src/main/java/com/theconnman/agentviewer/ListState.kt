@@ -55,3 +55,23 @@ internal fun expandGroup(filter: SessionFilter, group: String, toggled: Set<Stri
 
 /** PURE: whether a grouping's headers are folders, which is what a long press can start work in. */
 internal fun groupIsFolder(filter: SessionFilter): Boolean = filter != SessionFilter.STATE
+
+/** The TUI's `is_hold_title`: a parked thread whose whole title is `hold`, in any letter case. */
+internal fun Session.isHold(): Boolean = title.equals("hold", ignoreCase = true)
+
+/**
+ * PURE: the folder groups of the `all` and `by project` listings, sorted by path, each with the
+ * rows drawn under it. A hold thread is never a row and is never counted, but it keeps its
+ * folder: a folder whose only session is a hold thread has a header with nothing under it,
+ * exactly as the TUI's project headers do, so it can still be folded and long-pressed to start
+ * work there. `matches` is the search box; a hold-only folder stays while its path matches.
+ */
+internal fun folderGroups(
+    sessions: List<Session>,
+    matches: (Session) -> Boolean = { true },
+): List<Pair<String, List<Session>>> =
+    sessions
+        .filter { !it.hidden && !it.companion && matches(it) }
+        .groupBy { it.projectRoot ?: it.cwd }
+        .toSortedMap()
+        .map { (folder, rows) -> folder to rows.filterNot { it.isHold() } }
