@@ -12,6 +12,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
@@ -40,11 +41,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -61,6 +60,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.font.FontFamily
@@ -145,7 +146,8 @@ enum class AppTheme(val displayName: String, val colors: ViewerColors) {
     }
 }
 
-private enum class BottomTab { SESSIONS, TRIAGE, NEW }
+/** Two tabs. Starting work is not a screen: it is a long press on the folder it belongs in. */
+private enum class BottomTab { SESSIONS, TRIAGE }
 internal enum class SessionFilter { ALL, PROJECT, STATE }
 
 /** The filter chips, in the order the row draws them. There is no hidden chip: the server only
@@ -157,7 +159,7 @@ internal val sessionFilters: List<Pair<SessionFilter, String>> = listOf(
 )
 
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
-    sessions.filter { !it.hidden && !it.companion && !it.title.equals("Hold", ignoreCase = true) }
+    sessions.filter { !it.hidden && !it.companion && !it.isHold() }
 
 /** The phone's triage inbox, in the TUI's order (`ui::triage::triage_queue`): every needs-input
  * session, then every done or idle session, longest wait first within each group. Working, error
@@ -215,6 +217,22 @@ fun AgentViewerApp() {
     var notice by remember { mutableStateOf<String?>(null) }
     // The row whose long-press action sheet is open, if any.
     var actionsKey by remember { mutableStateOf<String?>(null) }
+    // The folder whose long-press spawn sheet is open, if any.
+    var spawnFolder by rememberSaveable { mutableStateOf<String?>(null) }
+    // The list's filter and collapsed groups live here, above the list screen, so a visit to a
+    // terminal does not reset them, and in preferences so a relaunch does not either.
+    val context = LocalContext.current
+    val listPrefs = remember(context) { ListPrefs(context) }
+    var filter by remember { mutableStateOf(listPrefs.filter) }
+    var toggledGroups by remember { mutableStateOf(listPrefs.toggled()) }
+    val setFilter: (SessionFilter) -> Unit = {
+        filter = it
+        listPrefs.filter = it
+    }
+    val setToggledGroups: (Set<String>) -> Unit = {
+        toggledGroups = it
+        listPrefs.setToggled(it)
+    }
     // Capabilities are backend-advertised per session and fetched on first use, so a tap on a row
     // that cannot be attached (Grok) is a notice rather than a broken terminal screen. Keyed by
     // `capabilityCacheKey`, so a status change refetches rather than serving a stale `stop`.
@@ -223,6 +241,8 @@ fun AgentViewerApp() {
     // cannot switch a terminal the user has already moved on from.
     var pendingOpen by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val api = remember { ApiClient() }
+    val launcher = remember { SpawnLauncher.default }
+    val listSequence = remember { ListSequencer() }
     val foreground = rememberForeground()
     val scope = rememberCoroutineScope()
     val colors = appTheme.colors
@@ -238,12 +258,18 @@ fun AgentViewerApp() {
         loadError = null
         if (actionsKey != null && fresh.none { it.key() == actionsKey }) actionsKey = null
     }
+    // Every listing request takes a generation and a response is applied only if nothing
+    // newer already was, so a poll that left before a spawn cannot undo the refresh after it.
+    val fetchSessions: suspend () -> Unit = {
+        val generation = listSequence.next()
+        runCatching { api.sessions() }
+            .onSuccess { if (listSequence.accept(generation)) applySessions(it) }
+            .onFailure { loadError = it.message ?: "Could not load sessions" }
+    }
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
         while (isActive) {
-            runCatching { api.sessions() }
-                .onSuccess(applySessions)
-                .onFailure { loadError = it.message ?: "Could not load sessions" }
+            fetchSessions()
             delay(2_000)
         }
     }
@@ -255,12 +281,25 @@ fun AgentViewerApp() {
     }
 
     val refresh: () -> Unit = {
-        scope.launch {
-            runCatching { api.sessions() }
-                .onSuccess(applySessions)
-                .onFailure { loadError = it.message ?: "Could not load sessions" }
-        }
+        scope.launch { fetchSessions() }
         Unit
+    }
+    // A finished spawn is handled here, not in the sheet, so it lands whether or not the sheet
+    // is still open (swiped away while starting, or recreated by a rotation).
+    LaunchedEffect(launcher.outcome) {
+        val outcome = launcher.outcome ?: return@LaunchedEffect
+        if (outcome.error == null) {
+            if (spawnFolder == outcome.folder) spawnFolder = null
+            // The new row lands in this folder's group; make sure it can be seen.
+            setToggledGroups(expandGroup(filter, outcome.folder, toggledGroups))
+            notice = "started in ${outcome.folder.substringAfterLast('/')}"
+            launcher.consume(outcome)
+            refresh()
+        } else if (spawnFolder != outcome.folder) {
+            notice = "could not start in ${outcome.folder.substringAfterLast('/')}: ${outcome.error}"
+            launcher.consume(outcome)
+        }
+        // With the sheet open, it shows the error itself and consumes it on dismiss.
     }
     suspend fun capabilitiesFor(session: Session): Capabilities? =
         capabilityCache[session.capabilityCacheKey()]
@@ -333,9 +372,14 @@ fun AgentViewerApp() {
                                 sessions = sessions,
                                 error = loadError,
                                 colors = colors,
+                                filter = filter,
+                                toggledGroups = toggledGroups,
+                                onFilter = setFilter,
+                                onToggleGroup = { group -> setToggledGroups(toggleGroup(filter, group, toggledGroups)) },
                                 onTheme = { appTheme = nextTheme(appTheme) },
                                 onOpen = open,
                                 onActions = openActions,
+                                onSpawn = { folder -> spawnFolder = folder },
                             )
 
                             BottomTab.TRIAGE -> TriageScreen(
@@ -345,23 +389,19 @@ fun AgentViewerApp() {
                                 onActions = openActions,
                                 onBack = { tab = BottomTab.SESSIONS },
                             )
-
-                            BottomTab.NEW -> ComposerScreen(
-                                api = api,
-                                colors = colors,
-                                onCreated = {
-                                    tab = BottomTab.SESSIONS
-                                    refresh()
-                                },
-                                onClose = { tab = BottomTab.SESSIONS },
-                            )
                         }
                         notice?.let { FooterNotice(it, colors, Modifier.align(Alignment.BottomCenter)) }
                     }
-                    if (tab != BottomTab.NEW) {
-                        BottomNavigation(tab = tab, sessions = sessions, colors = colors) { tab = it }
-                    }
+                    BottomNavigation(tab = tab, sessions = sessions, colors = colors) { tab = it }
                 }
+            }
+            spawnFolder?.let { folder ->
+                SpawnSheet(
+                    folder = folder,
+                    launcher = launcher,
+                    colors = colors,
+                    onDismiss = { spawnFolder = null },
+                )
             }
             actionsSession?.let { session ->
                 SessionActionsSheet(
@@ -412,35 +452,46 @@ private fun rememberForeground(): Boolean {
     return foreground
 }
 
+/**
+ * The session list. Every group header folds on a tap (the fold is remembered, see `ListPrefs`),
+ * and a folder header starts a new session in that folder on a long press.
+ */
 @Composable
-private fun SessionListScreen(
+internal fun SessionListScreen(
     sessions: List<Session>,
     error: String?,
     colors: ViewerColors,
+    filter: SessionFilter,
+    toggledGroups: Set<String>,
+    onFilter: (SessionFilter) -> Unit,
+    onToggleGroup: (String) -> Unit,
     onTheme: () -> Unit,
     onOpen: (Session) -> Unit,
     onActions: (Session) -> Unit,
+    onSpawn: (String) -> Unit,
 ) {
-    var filter by remember { mutableStateOf(SessionFilter.ALL) }
-    var expandedProjects by remember { mutableStateOf(emptySet<String>()) }
     var searchVisible by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     val normalSessions = normalSessionRows(sessions)
-    val filtered = normalSessions
-        .filter { session ->
-            query.isBlank() || listOf(
-                session.title,
-                session.summary,
-                session.cwd,
-                session.projectRoot.orEmpty(),
-            ).any { it.contains(query, ignoreCase = true) }
-        }
+    val matches = { session: Session ->
+        query.isBlank() || listOf(
+            session.title,
+            session.summary,
+            session.cwd,
+            session.projectRoot.orEmpty(),
+        ).any { it.contains(query, ignoreCase = true) }
+    }
     val groups = if (filter == SessionFilter.STATE) {
-        filtered.groupBy { statusLabel(it.status) }
+        normalSessions.filter(matches)
+            .groupBy { statusLabel(it.status) }
             .toList()
             .sortedBy { (_, rows) -> rows.minOf(::statusRank) }
     } else {
-        filtered.groupBy { it.projectRoot ?: it.cwd }.toSortedMap().toList()
+        // Folder groups come from every served session, hold threads included, so a folder
+        // held open by a parked `hold` thread keeps its header (with nothing under it) and
+        // can still be long-pressed; `normalSessionRows` would have dropped the folder with
+        // the row.
+        folderGroups(sessions, matches)
     }
     val waiting = normalSessions.count { it.status is Status.NeedsInput }
     val working = normalSessions.count { it.status == Status.Working }
@@ -478,7 +529,7 @@ private fun SessionListScreen(
             StateCount("working", working, colors.accent, colors)
             StateCount("done", done, colors.ok, colors)
         }
-        FilterRow(filter, colors) { filter = it }
+        FilterRow(filter, colors, onFilter)
         if (error != null) {
             Text(
                 text = error,
@@ -492,25 +543,15 @@ private fun SessionListScreen(
         }
         LazyColumn(modifier = Modifier.weight(1f)) {
             groups.forEach { (group, rows) ->
-                val expandable = filter == SessionFilter.PROJECT
-                val expanded = !expandable || group in expandedProjects
+                val expanded = groupExpanded(filter, group, toggledGroups)
                 item(key = "group-$filter-$group") {
-                    ProjectHeader(
+                    GroupHeader(
                         label = group,
                         count = rows.size,
                         colors = colors,
                         expanded = expanded,
-                        onToggle = if (expandable) {
-                            {
-                                expandedProjects = if (expanded) {
-                                    expandedProjects - group
-                                } else {
-                                    expandedProjects + group
-                                }
-                            }
-                        } else {
-                            null
-                        },
+                        onToggle = { onToggleGroup(group) },
+                        onSpawn = if (groupIsFolder(filter)) ({ onSpawn(group) }) else null,
                     )
                 }
                 if (expanded) {
@@ -533,8 +574,10 @@ private fun MainHeader(
     onSearch: () -> Unit,
     onTheme: () -> Unit,
 ) {
+    // The controls are 44 dp touch targets around 20 dp glyphs, so the row ends 12 dp short of
+    // the text margin and the glyphs themselves land on the same 18 dp line as the title.
     Row(
-        modifier = Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 18.dp),
+        modifier = Modifier.fillMaxWidth().height(68.dp).padding(start = 18.dp, end = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -552,28 +595,33 @@ private fun MainHeader(
     }
 }
 
+/** A round 44 dp touch target with its glyph dead centre; every header control uses it. */
 @Composable
-private fun HeaderControl(onClick: () -> Unit, content: @Composable () -> Unit) {
+internal fun HeaderControl(onClick: () -> Unit, content: @Composable () -> Unit) {
     Box(
         modifier = Modifier.size(44.dp).clip(CircleShape).clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { content() }
 }
 
+// Every glyph below is drawn so its ink spans the canvas symmetrically (bounding box centred on
+// the canvas centre); a glyph whose ink sits in one corner of its canvas is what reads as
+// "off centre" once the canvas itself is centred in a control.
 @Composable
 private fun SearchGlyph(color: Color) {
     Canvas(modifier = Modifier.size(20.dp)) {
         val stroke = 1.7.dp.toPx()
+        // Lens 1.5..14.5, handle to 18.5: ink spans 1.5..18.5 on both axes.
         drawCircle(
             color = color,
-            radius = 6.dp.toPx(),
-            center = Offset(9.dp.toPx(), 9.dp.toPx()),
+            radius = 6.5.dp.toPx(),
+            center = Offset(8.dp.toPx(), 8.dp.toPx()),
             style = Stroke(width = stroke),
         )
         drawLine(
             color = color,
-            start = Offset(13.5.dp.toPx(), 13.5.dp.toPx()),
-            end = Offset(19.dp.toPx(), 19.dp.toPx()),
+            start = Offset(12.7.dp.toPx(), 12.7.dp.toPx()),
+            end = Offset(18.5.dp.toPx(), 18.5.dp.toPx()),
             strokeWidth = stroke,
         )
     }
@@ -597,52 +645,6 @@ private fun GlobeGlyph(color: Color) {
             end = Offset(18.dp.toPx(), 10.dp.toPx()),
             strokeWidth = stroke,
         )
-    }
-}
-
-@Composable
-private fun Header(
-    title: String,
-    subtitle: String?,
-    colors: ViewerColors,
-    leading: String? = null,
-    trailing: String? = null,
-    onLeading: (() -> Unit)? = null,
-    onTrailing: (() -> Unit)? = null,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 18.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (leading != null) {
-            Text(
-                text = leading,
-                color = colors.muted,
-                fontSize = 26.sp,
-                modifier = Modifier.padding(end = 12.dp).clickable { onLeading?.invoke() },
-            )
-        }
-        Column(modifier = Modifier.weight(1f)) {
-            Text(title, color = colors.text, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
-            if (subtitle != null) {
-                Text(
-                    subtitle,
-                    color = colors.faint,
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                    letterSpacing = 0.4.sp,
-                )
-            }
-        }
-        if (trailing != null) {
-            Text(
-                text = trailing,
-                color = colors.muted,
-                fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.clip(RoundedCornerShape(7.dp)).clickable { onTrailing?.invoke() }.padding(8.dp),
-            )
-        }
     }
 }
 
@@ -680,22 +682,31 @@ private fun FilterRow(selected: SessionFilter, colors: ViewerColors, onSelected:
     }
 }
 
+/**
+ * One group header. A tap folds or unfolds the group; on a folder group a long press starts a
+ * new session there (`onSpawn` is null for the by-state grouping, whose headers are not places).
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ProjectHeader(
+private fun GroupHeader(
     label: String,
     count: Int,
     colors: ViewerColors,
     expanded: Boolean,
-    onToggle: (() -> Unit)?,
+    onToggle: () -> Unit,
+    onSpawn: (() -> Unit)?,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().background(colors.surface).border(1.dp, colors.border)
-            .then(if (onToggle != null) Modifier.clickable(onClick = onToggle) else Modifier)
-            .padding(horizontal = 18.dp, vertical = 7.dp),
+            // A long press on a state header is consumed and does nothing; left null, Compose
+            // would count the release as a tap and fold the group.
+            .combinedClickable(onClick = onToggle, onLongClick = onSpawn ?: {})
+            .semantics { contentDescription = if (expanded) "collapse $label" else "expand $label" }
+            .padding(horizontal = 18.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(if (expanded) "⌄" else "›", color = colors.faint, fontSize = 14.sp)
-        Spacer(Modifier.width(8.dp))
+        GroupChevron(expanded, colors.faint)
+        Spacer(Modifier.width(9.dp))
         Text(
             label,
             color = colors.muted,
@@ -706,6 +717,22 @@ private fun ProjectHeader(
             overflow = TextOverflow.Ellipsis,
         )
         Text(count.toString(), color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+    }
+}
+
+/** A drawn chevron, down when open and right when folded. The text glyphs it replaces (`⌄`,
+ * `›`) hang off the baseline and never sat level with the label. */
+@Composable
+private fun GroupChevron(expanded: Boolean, color: Color) {
+    Canvas(Modifier.size(12.dp)) {
+        val stroke = 1.7.dp.toPx()
+        if (expanded) {
+            drawLine(color, Offset(2.5.dp.toPx(), 4.dp.toPx()), Offset(6.dp.toPx(), 8.dp.toPx()), stroke)
+            drawLine(color, Offset(6.dp.toPx(), 8.dp.toPx()), Offset(9.5.dp.toPx(), 4.dp.toPx()), stroke)
+        } else {
+            drawLine(color, Offset(4.dp.toPx(), 2.5.dp.toPx()), Offset(8.dp.toPx(), 6.dp.toPx()), stroke)
+            drawLine(color, Offset(8.dp.toPx(), 6.dp.toPx()), Offset(4.dp.toPx(), 9.5.dp.toPx()), stroke)
+        }
     }
 }
 
@@ -728,9 +755,12 @@ private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Uni
         horizontalArrangement = Arrangement.spacedBy(11.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        StatusDot(statusColor(session.status, colors), Modifier.padding(top = 5.dp))
         Column(modifier = Modifier.weight(1f)) {
+            // The dot, the mark and the title share one row so all three are centred on the
+            // same line; the lines below indent past the dot to keep the title's left edge.
             Row(verticalAlignment = Alignment.CenterVertically) {
+                StatusDot(statusColor(session.status, colors))
+                Spacer(Modifier.width(11.dp))
                 BackendIcon(session.backend, colors, size = 13.dp)
                 Spacer(Modifier.width(7.dp))
                 Text(
@@ -750,9 +780,9 @@ private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Uni
                 lineHeight = 15.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 4.dp),
+                modifier = Modifier.padding(start = 20.dp, top = 4.dp),
             )
-            Row(modifier = Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(modifier = Modifier.padding(start = 20.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(statusLabel(session.status), color = statusColor(session.status, colors), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 session.prRefs.firstOrNull()?.let { pr ->
                     Spacer(Modifier.width(8.dp))
@@ -768,6 +798,17 @@ private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Uni
         }
         Text(sessionAge(session.updatedAtMs), color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
     }
+}
+
+/** Test seams: the screens are private, the screenshot test renders them through these. */
+@Composable
+internal fun TriageScreenPreview(sessions: List<Session>, colors: ViewerColors) {
+    TriageScreen(sessions = sessions, colors = colors, onOpen = {}, onActions = {}, onBack = {})
+}
+
+@Composable
+internal fun BottomNavigationPreview(sessions: List<Session>, colors: ViewerColors) {
+    BottomNavigation(tab = BottomTab.SESSIONS, sessions = sessions, colors = colors) {}
 }
 
 @Composable
@@ -807,10 +848,11 @@ private fun TriageScreen(
 @Composable
 private fun TriageHeader(count: Int, colors: ViewerColors, onBack: () -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 10.dp),
+        modifier = Modifier.fillMaxWidth().height(68.dp).padding(start = 6.dp, end = 18.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         HeaderControl(onClick = onBack) { BackGlyph(colors.muted) }
+        Spacer(Modifier.width(4.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text("triage", color = colors.text, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
             Text(
@@ -826,7 +868,6 @@ private fun TriageHeader(count: Int, colors: ViewerColors, onBack: () -> Unit) {
         ) {
             Text(count.toString(), color = colors.bg, fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
-        Spacer(Modifier.width(8.dp))
     }
 }
 
@@ -886,170 +927,6 @@ private fun TriageCard(
             modifier = Modifier.fillMaxWidth().background(colors.bg, RoundedCornerShape(7.dp)).padding(11.dp),
         )
         Text(statusLabel(session.status), color = accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-@Composable
-private fun ComposerScreen(
-    api: ApiClient,
-    colors: ViewerColors,
-    onCreated: () -> Unit,
-    onClose: () -> Unit,
-) {
-    var provider by rememberSaveable { mutableStateOf(ComposerProvider.AUTO) }
-    var models by remember { mutableStateOf<Map<ComposerProvider, List<String>>>(emptyMap()) }
-    var modelsLoaded by remember { mutableStateOf(false) }
-    var model by rememberSaveable { mutableStateOf("auto") }
-    var folder by rememberSaveable { mutableStateOf("") }
-    var task by rememberSaveable { mutableStateOf("") }
-    var submitting by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-    val submitter = remember(api) { SessionSubmitter { request -> api.create(request) } }
-    LaunchedEffect(Unit) {
-        runCatching { api.models() }
-            .onSuccess {
-                models = it
-                modelsLoaded = true
-            }
-            .onFailure { error = it.message ?: "Could not load models" }
-    }
-    fun fallbackModel(value: ComposerProvider): String =
-        if (value == ComposerProvider.AUTO) "auto" else "default"
-    fun discoveredModels(value: ComposerProvider): List<String> =
-        models[value].orEmpty().ifEmpty { listOf(fallbackModel(value)) }
-    val choices = if (modelsLoaded) {
-        discoveredModels(provider)
-    } else {
-        listOf(model)
-    }
-    LaunchedEffect(modelsLoaded, models) {
-        if (modelsLoaded) {
-            val discovered = discoveredModels(provider)
-            if (model !in discovered) model = discovered.first()
-        }
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        Header("new session", null, colors, leading = "×", onLeading = onClose)
-        Column(
-            modifier = Modifier.weight(1f).padding(horizontal = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp),
-        ) {
-            FormLabel("provider", colors)
-            Row(
-                modifier = Modifier.fillMaxWidth().background(colors.surface, RoundedCornerShape(10.dp)).padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                ComposerProvider.entries.forEach { option ->
-                    val active = option == provider
-                    Box(
-                        modifier = Modifier.weight(1f).clip(RoundedCornerShape(7.dp))
-                            .background(if (active) colors.selbg else Color.Transparent)
-                            .clickable {
-                                if (provider != option) {
-                                    provider = option
-                                    model = if (modelsLoaded) {
-                                        discoveredModels(option).first()
-                                    } else {
-                                        fallbackModel(option)
-                                    }
-                                }
-                            }
-                            .padding(vertical = 8.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (option == ComposerProvider.AUTO) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    "auto",
-                                    color = if (active) colors.text else colors.muted,
-                                    fontSize = 14.sp,
-                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                )
-                                Text("router", color = colors.accent, fontFamily = FontFamily.Monospace, fontSize = 9.sp)
-                            }
-                        } else {
-                            val backend = if (option == ComposerProvider.CLAUDE) BackendKind.CLAUDE else BackendKind.CODEX
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                BackendIcon(backend, colors, size = 14.dp)
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    option.wireName,
-                                    color = if (active) colors.text else colors.muted,
-                                    fontSize = 14.sp,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            FormLabel("folder", colors)
-            OutlinedTextField(
-                value = folder,
-                onValueChange = { folder = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                placeholder = { Text("/home/brian/git/project", color = colors.faint) },
-                textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = colors.text),
-                leadingIcon = { FolderGlyph(colors.accent) },
-                trailingIcon = { ChevronGlyph(colors.faint) },
-            )
-            FormLabel("model", colors)
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                choices.forEach { choice ->
-                    val active = choice == model
-                    Text(
-                        choice,
-                        color = if (active) colors.accent else colors.muted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp,
-                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (active) colors.selbg else Color.Transparent)
-                            .border(1.dp, if (active) colors.accent else colors.border, RoundedCornerShape(20.dp))
-                            .clickable { model = choice }.padding(horizontal = 15.dp, vertical = 11.dp),
-                    )
-                }
-            }
-            FormLabel("task", colors)
-            OutlinedTextField(
-                value = task,
-                onValueChange = { task = it },
-                modifier = Modifier.fillMaxWidth().weight(1f),
-                placeholder = { Text("Describe the work to start", color = colors.faint) },
-                textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = colors.text),
-            )
-            error?.let { Text(it, color = colors.err, fontSize = 11.sp, fontFamily = FontFamily.Monospace) }
-        }
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 16.dp)) {
-            LaunchButton(
-                colors = colors,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                enabled = task.isNotBlank() && folder.isNotBlank() && !submitting,
-            ) {
-                if (submitting) return@LaunchButton
-                submitting = true
-                scope.launch {
-                    val result = submitter.submit(NewSessionRequest(provider, model, folder, task))
-                        ?: return@launch
-                    result.onSuccess { onCreated() }
-                        .onFailure { failure ->
-                            submitting = false
-                            error = failure.message ?: "Could not start session"
-                        }
-                }
-            }
-            Text(
-                "routes through agent-router · runs detached on remote-dev",
-                color = colors.faint,
-                fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            )
-        }
     }
 }
 
@@ -1240,7 +1117,9 @@ private fun BottomNavigation(tab: BottomTab, sessions: List<Session>, colors: Vi
     // The badge is what is blocked on you, not the whole review queue.
     val waiting = normalSessionRows(sessions).count { it.status is Status.NeedsInput }
     Row(
-        modifier = Modifier.fillMaxWidth().background(colors.surface).border(1.dp, colors.border).padding(bottom = 20.dp),
+        // The window is already inset from the gesture bar (`safeDrawingPadding`), so the bar
+        // carries no extra bottom padding: its icon and label sit in the middle of the strip.
+        modifier = Modifier.fillMaxWidth().background(colors.surface).border(1.dp, colors.border),
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
         BottomTab.entries.forEach { item ->
@@ -1248,7 +1127,6 @@ private fun BottomNavigation(tab: BottomTab, sessions: List<Session>, colors: Vi
             val label = when (item) {
                 BottomTab.SESSIONS -> "sessions"
                 BottomTab.TRIAGE -> "triage"
-                BottomTab.NEW -> "new"
             }
             val itemColor = if (active) colors.accent else colors.muted
             Box(
@@ -1279,11 +1157,6 @@ private fun BottomNavigation(tab: BottomTab, sessions: List<Session>, colors: Vi
 }
 
 @Composable
-private fun FormLabel(text: String, colors: ViewerColors) {
-    Text(text, color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 10.sp, letterSpacing = 1.sp)
-}
-
-@Composable
 private fun ActionButton(
     text: String,
     background: Color,
@@ -1302,30 +1175,6 @@ private fun ActionButton(
 }
 
 @Composable
-private fun LaunchButton(
-    colors: ViewerColors,
-    modifier: Modifier,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier,
-        shape = RoundedCornerShape(10.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = colors.accent,
-            contentColor = colors.bg,
-            disabledContainerColor = colors.accent.copy(alpha = 0.35f),
-        ),
-    ) {
-        ArrowRightGlyph(colors.bg)
-        Spacer(Modifier.width(9.dp))
-        Text("kick it off", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-@Composable
 private fun BottomGlyph(tab: BottomTab, color: Color) {
     Canvas(Modifier.size(21.dp)) {
         val stroke = 1.8.dp.toPx()
@@ -1333,20 +1182,37 @@ private fun BottomGlyph(tab: BottomTab, color: Color) {
             BottomTab.SESSIONS -> listOf(5f, 10.5f, 16f).forEach { y ->
                 drawLine(color, Offset(2.dp.toPx(), y.dp.toPx()), Offset(19.dp.toPx(), y.dp.toPx()), stroke)
             }
+            // An inbox tray on the same 2..19 footprint as the list lines beside it. The `!`
+            // it replaces was one thin 18 dp column next to a 17 dp wide list: the pair never
+            // read as level, and the mark said "alert" rather than "queue".
             BottomTab.TRIAGE -> {
-                drawLine(color, Offset(10.5.dp.toPx(), 2.dp.toPx()), Offset(10.5.dp.toPx(), 13.dp.toPx()), stroke)
-                drawCircle(color, 1.2.dp.toPx(), Offset(10.5.dp.toPx(), 18.dp.toPx()))
-            }
-            BottomTab.NEW -> {
-                drawLine(color, Offset(10.5.dp.toPx(), 3.dp.toPx()), Offset(10.5.dp.toPx(), 18.dp.toPx()), stroke)
-                drawLine(color, Offset(3.dp.toPx(), 10.5.dp.toPx()), Offset(18.dp.toPx(), 10.5.dp.toPx()), stroke)
+                val tray = Path().apply {
+                    moveTo(2.dp.toPx(), 11.dp.toPx())
+                    lineTo(5.dp.toPx(), 4.dp.toPx())
+                    lineTo(16.dp.toPx(), 4.dp.toPx())
+                    lineTo(19.dp.toPx(), 11.dp.toPx())
+                    lineTo(19.dp.toPx(), 17.dp.toPx())
+                    lineTo(2.dp.toPx(), 17.dp.toPx())
+                    close()
+                }
+                drawPath(tray, color, style = Stroke(stroke, join = StrokeJoin.Round))
+                val slot = Path().apply {
+                    moveTo(2.dp.toPx(), 11.dp.toPx())
+                    lineTo(6.5.dp.toPx(), 11.dp.toPx())
+                    lineTo(8.dp.toPx(), 13.5.dp.toPx())
+                    lineTo(13.dp.toPx(), 13.5.dp.toPx())
+                    lineTo(14.5.dp.toPx(), 11.dp.toPx())
+                    lineTo(19.dp.toPx(), 11.dp.toPx())
+                }
+                drawPath(slot, color, style = Stroke(stroke, join = StrokeJoin.Round))
             }
         }
     }
 }
 
+/** The one back chevron, shared by the triage and terminal headers. */
 @Composable
-private fun BackGlyph(color: Color) {
+internal fun BackGlyph(color: Color) {
     Canvas(Modifier.size(22.dp)) {
         val stroke = 1.9.dp.toPx()
         drawLine(color, Offset(15.dp.toPx(), 4.dp.toPx()), Offset(7.dp.toPx(), 11.dp.toPx()), stroke)
@@ -1408,42 +1274,10 @@ private fun ArchiveGlyph(color: Color) {
 private fun PencilGlyph(color: Color) {
     Canvas(Modifier.size(18.dp)) {
         val stroke = 1.8.dp.toPx()
-        drawLine(color, Offset(3.dp.toPx(), 15.dp.toPx()), Offset(14.dp.toPx(), 4.dp.toPx()), stroke)
-        drawLine(color, Offset(5.dp.toPx(), 17.dp.toPx()), Offset(16.dp.toPx(), 6.dp.toPx()), stroke)
-        drawLine(color, Offset(14.dp.toPx(), 4.dp.toPx()), Offset(16.dp.toPx(), 6.dp.toPx()), stroke)
-        drawLine(color, Offset(3.dp.toPx(), 15.dp.toPx()), Offset(5.dp.toPx(), 17.dp.toPx()), stroke)
-    }
-}
-
-@Composable
-private fun ArrowRightGlyph(color: Color) {
-    Canvas(Modifier.size(18.dp)) {
-        val stroke = 2.dp.toPx()
-        drawLine(color, Offset(1.dp.toPx(), 9.dp.toPx()), Offset(17.dp.toPx(), 9.dp.toPx()), stroke)
-        drawLine(color, Offset(12.dp.toPx(), 4.dp.toPx()), Offset(17.dp.toPx(), 9.dp.toPx()), stroke)
-        drawLine(color, Offset(17.dp.toPx(), 9.dp.toPx()), Offset(12.dp.toPx(), 14.dp.toPx()), stroke)
-    }
-}
-
-@Composable
-private fun FolderGlyph(color: Color) {
-    Canvas(Modifier.size(18.dp)) {
-        val stroke = 1.7.dp.toPx()
-        drawLine(color, Offset(1.dp.toPx(), 5.dp.toPx()), Offset(7.dp.toPx(), 5.dp.toPx()), stroke)
-        drawLine(color, Offset(7.dp.toPx(), 5.dp.toPx()), Offset(9.dp.toPx(), 7.dp.toPx()), stroke)
-        drawLine(color, Offset(9.dp.toPx(), 7.dp.toPx()), Offset(17.dp.toPx(), 7.dp.toPx()), stroke)
-        drawLine(color, Offset(1.dp.toPx(), 5.dp.toPx()), Offset(1.dp.toPx(), 16.dp.toPx()), stroke)
-        drawLine(color, Offset(1.dp.toPx(), 16.dp.toPx()), Offset(17.dp.toPx(), 16.dp.toPx()), stroke)
-        drawLine(color, Offset(17.dp.toPx(), 7.dp.toPx()), Offset(17.dp.toPx(), 16.dp.toPx()), stroke)
-    }
-}
-
-@Composable
-private fun ChevronGlyph(color: Color) {
-    Canvas(Modifier.size(16.dp)) {
-        val stroke = 2.dp.toPx()
-        drawLine(color, Offset(5.dp.toPx(), 2.dp.toPx()), Offset(11.dp.toPx(), 8.dp.toPx()), stroke)
-        drawLine(color, Offset(11.dp.toPx(), 8.dp.toPx()), Offset(5.dp.toPx(), 14.dp.toPx()), stroke)
+        drawLine(color, Offset(3.dp.toPx(), 13.dp.toPx()), Offset(13.dp.toPx(), 3.dp.toPx()), stroke)
+        drawLine(color, Offset(5.dp.toPx(), 15.dp.toPx()), Offset(15.dp.toPx(), 5.dp.toPx()), stroke)
+        drawLine(color, Offset(13.dp.toPx(), 3.dp.toPx()), Offset(15.dp.toPx(), 5.dp.toPx()), stroke)
+        drawLine(color, Offset(3.dp.toPx(), 13.dp.toPx()), Offset(5.dp.toPx(), 15.dp.toPx()), stroke)
     }
 }
 

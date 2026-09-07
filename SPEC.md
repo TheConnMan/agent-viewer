@@ -1032,7 +1032,10 @@ published crate, which is why `cargo install` targets the git URL.
 ## Phone companion — the v2 terminal surface
 
 `agent-viewer-server` (axum, bin plus lib) shares `-core` with the TUI, binds only
-`127.0.0.1:8477`, and reaches the phone through `tailscale serve` on 8443.
+`127.0.0.1:8477`, and reaches the phone through `tailscale serve` on 8443. On this box it is a
+systemd user unit with `Restart=always` (README "Running it"): the first version was started by
+hand and vanished with the 2026-09-06 reboot, and every request from the phone then answered 502
+from the proxy until someone noticed, so "keep it up" is the unit, not a habit.
 `require_tailscale_user` rejects anything without a `Tailscale-User-Login` header with 401;
 the terminal route additionally demands `Origin: https://appassets.androidplatform.net`
 (`ANDROID_ORIGIN`) and answers 403 to every other origin. The route is
@@ -1167,6 +1170,76 @@ empty backend on a CLI timeout, so rows do vanish and return). The Android back 
 `BackHandler`; `shouldBackButtonBeMappedToEscape()` stays `false`, otherwise the same key would
 type `Esc` into the CLI instead. Leaving closes the socket and not the session, which is the
 grace path below.
+
+**Starting work is a long press on a folder, not a tab.** The first companion had a third
+bottom tab, `new`, with a full composer screen (provider segment, folder text field, model chips,
+task field). Brian's verdict on the phone: "the whole new thread interface I don't like, remove
+it. I should be able to long press the folder group header to spawn a new thread there." So the
+tab and `ComposerScreen` are gone. A long press on a group header in the `all` or `by project`
+grouping opens `SpawnSheet` (a `ModalBottomSheet`) with the folder fixed to the header pressed,
+a provider row (`auto`, `claude`, `codex`) and a task field; the request carries `model: null`,
+so the server routes exactly as an `auto` spawn from the TUI does and the phone has no model
+picker to keep in sync with the catalog. State headers (`by state`) are not places, so their
+long press is consumed and does nothing: with `onLongClick` left null, `combinedClickable`
+counts the release as a tap and folds the group, which the screenshot test pins. After a spawn
+the folder's group is forced open so the new row is visible on the next poll, and the footer
+notice names the folder.
+
+The Grok review of the first cut found two state bugs, fixed in the same round. The sheet ran
+its `POST` in a `rememberCoroutineScope`, which a rotation cancels: the request still completed
+on the server, but the success path (dismiss, notice, unfold) never ran and the restored sheet
+offered Start again with the same task, so one tap could make two sessions. `SpawnLauncher` now
+owns the request in a process-lifetime scope, holds `inFlight` and `outcome` as Compose state,
+and admits one request at a time; the sheet reads it and `AgentViewerApp` acts on the outcome
+whether or not the sheet is still open. A sheet restored after process death with its draft
+marked submitted and nothing in flight closes itself: the list is the record of whether the
+spawn landed. And the 2 s poll and the post-spawn `refresh()` were last-write-wins, so a poll
+that left before the spawn could answer after the refresh and hide the new row for a tick;
+`ListSequencer` gives every listing request a generation and a response applies only if
+nothing newer already has. The third finding, that the sheet stays open after its folder's
+last row leaves the list, is by design: the sheet is a place, not a row, and a folder on disk
+is still somewhere to start work.
+
+Round three of the same feedback, after v1.9 was on the phone. "When I type a super long
+prompt, I can't submit it because the input box gets too high": the task field had a minimum
+height and no maximum, the sheet's column did not scroll, and a `ModalBottomSheet` opens
+half-height by default, so a dictated prompt pushed Start off the screen. The field now stops at
+`taskFieldMaxHeight` (200 dp, about ten lines) and scrolls inside itself, the column scrolls and
+carries `imePadding`, and the sheet skips the partially expanded state. `SpawnSheetTest` types
+eighty lines, asserts Start is still displayed, and checks the whole text reaches the wire. "The
+wiki folder doesn't show up in the UI even though it has a hidden Hold thread keeping it open":
+the thread is not archived (the server lists it, `hidden: false`); it is the presentation rule
+from the TUI, where a `hold` title is never a row but its project header stays with count zero.
+The phone's `normalSessionRows` dropped the row and the folder with it, so `folderGroups` in
+`ListState.kt` now builds the `all`/`by project` headers from every served session and strips
+hold rows underneath, matching `app.rs`; by-state sections, counts, triage and the badge still
+exclude them. And the triage tab's `!` glyph, a single 18 dp column beside a 17 dp wide list
+mark, never read as level; it is now an inbox tray on the same 2..19 footprint.
+
+**Group headers fold on a tap, and the fold survives a relaunch.** Every grouping's headers fold
+(the first cut folded only `by project`), and the fold state plus the active filter live in
+`ListPrefs` (`SharedPreferences` `list`): the filter as a name, the groups as a set of toggles
+keyed `FILTER|group`. Toggles rather than "collapsed" so the two defaults coexist: `all` and
+`by state` open until tapped, `by project` folded until tapped. The state is held in
+`AgentViewerApp`, above `SessionListScreen`, because the list composable leaves the tree while
+a terminal is open and a `remember` inside it would reset on the way back; preferences cover
+the process being killed. `ListStateTest` covers the rule and the round trip through a fresh
+`ListPrefs` over the same store.
+
+**Glyph placement.** Brian: "review the icon placement, they look off center in a lot of
+places." Four causes, all in `ViewerApp.kt`: the group-header chevrons were the text glyphs
+`⌄` and `›`, which hang off the baseline (now a drawn `GroupChevron`); the bottom bar carried a
+20 dp bottom padding left over from before `safeDrawingPadding`, so its icons sat in the top
+64 dp of an 84 dp strip; the row's status dot was pinned with a top padding against the title
+rather than centred on the title line (the dot, mark and title now share one row and the lines
+below indent past the dot); and the search and pencil glyphs had their ink in one corner of
+their canvas. The header controls are 44 dp targets around 20 dp glyphs, so the header rows now
+end 12 dp short of the text margin and the glyphs land on the same 18 dp line as the title and
+the group counts; the terminal header uses the same `HeaderControl` and `BackGlyph` as triage
+instead of a text button. `ScreenshotTest` renders the list (all, folded, by state) and triage
+surfaces with sample sessions to `android/app/build/screenshots/*.png` under Robolectric NATIVE
+graphics, by software-drawing the decor view: the compose-test `captureToImage` waits on a draw
+callback Robolectric never delivers. Look at the PNGs when touching layout.
 
 The triage tab is `triageSessionRows`, which mirrors the TUI's `triage_queue` exactly: every
 needs-input session, then every done or idle session, ascending `updated_at_ms` in each group,

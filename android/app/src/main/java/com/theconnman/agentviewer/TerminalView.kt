@@ -526,10 +526,12 @@ internal fun TerminalConsole(
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier.fillMaxWidth().height(60.dp).padding(horizontal = 8.dp),
+            // The same back control as the triage header, so the chevron sits where it does there.
+            modifier = Modifier.fillMaxWidth().height(60.dp).padding(start = 6.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TextButton(onClick = onBack) { Text("back", color = colors.muted) }
+            HeaderControl(onClick = onBack) { BackGlyph(colors.muted) }
+            Spacer(Modifier.width(4.dp))
             BackendIcon(session.backend, colors, size = 15.dp)
             Spacer(Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
