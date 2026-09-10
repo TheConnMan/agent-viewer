@@ -140,7 +140,7 @@ internal fun SpawnSheet(
  * room for the provider row and Start above the keyboard. Past this the field scrolls. */
 private val taskFieldMaxHeight = 200.dp
 
-/** Who does the work: the router's choice, or a pinned CLI. Same three entries as the server. */
+/** Who does the work: the router's choice, or one of the three pinned CLIs. */
 @Composable
 private fun ProviderChips(
     selected: ComposerProvider,
@@ -164,6 +164,7 @@ private fun ProviderChips(
                     ComposerProvider.AUTO -> null
                     ComposerProvider.CLAUDE -> BackendKind.CLAUDE
                     ComposerProvider.CODEX -> BackendKind.CODEX
+                    ComposerProvider.GROK -> BackendKind.GROK
                 }
                 if (backend != null) {
                     BackendIcon(backend, colors, size = 13.dp)

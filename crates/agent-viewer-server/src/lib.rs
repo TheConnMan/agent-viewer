@@ -1642,6 +1642,7 @@ async fn spawn_session(
         "auto" => None,
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
+        "grok" => Some(BackendKind::Grok),
         _ => return Err(ApiError::bad_request("unknown provider")),
     };
     if provider.is_none() && !state.router_available {

@@ -653,7 +653,7 @@ paths.
 
 The Android companion has a session list and a triage inbox. There is no new-session screen:
 **long-pressing a folder header** in the list opens a sheet that starts a session in that
-folder (a task, and `auto`, `claude` or `codex` for who does it; the server's routing picks the
+folder (a task, and `auto`, `claude`, `codex` or `grok` for who does it; the server's routing picks the
 model). The task field stops growing at about ten lines and scrolls inside itself, so Start
 stays on screen however long the prompt runs. A folder whose only session is a `hold` thread
 keeps its header with a count of zero, as on the desktop, so it can still be pressed to start
@@ -672,7 +672,8 @@ sessions only; archived, companion, and subagent threads are not on the phone, a
 hidden filter to reach them. Rows carry the vendor mark of their backend (Claude, OpenAI, xAI),
 tinted in the backend colour, in place of the TUI's `[cc]`/`[cx]`/`[gx]` tags. The four shipped
 themes are `analog amber`, `dracula`, `tokyo night`, and `paper light`, and the status and
-navigation bar icons follow the theme.
+navigation bar icons follow the theme. The summary counts waiting, working, idle, and done
+sessions across all three backends, and pulling down on either list fetches a fresh snapshot.
 
 The triage tab walks the same queue as the TUI's `Ctrl+N`: every session needing input, then
 every done or idle session, longest wait first within each group. A tap on a card opens the

@@ -63,6 +63,15 @@ impl FakeBackend {
         }
     }
 
+    fn with_kind(kind: BackendKind, calls: Arc<FakeCalls>) -> Self {
+        Self {
+            kind,
+            sessions: Vec::new(),
+            calls,
+            attach_script: None,
+        }
+    }
+
     fn attachable(session: Session, calls: Arc<FakeCalls>, script: impl Into<String>) -> Self {
         Self::attachable_kind(BackendKind::Codex, session, calls, script)
     }
@@ -89,6 +98,40 @@ impl FakeBackend {
             attach_script: Some(script.into()),
         }
     }
+}
+
+#[tokio::test]
+async fn grok_is_a_pinnable_spawn_provider() {
+    let calls = Arc::new(FakeCalls::default());
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::with_kind(
+        BackendKind::Grok,
+        Arc::clone(&calls),
+    ))]);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/sessions",
+            json!({
+                "provider": "grok",
+                "dir": "/tmp/project",
+                "task": "Run it with Grok",
+                "model": null
+            }),
+        ))
+        .await
+        .expect("Grok spawn response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({
+            "backend": "Grok",
+            "session_id": "spawned-session",
+            "pid": null
+        })
+    );
+    assert_eq!(calls.spawn.load(Ordering::SeqCst), 1);
 }
 
 impl Backend for FakeBackend {
