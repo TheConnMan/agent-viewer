@@ -1177,7 +1177,7 @@ task field). Brian's verdict on the phone: "the whole new thread interface I don
 it. I should be able to long press the folder group header to spawn a new thread there." So the
 tab and `ComposerScreen` are gone. A long press on a group header in the `all` or `by project`
 grouping opens `SpawnSheet` (a `ModalBottomSheet`) with the folder fixed to the header pressed,
-a provider row (`auto`, `claude`, `codex`) and a task field; the request carries `model: null`,
+a provider row (`auto`, `claude`, `codex`, `grok`) and a task field; the request carries `model: null`,
 so the server routes exactly as an `auto` spawn from the TUI does and the phone has no model
 picker to keep in sync with the catalog. State headers (`by state`) are not places, so their
 long press is consumed and does nothing: with `onLongClick` left null, `combinedClickable`
@@ -1199,6 +1199,12 @@ that left before the spawn could answer after the refresh and hide the new row f
 nothing newer already has. The third finding, that the sheet stays open after its folder's
 last row leaves the list, is by design: the sheet is a place, not a row, and a folder on disk
 is still somewhere to start work.
+
+The list summary has four explicit buckets: waiting, working, idle, and done. Grok's resident
+but inactive sessions normally resolve to idle, so omitting idle made the summary appear to
+omit Grok even though its rows were present. Both the session list and triage list use Material
+pull-to-refresh; the gesture runs the same generation-ordered fetch as the two-second poll and
+post-spawn refresh, and the indicator remains active until that request returns.
 
 Round three of the same feedback, after v1.9 was on the phone. "When I type a super long
 prompt, I can't submit it because the input box gets too high": the task field had a minimum

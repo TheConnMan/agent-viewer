@@ -14,7 +14,9 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.longClick
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.swipeDown
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -136,6 +138,8 @@ class ScreenshotTest {
                             onOpen = {},
                             onActions = {},
                             onSpawn = { spawnFolder = it },
+                            isRefreshing = false,
+                            onRefresh = {},
                         )
                     }
                     BottomNavigationPreview(sessions, colors)
@@ -175,6 +179,36 @@ class ScreenshotTest {
         compose.onNodeWithText("Keep the companion server up").assertIsDisplayed()
         compose.onNodeWithText(wiki).assertDoesNotExist()
         save("list-by-state")
+    }
+
+    @Test
+    fun `swiping down on the session list refreshes`() {
+        var refreshes = 0
+        compose.setContent {
+            Surface(modifier = Modifier.fillMaxSize(), color = colors.bg, contentColor = colors.text) {
+                SessionListScreen(
+                    sessions = sessions,
+                    error = null,
+                    colors = colors,
+                    filter = SessionFilter.ALL,
+                    toggledGroups = emptySet(),
+                    onFilter = {},
+                    onToggleGroup = {},
+                    onTheme = {},
+                    onOpen = {},
+                    onActions = {},
+                    onSpawn = {},
+                    isRefreshing = false,
+                    onRefresh = { refreshes += 1 },
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        compose.onNodeWithTag("session-list").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+
+        assertEquals(1, refreshes)
     }
 
     @Test

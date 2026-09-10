@@ -260,6 +260,9 @@ enum class ComposerProvider(val wireName: String) {
 
     @SerialName("codex")
     CODEX("codex"),
+
+    @SerialName("grok")
+    GROK("grok"),
 }
 
 /** A spawn. `model` is `null` when the phone leaves the choice to the server's routing. */
@@ -278,6 +281,7 @@ private data class RenameRequest(val name: String)
 private data class ModelsResponse(
     @SerialName("Codex") val codex: List<String>,
     @SerialName("Claude") val claude: List<String>,
+    @SerialName("Grok") val grok: List<String> = emptyList(),
     val auto: List<String> = emptyList(),
 )
 
@@ -299,6 +303,7 @@ class ApiClient(private val baseUrl: String = ApiConfig.DEFAULT_BASE_URL) {
             ComposerProvider.AUTO to response.auto,
             ComposerProvider.CLAUDE to response.claude,
             ComposerProvider.CODEX to response.codex,
+            ComposerProvider.GROK to response.grok,
         )
     }
 

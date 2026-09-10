@@ -46,6 +46,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -64,6 +65,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -161,6 +163,23 @@ internal val sessionFilters: List<Pair<SessionFilter, String>> = listOf(
 internal fun normalSessionRows(sessions: List<Session>): List<Session> =
     sessions.filter { !it.hidden && !it.companion && !it.isHold() }
 
+internal data class SessionStateCounts(
+    val waiting: Int,
+    val working: Int,
+    val idle: Int,
+    val done: Int,
+)
+
+internal fun sessionStateCounts(sessions: List<Session>): SessionStateCounts {
+    val rows = normalSessionRows(sessions)
+    return SessionStateCounts(
+        waiting = rows.count { it.status is Status.NeedsInput },
+        working = rows.count { it.status == Status.Working },
+        idle = rows.count { it.status == Status.Idle },
+        done = rows.count { it.status == Status.Done },
+    )
+}
+
 /** The phone's triage inbox, in the TUI's order (`ui::triage::triage_queue`): every needs-input
  * session, then every done or idle session, longest wait first within each group. Working, error
  * and unknown rows have nothing to review yet. The visibility rules are `normalSessionRows`. */
@@ -214,6 +233,7 @@ fun AgentViewerApp() {
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var loadError by remember { mutableStateOf<String?>(null) }
+    var refreshing by remember { mutableStateOf(false) }
     var notice by remember { mutableStateOf<String?>(null) }
     // The row whose long-press action sheet is open, if any.
     var actionsKey by remember { mutableStateOf<String?>(null) }
@@ -281,7 +301,16 @@ fun AgentViewerApp() {
     }
 
     val refresh: () -> Unit = {
-        scope.launch { fetchSessions() }
+        if (!refreshing) {
+            refreshing = true
+            scope.launch {
+                try {
+                    fetchSessions()
+                } finally {
+                    refreshing = false
+                }
+            }
+        }
         Unit
     }
     // A finished spawn is handled here, not in the sheet, so it lands whether or not the sheet
@@ -380,6 +409,8 @@ fun AgentViewerApp() {
                                 onOpen = open,
                                 onActions = openActions,
                                 onSpawn = { folder -> spawnFolder = folder },
+                                isRefreshing = refreshing,
+                                onRefresh = refresh,
                             )
 
                             BottomTab.TRIAGE -> TriageScreen(
@@ -388,6 +419,8 @@ fun AgentViewerApp() {
                                 onOpen = open,
                                 onActions = openActions,
                                 onBack = { tab = BottomTab.SESSIONS },
+                                isRefreshing = refreshing,
+                                onRefresh = refresh,
                             )
                         }
                         notice?.let { FooterNotice(it, colors, Modifier.align(Alignment.BottomCenter)) }
@@ -456,6 +489,7 @@ private fun rememberForeground(): Boolean {
  * The session list. Every group header folds on a tap (the fold is remembered, see `ListPrefs`),
  * and a folder header starts a new session in that folder on a long press.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SessionListScreen(
     sessions: List<Session>,
@@ -469,6 +503,8 @@ internal fun SessionListScreen(
     onOpen: (Session) -> Unit,
     onActions: (Session) -> Unit,
     onSpawn: (String) -> Unit,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
 ) {
     var searchVisible by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
@@ -493,75 +529,80 @@ internal fun SessionListScreen(
         // the row.
         folderGroups(sessions, matches)
     }
-    val waiting = normalSessions.count { it.status is Status.NeedsInput }
-    val working = normalSessions.count { it.status == Status.Working }
-    val done = normalSessions.count { it.status == Status.Done }
+    val counts = sessionStateCounts(sessions)
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        MainHeader(
-            total = normalSessions.size,
-            colors = colors,
-            onSearch = {
-                searchVisible = !searchVisible
-                if (!searchVisible) query = ""
-            },
-            onTheme = onTheme,
-        )
-        if (searchVisible) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp),
-                singleLine = true,
-                placeholder = { Text("search sessions", color = colors.faint) },
-                textStyle = androidx.compose.ui.text.TextStyle(
-                    color = colors.text,
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            MainHeader(
+                total = normalSessions.size,
+                colors = colors,
+                onSearch = {
+                    searchVisible = !searchVisible
+                    if (!searchVisible) query = ""
+                },
+                onTheme = onTheme,
+            )
+            if (searchVisible) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp),
+                    singleLine = true,
+                    placeholder = { Text("search sessions", color = colors.faint) },
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        color = colors.text,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                    ),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                StateCount("waiting", counts.waiting, colors.attn, colors)
+                StateCount("working", counts.working, colors.accent, colors)
+                StateCount("idle", counts.idle, colors.muted, colors)
+                StateCount("done", counts.done, colors.ok, colors)
+            }
+            FilterRow(filter, colors, onFilter)
+            if (error != null) {
+                Text(
+                    text = error,
+                    color = colors.err,
+                    fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                ),
-            )
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            StateCount("waiting", waiting, colors.attn, colors)
-            StateCount("working", working, colors.accent, colors)
-            StateCount("done", done, colors.ok, colors)
-        }
-        FilterRow(filter, colors, onFilter)
-        if (error != null) {
-            Text(
-                text = error,
-                color = colors.err,
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            groups.forEach { (group, rows) ->
-                val expanded = groupExpanded(filter, group, toggledGroups)
-                item(key = "group-$filter-$group") {
-                    GroupHeader(
-                        label = group,
-                        count = rows.size,
-                        colors = colors,
-                        expanded = expanded,
-                        onToggle = { onToggleGroup(group) },
-                        onSpawn = if (groupIsFolder(filter)) ({ onSpawn(group) }) else null,
-                    )
-                }
-                if (expanded) {
-                    items(rows, key = { it.key() }) { session ->
-                        SessionRow(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            LazyColumn(modifier = Modifier.weight(1f).testTag("session-list")) {
+                groups.forEach { (group, rows) ->
+                    val expanded = groupExpanded(filter, group, toggledGroups)
+                    item(key = "group-$filter-$group") {
+                        GroupHeader(
+                            label = group,
+                            count = rows.size,
+                            colors = colors,
+                            expanded = expanded,
+                            onToggle = { onToggleGroup(group) },
+                            onSpawn = if (groupIsFolder(filter)) ({ onSpawn(group) }) else null,
+                        )
+                    }
+                    if (expanded) {
+                        items(rows, key = { it.key() }) { session ->
+                            SessionRow(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
+                        }
                     }
                 }
-            }
-            if (groups.isEmpty()) {
-                item { EmptyState("no sessions here", colors) }
+                if (groups.isEmpty()) {
+                    item { EmptyState("no sessions here", colors) }
+                }
             }
         }
     }
@@ -803,7 +844,15 @@ private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Uni
 /** Test seams: the screens are private, the screenshot test renders them through these. */
 @Composable
 internal fun TriageScreenPreview(sessions: List<Session>, colors: ViewerColors) {
-    TriageScreen(sessions = sessions, colors = colors, onOpen = {}, onActions = {}, onBack = {})
+    TriageScreen(
+        sessions = sessions,
+        colors = colors,
+        onOpen = {},
+        onActions = {},
+        onBack = {},
+        isRefreshing = false,
+        onRefresh = {},
+    )
 }
 
 @Composable
@@ -811,6 +860,7 @@ internal fun BottomNavigationPreview(sessions: List<Session>, colors: ViewerColo
     BottomNavigation(tab = BottomTab.SESSIONS, sessions = sessions, colors = colors) {}
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TriageScreen(
     sessions: List<Session>,
@@ -818,27 +868,35 @@ private fun TriageScreen(
     onOpen: (Session) -> Unit,
     onActions: (Session) -> Unit,
     onBack: () -> Unit,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
 ) {
     val queue = triageSessionRows(sessions)
-    Column(modifier = Modifier.fillMaxSize()) {
-        TriageHeader(queue.size, colors, onBack)
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-        ) {
-            items(queue, key = { "triage-${it.key()}" }) { session ->
-                TriageCard(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
-            }
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CheckGlyph(colors.ok)
-                    Spacer(Modifier.width(8.dp))
-                    Text("nothing else is waiting on you", color = colors.muted, fontSize = 12.sp)
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            TriageHeader(queue.size, colors, onBack)
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+            ) {
+                items(queue, key = { "triage-${it.key()}" }) { session ->
+                    TriageCard(session, colors, onOpen = { onOpen(session) }, onActions = { onActions(session) })
+                }
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CheckGlyph(colors.ok)
+                        Spacer(Modifier.width(8.dp))
+                        Text("nothing else is waiting on you", color = colors.muted, fontSize = 12.sp)
+                    }
                 }
             }
         }

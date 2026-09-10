@@ -155,7 +155,7 @@ class ApiContractTest {
     @Test
     fun `composer supports exactly the provider catalog without effort`() {
         assertEquals(
-            listOf("auto", "claude", "codex"),
+            listOf("auto", "claude", "codex", "grok"),
             ComposerProvider.entries.map(ComposerProvider::wireName),
         )
 
@@ -173,6 +173,20 @@ class ApiContractTest {
         assertTrue(encoded.contains("\"model\":null"), encoded)
         assertTrue(encoded.contains("\"dir\":\"/home/brian/git/agent-viewer\""))
         assertFalse(encoded.contains("effort"))
+    }
+
+    @Test
+    fun `state counts include idle Grok sessions`() {
+        val counts = sessionStateCounts(
+            listOf(
+                session("codex-working", Status.Working),
+                session("claude-done", Status.Done).copy(backend = BackendKind.CLAUDE),
+                session("grok-idle-one", Status.Idle).copy(backend = BackendKind.GROK),
+                session("grok-idle-two", Status.Idle).copy(backend = BackendKind.GROK),
+            ),
+        )
+
+        assertEquals(SessionStateCounts(waiting = 0, working = 1, idle = 2, done = 1), counts)
     }
 
     @Test

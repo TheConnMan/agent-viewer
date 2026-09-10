@@ -37,7 +37,7 @@ class SpawnSheetTest {
     @Test
     fun `start posts the pressed folder and the typed task, pinned to the chosen provider`() {
         val folder = "/home/brian/git/theconnman/agent-viewer"
-        LoopbackServer("""{"backend":"Claude","session_id":"abc","pid":null}""").use { server ->
+        LoopbackServer("""{"backend":"Grok","session_id":"abc","pid":null}""").use { server ->
             val api = ApiClient(server.baseUrl)
             val launcher = SpawnLauncher({ api.create(it) }, Dispatchers.Unconfined)
             compose.setContent {
@@ -52,7 +52,7 @@ class SpawnSheetTest {
             compose.onNodeWithText(folder).assertExists()
             compose.onNodeWithText("start").assertIsNotEnabled()
 
-            compose.onNodeWithText("claude").performClick()
+            compose.onNodeWithText("grok").performClick()
             compose.onNode(hasSetTextAction()).performTextInput("Keep the companion server up")
             compose.onNodeWithText("start").assertIsEnabled()
             compose.onNodeWithText("start").performClick()
@@ -64,7 +64,7 @@ class SpawnSheetTest {
             assertEquals("POST", request.method)
             assertEquals("/sessions", request.path)
             val body = Json.parseToJsonElement(request.body).jsonObject
-            assertEquals("claude", body.getValue("provider").jsonPrimitive.content)
+            assertEquals("grok", body.getValue("provider").jsonPrimitive.content)
             assertEquals(folder, body.getValue("dir").jsonPrimitive.content)
             assertEquals("Keep the companion server up", body.getValue("task").jsonPrimitive.content)
             assertTrue(body.getValue("model") is JsonNull, "no model picker on the phone: $body")
