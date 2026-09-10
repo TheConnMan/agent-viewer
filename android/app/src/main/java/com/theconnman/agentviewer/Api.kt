@@ -130,6 +130,24 @@ object StatusSerializer : KSerializer<Status> {
 }
 
 @Serializable
+enum class PrBadgeColor {
+    @SerialName("Default")
+    DEFAULT,
+
+    @SerialName("Attention")
+    ATTENTION,
+
+    @SerialName("Passed")
+    PASSED,
+
+    @SerialName("Merged")
+    MERGED,
+
+    @SerialName("Muted")
+    MUTED,
+}
+
+@Serializable
 data class PrRef(
     val id: String,
     val href: String? = null,
@@ -154,6 +172,7 @@ data class Session(
     val pid: Long? = null,
     @SerialName("rollout_path") val rolloutPath: String? = null,
     @SerialName("pr_refs") val prRefs: List<PrRef> = emptyList(),
+    @SerialName("pr_color") val prColor: PrBadgeColor = PrBadgeColor.DEFAULT,
     @SerialName("daemon_hosted") val daemonHosted: Boolean = false,
     @SerialName("project_root") val projectRoot: String? = null,
 )

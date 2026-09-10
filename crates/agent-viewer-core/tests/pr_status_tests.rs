@@ -440,3 +440,21 @@ fn aggregate_single_merged_passthrough() {
         PrBadgeColor::Merged
     );
 }
+
+#[test]
+fn badge_color_serializes_as_pascal_case_for_the_phone() {
+    for (color, wire) in [
+        (PrBadgeColor::Default, "Default"),
+        (PrBadgeColor::Attention, "Attention"),
+        (PrBadgeColor::Passed, "Passed"),
+        (PrBadgeColor::Merged, "Merged"),
+        (PrBadgeColor::Muted, "Muted"),
+    ] {
+        let value = serde_json::Value::String(wire.to_string());
+        assert_eq!(serde_json::to_value(color).expect("serialize"), value);
+        assert_eq!(
+            serde_json::from_value::<PrBadgeColor>(value).expect("deserialize"),
+            color
+        );
+    }
+}

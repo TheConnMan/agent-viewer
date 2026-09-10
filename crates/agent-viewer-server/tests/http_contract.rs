@@ -7,8 +7,8 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_viewer_core::{
-    ArchiveMode, AttachRefusal, Backend, BackendKind, Capabilities, Error, Session, SessionOrigin,
-    SpawnResult, Status, TailEvent,
+    ArchiveMode, AttachRefusal, Backend, BackendKind, Capabilities, Error, PrRef, Session,
+    SessionOrigin, SpawnResult, Status, TailEvent,
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header::CONTENT_TYPE};
@@ -681,6 +681,34 @@ async fn sessions_serve_visible_rows_only() {
     drop(fixture);
 }
 
+/// The list carries the TUI's PR-badge color bucket so the phone can paint `#315` the same
+/// way. An uncached row is `Default` (the flat accent); live colors fill in on later ticks.
+#[tokio::test]
+async fn sessions_include_pr_color() {
+    let fixture = project_fixture();
+    let calls = Arc::new(FakeCalls::default());
+    let mut row = session(fixture.cwd.clone());
+    row.pr_refs = vec![PrRef {
+        id: "42".to_string(),
+        href: None,
+    }];
+    let app = agent_viewer_server::router_with_backends(vec![Box::new(FakeBackend::new(
+        row,
+        Arc::clone(&calls),
+    ))]);
+
+    let response = app
+        .oneshot(request(Method::GET, "/sessions", true))
+        .await
+        .expect("sessions response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let sessions = json_body(response).await;
+    assert_eq!(sessions[0]["pr_refs"][0]["id"], "42");
+    assert_eq!(sessions[0]["pr_color"], "Default");
+
+    drop(fixture);
+}
+
 /// A Codex title is the thread's whole first prompt, so the list bounds it. The bound counts
 /// CHARS: a byte cut would split a multi-byte title into invalid UTF-8.
 #[tokio::test]
@@ -789,6 +817,7 @@ async fn router_exposes_authenticated_backend_contracts() {
         sessions[0]["project_root"],
         project_root.to_string_lossy().as_ref()
     );
+    assert_eq!(sessions[0]["pr_color"], "Default");
 
     let response = app
         .clone()

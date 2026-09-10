@@ -9,7 +9,8 @@ use agent_viewer_core::backend::all_backends;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::state::{apply_viewer_state, match_spawn};
 use agent_viewer_core::{
-    Backend, BackendKind, Capabilities, Error, Session, TailEvent, ViewerDb, mark_dead_dirs,
+    Backend, BackendKind, Capabilities, Error, PrBadgeColor, PrStatusCache, Session, TailEvent,
+    ViewerDb, mark_dead_dirs,
 };
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -271,6 +272,8 @@ struct SessionView {
     #[serde(flatten)]
     session: Session,
     project_root: PathBuf,
+    /// Aggregated live GitHub color for `pr_refs`, same buckets the TUI badge uses.
+    pr_color: PrBadgeColor,
 }
 
 impl SessionView {
@@ -279,6 +282,7 @@ impl SessionView {
         Self {
             session,
             project_root,
+            pr_color: PrBadgeColor::Default,
         }
     }
 
@@ -660,6 +664,8 @@ pub fn router_with_backends_and_terminal_timing(
         &mut backends,
         &mut last,
         None,
+        &mut PrStatusCache::new(),
+        0,
     )));
     build_router(AppState {
         snapshot,
@@ -701,9 +707,16 @@ fn start_refresh_thread(
         .spawn(move || {
             let db = ViewerDb::open_default().ok();
             let mut last = vec![Vec::new(); backends.len()];
+            let mut pr_status = PrStatusCache::new();
             let mut ready_tx = Some(ready_tx);
             loop {
-                let next = refresh_snapshot(&mut backends, &mut last, db.as_ref());
+                let next = refresh_snapshot(
+                    &mut backends,
+                    &mut last,
+                    db.as_ref(),
+                    &mut pr_status,
+                    agent_viewer_core::spawn::now_ms(),
+                );
                 match snapshot.write() {
                     Ok(mut current) => *current = next,
                     Err(poisoned) => *poisoned.into_inner() = next,
@@ -723,6 +736,8 @@ fn refresh_snapshot(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
     db: Option<&ViewerDb>,
+    pr_status: &mut PrStatusCache,
+    now_ms: i64,
 ) -> Vec<SessionView> {
     let mut sessions = Vec::new();
     for (index, backend) in backends.iter_mut().enumerate() {
@@ -741,7 +756,24 @@ fn refresh_snapshot(
         let _ = db.prune_resolved_missing(&live);
     }
     mark_dead_dirs(&mut sessions);
-    sessions.into_iter().map(SessionView::new).collect()
+    let mut views: Vec<SessionView> = sessions.into_iter().map(SessionView::new).collect();
+    paint_pr_colors(&mut views, pr_status, now_ms);
+    views
+}
+
+/// Stamp each row with the cached GitHub badge color and kick off fetches for visible PRs
+/// the cache does not already hold. Hidden, companion, and subagent rows are never fetched:
+/// the phone never lists them.
+fn paint_pr_colors(views: &mut [SessionView], pr_status: &mut PrStatusCache, now_ms: i64) {
+    pr_status.poll(now_ms);
+    for view in views.iter() {
+        if is_visible(&view.session) {
+            pr_status.request_refs(&view.session.pr_refs, now_ms);
+        }
+    }
+    for view in views.iter_mut() {
+        view.pr_color = pr_status.badge_color(&view.session.pr_refs);
+    }
 }
 
 fn apply_overlay(db: &ViewerDb, sessions: &mut [Session]) {
@@ -1787,5 +1819,63 @@ fn core_error(action: &str, error: Error) -> ApiError {
             ApiError::unsupported(format!("{name} does not support {action}"))
         }
         error => ApiError::internal(format!("{action} failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod pr_color_tests {
+    use super::{SessionView, paint_pr_colors};
+    use agent_viewer_core::{
+        BackendKind, PrBadgeColor, PrRef, PrStatusCache, Session, SessionOrigin, Status,
+    };
+    use std::path::PathBuf;
+
+    fn session_with_pr(hidden: bool) -> Session {
+        Session {
+            backend: BackendKind::Codex,
+            id: "session-1".to_string(),
+            short_id: None,
+            origin: SessionOrigin::Background,
+            title: "Paint the chip".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            git_branch: None,
+            status: Status::Done,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            hidden,
+            companion: false,
+            subagent: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: vec![PrRef {
+                id: "42".to_string(),
+                href: Some("https://github.com/TheConnMan/agent-viewer/pull/42".to_string()),
+            }],
+            daemon_hosted: false,
+        }
+    }
+
+    #[test]
+    fn paint_stamps_a_seeded_merged_color_on_a_visible_row() {
+        let mut cache = PrStatusCache::new();
+        cache.seed(
+            ("TheConnMan".to_string(), "agent-viewer".to_string(), 42),
+            PrBadgeColor::Merged,
+            0,
+        );
+        let mut views = vec![SessionView::new(session_with_pr(false))];
+        paint_pr_colors(&mut views, &mut cache, 1_000);
+        assert_eq!(views[0].pr_color, PrBadgeColor::Merged);
+        assert_eq!(cache.in_flight_len(), 0, "a fresh seed must not refetch");
+    }
+
+    #[test]
+    fn paint_does_not_fetch_an_archived_row() {
+        let mut cache = PrStatusCache::new();
+        let mut views = vec![SessionView::new(session_with_pr(true))];
+        paint_pr_colors(&mut views, &mut cache, 0);
+        assert_eq!(views[0].pr_color, PrBadgeColor::Default);
+        assert_eq!(cache.in_flight_len(), 0, "hidden rows are never sent to gh");
     }
 }

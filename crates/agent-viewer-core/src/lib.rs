@@ -5,6 +5,7 @@ pub mod error;
 pub mod grok;
 pub mod group;
 pub mod platform;
+pub mod pr_cache;
 pub mod pr_status;
 pub mod pty;
 pub mod router;
@@ -18,6 +19,7 @@ pub use backend::{
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use grok::{GrokBackend, GrokDiagnostics, GrokLifecycle};
+pub use pr_cache::PrStatusCache;
 pub use pr_status::PrBadgeColor;
 pub use state::{
     ListingCacheClaim, ListingCacheLease, ListingCacheRead, ListingCacheSnapshot,

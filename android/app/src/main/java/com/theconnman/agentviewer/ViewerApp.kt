@@ -101,6 +101,16 @@ data class ViewerColors(
     val cx: Color,
 )
 
+/** Same mapping the TUI uses: unknown is accent, pending/failing is warn, passing is ok,
+ * merged is purple, draft/closed is muted. */
+internal fun prBadgeThemeColor(color: PrBadgeColor, colors: ViewerColors): Color = when (color) {
+    PrBadgeColor.DEFAULT -> colors.accent
+    PrBadgeColor.ATTENTION -> colors.warn
+    PrBadgeColor.PASSED -> colors.ok
+    PrBadgeColor.MERGED -> colors.merged
+    PrBadgeColor.MUTED -> colors.muted
+}
+
 enum class AppTheme(val displayName: String, val colors: ViewerColors) {
     ANALOG_AMBER(
         "analog amber",
@@ -826,13 +836,14 @@ private fun SessionRow(session: Session, colors: ViewerColors, onOpen: () -> Uni
             Row(modifier = Modifier.padding(start = 20.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(statusLabel(session.status), color = statusColor(session.status, colors), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                 session.prRefs.firstOrNull()?.let { pr ->
+                    val chip = prBadgeThemeColor(session.prColor, colors)
                     Spacer(Modifier.width(8.dp))
                     Text(
                         "#${pr.id}",
-                        color = colors.merged,
+                        color = chip,
                         fontFamily = FontFamily.Monospace,
                         fontSize = 10.sp,
-                        modifier = Modifier.border(1.dp, colors.merged, RoundedCornerShape(4.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
+                        modifier = Modifier.border(1.dp, chip, RoundedCornerShape(4.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
                     )
                 }
             }
@@ -1051,7 +1062,8 @@ private fun SessionActionsSheet(
             ) {
                 StatusPill(session.status, colors)
                 session.gitBranch?.let { DetailBadge(it, colors.muted, colors.bg) }
-                session.prRefs.forEach { DetailBadge("#${it.id}", colors.merged, colors.bg) }
+                val chip = prBadgeThemeColor(session.prColor, colors)
+                session.prRefs.forEach { DetailBadge("#${it.id}", chip, colors.bg) }
                 Text(sessionAge(session.updatedAtMs), color = colors.faint, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
             }
             Text(
