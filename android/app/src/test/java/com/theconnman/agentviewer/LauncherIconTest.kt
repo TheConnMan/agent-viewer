@@ -48,7 +48,7 @@ class LauncherIconTest {
 
         val adaptive = drawable as AdaptiveIconDrawable
         assertSage("background", rasterPoint(adaptive.background, 54, 54))
-        assertCharcoal("foreground bezel", rasterPoint(adaptive.foreground, 54, 32))
+        assertCharcoal("foreground bezel", rasterPoint(adaptive.foreground, 54, 40))
 
         // The mask (circle/squircle) plus the 25% layer inset shift glyph coordinates, so
         // count colours rather than pinning a pixel.
@@ -79,12 +79,13 @@ class LauncherIconTest {
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         drawable!!.setBounds(0, 0, size, size)
         drawable.draw(Canvas(bitmap))
-        // Viewport 630 maps 1:1 onto this 108px raster (no adaptive inset).
+        // Viewport 630 maps 1:1 onto this 108px raster (no adaptive inset). Glyph is 80%
+        // scale, shifted down 22px, so samples sit lower than the original crop.
         assertEquals("corner stays transparent", 0, Color.alpha(bitmap.getPixel(2, 2)))
-        assertEquals("screen interior is a hole", 0, Color.alpha(bitmap.getPixel(34, 38)))
-        assertEquals("left eye is a hole", 0, Color.alpha(bitmap.getPixel(50, 51)))
-        assertCharcoal("monitor bezel", bitmap.getPixel(54, 32))
-        assertCharcoal("robot head", bitmap.getPixel(46, 46))
+        assertEquals("screen interior is a hole", 0, Color.alpha(bitmap.getPixel(38, 45)))
+        assertEquals("left eye is a hole", 0, Color.alpha(bitmap.getPixel(51, 55)))
+        assertCharcoal("monitor bezel", bitmap.getPixel(54, 40))
+        assertCharcoal("robot head", bitmap.getPixel(48, 52))
     }
 
     private fun rasterPoint(drawable: android.graphics.drawable.Drawable, x: Int, y: Int): Int {
