@@ -56,6 +56,31 @@ class ApiContractTest {
         assertEquals("thread-123", session.id)
         assertEquals("/home/brian/git/agent-viewer", session.projectRoot)
         assertEquals("Approve the design", (session.status as Status.NeedsInput).reason)
+        assertEquals(PrBadgeColor.DEFAULT, session.prColor)
+    }
+
+    @Test
+    fun `decodes a live PR badge color and defaults when the field is missing`() {
+        val merged = ApiJson.json.decodeFromString<Session>(
+            sessionJson("thread-merged", "Codex").replace(
+                "\"updated_at_ms\": 1724151000000",
+                "\"updated_at_ms\": 1724151000000, \"pr_color\": \"Merged\"",
+            ),
+        )
+        val legacy = ApiJson.json.decodeFromString<Session>(sessionJson("thread-legacy", "Codex"))
+
+        assertEquals(PrBadgeColor.MERGED, merged.prColor)
+        assertEquals(PrBadgeColor.DEFAULT, legacy.prColor)
+    }
+
+    @Test
+    fun `PR badge colors match the TUI theme tokens`() {
+        val colors = AppTheme.ANALOG_AMBER.colors
+        assertEquals(colors.accent, prBadgeThemeColor(PrBadgeColor.DEFAULT, colors))
+        assertEquals(colors.warn, prBadgeThemeColor(PrBadgeColor.ATTENTION, colors))
+        assertEquals(colors.ok, prBadgeThemeColor(PrBadgeColor.PASSED, colors))
+        assertEquals(colors.merged, prBadgeThemeColor(PrBadgeColor.MERGED, colors))
+        assertEquals(colors.muted, prBadgeThemeColor(PrBadgeColor.MUTED, colors))
     }
 
     @Test

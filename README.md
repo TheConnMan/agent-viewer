@@ -665,7 +665,10 @@ the TUI would attach to, rendered by an embedded VT emulator, with the CLI's own
 the composing. **Long-pressing a session** opens its action sheet, with status, branch, PR refs
 and age at the top and every action the backend advertises for that row underneath: open
 terminal, stop, archive (Codex hides reversibly; Claude and Grok stop and delete, and the sheet
-says which), and rename. A backend that cannot be attached from the phone (Grok) answers a tap
+says which), and rename. The `#315` chip on the list row and the sheet is colored by the same
+live GitHub status the TUI uses (yellow pending or failing, green passing, purple merged, grey
+draft or closed, accent when unknown), so a merged PR is distinguishable from an open one when
+you are deciding whether to archive. A backend that cannot be attached from the phone (Grok) answers a tap
 with a footer notice, and its long press still works. Android's back button leaves the terminal
 for the list; the session keeps running under its grace window (below). The list shows visible
 sessions only; archived, companion, and subagent threads are not on the phone, and there is no

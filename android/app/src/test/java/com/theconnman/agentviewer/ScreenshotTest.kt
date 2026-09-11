@@ -57,6 +57,7 @@ class ScreenshotTest {
         backend: BackendKind = BackendKind.CLAUDE,
         ageMinutes: Long = 5,
         pr: String? = null,
+        prColor: PrBadgeColor = PrBadgeColor.DEFAULT,
     ) = Session(
         backend = backend,
         id = id,
@@ -69,6 +70,7 @@ class ScreenshotTest {
         updatedAtMs = now - ageMinutes * 60_000,
         summary = "reading crates/agent-viewer-server/src/lib.rs",
         prRefs = listOfNotNull(pr?.let { PrRef(it) }),
+        prColor = prColor,
         projectRoot = folder,
     )
 
@@ -77,7 +79,7 @@ class ScreenshotTest {
     private val wiki = "/home/brian/wiki"
     private val sessions = listOf(
         session("a1", "Phone feedback: spawn from folder headers", Status.Working, viewer),
-        session("a2", "Keep the companion server up", Status.NeedsInput("Approve the unit file"), viewer, BackendKind.CODEX, 42, pr = "118"),
+        session("a2", "Keep the companion server up", Status.NeedsInput("Approve the unit file"), viewer, BackendKind.CODEX, 42, pr = "118", prColor = PrBadgeColor.ATTENTION),
         session("a3", "Review icon placement", Status.Done, viewer, BackendKind.GROK, 130),
         session("b1", "Route Grok spawns", Status.Idle, router, BackendKind.CODEX, 900),
         // A parked thread holding the wiki folder open: never a row, but the folder is a place.

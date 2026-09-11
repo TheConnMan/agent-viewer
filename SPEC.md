@@ -973,7 +973,7 @@ Cargo workspace, three crates plus one vendored dependency. Live-refresh the reg
   the binary is installed. It deliberately is not a `Backend`: it enumerates nothing and owns
   no sessions. Pinned Grok temporarily uses `GrokLifecycle` directly until Router Phase 2.
 - `pr_status.rs` parses a GitHub PR href, fetches its live state via `gh`, and maps that to a
-  badge color.
+  badge color. `pr_cache.rs` is the TTL cache both the TUI and the companion server read.
 - `pty.rs` is the embedded-attach engine: a real PTY plus child plus vt100 parser, with the
   bounded scrollback, the palette replies, and the optional output tap the companion server
   streams from.
@@ -989,8 +989,8 @@ Cargo workspace, three crates plus one vendored dependency. Live-refresh the reg
 `agent-viewer-tui` (bin): `ratatui` + `crossterm` over `-core`. `main.rs` owns the run loop and
 the refresh tick; `app.rs` the row model and grouping; `keys.rs` the per-mode key routing;
 `actions.rs` what those keys do; `composer.rs`, `attach.rs`, and `mouse.rs` the input encodings;
-`ops.rs` and `mutations.rs` the background mutation worker; `model_cache.rs`, `pr_cache.rs`, and
-`shared_listing.rs` the off-thread caches; `logos.rs` the inline brand marks; `terminal_title.rs`
+`ops.rs` and `mutations.rs` the background mutation worker; `model_cache.rs`, `pr_cache.rs`
+(a re-export of `-core`'s cache), and `shared_listing.rs` the off-thread caches; `logos.rs` the inline brand marks; `terminal_title.rs`
 the tab title. Rendering lives under `ui/`: `list.rs`, `header.rs`, `composer.rs`, `overlay.rs`,
 `palette.rs`, `wall.rs`, `triage.rs`, `tail.rs`, `theme.rs`, `sprite.rs`, `age.rs`.
 
@@ -1065,7 +1065,8 @@ bounding together take the response to a few KB. Both happen in the view layer o
 (`SessionView::bounded`, `is_visible`): the snapshot and `-core` keep the full text and the
 full row set, so the TUI, the terminal route, and every `/sessions/{id}/…` lookup are
 unchanged — those resolve against the unfiltered snapshot and can still reach a hidden row by
-id. The JSON shape is untouched, so an older phone build keeps decoding it.
+id. Additive fields such as `pr_color` (the aggregated GitHub badge bucket, same values as
+`PrBadgeColor`) are ignored by older phone builds.
 
 ### Wire protocol
 
@@ -1371,11 +1372,13 @@ stack and lives exactly as long as the child.
 A badge's live color comes from `gh pr view <url> --json state,mergedAt,isDraft,reviewDecision,
 reviewRequests,statusCheckRollup`, run under a 10s deadline (`PR_STATUS_TIMEOUT`); any failure,
 including a missing `gh`, degrades to the flat default color rather than erroring. `pr_status.rs`
-itself is a pure fetch-and-map with no cache. The cache is one layer up in the TUI
-(`PrStatusCache`, modeled on the mutation runner): each resolvable PR key gets a fetch on a
-worker thread, keys already in flight are never re-spawned, results drain non-blocking, the
-render path reads cached colors purely, and an entry re-fetches once past its 30s TTL. Nothing
-here is persisted, so a fresh viewer fills its badges in over its first few seconds.
+itself is a pure fetch-and-map with no cache. The cache is `PrStatusCache` in `-core` (modeled
+on the mutation runner), used by the TUI render path and by the companion server's listing
+snapshot: each resolvable PR key gets a fetch on a worker thread, keys already in flight are
+never re-spawned, results drain non-blocking, the read path is pure, and an entry re-fetches
+once past its 30s TTL. The list JSON carries the aggregated bucket as `pr_color`. Nothing here
+is persisted, so a fresh viewer or a just-started server fills its badges in over its first few
+seconds. The phone paints that bucket with the same theme tokens as the TUI.
 
 ### Dead-cwd marking
 

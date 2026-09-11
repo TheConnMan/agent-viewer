@@ -4,7 +4,7 @@
 
 /// The color bucket for a PR badge, mapped from live GitHub state. `Default` keeps the
 /// current flat badge (unknown / unresolved / fetch failed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PrBadgeColor {
     Default,
     Attention, // checks pending OR failing OR review requested
