@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Robot-on-monitor mark from the trimmed square source. Viewport matches the 630px crop so
+     the glyph sits in the adaptive-icon safe zone; evenOdd punches the screen and the eyes. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="630"
+    android:viewportHeight="630">
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:fillType="evenOdd"
+        android:pathData="M158,179h314v230H158zM179,198h272v193H179z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M298,409h35v25H298z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M247,434h136v18H247z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M300,217h31v26H300z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M311,243h9v17H311z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:fillType="evenOdd"
+        android:pathData="M260,260h111v59H260zM283,289h17v17H283zM331,289h17v17H331z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M237,280h16v26H237z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M377,280h16v26H377z" />
+    <path
+        android:fillColor="#FF1B1B1B"
+        android:pathData="M262,349h106L389,377H241z" />
+</vector>
