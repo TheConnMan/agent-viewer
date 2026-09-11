@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Robot-on-monitor mark from the trimmed square source. Viewport matches the 630px crop so
-     the glyph sits in the adaptive-icon safe zone; evenOdd punches the screen and the eyes. -->
+<!-- Robot-on-monitor mark, scaled to 80% and shifted down 22px in the 630 viewport so a
+     circular Pixel mask has sage padding and the screen sits on the optical centre.
+     evenOdd punches the screen and the eyes. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
@@ -9,30 +10,30 @@
     <path
         android:fillColor="#FF1B1B1B"
         android:fillType="evenOdd"
-        android:pathData="M158,179h314v230H158zM179,198h272v193H179z" />
+        android:pathData="M189.40,228.20h251.20v184h-251.20zM206.20,243.40h217.60v154.40h-217.60z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M298,409h35v25H298z" />
+        android:pathData="M301.40,412.20h28v20h-28z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M247,434h136v18H247z" />
+        android:pathData="M260.60,432.20h108.80v14.40h-108.80z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M300,217h31v26H300z" />
+        android:pathData="M303,258.60h24.80v20.80h-24.80z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M311,243h9v17H311z" />
+        android:pathData="M311.80,279.40h7.20v13.60h-7.20z" />
     <path
         android:fillColor="#FF1B1B1B"
         android:fillType="evenOdd"
-        android:pathData="M260,260h111v59H260zM283,289h17v17H283zM331,289h17v17H331z" />
+        android:pathData="M271,293h88.80v47.20h-88.80zM289.40,316.20h13.60v13.60h-13.60zM327.80,316.20h13.60v13.60h-13.60z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M237,280h16v26H237z" />
+        android:pathData="M252.60,309h12.80v20.80h-12.80z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M377,280h16v26H377z" />
+        android:pathData="M364.60,309h12.80v20.80h-12.80z" />
     <path
         android:fillColor="#FF1B1B1B"
-        android:pathData="M262,349h106L389,377H241z" />
+        android:pathData="M272.60,364.20L357.40,364.20L374.20,386.60L255.80,386.60z" />
 </vector>
