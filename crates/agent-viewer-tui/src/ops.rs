@@ -650,12 +650,73 @@ mod tests {
     use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, TailEvent, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::mutations::MutationRunner;
-    use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
+    use agent_viewer_tui::shared_listing::{
+        SpawnDirectoryMode, SpawnTarget, TargetRequest, authoritative_target,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
     use std::time::{Duration, Instant};
+
+    fn median_sample(samples: &[Duration]) -> Duration {
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        ordered[ordered.len() / 2]
+    }
+
+    fn is_release_build() -> bool {
+        cfg!(not(debug_assertions))
+    }
+
+    #[test]
+    #[ignore = "live release benchmark against the real Codex registry"]
+    fn live_release_codex_authoritative_lookup_benchmark() {
+        assert!(
+            is_release_build(),
+            "run this ignored benchmark with cargo test --release"
+        );
+        const SAMPLE_COUNT: usize = 5;
+
+        let request = {
+            let mut selector = fresh_backend(BackendKind::Codex);
+            let selected = selector
+                .list()
+                .expect("list real Codex sessions before timing")
+                .into_iter()
+                .next_back()
+                .expect("the real Codex registry must contain a session");
+            TargetRequest::from(&selected)
+        };
+
+        let mut targeted_samples = Vec::with_capacity(SAMPLE_COUNT);
+        let mut list_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let mut targeted_backend = fresh_backend(BackendKind::Codex);
+            let started = Instant::now();
+            let targeted = authoritative_target(targeted_backend.as_mut(), &request)
+                .expect("targeted authority must resolve the selected Codex session");
+            targeted_samples.push(started.elapsed());
+            assert_eq!(targeted.backend, BackendKind::Codex);
+
+            let mut list_backend = fresh_backend(BackendKind::Codex);
+            let started = Instant::now();
+            let listed = list_backend.list().expect("list real Codex sessions");
+            list_samples.push(started.elapsed());
+            assert!(
+                listed.iter().any(|session| session.id == request.id()),
+                "the selected Codex session must remain in the full listing"
+            );
+        }
+
+        println!("targeted session_by_id samples: {targeted_samples:?}");
+        println!("full list samples: {list_samples:?}");
+        println!(
+            "medians: targeted session_by_id {:?}, full list {:?}",
+            median_sample(&targeted_samples),
+            median_sample(&list_samples)
+        );
+    }
 
     /// A routed row with no job id is matched by `match_spawn`'s cwd + creation-time rule, and
     /// that window closes 30s after the stamp. Classification plus dispatch can run for most of
