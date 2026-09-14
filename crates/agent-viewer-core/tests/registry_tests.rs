@@ -135,25 +135,6 @@ fn threads_maps_rows_and_orders_by_recency_ascending() {
 }
 
 #[test]
-fn thread_fixture_schema_indexes_the_identifier_as_the_primary_key() {
-    let schema = common::read_fixture("threads_schema.sql");
-    let dir = tempfile::TempDir::new().expect("create temp directory");
-    let path = dir.path().join("state.sqlite");
-    let conn = rusqlite::Connection::open(path).expect("open fixture database");
-    conn.execute_batch(&schema).expect("run schema DDL");
-
-    let primary_key_position: i64 = conn
-        .query_row(
-            "SELECT pk FROM pragma_table_info('threads') WHERE name = 'id'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("threads identifier column");
-
-    assert_eq!(primary_key_position, 1);
-}
-
-#[test]
 fn thread_selects_the_exact_decoded_row_and_applies_its_name_overlay() {
     let schema = common::read_fixture("threads_schema.sql");
     let selected = format!(

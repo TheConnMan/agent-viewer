@@ -640,8 +640,8 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mutation, RouterOutcome, fresh_backend, run_remove, run_spawn_routed,
-        run_spawn_with_backend, run_spawn_with_backend_and_skill_spawner,
+        Mutation, RouterOutcome, fresh_backend, fresh_backend_with_codex_home, run_remove,
+        run_spawn_routed, run_spawn_with_backend, run_spawn_with_backend_and_skill_spawner,
         spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
@@ -667,6 +667,61 @@ mod tests {
 
     fn is_release_build() -> bool {
         cfg!(not(debug_assertions))
+    }
+
+    #[test]
+    fn production_codex_constructor_dispatches_targeted_authority() {
+        let home = tempfile::tempdir().expect("temporary Codex home");
+        let rollout = home.path().join("target.jsonl");
+        let pr_href = "https://github.com/acme/agentviewer/pull/42";
+        let call = r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_target_pr","input":"gh pr create"}}"#;
+        let result = format!(
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","call_id":"call_target_pr","output":[{{"type":"input_text","text":"Script completed\nOutput:\n{pr_href}\n"}}]}}}}"#
+        );
+        std::fs::write(&rollout, format!("{call}\n{result}\n")).expect("write PR rollout");
+
+        let db_path = home.path().join("state_1.sqlite");
+        let connection = rusqlite::Connection::open(&db_path).expect("create fixture registry");
+        connection
+            .execute_batch(include_str!(
+                "../../agent-viewer-core/tests/fixtures/threads_schema.sql"
+            ))
+            .expect("create fixture schema");
+        connection
+            .execute(
+                "INSERT INTO threads \
+                 (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, \
+                  sandbox_policy, approval_mode, archived, model, git_branch, first_user_message, \
+                  preview, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, 1, 1, 'cli', 'openai', '/tmp/target', 'Target', \
+                         'workspace-write', 'on-request', 0, 'gpt-5', 'main', 'first', \
+                         'preview', 1000, 2000)",
+                rusqlite::params!["target", rollout.to_string_lossy().as_ref()],
+            )
+            .expect("insert fixture thread");
+        drop(connection);
+
+        let mut listing =
+            fresh_backend_with_codex_home(BackendKind::Codex, home.path().to_path_buf());
+        let listed = listing
+            .list()
+            .expect("list fixture sessions")
+            .into_iter()
+            .find(|session| session.id == "target")
+            .expect("target fixture session");
+        assert_eq!(listed.pr_refs.len(), 1);
+        assert_eq!(listed.pr_refs[0].id, "42");
+
+        let request = TargetRequest::from(&listed);
+        let mut targeted =
+            fresh_backend_with_codex_home(BackendKind::Codex, home.path().to_path_buf());
+        let session = authoritative_target(targeted.as_mut(), &request)
+            .expect("production backend dispatches targeted lookup");
+        assert!(session.pr_refs.is_empty());
+
+        let mut expected = listed;
+        expected.pr_refs.clear();
+        assert_eq!(session, expected);
     }
 
     #[test]

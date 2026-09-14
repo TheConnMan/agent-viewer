@@ -41,6 +41,7 @@ unicode-width = "0.2"
 criterion = { version = "0.8.2", default-features = false, features = [
     "cargo_bench_support",
 ] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 tempfile = "3.27.0"
 
 [[bench]]

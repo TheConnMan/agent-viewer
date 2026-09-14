@@ -55,32 +55,22 @@ where
     None
 }
 
-/// The targeted lookup and the full listing may observe a registry row at different times.
-/// Compare the fields that determine identity and routing, while allowing the registry's
-/// mutable timestamp and the targeted path's deliberately omitted PR metadata to differ.
+/// The targeted lookup and full listing can observe a live registry row at different instants.
+/// Normalize that timestamp race and the intentionally omitted PR display metadata, then compare
+/// the complete session so every stable identity, display, and routing field remains in parity.
 fn assert_targeted_matches_listing(
     targeted: &agent_viewer_core::Session,
     listed: &agent_viewer_core::Session,
     state: &str,
 ) {
-    assert_eq!(targeted.backend, listed.backend, "{state}: backend differs");
-    assert_eq!(targeted.id, listed.id, "{state}: id differs");
-    assert_eq!(targeted.origin, listed.origin, "{state}: origin differs");
-    assert_eq!(targeted.cwd, listed.cwd, "{state}: cwd differs");
-    assert_eq!(
-        targeted.rollout_path, listed.rollout_path,
-        "{state}: rollout path differs"
+    assert!(
+        targeted.updated_at_ms >= listed.updated_at_ms,
+        "{state}: the later targeted read must not move the registry timestamp backwards"
     );
-    assert_eq!(targeted.status, listed.status, "{state}: status differs");
-    assert_eq!(targeted.pid, listed.pid, "{state}: pid differs");
-    assert_eq!(
-        targeted.subagent, listed.subagent,
-        "{state}: subagent routing identity differs"
-    );
-    assert_eq!(
-        targeted.daemon_hosted, listed.daemon_hosted,
-        "{state}: daemon hosting differs"
-    );
+    let mut expected = listed.clone();
+    expected.pr_refs.clear();
+    expected.updated_at_ms = targeted.updated_at_ms;
+    assert_eq!(targeted, &expected, "{state}: session fields differ");
 }
 
 /// Read the latest valid persisted name for one thread from Codex's append only index.
@@ -778,6 +768,10 @@ fn codex_spawn_identity_and_immediate_rename_persists() {
         .session_by_id(&thread_id)
         .expect("query completed thread by identifier")
         .expect("completed thread exists by identifier");
+    assert_eq!(
+        targeted.title, user_name,
+        "targeted lookup must apply the persisted session index name"
+    );
     assert_targeted_matches_listing(
         &targeted,
         &completed,

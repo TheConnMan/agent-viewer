@@ -2119,6 +2119,38 @@ mod async_attach_tests {
             .kill();
     }
 
+    #[test]
+    fn completed_attach_plan_keeps_authoritative_refs_when_display_row_vanished() {
+        let mut fresh = sess(
+            "vanished_pr_focus",
+            "/tmp/agentviewer_vanished_pr_attach",
+            200,
+        );
+        fresh.backend = BackendKind::Codex;
+        fresh.status = Status::Working;
+        fresh.daemon_hosted = true;
+        fresh.pr_refs.clear();
+
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let plan = AttachPlan {
+            session: fresh.clone(),
+            command,
+        };
+        let mut ui = test_ui_with(Vec::new());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
+        assert_eq!(ui.focused_session.as_ref(), Some(&fresh));
+
+        let key = (BackendKind::Codex, fresh.id.clone());
+        ui.attached
+            .get_mut(&key)
+            .expect("fresh attached child")
+            .kill();
+    }
+
     /// The control for the two drop tests below: a plan that lands while its row is still the
     /// selected one is installed exactly as before.
     #[test]
