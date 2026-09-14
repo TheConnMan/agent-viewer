@@ -135,6 +135,85 @@ fn threads_maps_rows_and_orders_by_recency_ascending() {
 }
 
 #[test]
+fn thread_fixture_schema_indexes_the_identifier_as_the_primary_key() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let dir = tempfile::TempDir::new().expect("create temp directory");
+    let path = dir.path().join("state.sqlite");
+    let conn = rusqlite::Connection::open(path).expect("open fixture database");
+    conn.execute_batch(&schema).expect("run schema DDL");
+
+    let primary_key_position: i64 = conn
+        .query_row(
+            "SELECT pk FROM pragma_table_info('threads') WHERE name = 'id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("threads identifier column");
+
+    assert_eq!(primary_key_position, 1);
+}
+
+#[test]
+fn thread_selects_the_exact_decoded_row_and_applies_its_name_overlay() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let selected = format!(
+        "{INSERT_COLS}\
+         ('fixture_thread_duplicate','/r/selected.jsonl',1,2,'exec','openai',\
+          '/selected','SQLite Selected Name','workspace-write','on-request',1,\
+          'gpt-5','selected-branch','selected message','selected preview',1500,2500)"
+    );
+    let decoy = format!(
+        "{INSERT_COLS}\
+         ('fixture_thread_ordinary','/r/decoy.jsonl',3,4,'vscode','openai',\
+          '/decoy','SQLite Decoy Name','workspace-write','on-request',0,\
+          'gpt-5','decoy-branch','decoy message','decoy preview',3500,4500)"
+    );
+    let (dir, path) = common::temp_db(&schema, &[selected.as_str(), decoy.as_str()]);
+    copy_session_index(&dir);
+
+    let listed = Registry::open(&path)
+        .expect("open list registry read only")
+        .threads()
+        .expect("query full thread list")
+        .into_iter()
+        .find(|thread| thread.id == "fixture_thread_duplicate")
+        .expect("selected thread in full list");
+    let thread = Registry::open(&path)
+        .expect("open target registry read only")
+        .thread("fixture_thread_duplicate")
+        .expect("query exact thread")
+        .expect("selected thread exists");
+
+    assert_eq!(thread, listed);
+    assert_eq!(thread.id, "fixture_thread_duplicate");
+    assert_eq!(thread.rollout_path, PathBuf::from("/r/selected.jsonl"));
+    assert_eq!(thread.created_at_ms, 1500);
+    assert_eq!(thread.updated_at_ms, 2500);
+    assert_eq!(thread.source, Source::Exec);
+    assert_eq!(thread.parent_thread_id, None);
+    assert_eq!(thread.cwd, PathBuf::from("/selected"));
+    assert_eq!(thread.git_branch.as_deref(), Some("selected-branch"));
+    assert_eq!(thread.title, "Latest Index Name");
+    assert!(thread.archived);
+    assert_eq!(thread.preview, "selected preview");
+}
+
+#[test]
+fn thread_returns_none_for_a_missing_identifier() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let selected = thread_insert("fixture_thread_duplicate", "Selected", 3000);
+    let decoy = thread_insert("fixture_thread_ordinary", "Decoy", 2000);
+    let (_dir, path) = common::temp_db(&schema, &[selected.as_str(), decoy.as_str()]);
+
+    let thread = Registry::open(&path)
+        .expect("open read only")
+        .thread("fixture_thread_missing")
+        .expect("query missing thread");
+
+    assert_eq!(thread, None);
+}
+
+#[test]
 fn threads_extract_only_valid_spawn_parent_ids() {
     let schema = common::read_fixture("threads_schema.sql");
     let nested = format!(

@@ -1888,7 +1888,7 @@ mod async_attach_tests {
     use super::{close_triage, install_attach_plan, open_triage, skip_triage_item, submit_attach};
     use crate::keys::tests::{sess, test_ui_with};
     use crate::ops::AttachPlan;
-    use agent_viewer_core::{BackendKind, Session, Status};
+    use agent_viewer_core::{BackendKind, PrRef, Session, Status};
     use agent_viewer_tui::app::{GroupKey, Row};
     use agent_viewer_tui::shared_listing::TargetRequest;
     use agent_viewer_tui::ui::Mode;
@@ -2052,6 +2052,61 @@ mod async_attach_tests {
         assert!(matches!(ui.mode, Mode::Attached));
         assert!(ui.attached.contains_key(&key));
 
+        ui.attached
+            .get_mut(&key)
+            .expect("fresh attached child")
+            .kill();
+    }
+
+    #[test]
+    fn completed_attach_plan_restores_only_the_displayed_pr_references() {
+        let mut displayed = sess(
+            "fresh_pr_focus",
+            "/tmp/agentviewer_displayed_pr_attach",
+            100,
+        );
+        displayed.backend = BackendKind::Codex;
+        displayed.title = "cached title".to_string();
+        displayed.status = Status::Done;
+        displayed.pid = Some(101);
+        displayed.daemon_hosted = false;
+        displayed.pr_refs = vec![PrRef {
+            id: "315".to_string(),
+            href: Some("https://github.com/TheConnMan/agent-viewer/pull/315".to_string()),
+        }];
+
+        let mut fresh = displayed.clone();
+        fresh.title = "fresh authoritative title".to_string();
+        fresh.cwd = "/tmp/agentviewer_fresh_pr_attach".into();
+        fresh.status = Status::Working;
+        fresh.pid = None;
+        fresh.daemon_hosted = true;
+        fresh.updated_at_ms = 200;
+        fresh.pr_refs.clear();
+
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let plan = AttachPlan {
+            session: fresh.clone(),
+            command,
+        };
+        let mut ui = test_ui_with(vec![displayed.clone()]);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24))
+            .expect("test terminal");
+
+        assert!(install_attach_plan(&mut ui, &mut terminal, plan).expect("install attach plan"));
+
+        let mut expected = fresh.clone();
+        expected.pr_refs = displayed.pr_refs;
+        let focused = ui.focused_session.as_ref().expect("focused session");
+        assert_eq!(focused, &expected);
+        assert_eq!(focused.status, fresh.status);
+        assert_eq!(focused.pid, fresh.pid);
+        assert_eq!(focused.daemon_hosted, fresh.daemon_hosted);
+        assert_eq!(focused.cwd, fresh.cwd);
+        assert_eq!(focused.title, fresh.title);
+
+        let key = (BackendKind::Codex, fresh.id.clone());
         ui.attached
             .get_mut(&key)
             .expect("fresh attached child")

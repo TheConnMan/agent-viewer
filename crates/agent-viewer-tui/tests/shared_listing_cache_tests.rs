@@ -23,6 +23,45 @@ struct CountedBackend {
     delay: std::time::Duration,
 }
 
+struct TargetedBackend {
+    kind: BackendKind,
+    target: Option<Session>,
+    requested_ids: Vec<String>,
+}
+
+impl Backend for TargetedBackend {
+    fn kind(&self) -> BackendKind {
+        self.kind
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::none()
+    }
+
+    fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+        panic!("target authority must not materialize the full listing")
+    }
+
+    fn session_by_id(&mut self, id: &str) -> agent_viewer_core::Result<Option<Session>> {
+        self.requested_ids.push(id.to_string());
+        Ok(self.target.clone())
+    }
+
+    fn spawn(
+        &self,
+        _dir: &std::path::Path,
+        _task: &str,
+        _model: Option<&str>,
+        _effort: Option<&str>,
+    ) -> agent_viewer_core::Result<SpawnResult> {
+        unreachable!("spawn is not exercised by listing tests")
+    }
+
+    fn attach_command(&self, _session: &Session) -> Result<std::process::Command, AttachRefusal> {
+        unreachable!("attach is not exercised by listing tests")
+    }
+}
+
 impl CountedBackend {
     fn sessions(kind: BackendKind, scope: &ListingCacheScope, sessions: Vec<Session>) -> Self {
         Self {
@@ -365,17 +404,48 @@ fn successful_empty_listing_replaces_rows_and_cached_error_keeps_notice() {
 }
 
 #[test]
-fn authoritative_target_returns_the_fresh_row() {
-    let scope = scope(BackendKind::Codex);
+fn authoritative_target_dispatches_the_exact_id_without_a_full_listing() {
     let displayed = session(BackendKind::Codex, "thread_123", Some(101), false);
     let fresh = session(BackendKind::Codex, "thread_123", Some(202), false);
     let request = TargetRequest::from(&displayed);
-    let mut backend = CountedBackend::sessions(BackendKind::Codex, &scope, vec![fresh.clone()]);
+    let mut backend = TargetedBackend {
+        kind: BackendKind::Codex,
+        target: Some(fresh.clone()),
+        requested_ids: Vec::new(),
+    };
+
+    let resolved = authoritative_target(&mut backend, &request).expect("fresh target");
+
+    assert_eq!(resolved, fresh);
+    assert_eq!(backend.requested_ids, vec!["thread_123"]);
+}
+
+#[test]
+fn authoritative_target_uses_the_default_full_listing_for_claude() {
+    let scope = scope(BackendKind::Claude);
+    let displayed = session(BackendKind::Claude, "agent_123", Some(101), false);
+    let fresh = session(BackendKind::Claude, "agent_123", Some(202), false);
+    let request = TargetRequest::from(&displayed);
+    let mut backend = CountedBackend::sessions(BackendKind::Claude, &scope, vec![fresh.clone()]);
 
     let resolved = authoritative_target(&mut backend, &request).expect("fresh target");
 
     assert_eq!(resolved, fresh);
     assert_eq!(backend.calls, 1);
+}
+
+#[test]
+fn authoritative_target_reports_a_missing_backend_without_querying_it() {
+    let scope = scope(BackendKind::Claude);
+    let request = TargetRequest::new(BackendKind::Codex, "thread_123");
+    let mut backend = CountedBackend::sessions(BackendKind::Claude, &scope, Vec::new());
+
+    let result = authoritative_target(&mut backend, &request);
+
+    assert!(
+        matches!(result, Err(TargetResolution::Missing { notice }) if notice == "codex backend is no longer available")
+    );
+    assert_eq!(backend.calls, 0);
 }
 
 #[test]
