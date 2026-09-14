@@ -426,6 +426,54 @@ impl CodexBackend {
         self.with_registry(Registry::threads)
     }
 
+    fn query_thread(&self, id: &str) -> Result<Option<registry::Thread>> {
+        self.with_registry(|registry| registry.thread(id))
+    }
+
+    fn session_from_thread(
+        &mut self,
+        thread: registry::Thread,
+        scan: &status::CodexProcessScan,
+        pr_refs: Vec<crate::backend::PrRef>,
+    ) -> Session {
+        // The resolver canonicalizes once (cached) and returns the owning pid from the same
+        // open map, so no per-tick canonicalize is needed here.
+        let attached = scan.attached_threads.contains(&thread.id);
+        let (status, pid, daemon_hosted) =
+            self.resolver
+                .resolve_scanned(&thread.rollout_path, scan, attached);
+        let companion = thread.source.is_companion();
+        // The parsed `source` enum is the ONLY authority on subagent-ness. `companion` is a
+        // presentation flag other passes (mark_dead_dirs) also set, so stop routing reads this
+        // instead.
+        let subagent = matches!(thread.source, source::Source::Subagent(_));
+        let origin = if matches!(thread.source, source::Source::Exec) {
+            SessionOrigin::Exec
+        } else {
+            SessionOrigin::Interactive
+        };
+        Session {
+            backend: BackendKind::Codex,
+            id: thread.id,
+            short_id: None,
+            origin,
+            title: crate::backend::sanitize_display_text(&thread.title),
+            cwd: thread.cwd,
+            git_branch: thread.git_branch,
+            status,
+            created_at_ms: thread.created_at_ms,
+            updated_at_ms: thread.updated_at_ms,
+            hidden: thread.archived,
+            companion,
+            subagent,
+            summary: crate::backend::sanitize_display_text(&thread.preview),
+            pid,
+            rollout_path: Some(thread.rollout_path),
+            pr_refs,
+            daemon_hosted,
+        }
+    }
+
     /// Rollout paths of every thread spawned beneath `root_id`, transitively (the root's own
     /// rollout is not among them). Best-effort: an unreadable registry yields none.
     ///
@@ -549,46 +597,24 @@ impl Backend for CodexBackend {
                 .pr_scan
                 .refs_for(&threads[idx].rollout_path, &mut budget);
         }
-        let mut sessions = Vec::with_capacity(threads.len());
-        for (idx, thread) in threads.into_iter().enumerate() {
-            // The resolver canonicalizes once (cached) and returns the owning pid from the
-            // same open map, so no per-tick canonicalize is needed here.
-            let attached = scan.attached_threads.contains(&thread.id);
-            let (status, pid, daemon_hosted) =
-                self.resolver
-                    .resolve_scanned(&thread.rollout_path, &scan, attached);
-            let companion = thread.source.is_companion();
-            // The parsed `source` enum is the ONLY authority on subagent-ness. `companion` is
-            // a presentation flag other passes (mark_dead_dirs) also set, so stop routing
-            // reads this instead.
-            let subagent = matches!(thread.source, source::Source::Subagent(_));
-            let origin = if matches!(thread.source, source::Source::Exec) {
-                SessionOrigin::Exec
-            } else {
-                SessionOrigin::Interactive
-            };
-            sessions.push(Session {
-                backend: BackendKind::Codex,
-                id: thread.id,
-                short_id: None,
-                origin,
-                title: crate::backend::sanitize_display_text(&thread.title),
-                cwd: thread.cwd,
-                git_branch: thread.git_branch,
-                status,
-                created_at_ms: thread.created_at_ms,
-                updated_at_ms: thread.updated_at_ms,
-                hidden: thread.archived,
-                companion,
-                subagent,
-                summary: crate::backend::sanitize_display_text(&thread.preview),
-                pid,
-                rollout_path: Some(thread.rollout_path),
-                pr_refs: std::mem::take(&mut pr_refs[idx]),
-                daemon_hosted,
-            });
-        }
-        Ok(sessions)
+        Ok(threads
+            .into_iter()
+            .enumerate()
+            .map(|(idx, thread)| {
+                self.session_from_thread(thread, &scan, std::mem::take(&mut pr_refs[idx]))
+            })
+            .collect())
+    }
+
+    fn session_by_id(&mut self, id: &str) -> Result<Option<Session>> {
+        let Some(thread) = self.query_thread(id)? else {
+            return Ok(None);
+        };
+        // Keep the destructive resume guard authoritative: one fresh process sweep and one
+        // rollout status resolution for the selected thread. PR references are display-only
+        // metadata and deliberately do not trigger transcript scanning on this path.
+        let scan = status::scan_codex_processes();
+        Ok(Some(self.session_from_thread(thread, &scan, Vec::new())))
     }
 
     fn tail(&self, session: &Session, max_events: usize) -> Result<Vec<crate::TailEvent>> {

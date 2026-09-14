@@ -478,6 +478,11 @@ pub trait Backend: Send {
     /// &mut self: the codex impl caches per-rollout status by (mtime, len).
     /// Sessions are returned by updated_at_ms ascending.
     fn list(&mut self) -> crate::error::Result<Vec<Session>>;
+    /// Resolve one session by its exact backend identifier.
+    /// Backends without a targeted source retain the full listing behavior.
+    fn session_by_id(&mut self, id: &str) -> crate::error::Result<Option<Session>> {
+        Ok(self.list()?.into_iter().find(|session| session.id == id))
+    }
     /// Epoch millisecond timestamps of turn events for `session` and its descendant
     /// subtree within the last `window`, oldest first. Empty when the backend cannot say.
     fn turn_activity(

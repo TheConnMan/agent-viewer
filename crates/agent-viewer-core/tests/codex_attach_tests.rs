@@ -262,8 +262,7 @@ fn codex_session_by_id_returns_none_for_a_missing_identifier() {
     let schema = common::read_fixture("threads_schema.sql");
     let row = thread_row("present", "cli", 1000);
     let (dir, path) = common::temp_db(&schema, &[row.as_str()]);
-    std::fs::rename(&path, dir.path().join("state_1.sqlite"))
-        .expect("rename fixture database");
+    std::fs::rename(&path, dir.path().join("state_1.sqlite")).expect("rename fixture database");
 
     let mut backend = CodexBackend::new(dir.path().to_path_buf());
     assert_eq!(

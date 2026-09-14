@@ -674,7 +674,10 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     plan: AttachPlan,
 ) -> io::Result<bool> {
-    let AttachPlan { session, command } = plan;
+    let AttachPlan {
+        mut session,
+        command,
+    } = plan;
     let key: Key = (session.backend, session.id.clone());
     let capture_on_attach = matches!(
         session.backend,
@@ -722,7 +725,10 @@ pub(crate) fn install_attach_plan<B: ratatui::backend::Backend>(
         }
     }
 
-    ui.focused = Some(key);
+    ui.focused = Some(key.clone());
+    if let Some(displayed) = ui.app.session_for(&key) {
+        session.pr_refs.clone_from(&displayed.pr_refs);
+    }
     ui.focused_session = Some(session);
     // Triage keeps its modal: the child it just landed belongs in the panel, not on the whole
     // screen. Leaving the mode alone is what makes the queue survive an attach.

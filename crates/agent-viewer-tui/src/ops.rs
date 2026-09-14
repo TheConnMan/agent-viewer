@@ -171,8 +171,12 @@ fn spawn_selection_from_mutation(
 
 /// A fresh backend instance for a worker thread.
 fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
+    fresh_backend_with_codex_home(kind, default_codex_home())
+}
+
+fn fresh_backend_with_codex_home(kind: BackendKind, codex_home: PathBuf) -> Box<dyn Backend> {
     match kind {
-        BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
+        BackendKind::Codex => Box::new(CodexBackend::new(codex_home)),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
         BackendKind::Grok => Box::new(GrokBackend::new()),
     }
