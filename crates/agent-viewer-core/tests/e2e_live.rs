@@ -55,6 +55,34 @@ where
     None
 }
 
+/// The targeted lookup and the full listing may observe a registry row at different times.
+/// Compare the fields that determine identity and routing, while allowing the registry's
+/// mutable timestamp and the targeted path's deliberately omitted PR metadata to differ.
+fn assert_targeted_matches_listing(
+    targeted: &agent_viewer_core::Session,
+    listed: &agent_viewer_core::Session,
+    state: &str,
+) {
+    assert_eq!(targeted.backend, listed.backend, "{state}: backend differs");
+    assert_eq!(targeted.id, listed.id, "{state}: id differs");
+    assert_eq!(targeted.origin, listed.origin, "{state}: origin differs");
+    assert_eq!(targeted.cwd, listed.cwd, "{state}: cwd differs");
+    assert_eq!(
+        targeted.rollout_path, listed.rollout_path,
+        "{state}: rollout path differs"
+    );
+    assert_eq!(targeted.status, listed.status, "{state}: status differs");
+    assert_eq!(targeted.pid, listed.pid, "{state}: pid differs");
+    assert_eq!(
+        targeted.subagent, listed.subagent,
+        "{state}: subagent routing identity differs"
+    );
+    assert_eq!(
+        targeted.daemon_hosted, listed.daemon_hosted,
+        "{state}: daemon hosting differs"
+    );
+}
+
 /// Read the latest valid persisted name for one thread from Codex's append only index.
 fn latest_indexed_thread_name(path: &Path, thread_id: &str) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
@@ -586,11 +614,10 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
         Status::Working,
         "targeted lookup must observe the live daemon turn"
     );
-    let mut expected_targeted = session.clone();
-    expected_targeted.pr_refs.clear();
-    assert_eq!(
-        targeted, expected_targeted,
-        "targeted and full materialization must agree while the daemon turn is working"
+    assert_targeted_matches_listing(
+        &targeted,
+        &session,
+        "targeted and full materialization while working",
     );
 
     // 4. THE GUARD: the daemon holds this rollout's fd, so the row must carry no pid at all.
@@ -751,11 +778,10 @@ fn codex_spawn_identity_and_immediate_rename_persists() {
         .session_by_id(&thread_id)
         .expect("query completed thread by identifier")
         .expect("completed thread exists by identifier");
-    let mut expected_targeted = completed;
-    expected_targeted.pr_refs.clear();
-    assert_eq!(
-        targeted, expected_targeted,
-        "targeted and full materialization must agree after the daemon turn finishes"
+    assert_targeted_matches_listing(
+        &targeted,
+        &completed,
+        "targeted and full materialization after completion",
     );
 
     let mut later_titles = Vec::new();
