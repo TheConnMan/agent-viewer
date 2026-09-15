@@ -297,13 +297,12 @@ impl TargetResolution {
     }
 }
 
-fn target_from_listing(
+fn validate_target(
     request: &TargetRequest,
-    sessions: Vec<Session>,
+    session: Option<Session>,
 ) -> Result<Session, TargetResolution> {
-    sessions
-        .into_iter()
-        .find(|session| session.backend == request.backend && session.id == request.id)
+    session
+        .filter(|session| session.backend == request.backend && session.id == request.id)
         .ok_or_else(|| TargetResolution::Missing {
             notice: format!("{} session is no longer available", request.backend.name()),
         })
@@ -318,10 +317,11 @@ pub fn authoritative_target(
             notice: format!("{} backend is no longer available", request.backend.name()),
         });
     }
-    let sessions = backend
-        .list()
-        .map_err(|error| TargetResolution::SourceError {
-            notice: source_error(request.backend, error),
-        })?;
-    target_from_listing(request, sessions)
+    let session =
+        backend
+            .session_by_id(request.id())
+            .map_err(|error| TargetResolution::SourceError {
+                notice: source_error(request.backend, error),
+            })?;
+    validate_target(request, session)
 }

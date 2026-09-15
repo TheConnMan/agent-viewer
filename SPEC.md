@@ -75,7 +75,10 @@ check is the fast path for readers. Successful empty listings are snapshots too.
 wait for the lease holder and then read its snapshot rather than independently listing.
 
 This cache is display only. Attach, mutations, and session derived spawn directories always
-relist their authoritative source.
+resolve their authoritative source. They use `Backend::session_by_id` for a direct single
+session lookup when the backend supports one, and otherwise use the default implementation,
+which performs a full `Backend::list` and selects the requested identifier. Fleet refresh still
+enumerates every session and continues to populate the shared display snapshot.
 
 ## Grok storage and lifecycle contract
 
@@ -724,6 +727,14 @@ calling `thread/resume` from the viewer's own client: the join happens in the `c
 Enumeration reads `state_*.sqlite` with the read only session index overlay above. Rename remains
 `thread/name/set`, which persists an explicit Codex name to `session_index.jsonl`, and attach uses
 `codex resume --remote unix://<socketPath> <id>` (D-004).
+Authoritative single session operations call `Backend::session_by_id`. The Codex implementation
+queries one exact registry row, performs one fresh process scan, and reads only that session's
+rollout tail for the existing safety resolution. It does not scan transcript PR metadata; PR
+references remain display data and are restored from the current visible row only after attach
+routing and PTY creation succeed. Other backends retain the default full listing behavior. The
+former Codex target path materialized the whole fleet and scanned every rollout before one attach;
+that full listing measured about 1.23 seconds and was the identified latency cause. Fleet refresh
+still uses full enumeration.
 The transport is RFC6455-framed JSON-RPC over the Unix socket (D-009), discovered
 rather than hardcoded: `codex app-server daemon version` prints `socketPath`, and
 `"status":"running"` is the availability gate. Verified on this box on 2026-07-26 (output

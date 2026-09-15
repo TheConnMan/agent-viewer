@@ -51,6 +51,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "resvg",
+ "rusqlite",
  "tempfile",
  "tui-term",
  "unicode-segmentation",

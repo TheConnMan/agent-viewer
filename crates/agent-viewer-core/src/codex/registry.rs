@@ -1,5 +1,6 @@
 use super::source::Source;
 use crate::error::{Error, Result};
+use rusqlite::OptionalExtension;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,30 +113,7 @@ impl Registry {
              FROM threads",
         )?;
         let mut threads = stmt
-            .query_map([], |row| {
-                let raw_source = row.get::<_, String>(4)?;
-                let source = Source::parse(&raw_source);
-                // Only a subagent row can carry a spawn parent: every other `source` is one of
-                // the flat `cli`/`exec`/`vscode` strings, which `Source::parse` matches before
-                // it ever reaches JSON. Gating here keeps the JSON parse to once per row
-                // instead of once in each of these two fields.
-                let parent_thread_id = matches!(source, Source::Subagent(_))
-                    .then(|| spawn_parent_thread_id(&raw_source))
-                    .flatten();
-                Ok(Thread {
-                    id: row.get(0)?,
-                    rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
-                    created_at_ms: row.get(2)?,
-                    updated_at_ms: row.get(3)?,
-                    source,
-                    parent_thread_id,
-                    cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
-                    git_branch: row.get(6)?,
-                    title: row.get(7)?,
-                    archived: row.get::<_, i64>(8)? != 0,
-                    preview: row.get(9)?,
-                })
-            })?
+            .query_map([], decode_thread)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         threads.sort_by(|a, b| {
             a.updated_at_ms
@@ -151,6 +129,25 @@ impl Registry {
         Ok(threads)
     }
 
+    /// One exact row by identifier, with the same effective timestamps, source decoding, and
+    /// final `session_index.jsonl` name overlay as `threads`.
+    pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rollout_path, \
+                    COALESCE(created_at_ms, created_at * 1000), \
+                    COALESCE(updated_at_ms, updated_at * 1000), \
+                    source, cwd, git_branch, title, archived, preview \
+             FROM threads WHERE id = ?1",
+        )?;
+        let Some(mut thread) = stmt.query_row([id], decode_thread).optional()? else {
+            return Ok(None);
+        };
+        if let Some(name) = self.thread_names().get(&thread.id) {
+            thread.title.clone_from(name);
+        }
+        Ok(Some(thread))
+    }
+
     /// Distinct non-empty `model` values across all threads, most-used first (bare slugs,
     /// no provider prefix). Best-effort discovery source for the model picker fallback.
     pub fn distinct_models(&self) -> Result<Vec<String>> {
@@ -163,6 +160,30 @@ impl Registry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(models)
     }
+}
+
+fn decode_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
+    let raw_source = row.get::<_, String>(4)?;
+    let source = Source::parse(&raw_source);
+    // Only a subagent row can carry a spawn parent: every other `source` is one of the flat
+    // `cli`/`exec`/`vscode` strings, which `Source::parse` matches before it ever reaches JSON.
+    // Gating here keeps the JSON parse to once per row instead of once in each field.
+    let parent_thread_id = matches!(source, Source::Subagent(_))
+        .then(|| spawn_parent_thread_id(&raw_source))
+        .flatten();
+    Ok(Thread {
+        id: row.get(0)?,
+        rollout_path: std::path::PathBuf::from(row.get::<_, String>(1)?),
+        created_at_ms: row.get(2)?,
+        updated_at_ms: row.get(3)?,
+        source,
+        parent_thread_id,
+        cwd: std::path::PathBuf::from(row.get::<_, String>(5)?),
+        git_branch: row.get(6)?,
+        title: row.get(7)?,
+        archived: row.get::<_, i64>(8)? != 0,
+        preview: row.get(9)?,
+    })
 }
 
 fn spawn_parent_thread_id(raw_source: &str) -> Option<String> {

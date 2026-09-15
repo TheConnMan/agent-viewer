@@ -118,12 +118,51 @@ const INSERT_COLS: &str = "INSERT INTO threads \
      preview, created_at_ms, updated_at_ms) VALUES ";
 
 fn thread_row(id: &str, source: &str, updated_ms: i64) -> String {
+    thread_row_with_rollout(
+        id,
+        source,
+        updated_ms,
+        &PathBuf::from(format!("/nonexistent/sessions/{id}.jsonl")),
+    )
+}
+
+fn thread_row_with_rollout(
+    id: &str,
+    source: &str,
+    updated_ms: i64,
+    rollout: &std::path::Path,
+) -> String {
     format!(
         "{INSERT_COLS}\
-         ('{id}','/nonexistent/sessions/{id}.jsonl',1,1,'{source}','openai',\
+         ('{id}','{}',1,1,'{source}','openai',\
           '/home/user/proj','{id} Title','workspace-write','on-request',0,\
-          'gpt-5','main','first msg','preview',1000,{updated_ms})"
+          'gpt-5','main','first msg','preview',1000,{updated_ms})",
+        rollout.display()
     )
+}
+
+fn write_successful_pr_creation_rollout(path: &std::path::Path, href: &str) {
+    let call = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_target_pr",
+            "input": "await tools.exec_command({cmd: 'gh pr create'})"
+        }
+    });
+    let result = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call_output",
+            "call_id": "call_target_pr",
+            "output": [{
+                "type": "input_text",
+                "text": format!("Script completed\nOutput:\n{href}\n")
+            }]
+        }
+    });
+    std::fs::write(path, format!("{call}\n{result}\n")).expect("write PR rollout");
 }
 
 /// `source == exec` is the ONLY source that becomes SessionOrigin::Exec; every other
@@ -179,6 +218,59 @@ fn codex_origin_is_exec_only_for_exec_source() {
     assert!(!subagent("t_exec"), "an exec parent owns its own process");
     assert!(!subagent("t_cli"));
     assert!(!subagent("t_vscode"));
+}
+
+#[test]
+fn codex_session_by_id_matches_full_session_without_scanning_pr_refs() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let dir = tempfile::TempDir::new().expect("create temp directory");
+    let rollout = dir.path().join("target.jsonl");
+    let pr_href = "https://github.com/acme/agentviewer/pull/42";
+    write_successful_pr_creation_rollout(&rollout, pr_href);
+    let target = thread_row_with_rollout("target", "cli", 2000, &rollout);
+    let decoy = thread_row("decoy", "vscode", 1000);
+    let refs = [target.as_str(), decoy.as_str()];
+    let (db_dir, db_path) = common::temp_db(&schema, &refs);
+    std::fs::rename(&db_path, db_dir.path().join("state_1.sqlite"))
+        .expect("rename fixture database");
+
+    let mut listing_backend = CodexBackend::new(db_dir.path().to_path_buf());
+    let listed = listing_backend
+        .list()
+        .expect("list codex sessions")
+        .into_iter()
+        .find(|session| session.id == "target")
+        .expect("target session in full listing");
+    assert_eq!(listed.pr_refs.len(), 1);
+    assert_eq!(listed.pr_refs[0].id, "42");
+    assert_eq!(listed.pr_refs[0].href.as_deref(), Some(pr_href));
+
+    let mut targeted_backend = CodexBackend::new(db_dir.path().to_path_buf());
+    let targeted = targeted_backend
+        .session_by_id("target")
+        .expect("query target session")
+        .expect("target session exists");
+    assert!(targeted.pr_refs.is_empty());
+
+    let mut expected = listed;
+    expected.pr_refs.clear();
+    assert_eq!(targeted, expected);
+}
+
+#[test]
+fn codex_session_by_id_returns_none_for_a_missing_identifier() {
+    let schema = common::read_fixture("threads_schema.sql");
+    let row = thread_row("present", "cli", 1000);
+    let (dir, path) = common::temp_db(&schema, &[row.as_str()]);
+    std::fs::rename(&path, dir.path().join("state_1.sqlite")).expect("rename fixture database");
+
+    let mut backend = CodexBackend::new(dir.path().to_path_buf());
+    assert_eq!(
+        backend
+            .session_by_id("missing")
+            .expect("query missing session"),
+        None
+    );
 }
 
 // --- per-row stop capability ---

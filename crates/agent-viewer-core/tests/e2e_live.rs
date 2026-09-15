@@ -55,6 +55,24 @@ where
     None
 }
 
+/// The targeted lookup and full listing can observe a live registry row at different instants.
+/// Normalize that timestamp race and the intentionally omitted PR display metadata, then compare
+/// the complete session so every stable identity, display, and routing field remains in parity.
+fn assert_targeted_matches_listing(
+    targeted: &agent_viewer_core::Session,
+    listed: &agent_viewer_core::Session,
+    state: &str,
+) {
+    assert!(
+        targeted.updated_at_ms >= listed.updated_at_ms,
+        "{state}: the later targeted read must not move the registry timestamp backwards"
+    );
+    let mut expected = listed.clone();
+    expected.pr_refs.clear();
+    expected.updated_at_ms = targeted.updated_at_ms;
+    assert_eq!(targeted, &expected, "{state}: session fields differ");
+}
+
 /// Read the latest valid persisted name for one thread from Codex's append only index.
 fn latest_indexed_thread_name(path: &Path, thread_id: &str) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
@@ -577,6 +595,20 @@ fn codex_daemon_spawn_is_joinable_and_interrupt_spares_the_daemon() {
         s.id == thread_id && s.status == Status::Working
     })
     .expect("daemon-spawned thread never reached Working in list()");
+    let targeted = backend
+        .session_by_id(&thread_id)
+        .expect("query daemon thread by identifier")
+        .expect("daemon thread exists by identifier");
+    assert_eq!(
+        targeted.status,
+        Status::Working,
+        "targeted lookup must observe the live daemon turn"
+    );
+    assert_targeted_matches_listing(
+        &targeted,
+        &session,
+        "targeted and full materialization while working",
+    );
 
     // 4. THE GUARD: the daemon holds this rollout's fd, so the row must carry no pid at all.
     assert!(
@@ -728,10 +760,23 @@ fn codex_spawn_identity_and_immediate_rename_persists() {
         "thread name set must persist the requested name in the session index"
     );
 
-    poll_session(&mut backend, Duration::from_secs(180), |session| {
+    let completed = poll_session(&mut backend, Duration::from_secs(180), |session| {
         session.id == thread_id && session.status == Status::Done
     })
     .expect("renamed thread never finished");
+    let targeted = backend
+        .session_by_id(&thread_id)
+        .expect("query completed thread by identifier")
+        .expect("completed thread exists by identifier");
+    assert_eq!(
+        targeted.title, user_name,
+        "targeted lookup must apply the persisted session index name"
+    );
+    assert_targeted_matches_listing(
+        &targeted,
+        &completed,
+        "targeted and full materialization after completion",
+    );
 
     let mut later_titles = Vec::new();
     for _ in 0..3 {

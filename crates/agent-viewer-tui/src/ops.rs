@@ -171,8 +171,12 @@ fn spawn_selection_from_mutation(
 
 /// A fresh backend instance for a worker thread.
 fn fresh_backend(kind: BackendKind) -> Box<dyn Backend> {
+    fresh_backend_with_codex_home(kind, default_codex_home())
+}
+
+fn fresh_backend_with_codex_home(kind: BackendKind, codex_home: PathBuf) -> Box<dyn Backend> {
     match kind {
-        BackendKind::Codex => Box::new(CodexBackend::new(default_codex_home())),
+        BackendKind::Codex => Box::new(CodexBackend::new(codex_home)),
         BackendKind::Claude => Box::new(ClaudeBackend::new()),
         BackendKind::Grok => Box::new(GrokBackend::new()),
     }
@@ -636,8 +640,8 @@ pub(crate) fn run_mutation(m: Mutation) -> Result<MutationOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mutation, RouterOutcome, fresh_backend, run_remove, run_spawn_routed,
-        run_spawn_with_backend, run_spawn_with_backend_and_skill_spawner,
+        Mutation, RouterOutcome, fresh_backend, fresh_backend_with_codex_home, run_remove,
+        run_spawn_routed, run_spawn_with_backend, run_spawn_with_backend_and_skill_spawner,
         spawn_selection_from_mutation,
     };
     use agent_viewer_core::backend::{Backend, BackendKind, Capabilities, Status};
@@ -646,12 +650,128 @@ mod tests {
     use agent_viewer_core::{ListingCacheClaim, Session, SpawnResult, TailEvent, ViewerDb};
     use agent_viewer_tui::app::{App, Row};
     use agent_viewer_tui::mutations::MutationRunner;
-    use agent_viewer_tui::shared_listing::{SpawnDirectoryMode, SpawnTarget, TargetRequest};
+    use agent_viewer_tui::shared_listing::{
+        SpawnDirectoryMode, SpawnTarget, TargetRequest, authoritative_target,
+    };
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
     use std::time::{Duration, Instant};
+
+    fn median_sample(samples: &[Duration]) -> Duration {
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        ordered[ordered.len() / 2]
+    }
+
+    fn is_release_build() -> bool {
+        cfg!(not(debug_assertions))
+    }
+
+    #[test]
+    fn production_codex_constructor_dispatches_targeted_authority() {
+        let home = tempfile::tempdir().expect("temporary Codex home");
+        let rollout = home.path().join("target.jsonl");
+        let pr_href = "https://github.com/acme/agentviewer/pull/42";
+        let call = r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_target_pr","input":"gh pr create"}}"#;
+        let result = format!(
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","call_id":"call_target_pr","output":[{{"type":"input_text","text":"Script completed\nOutput:\n{pr_href}\n"}}]}}}}"#
+        );
+        std::fs::write(&rollout, format!("{call}\n{result}\n")).expect("write PR rollout");
+
+        let db_path = home.path().join("state_1.sqlite");
+        let connection = rusqlite::Connection::open(&db_path).expect("create fixture registry");
+        connection
+            .execute_batch(include_str!(
+                "../../agent-viewer-core/tests/fixtures/threads_schema.sql"
+            ))
+            .expect("create fixture schema");
+        connection
+            .execute(
+                "INSERT INTO threads \
+                 (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, \
+                  sandbox_policy, approval_mode, archived, model, git_branch, first_user_message, \
+                  preview, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, 1, 1, 'cli', 'openai', '/tmp/target', 'Target', \
+                         'workspace-write', 'on-request', 0, 'gpt-5', 'main', 'first', \
+                         'preview', 1000, 2000)",
+                rusqlite::params!["target", rollout.to_string_lossy().as_ref()],
+            )
+            .expect("insert fixture thread");
+        drop(connection);
+
+        let mut listing =
+            fresh_backend_with_codex_home(BackendKind::Codex, home.path().to_path_buf());
+        let listed = listing
+            .list()
+            .expect("list fixture sessions")
+            .into_iter()
+            .find(|session| session.id == "target")
+            .expect("target fixture session");
+        assert_eq!(listed.pr_refs.len(), 1);
+        assert_eq!(listed.pr_refs[0].id, "42");
+
+        let request = TargetRequest::from(&listed);
+        let mut targeted =
+            fresh_backend_with_codex_home(BackendKind::Codex, home.path().to_path_buf());
+        let session = authoritative_target(targeted.as_mut(), &request)
+            .expect("production backend dispatches targeted lookup");
+        assert!(session.pr_refs.is_empty());
+
+        let mut expected = listed;
+        expected.pr_refs.clear();
+        assert_eq!(session, expected);
+    }
+
+    #[test]
+    #[ignore = "live release benchmark against the real Codex registry"]
+    fn live_release_codex_authoritative_lookup_benchmark() {
+        assert!(
+            is_release_build(),
+            "run this ignored benchmark with cargo test --release"
+        );
+        const SAMPLE_COUNT: usize = 5;
+
+        let request = {
+            let mut selector = fresh_backend(BackendKind::Codex);
+            let selected = selector
+                .list()
+                .expect("list real Codex sessions before timing")
+                .into_iter()
+                .next_back()
+                .expect("the real Codex registry must contain a session");
+            TargetRequest::from(&selected)
+        };
+
+        let mut targeted_samples = Vec::with_capacity(SAMPLE_COUNT);
+        let mut list_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let mut targeted_backend = fresh_backend(BackendKind::Codex);
+            let started = Instant::now();
+            let targeted = authoritative_target(targeted_backend.as_mut(), &request)
+                .expect("targeted authority must resolve the selected Codex session");
+            targeted_samples.push(started.elapsed());
+            assert_eq!(targeted.backend, BackendKind::Codex);
+
+            let mut list_backend = fresh_backend(BackendKind::Codex);
+            let started = Instant::now();
+            let listed = list_backend.list().expect("list real Codex sessions");
+            list_samples.push(started.elapsed());
+            assert!(
+                listed.iter().any(|session| session.id == request.id()),
+                "the selected Codex session must remain in the full listing"
+            );
+        }
+
+        println!("targeted session_by_id samples: {targeted_samples:?}");
+        println!("full list samples: {list_samples:?}");
+        println!(
+            "medians: targeted session_by_id {:?}, full list {:?}",
+            median_sample(&targeted_samples),
+            median_sample(&list_samples)
+        );
+    }
 
     /// A routed row with no job id is matched by `match_spawn`'s cwd + creation-time rule, and
     /// that window closes 30s after the stamp. Classification plus dispatch can run for most of
