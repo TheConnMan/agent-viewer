@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod error;
 pub mod grok;
+mod grok_pr_fallback;
 pub mod group;
 pub mod platform;
 pub mod pr_cache;
@@ -19,6 +20,7 @@ pub use backend::{
 };
 pub use error::{AttachRefusal, Error, Result};
 pub use grok::{GrokBackend, GrokDiagnostics, GrokLifecycle};
+pub use grok_pr_fallback::GrokPrFallback;
 pub use pr_cache::PrStatusCache;
 pub use pr_status::PrBadgeColor;
 pub use state::{

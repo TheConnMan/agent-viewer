@@ -301,14 +301,15 @@ cache rereads every thirty seconds.
 - The status classifier reads a 64 KiB tail window. The tail *pane* reads a wider one; see
   "Bounded transcript tails".
 
-## PR refs — transcripts, not registries
+## PR refs from transcripts and Grok branch fallback
 
 Claude records its PRs in `jobs/<short>/state.json` (`children[]` where `kind == "pr"`). Codex
 and Grok record them nowhere: the Codex registry has no PR column, Grok `summary.json` has no
 PR field, and `threads.git_branch` is captured when the Codex thread starts, so it is stale the
 moment the agent branches (measured: the thread that opened `curie-eng/curie/pull/1089` still
-reports `task/fix-interactive-clippy`). Branch lookups are therefore not a usable source. The
-transcript is the source only when it proves that the same session successfully opened the PR.
+reports `task/fix-interactive-clippy`). Branch lookups are not a general source. Codex uses
+transcript proof only. Grok uses transcript proof first, with the narrowly scoped branch based
+exception documented below for rows whose transcripts have no successful creation proof.
 
 ### Codex
 
@@ -379,6 +380,67 @@ lines only) rather than Codex's per-file offset scanner. A warm listing with an 
 history file key skips that read; an updates-file change does not re-parse history.
 `MAX_REFS` is 4, keeping the most recent successful refs. Roster-only rows with no durable
 history keep empty `pr_refs`.
+
+### Grok branch fallback
+
+After the Grok backend lists its rows, viewer owned listing code decorates only Grok rows whose
+`pr_refs` are empty. Backends remain ignorant of the viewer database and their own listing output
+is unchanged. The decorator is used by both the TUI shared listing publisher and the companion
+server refresh path. If viewer state is unavailable, it does no fallback work and leaves the
+backend output as received. If the initial read of stored fallback values fails, the fallback
+pass fails. The TUI then serves its shared or last good rows with a notice, and the server keeps
+its last good rows, so an unreadable database never publishes empty references over a warm chip.
+Claim, completion, failure, and prune writes are advisory. A failed write is ignored, projected
+references and fresh backend fields remain, no command runs when a claim fails, and the key can
+retry on a later pass.
+
+The decorator first resolves each eligible absolute session `cwd` with this exact command, using
+the supplied path through its explicit `-C` flag:
+
+```
+git -C <cwd> rev-parse --path-format=absolute --show-toplevel --abbrev-ref HEAD --git-common-dir
+```
+
+The command has a two second timeout and must return exactly three safe lines: the worktree root,
+the branch, and the absolute Git common directory. A detached `HEAD` returns the literal `HEAD`
+branch and cannot produce a fallback badge. An unborn `HEAD` makes the command fail, so no
+fallback identity is stored. The repository query then runs from a resolved root with this exact
+command:
+
+```
+gh pr list --state open --json number,url,isCrossRepository,headRefName --limit 100
+```
+
+It has a ten second timeout. There is no `--head` or `--base` filter. The response is bounded to
+100 entries and four references per branch. A valid entry must have a positive number, a
+canonical pull request URL whose number agrees with the JSON number, a safe head branch, and a
+boolean `isCrossRepository` field. Cross repository entries are rejected, which excludes fork
+pull requests. The remaining entries are grouped by their head branch and matched to the live
+worktree branch in the same Git repository.
+
+The fallback state is stored in the viewer database in two tables:
+
+```
+worktree_identity(cwd, root, branch, common_dir, success_at_ms, attempt_ms, busy_until_ms)
+repository_prs(common_dir, prs_json, success_at_ms, attempt_ms, busy_until_ms)
+```
+
+The first table stores the Git identity for a session path. The second stores one coherent JSON
+inventory for a repository. Successful values remain available for 60 seconds. Expiry marks a
+value due for refresh but never removes it. A failed command keeps the previous value and places
+the key behind a five second retry fence measured from completion. A later completion updates the
+row only when its `attempt_ms` still matches the claim token, so a late process cannot overwrite a
+newer result. Claims use the live clock at claim and completion time.
+
+Each listing pass executes at most one fallback command. When more than one identity or repository
+is due, the database orders candidates by oldest `attempt_ms`, then by key, so separate viewers
+share fair progress without a private cursor. Missing worktree paths are pruned only when they are
+not busy. Repository rows are pruned only after no retained worktree references them. The TUI
+publishes decorated rows through its existing shared listing snapshot, so every viewer reads the
+same published chips. The server keeps its last good decorated rows when a refresh fails.
+
+The fallback is display data only. Attach, mutations, and spawn directory resolution continue to
+use their authoritative sources. Codex and Claude behavior is unchanged.
 
 ## Status detection — TWO signals, both required
 
@@ -1342,7 +1404,10 @@ bracketed paste, and a full IME composition cycle each reach the transport as th
 `state.rs` owns the only SQLite this tool writes: `spawned` (the spawn records that keep a
 viewer-started session from being filtered away as a companion), `collapsed_groups` (which also
 carries the persisted theme under a `theme:` key), `settings` (sprite, age ramp), `model_cache`,
-and the two listing-cache tables.
+the two listing-cache tables, and the two Grok branch fallback tables
+`worktree_identity` and `repository_prs` described in "Grok branch fallback". Backend
+implementations never read or write this database. Viewer owned listing code adds the Grok
+decoration after backend listing and before publication.
 
 Those are two tables on purpose. The listing payload used to sit in `backend_listing_cache`
 beside the lease columns, and that is not free: SQLite rewrites a row's entire record, overflow

@@ -1,12 +1,14 @@
 use agent_viewer_core::claude::ClaudeBackend;
 use agent_viewer_core::codex::CodexBackend;
 use agent_viewer_core::{
-    Backend, BackendKind, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
+    Backend, BackendKind, GrokPrFallback, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
     ListingCacheSnapshot, ListingCacheWrite, PrRef, Session, SessionOrigin, Status, ViewerDb,
 };
 use rusqlite::{Connection, params};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -857,6 +859,329 @@ fn a_lease_deadline_beyond_the_horizon_does_not_hold_the_scope() {
         ),
         "a lease deadline a day out must be treated as expired, not held"
     );
+}
+
+struct BranchFallbackRunner {
+    responses: VecDeque<Option<String>>,
+    calls: usize,
+}
+
+impl BranchFallbackRunner {
+    fn new(responses: impl IntoIterator<Item = Option<String>>) -> BranchFallbackRunner {
+        BranchFallbackRunner {
+            responses: responses.into_iter().collect(),
+            calls: 0,
+        }
+    }
+
+    fn run(&mut self, _command: Command, _timeout: Duration) -> Option<String> {
+        self.calls += 1;
+        self.responses.pop_front().flatten()
+    }
+}
+
+fn branch_fallback_session(cwd: &Path) -> Session {
+    Session {
+        backend: BackendKind::Grok,
+        id: "shared-grok-session".to_string(),
+        short_id: None,
+        origin: SessionOrigin::Interactive,
+        title: "Shared Grok session".to_string(),
+        cwd: cwd.to_path_buf(),
+        git_branch: None,
+        status: Status::Unknown,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        hidden: false,
+        companion: false,
+        subagent: false,
+        summary: String::new(),
+        pid: None,
+        rollout_path: None,
+        pr_refs: Vec::new(),
+        daemon_hosted: false,
+    }
+}
+
+fn branch_git_identity(root: &Path, branch: &str, common_dir: &Path) -> String {
+    format!("{}\n{}\n{}\n", root.display(), branch, common_dir.display())
+}
+
+fn branch_inventory(branch: &str, number: u64) -> String {
+    serde_json::json!([{
+        "number": number,
+        "url": format!("https://github.com/TheConnMan/agent-viewer/pull/{number}"),
+        "isCrossRepository": false,
+        "headRefName": branch
+    }])
+    .to_string()
+}
+
+fn decorate_branch_refs(
+    fallback: &mut GrokPrFallback,
+    db: &ViewerDb,
+    rows: &mut [Session],
+    now_ms: i64,
+    runner: &mut BranchFallbackRunner,
+) {
+    let mut invoke = |command, timeout| runner.run(command, timeout);
+    let mut clock = || now_ms;
+    fallback
+        .attach_branch_pr_refs_with_runner(db, rows, &mut clock, &mut invoke)
+        .expect("decorate Grok pull request refs");
+}
+
+fn branch_ref_ids(row: &Session) -> Vec<&str> {
+    row.pr_refs
+        .iter()
+        .map(|reference| reference.id.as_str())
+        .collect()
+}
+
+fn seed_grok_identity(db: &ViewerDb, cwd: &Path, branch: &str, common_dir: &Path, now_ms: i64) {
+    let cwd = cwd.to_str().expect("UTF8 worktree path");
+    let token = db
+        .claim_grok_worktree_identity(cwd, now_ms)
+        .expect("claim worktree identity")
+        .expect("unclaimed worktree identity");
+    assert!(
+        db.complete_grok_worktree_identity(
+            &token,
+            cwd,
+            Some(branch),
+            common_dir.to_str().expect("UTF8 git common directory"),
+            now_ms + 1,
+        )
+        .expect("complete worktree identity")
+    );
+}
+
+fn seed_grok_repository(db: &ViewerDb, common_dir: &Path, now_ms: i64) {
+    let common_dir = common_dir.to_str().expect("UTF8 git common directory");
+    let token = db
+        .claim_grok_repository_prs(common_dir, now_ms)
+        .expect("claim repository inventory")
+        .expect("unclaimed repository inventory");
+    assert!(
+        db.complete_grok_repository_prs(&token, "{}", now_ms + 1)
+            .expect("complete repository inventory")
+    );
+}
+
+#[test]
+fn grok_pruning_preserves_another_live_scope_and_removes_missing_paths() {
+    let (directory, _path, first, second) = open_viewers();
+    let current = directory.path().join("current-scope-worktree");
+    let other_live = directory.path().join("other-live-scope-worktree");
+    let missing = directory.path().join("missing-worktree");
+    let current_common = directory.path().join("current-common");
+    let other_common = directory.path().join("other-common");
+    let missing_common = directory.path().join("missing-common");
+    std::fs::create_dir_all(&current).expect("current worktree");
+    std::fs::create_dir_all(&other_live).expect("other live worktree");
+    std::fs::create_dir_all(&current_common).expect("current git common directory");
+    std::fs::create_dir_all(&other_common).expect("other git common directory");
+    let current_text = current.to_str().expect("UTF8 current worktree").to_string();
+    let other_text = other_live
+        .to_str()
+        .expect("UTF8 other live worktree")
+        .to_string();
+    let missing_text = missing.to_str().expect("UTF8 missing worktree").to_string();
+    let current_common_text = current_common
+        .to_str()
+        .expect("UTF8 current common directory")
+        .to_string();
+    let other_common_text = other_common
+        .to_str()
+        .expect("UTF8 other common directory")
+        .to_string();
+    let missing_common_text = missing_common
+        .to_str()
+        .expect("UTF8 missing common directory")
+        .to_string();
+
+    seed_grok_identity(&first, &current, "task/current", &current_common, 1_000);
+    seed_grok_identity(&first, &other_live, "task/other", &other_common, 1_010);
+    seed_grok_identity(&first, &missing, "task/missing", &missing_common, 1_020);
+    seed_grok_repository(&first, &current_common, 1_030);
+    seed_grok_repository(&first, &other_common, 1_040);
+    seed_grok_repository(&first, &missing_common, 1_050);
+
+    second
+        .prune_grok_pr_fallback(2_000)
+        .expect("prune missing worktrees");
+
+    let identities = first
+        .grok_worktree_identities(&[current_text.clone(), other_text.clone(), missing_text])
+        .expect("read retained worktrees");
+    assert_eq!(identities.len(), 2);
+    assert!(identities.iter().any(|row| row.cwd == current_text));
+    assert!(identities.iter().any(|row| row.cwd == other_text));
+
+    let repositories = first
+        .grok_repository_prs(&[
+            current_common_text.clone(),
+            other_common_text.clone(),
+            missing_common_text,
+        ])
+        .expect("read retained repositories");
+    assert_eq!(repositories.len(), 2);
+    assert!(
+        repositories
+            .iter()
+            .any(|row| row.common_dir == current_common_text)
+    );
+    assert!(
+        repositories
+            .iter()
+            .any(|row| row.common_dir == other_common_text)
+    );
+}
+
+#[test]
+fn grok_branch_fallback_is_shared_fenced_and_replaced_across_viewers() {
+    let (_directory, _path, first, second) = open_viewers();
+    let repository = tempfile::tempdir().expect("temporary repository");
+    let root = repository.path().join("worktree");
+    let cwd = root.join("nested");
+    let common_dir = repository.path().join("git-common");
+    std::fs::create_dir_all(&cwd).expect("worktree directory");
+    std::fs::create_dir_all(&common_dir).expect("git common directory");
+    let branch = "task/shared-next-pr";
+    let old_inventory = branch_inventory(branch, 2_651);
+    let mut first_fallback = GrokPrFallback::default();
+    let mut second_fallback = GrokPrFallback::default();
+    let mut first_rows = vec![branch_fallback_session(&cwd)];
+    let mut initial = BranchFallbackRunner::new([
+        Some(branch_git_identity(&root, branch, &common_dir)),
+        Some(old_inventory.clone()),
+    ]);
+
+    decorate_branch_refs(
+        &mut first_fallback,
+        &first,
+        &mut first_rows,
+        1_000,
+        &mut initial,
+    );
+    assert_eq!(initial.calls, 1);
+    assert!(first_rows[0].pr_refs.is_empty());
+    decorate_branch_refs(
+        &mut first_fallback,
+        &first,
+        &mut first_rows,
+        1_001,
+        &mut initial,
+    );
+    assert_eq!(initial.calls, 2);
+    assert_eq!(branch_ref_ids(&first_rows[0]), vec!["2651"]);
+
+    let mut second_rows = vec![branch_fallback_session(&cwd)];
+    let mut warm_reader = BranchFallbackRunner::new([]);
+    decorate_branch_refs(
+        &mut second_fallback,
+        &second,
+        &mut second_rows,
+        4_000,
+        &mut warm_reader,
+    );
+    assert_eq!(warm_reader.calls, 0);
+    assert_eq!(branch_ref_ids(&second_rows[0]), vec!["2651"]);
+
+    let mut identity_refresh =
+        BranchFallbackRunner::new([Some(branch_git_identity(&root, branch, &common_dir))]);
+    let mut stale_rows = vec![branch_fallback_session(&cwd)];
+    decorate_branch_refs(
+        &mut first_fallback,
+        &first,
+        &mut stale_rows,
+        61_000,
+        &mut identity_refresh,
+    );
+    assert_eq!(identity_refresh.calls, 1);
+    assert_eq!(branch_ref_ids(&stale_rows[0]), vec!["2651"]);
+
+    let mut failed_refresh = BranchFallbackRunner::new([None]);
+    let mut failed_rows = vec![branch_fallback_session(&cwd)];
+    decorate_branch_refs(
+        &mut first_fallback,
+        &first,
+        &mut failed_rows,
+        61_001,
+        &mut failed_refresh,
+    );
+    assert_eq!(failed_refresh.calls, 1);
+    assert_eq!(branch_ref_ids(&failed_rows[0]), vec!["2651"]);
+
+    let mut backoff_reader = BranchFallbackRunner::new([]);
+    let mut backoff_rows = vec![branch_fallback_session(&cwd)];
+    decorate_branch_refs(
+        &mut second_fallback,
+        &second,
+        &mut backoff_rows,
+        63_000,
+        &mut backoff_reader,
+    );
+    assert_eq!(backoff_reader.calls, 0);
+    assert_eq!(branch_ref_ids(&backoff_rows[0]), vec!["2651"]);
+
+    let mut late_rows = vec![branch_fallback_session(&cwd)];
+    let mut late_calls = 0;
+    let mut late_completion = |_command: Command, _timeout: Duration| {
+        late_calls += 1;
+
+        let mut held_rows = vec![branch_fallback_session(&cwd)];
+        let mut held_reader = BranchFallbackRunner::new([]);
+        decorate_branch_refs(
+            &mut second_fallback,
+            &second,
+            &mut held_rows,
+            70_000,
+            &mut held_reader,
+        );
+        assert_eq!(held_reader.calls, 0);
+        assert_eq!(branch_ref_ids(&held_rows[0]), vec!["2651"]);
+
+        let mut takeover_rows = vec![branch_fallback_session(&cwd)];
+        let mut takeover = BranchFallbackRunner::new([Some("[]".to_string())]);
+        decorate_branch_refs(
+            &mut second_fallback,
+            &second,
+            &mut takeover_rows,
+            76_001,
+            &mut takeover,
+        );
+        assert_eq!(takeover.calls, 1);
+        assert!(takeover_rows[0].pr_refs.is_empty());
+
+        Some(old_inventory.clone())
+    };
+    let mut late_clock = || 66_001;
+    first_fallback
+        .attach_branch_pr_refs_with_runner(
+            &first,
+            &mut late_rows,
+            &mut late_clock,
+            &mut late_completion,
+        )
+        .expect("complete fenced Grok refresh");
+    assert_eq!(late_calls, 1);
+    assert!(
+        late_rows[0].pr_refs.is_empty(),
+        "a late completion must not restore the inventory replaced by a newer claim"
+    );
+
+    let mut final_rows = vec![branch_fallback_session(&cwd)];
+    let mut final_reader = BranchFallbackRunner::new([]);
+    decorate_branch_refs(
+        &mut second_fallback,
+        &second,
+        &mut final_rows,
+        76_002,
+        &mut final_reader,
+    );
+    assert_eq!(final_reader.calls, 0);
+    assert!(final_rows[0].pr_refs.is_empty());
 }
 
 #[test]
