@@ -80,6 +80,13 @@ session lookup when the backend supports one, and otherwise use the default impl
 which performs a full `Backend::list` and selects the requested identifier. Fleet refresh still
 enumerates every session and continues to populate the shared display snapshot.
 
+The TUI gives each backend its own persistent listing worker and combines their latest results
+before updating the row model. A blocked provider therefore cannot stop another provider from
+refreshing. Each worker catches a listing panic, retains its last good rows, resets its cache
+cursor, reports the failure, and retries. The aggregator reports a backend as stale when it has
+not completed a refresh for ten seconds, so a stuck worker is visible instead of looking like an
+unchanged fleet. A forced refresh wakes every backend worker.
+
 ## Grok storage and lifecycle contract
 
 The Grok backend is supported only on Linux. Its official lifecycle transport uses Unix domain
