@@ -41,6 +41,9 @@ use pending_reply::PendingReply;
 
 /// How often the refresh worker re-lists the backends (off the UI thread).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
+/// A backend that has not completed several expected refreshes is called out in the footer.
+const REFRESH_STALE_AFTER: Duration = Duration::from_secs(10);
+const REFRESH_THREAD_PREFIX: &str = "agent_viewer_refresh_";
 /// How long a footer notice stays up (age-based, independent of loop phase).
 const NOTICE_MS: i64 = 4000;
 const STOP_FAILURE_MARKER: &str = "\0stop failure\0";
@@ -471,22 +474,110 @@ impl Refresher {
 /// backends here are the ONLY set that calls `list()`; the UI keeps a separate cheap set
 /// for attach/spawn/mutation so a slow `list()` never blocks input or render.
 fn spawn_refresh_worker(
-    mut backends: Vec<Box<dyn Backend>>,
-    mut last: Vec<Vec<Session>>,
-    mut cursors: Vec<RefreshCursor>,
+    backends: Vec<Box<dyn Backend>>,
+    last: Vec<Vec<Session>>,
+    cursors: Vec<RefreshCursor>,
 ) -> Refresher {
     let (snap_tx, snap_rx) = channel::<Snapshot>();
     let (wake_tx, wake_rx) = channel::<()>();
-    let db = ViewerDb::open_default().ok();
+    let (backend_tx, backend_rx) = channel::<(usize, Vec<Session>, String, usize)>();
+    let mut worker_wakes = Vec::with_capacity(backends.len());
+    let mut combined = last.clone();
+    let backend_names = backends
+        .iter()
+        .map(|backend| backend.kind().name().to_string())
+        .collect::<Vec<_>>();
+
+    for (index, ((mut backend, mut backend_last), mut cursor)) in
+        backends.into_iter().zip(last).zip(cursors).enumerate()
+    {
+        let (worker_wake_tx, worker_wake_rx) = channel::<()>();
+        worker_wakes.push(worker_wake_tx);
+        let backend_tx = backend_tx.clone();
+        let worker_name = format!("{REFRESH_THREAD_PREFIX}{}", backend.kind().name());
+        thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || {
+                let db = ViewerDb::open_default().ok();
+                loop {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh(
+                            std::slice::from_mut(&mut backend),
+                            std::slice::from_mut(&mut backend_last),
+                            std::slice::from_mut(&mut cursor),
+                            db.as_ref(),
+                        )
+                    }));
+                    let snapshot = match result {
+                        Ok((sessions, notice, ok_count)) => (index, sessions, notice, ok_count),
+                        Err(_) => {
+                            cursor = RefreshCursor::default();
+                            (
+                                index,
+                                backend_last.clone(),
+                                format!("{} refresh panicked; retrying", backend.kind().name()),
+                                0,
+                            )
+                        }
+                    };
+                    if backend_tx.send(snapshot).is_err() {
+                        return;
+                    }
+                    match worker_wake_rx.recv_timeout(REFRESH_INTERVAL) {
+                        Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            })
+            .expect("refresh worker thread");
+    }
+    drop(backend_tx);
+
     thread::spawn(move || {
+        while wake_rx.recv().is_ok() {
+            worker_wakes.retain(|wake| wake.send(()).is_ok());
+            if worker_wakes.is_empty() {
+                return;
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        let mut notices = vec![String::new(); combined.len()];
+        let mut ok = vec![1; combined.len()];
+        let mut last_completed = vec![std::time::Instant::now(); combined.len()];
         loop {
-            let snapshot = refresh(&mut backends, &mut last, &mut cursors, db.as_ref());
+            match backend_rx.recv_timeout(REFRESH_INTERVAL) {
+                Ok((index, sessions, notice, ok_count)) => {
+                    let Some(slot) = combined.get_mut(index) else {
+                        continue;
+                    };
+                    *slot = sessions;
+                    notices[index] = notice;
+                    ok[index] = ok_count;
+                    last_completed[index] = std::time::Instant::now();
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            let mut active_notices = notices
+                .iter()
+                .filter(|notice| !notice.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            active_notices.extend(stale_refresh_notices(
+                &backend_names,
+                &last_completed,
+                std::time::Instant::now(),
+                REFRESH_STALE_AFTER,
+            ));
+            let snapshot = (
+                combined.iter().flatten().cloned().collect(),
+                active_notices.join("  |  "),
+                ok.iter().sum(),
+            );
             if snap_tx.send(snapshot).is_err() {
                 return; // UI gone — stop listing.
-            }
-            match wake_rx.recv_timeout(REFRESH_INTERVAL) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     });
@@ -494,6 +585,34 @@ fn spawn_refresh_worker(
         snapshots: snap_rx,
         wake: wake_tx,
     }
+}
+
+fn stale_refresh_notices(
+    backend_names: &[String],
+    last_completed: &[std::time::Instant],
+    now: std::time::Instant,
+    stale_after: Duration,
+) -> Vec<String> {
+    backend_names
+        .iter()
+        .zip(last_completed)
+        .filter(|(_, completed)| now.saturating_duration_since(**completed) >= stale_after)
+        .map(|(backend, _)| format!("{backend} refresh is stale"))
+        .collect()
+}
+
+fn retain_terminal_for_caught_refresh_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        if thread
+            .name()
+            .is_some_and(|name| name.starts_with(REFRESH_THREAD_PREFIX))
+        {
+            return;
+        }
+        previous(info);
+    }));
 }
 
 /// A footer notice with an age-based lifetime: it survives `NOTICE_MS` from when it was
@@ -819,6 +938,9 @@ fn main() -> io::Result<()> {
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
+    // Ratatui restores the terminal from its global panic hook. Listing panics are caught and
+    // retried, so restoring raw mode for those handled panics would break the still-running UI.
+    retain_terminal_for_caught_refresh_panics();
     set_terminal_title(&mut io::stdout(), &ui.workspace);
     // Mouse capture powers list selection and attached transcript scrolling for Codex and
     // Claude. Ctrl+T remains the manual override. Starts on to match `ui.mouse_capture`.
@@ -1805,6 +1927,81 @@ mod tests {
         error: String,
     }
 
+    struct PanicOnceListingBackend {
+        kind: BackendKind,
+        calls: TestArc<AtomicUsize>,
+        recovered: Session,
+    }
+
+    impl Backend for PanicOnceListingBackend {
+        fn kind(&self) -> BackendKind {
+            self.kind
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("simulated listing panic");
+            }
+            Ok(vec![self.recovered.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by listing refresh tests")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attaching is not exercised by listing refresh tests")
+        }
+    }
+
+    struct StaticListingBackend {
+        current: Session,
+    }
+
+    impl Backend for StaticListingBackend {
+        fn kind(&self) -> BackendKind {
+            self.current.backend
+        }
+
+        fn capabilities(&self) -> agent_viewer_core::Capabilities {
+            agent_viewer_core::Capabilities::none()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            Ok(vec![self.current.clone()])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &std::path::Path,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+        ) -> agent_viewer_core::Result<agent_viewer_core::SpawnResult> {
+            unreachable!("spawning is not exercised by listing refresh tests")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> Result<std::process::Command, agent_viewer_core::AttachRefusal> {
+            unreachable!("attaching is not exercised by listing refresh tests")
+        }
+    }
+
     impl Backend for CountedListingBackend {
         fn kind(&self) -> BackendKind {
             self.scope.backend()
@@ -1942,6 +2139,62 @@ mod tests {
         assert_eq!(plain_error.1, "codex: command failed: source unavailable");
         assert_eq!(plain_error.2, 0);
         assert_eq!(plain_last[0], vec![plain_local]);
+    }
+
+    #[test]
+    fn listing_panic_does_not_stop_other_backends_and_the_failed_backend_recovers() {
+        let calls = TestArc::new(AtomicUsize::new(0));
+        let recovered = session(BackendKind::Codex, "recovered", 2_000, false);
+        let healthy = session(BackendKind::Claude, "healthy", 2_000, false);
+        let backends: Vec<Box<dyn Backend>> = vec![
+            Box::new(PanicOnceListingBackend {
+                kind: BackendKind::Codex,
+                calls: TestArc::clone(&calls),
+                recovered: recovered.clone(),
+            }),
+            Box::new(StaticListingBackend {
+                current: healthy.clone(),
+            }),
+        ];
+        let refresher = spawn_refresh_worker(
+            backends,
+            vec![
+                vec![session(BackendKind::Codex, "old codex", 1_000, false)],
+                vec![session(BackendKind::Claude, "old claude", 1_000, false)],
+            ],
+            vec![RefreshCursor::default(), RefreshCursor::default()],
+        );
+        refresher.force();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let snapshot = loop {
+            if let Some(snapshot) = refresher.latest()
+                && snapshot.0.contains(&recovered)
+                && snapshot.0.contains(&healthy)
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "listing workers did not recover from a backend panic"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(snapshot.2, 2);
+    }
+
+    #[test]
+    fn stale_refresh_notice_names_only_the_backend_that_stopped_completing() {
+        let now = Instant::now();
+        let names = vec!["codex".to_string(), "claude".to_string()];
+        let completed = vec![now - Duration::from_secs(11), now - Duration::from_secs(1)];
+
+        assert_eq!(
+            stale_refresh_notices(&names, &completed, now, Duration::from_secs(10)),
+            ["codex refresh is stale"]
+        );
     }
 
     fn working_session(id: &str) -> Session {
