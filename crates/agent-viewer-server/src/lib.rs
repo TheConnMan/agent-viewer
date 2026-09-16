@@ -9,8 +9,8 @@ use agent_viewer_core::backend::all_backends;
 use agent_viewer_core::group::project_root;
 use agent_viewer_core::state::{apply_viewer_state, match_spawn};
 use agent_viewer_core::{
-    Backend, BackendKind, Capabilities, Error, PrBadgeColor, PrStatusCache, Session, TailEvent,
-    ViewerDb, mark_dead_dirs,
+    Backend, BackendKind, Capabilities, Error, GrokPrFallback, PrBadgeColor, PrStatusCache,
+    Session, TailEvent, ViewerDb, mark_dead_dirs,
 };
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -660,10 +660,12 @@ pub fn router_with_backends_and_terminal_timing(
     idle_timeout: Duration,
 ) -> Router {
     let mut last = vec![Vec::new(); backends.len()];
+    let mut grok_pr_fallback = GrokPrFallback::default();
     let snapshot = Arc::new(RwLock::new(refresh_snapshot(
         &mut backends,
         &mut last,
         None,
+        &mut grok_pr_fallback,
         &mut PrStatusCache::new(),
         0,
     )));
@@ -707,6 +709,7 @@ fn start_refresh_thread(
         .spawn(move || {
             let db = ViewerDb::open_default().ok();
             let mut last = vec![Vec::new(); backends.len()];
+            let mut grok_pr_fallback = GrokPrFallback::default();
             let mut pr_status = PrStatusCache::new();
             let mut ready_tx = Some(ready_tx);
             loop {
@@ -714,6 +717,7 @@ fn start_refresh_thread(
                     &mut backends,
                     &mut last,
                     db.as_ref(),
+                    &mut grok_pr_fallback,
                     &mut pr_status,
                     agent_viewer_core::spawn::now_ms(),
                 );
@@ -736,13 +740,21 @@ fn refresh_snapshot(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
     db: Option<&ViewerDb>,
+    grok_pr_fallback: &mut GrokPrFallback,
     pr_status: &mut PrStatusCache,
     now_ms: i64,
 ) -> Vec<SessionView> {
     let mut sessions = Vec::new();
     for (index, backend) in backends.iter_mut().enumerate() {
-        if let Ok(fresh) = backend.list() {
-            last[index] = fresh;
+        if let Ok(mut fresh) = backend.list() {
+            let decorated = db.is_none_or(|db| {
+                grok_pr_fallback
+                    .attach_branch_pr_refs(db, &mut fresh)
+                    .is_ok()
+            });
+            if decorated {
+                last[index] = fresh;
+            }
         }
         sessions.extend(last[index].iter().cloned());
     }
@@ -1877,5 +1889,199 @@ mod pr_color_tests {
         paint_pr_colors(&mut views, &mut cache, 0);
         assert_eq!(views[0].pr_color, PrBadgeColor::Default);
         assert_eq!(cache.in_flight_len(), 0, "hidden rows are never sent to gh");
+    }
+}
+
+#[cfg(test)]
+mod grok_fallback_tests {
+    use super::refresh_snapshot;
+    use agent_viewer_core::{
+        AttachRefusal, Backend, BackendKind, Capabilities, GrokPrFallback, PrStatusCache, Session,
+        SessionOrigin, SpawnResult, Status, ViewerDb,
+    };
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "agent-viewer-server-grok-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("temporary server state");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct MutableGrokBackend {
+        session: Session,
+        title: Arc<Mutex<String>>,
+    }
+
+    impl Backend for MutableGrokBackend {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Grok
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::none()
+        }
+
+        fn list(&mut self) -> agent_viewer_core::Result<Vec<Session>> {
+            let mut session = self.session.clone();
+            session.title = self.title.lock().expect("mutable title").clone();
+            Ok(vec![session])
+        }
+
+        fn spawn(
+            &self,
+            _dir: &Path,
+            _task: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+        ) -> agent_viewer_core::Result<SpawnResult> {
+            unreachable!("the refresh path never spawns")
+        }
+
+        fn attach_command(
+            &self,
+            _session: &Session,
+        ) -> std::result::Result<Command, AttachRefusal> {
+            unreachable!("the refresh path never attaches")
+        }
+    }
+
+    fn grok_session(root: &Path) -> Session {
+        Session {
+            backend: BackendKind::Grok,
+            id: "server-grok".to_string(),
+            short_id: None,
+            origin: SessionOrigin::Interactive,
+            title: String::new(),
+            cwd: root.to_path_buf(),
+            git_branch: None,
+            status: Status::Unknown,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            hidden: true,
+            companion: false,
+            subagent: false,
+            summary: String::new(),
+            pid: None,
+            rollout_path: None,
+            pr_refs: Vec::new(),
+            daemon_hosted: false,
+        }
+    }
+
+    #[test]
+    fn blocked_advisory_write_accepts_fresh_title_and_keeps_warm_ref() {
+        let directory = TestDirectory::new();
+        let database_path = directory.path().join("viewer.sqlite");
+        let database = ViewerDb::open(&database_path).expect("temporary viewer database");
+        let root = directory.path().join("worktree");
+        let common_dir = directory.path().join("common");
+        std::fs::create_dir_all(&root).expect("Grok worktree");
+        std::fs::create_dir_all(&common_dir).expect("Grok common directory");
+        let root_text = root.to_str().expect("UTF8 worktree");
+        let common_text = common_dir.to_str().expect("UTF8 common directory");
+        let branch = "task/server-grok-fallback";
+        let seeded_at_ms = agent_viewer_core::spawn::now_ms();
+        let identity = database
+            .claim_grok_worktree_identity(root_text, seeded_at_ms)
+            .expect("claim worktree identity")
+            .expect("unclaimed worktree identity");
+        assert!(
+            database
+                .complete_grok_worktree_identity(
+                    &identity,
+                    root_text,
+                    Some(branch),
+                    common_text,
+                    seeded_at_ms,
+                )
+                .expect("complete worktree identity")
+        );
+        let repository = database
+            .claim_grok_repository_prs(common_text, seeded_at_ms)
+            .expect("claim repository inventory")
+            .expect("unclaimed repository inventory");
+        assert!(
+            database
+                .complete_grok_repository_prs(
+                    &repository,
+                    r#"{"task/server-grok-fallback":[{"id":"2651","href":"https://github.com/TheConnMan/agent-viewer/pull/2651"}]}"#,
+                    seeded_at_ms,
+                )
+                .expect("complete repository inventory")
+        );
+
+        let title = Arc::new(Mutex::new("Warm title".to_string()));
+        let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(MutableGrokBackend {
+            session: grok_session(&root),
+            title: Arc::clone(&title),
+        })];
+        let mut last = vec![Vec::new()];
+        let mut fallback = GrokPrFallback::default();
+        let mut pr_status = PrStatusCache::new();
+        let warm = refresh_snapshot(
+            &mut backends,
+            &mut last,
+            Some(&database),
+            &mut fallback,
+            &mut pr_status,
+            seeded_at_ms,
+        );
+
+        assert_eq!(warm[0].session.title, "Warm title");
+        assert_eq!(warm[0].session.pr_refs[0].id, "2651");
+
+        rusqlite::Connection::open(&database_path)
+            .expect("open cache aging connection")
+            .execute_batch(
+                "UPDATE worktree_identity SET success_at_ms = 1;\
+                 UPDATE repository_prs SET success_at_ms = 1;",
+            )
+            .expect("age cached Grok metadata");
+        let blocker = rusqlite::Connection::open(&database_path).expect("open blocking connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("hold advisory write lock");
+        *title.lock().expect("mutable title") = "Changed title".to_string();
+
+        let blocked = refresh_snapshot(
+            &mut backends,
+            &mut last,
+            Some(&database),
+            &mut fallback,
+            &mut pr_status,
+            seeded_at_ms + 60_000,
+        );
+
+        assert_eq!(blocked[0].session.title, "Changed title");
+        assert_eq!(blocked[0].session.pr_refs[0].id, "2651");
+        assert_eq!(last[0][0].title, "Changed title");
+        assert_eq!(last[0][0].pr_refs[0].id, "2651");
+        blocker
+            .execute_batch("ROLLBACK;")
+            .expect("release advisory write lock");
     }
 }

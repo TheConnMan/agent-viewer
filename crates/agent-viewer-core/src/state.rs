@@ -1,9 +1,7 @@
-//! Viewer-owned state DB (the ONLY SQLite this tool writes) plus the pure overlay and
-//! spawn-matching functions. Backends stay ignorant of it: they never read or write this
-//! file, so nothing here can alter what a backend reports. The overlay is presentation-only
-//! now - it unhides viewer-spawned sessions (clearing `companion`) and fills in the pid the
-//! viewer recorded at spawn time for rows the backend could not supply one for. Titles,
-//! statuses, and hidden flags come from the backend unchanged.
+//! Viewer owned state DB, the only SQLite this tool writes, plus pure presentation helpers.
+//! Backends stay ignorant of this file and never read or write it. Viewer owned listing code
+//! may decorate Grok rows after backend listing with cached branch pull request references.
+//! The backend output itself remains unchanged.
 
 use crate::backend::{BackendKind, ListingCacheScope, Session};
 use crate::error::Result;
@@ -46,6 +44,22 @@ CREATE TABLE IF NOT EXISTS backend_listing_snapshot (\
   scope TEXT NOT NULL,\
   snapshot_json TEXT NOT NULL,\
   PRIMARY KEY (backend, scope)\
+);\
+CREATE TABLE IF NOT EXISTS worktree_identity (\
+  cwd TEXT PRIMARY KEY,\
+  root TEXT,\
+  branch TEXT,\
+  common_dir TEXT,\
+  success_at_ms INTEGER NOT NULL DEFAULT 0,\
+  attempt_ms INTEGER NOT NULL DEFAULT 0,\
+  busy_until_ms INTEGER NOT NULL DEFAULT 0\
+);\
+CREATE TABLE IF NOT EXISTS repository_prs (\
+  common_dir TEXT PRIMARY KEY,\
+  prs_json TEXT,\
+  success_at_ms INTEGER NOT NULL DEFAULT 0,\
+  attempt_ms INTEGER NOT NULL DEFAULT 0,\
+  busy_until_ms INTEGER NOT NULL DEFAULT 0\
 );";
 
 /// Legacy shadow-state tables the viewer no longer owns. Dropped once after a successful
@@ -90,6 +104,10 @@ pub struct CachedModels {
 pub const LISTING_CACHE_FRESHNESS_MS: i64 = 2_000;
 pub const LISTING_CACHE_LEASE_MS: i64 = 5_000;
 const VIEWER_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const GROK_PR_SUCCESS_FRESHNESS_MS: i64 = 60_000;
+const GROK_IDENTITY_CLAIM_MS: i64 = 2_000;
+const GROK_REPOSITORY_CLAIM_MS: i64 = 10_000;
+const GROK_PR_RETRY_MS: i64 = 5_000;
 
 /// A decoded raw backend listing plus the publication time stored by the coordinator.
 #[derive(Debug, Clone, PartialEq)]
@@ -404,6 +422,35 @@ pub struct ViewerState {
     pub spawn_pids: HashMap<(BackendKind, String), u32>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokWorktreeIdentityCacheRow {
+    pub cwd: String,
+    pub root: Option<String>,
+    pub branch: Option<String>,
+    pub common_dir: Option<String>,
+    pub success_at_ms: i64,
+    pub attempt_ms: i64,
+    pub busy_until_ms: i64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokRepositoryPrCacheRow {
+    pub common_dir: String,
+    pub prs_json: Option<String>,
+    pub success_at_ms: i64,
+    pub attempt_ms: i64,
+    pub busy_until_ms: i64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokPrRefreshToken {
+    pub key: String,
+    pub attempt_ms: i64,
+}
+
 impl ViewerDb {
     /// $HOME/.local/state/agent-viewer/viewer.db, parent dir created. Read-WRITE.
     /// A file that is not a database, or is corrupt, is deleted and recreated fresh (its
@@ -465,6 +512,259 @@ impl ViewerDb {
             conn,
             path: path.to_path_buf(),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn grok_worktree_identities(
+        &self,
+        cwds: &[String],
+    ) -> Result<Vec<GrokWorktreeIdentityCacheRow>> {
+        if cwds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..cwds.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT cwd, root, branch, common_dir, success_at_ms, attempt_ms, busy_until_ms \
+             FROM worktree_identity WHERE cwd IN ({placeholders})"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(cwds.iter()), |row| {
+            Ok(GrokWorktreeIdentityCacheRow {
+                cwd: row.get(0)?,
+                root: row.get(1)?,
+                branch: row.get(2)?,
+                common_dir: row.get(3)?,
+                success_at_ms: row.get(4)?,
+                attempt_ms: row.get(5)?,
+                busy_until_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[doc(hidden)]
+    pub fn grok_repository_prs(
+        &self,
+        common_dirs: &[String],
+    ) -> Result<Vec<GrokRepositoryPrCacheRow>> {
+        if common_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..common_dirs.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT common_dir, prs_json, success_at_ms, attempt_ms, busy_until_ms \
+             FROM repository_prs WHERE common_dir IN ({placeholders})"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(common_dirs.iter()), |row| {
+            Ok(GrokRepositoryPrCacheRow {
+                common_dir: row.get(0)?,
+                prs_json: row.get(1)?,
+                success_at_ms: row.get(2)?,
+                attempt_ms: row.get(3)?,
+                busy_until_ms: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[doc(hidden)]
+    pub fn claim_grok_worktree_identity(
+        &self,
+        cwd: &str,
+        now_ms: i64,
+    ) -> Result<Option<GrokPrRefreshToken>> {
+        let busy_until_ms = now_ms.saturating_add(GROK_IDENTITY_CLAIM_MS);
+        let stale_before_ms = now_ms.saturating_sub(GROK_PR_SUCCESS_FRESHNESS_MS);
+        let changed = self.conn.execute(
+            "INSERT INTO worktree_identity (cwd, attempt_ms, busy_until_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (cwd) DO UPDATE SET \
+               attempt_ms = excluded.attempt_ms, busy_until_ms = excluded.busy_until_ms \
+             WHERE worktree_identity.busy_until_ms <= ?2 \
+               AND (worktree_identity.success_at_ms = 0 \
+                    OR worktree_identity.success_at_ms > ?2 \
+                    OR worktree_identity.success_at_ms <= ?4)",
+            rusqlite::params![cwd, now_ms, busy_until_ms, stale_before_ms],
+        )?;
+        Ok((changed == 1).then(|| GrokPrRefreshToken {
+            key: cwd.to_string(),
+            attempt_ms: now_ms,
+        }))
+    }
+
+    #[doc(hidden)]
+    pub fn claim_grok_repository_prs(
+        &self,
+        common_dir: &str,
+        now_ms: i64,
+    ) -> Result<Option<GrokPrRefreshToken>> {
+        let busy_until_ms = now_ms.saturating_add(GROK_REPOSITORY_CLAIM_MS);
+        let stale_before_ms = now_ms.saturating_sub(GROK_PR_SUCCESS_FRESHNESS_MS);
+        let changed = self.conn.execute(
+            "INSERT INTO repository_prs (common_dir, attempt_ms, busy_until_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (common_dir) DO UPDATE SET \
+               attempt_ms = excluded.attempt_ms, busy_until_ms = excluded.busy_until_ms \
+             WHERE repository_prs.busy_until_ms <= ?2 \
+               AND (repository_prs.success_at_ms = 0 \
+                    OR repository_prs.success_at_ms > ?2 \
+                    OR repository_prs.success_at_ms <= ?4)",
+            rusqlite::params![common_dir, now_ms, busy_until_ms, stale_before_ms],
+        )?;
+        Ok((changed == 1).then(|| GrokPrRefreshToken {
+            key: common_dir.to_string(),
+            attempt_ms: now_ms,
+        }))
+    }
+
+    #[doc(hidden)]
+    pub fn complete_grok_worktree_identity(
+        &self,
+        token: &GrokPrRefreshToken,
+        root: &str,
+        branch: Option<&str>,
+        common_dir: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE worktree_identity \
+             SET root = ?1, branch = ?2, common_dir = ?3, success_at_ms = ?4, busy_until_ms = 0 \
+             WHERE cwd = ?5 AND attempt_ms = ?6",
+            rusqlite::params![
+                root,
+                branch,
+                common_dir,
+                now_ms,
+                token.key.as_str(),
+                token.attempt_ms
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[doc(hidden)]
+    pub fn complete_grok_repository_prs(
+        &self,
+        token: &GrokPrRefreshToken,
+        prs_json: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE repository_prs \
+             SET prs_json = ?1, success_at_ms = ?2, busy_until_ms = 0 \
+             WHERE common_dir = ?3 AND attempt_ms = ?4",
+            rusqlite::params![prs_json, now_ms, token.key.as_str(), token.attempt_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[doc(hidden)]
+    pub fn fail_grok_worktree_identity(
+        &self,
+        token: &GrokPrRefreshToken,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let busy_until_ms = now_ms.saturating_add(GROK_PR_RETRY_MS);
+        let changed = self.conn.execute(
+            "UPDATE worktree_identity SET busy_until_ms = ?1 \
+             WHERE cwd = ?2 AND attempt_ms = ?3",
+            rusqlite::params![busy_until_ms, token.key.as_str(), token.attempt_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[doc(hidden)]
+    pub fn fail_grok_repository_prs(
+        &self,
+        token: &GrokPrRefreshToken,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let busy_until_ms = now_ms.saturating_add(GROK_PR_RETRY_MS);
+        let changed = self.conn.execute(
+            "UPDATE repository_prs SET busy_until_ms = ?1 \
+             WHERE common_dir = ?2 AND attempt_ms = ?3",
+            rusqlite::params![busy_until_ms, token.key.as_str(), token.attempt_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[doc(hidden)]
+    pub fn prune_grok_pr_fallback(&self, now_ms: i64) -> Result<()> {
+        let identities = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT cwd, common_dir, busy_until_ms FROM worktree_identity")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let doomed_identities = identities
+            .iter()
+            .filter(|(cwd, _, busy_until_ms)| {
+                *busy_until_ms <= now_ms && matches!(Path::new(cwd).try_exists(), Ok(false))
+            })
+            .map(|(cwd, _, _)| cwd.clone())
+            .collect::<Vec<_>>();
+        let doomed_identity_set = doomed_identities.iter().cloned().collect::<HashSet<_>>();
+        let retained_common_dirs = identities
+            .iter()
+            .filter(|(cwd, _, _)| !doomed_identity_set.contains(cwd))
+            .filter_map(|(_, common_dir, _)| common_dir.clone())
+            .collect::<HashSet<_>>();
+        let doomed_repositories = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT common_dir, busy_until_ms FROM repository_prs")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .filter(|(common_dir, busy_until_ms)| {
+                    *busy_until_ms <= now_ms && !retained_common_dirs.contains(common_dir)
+                })
+                .map(|(common_dir, _)| common_dir)
+                .collect::<Vec<_>>()
+        };
+        if doomed_identities.is_empty() && doomed_repositories.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for cwd in doomed_identities {
+            if !matches!(Path::new(&cwd).try_exists(), Ok(false)) {
+                continue;
+            }
+            transaction.execute(
+                "DELETE FROM worktree_identity WHERE cwd = ?1 AND busy_until_ms <= ?2",
+                rusqlite::params![cwd, now_ms],
+            )?;
+        }
+        for common_dir in doomed_repositories {
+            transaction.execute(
+                "DELETE FROM repository_prs \
+                 WHERE common_dir = ?1 AND busy_until_ms <= ?2 \
+                   AND NOT EXISTS (SELECT 1 FROM worktree_identity \
+                                   WHERE worktree_identity.common_dir = ?1)",
+                rusqlite::params![common_dir, now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Read a display snapshot without changing its freshness or lease.

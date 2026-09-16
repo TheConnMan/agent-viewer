@@ -85,10 +85,14 @@ columns. The state as a word in the state's color (`Working`, `Needs input`, `Id
 `Error`, `Unknown`) begins the next shared left aligned column, followed by a muted one-line
 summary and any pull request badge. Elapsed time alone sits flush right. Sessions with
 associated pull requests show `#315` for one PR or `2 PRs` for several. Claude jobs take those
-from the job record; Codex and Grok sessions take them from successful PR-creation tool calls
-in their own transcripts, so those sessions badge only PRs they successfully opened. A fresh
-viewer fills Codex badges in over its first few seconds (Grok parses each chat history on
-listing and reuses the result until that file changes). The badge is
+from the job record. Codex rows use transcript proof only. Grok rows prefer successful pull
+request creation proof in their own transcripts. A Grok row with no
+transcript proof can, when viewer state is available, use same repository open pull requests
+whose head branch matches the live worktree branch, regardless of the target base. The first
+cold fill is gradual because fallback refreshes run at most one command per listing pass.
+Successful fallback data is fresh for 60 seconds and remains visible while a refresh is skipped
+or fails. A fresh viewer fills Codex badges in over its first few seconds (Grok parses each chat
+history on listing and reuses the result until that file changes). The badge is
 colored by the PR's live GitHub status: yellow when checks
 are pending or failing or a review is requested, green when checks have passed, purple when
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or

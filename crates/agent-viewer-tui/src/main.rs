@@ -12,7 +12,7 @@ use agent_viewer_core::platform::{Platform, current_platform};
 use agent_viewer_core::pty::{PtySession, PtySpec, VIEWPORT_SCROLLBACK_ROWS, spec_from_command};
 use agent_viewer_core::spawn::now_ms;
 use agent_viewer_core::state::{ViewerDb, apply_viewer_state, match_spawn, match_spawn_between};
-use agent_viewer_core::{Session, Status, mark_dead_dirs};
+use agent_viewer_core::{GrokPrFallback, Session, Status, mark_dead_dirs};
 use agent_viewer_tui::app::{App, Composer, DetachTracker, GroupKey, Row};
 use agent_viewer_tui::logos::LogoMarks;
 use agent_viewer_tui::model_cache::{ModelCache, is_stale};
@@ -477,6 +477,7 @@ fn spawn_refresh_worker(
     backends: Vec<Box<dyn Backend>>,
     last: Vec<Vec<Session>>,
     cursors: Vec<RefreshCursor>,
+    grok_pr_fallbacks: Vec<GrokPrFallback>,
 ) -> Refresher {
     let (snap_tx, snap_rx) = channel::<Snapshot>();
     let (wake_tx, wake_rx) = channel::<()>();
@@ -488,8 +489,12 @@ fn spawn_refresh_worker(
         .map(|backend| backend.kind().name().to_string())
         .collect::<Vec<_>>();
 
-    for (index, ((mut backend, mut backend_last), mut cursor)) in
-        backends.into_iter().zip(last).zip(cursors).enumerate()
+    for (index, (((mut backend, mut backend_last), mut cursor), mut grok_pr_fallback)) in backends
+        .into_iter()
+        .zip(last)
+        .zip(cursors)
+        .zip(grok_pr_fallbacks)
+        .enumerate()
     {
         let (worker_wake_tx, worker_wake_rx) = channel::<()>();
         worker_wakes.push(worker_wake_tx);
@@ -505,6 +510,7 @@ fn spawn_refresh_worker(
                             std::slice::from_mut(&mut backend),
                             std::slice::from_mut(&mut backend_last),
                             std::slice::from_mut(&mut cursor),
+                            std::slice::from_mut(&mut grok_pr_fallback),
                             db.as_ref(),
                         )
                     }));
@@ -829,8 +835,16 @@ fn main() -> io::Result<()> {
     // every backend fails to list, print the errors to stderr and exit without a UI.
     let mut last: Vec<Vec<Session>> = vec![Vec::new(); list_backends.len()];
     let mut cursors = vec![RefreshCursor::default(); list_backends.len()];
-    let (mut sessions, notice, ok_count) =
-        refresh(&mut list_backends, &mut last, &mut cursors, db.as_ref());
+    let mut grok_pr_fallbacks = (0..list_backends.len())
+        .map(|_| GrokPrFallback::default())
+        .collect::<Vec<_>>();
+    let (mut sessions, notice, ok_count) = refresh(
+        &mut list_backends,
+        &mut last,
+        &mut cursors,
+        &mut grok_pr_fallbacks,
+        db.as_ref(),
+    );
     if ok_count == 0 {
         eprintln!("agent-viewer: no backend could be listed");
         if !notice.is_empty() {
@@ -934,7 +948,7 @@ fn main() -> io::Result<()> {
     let activity_backends = all_backends();
     let activity = ActivityWorker::new(activity_backends);
     let tail = TailWorker::new(all_backends());
-    let refresher = spawn_refresh_worker(list_backends, last, cursors);
+    let refresher = spawn_refresh_worker(list_backends, last, cursors, grok_pr_fallbacks);
     let action_backends = all_backends();
 
     let mut terminal = ratatui::init();
@@ -1670,6 +1684,7 @@ fn refresh(
     backends: &mut [Box<dyn Backend>],
     last: &mut [Vec<Session>],
     cursors: &mut [RefreshCursor],
+    grok_pr_fallbacks: &mut [GrokPrFallback],
     db: Option<&ViewerDb>,
 ) -> (Vec<Session>, String, usize) {
     let mut all = Vec::new();
@@ -1677,7 +1692,14 @@ fn refresh(
     let mut ok_count = 0;
     let now = now_ms();
     for (i, backend) in backends.iter_mut().enumerate() {
-        match refresh_backend(db, backend.as_mut(), &last[i], &mut cursors[i], now) {
+        match refresh_backend(
+            db,
+            backend.as_mut(),
+            &last[i],
+            &mut cursors[i],
+            &mut grok_pr_fallbacks[i],
+            now,
+        ) {
             RefreshOutcome::Authoritative { sessions }
             | RefreshOutcome::Shared { sessions }
             | RefreshOutcome::Stale { sessions } => {
@@ -2062,9 +2084,15 @@ mod tests {
         })];
         let mut last = vec![Vec::new()];
         let mut cursors = vec![RefreshCursor::default()];
+        let mut grok_pr_fallbacks = vec![GrokPrFallback::default()];
 
-        let (sessions, notice, ok_count) =
-            refresh(&mut backends, &mut last, &mut cursors, Some(&follower));
+        let (sessions, notice, ok_count) = refresh(
+            &mut backends,
+            &mut last,
+            &mut cursors,
+            &mut grok_pr_fallbacks,
+            Some(&follower),
+        );
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(sessions.is_empty());
@@ -2109,8 +2137,15 @@ mod tests {
         })];
         let mut last = vec![vec![previous_local]];
         let mut cursors = vec![RefreshCursor::default()];
+        let mut grok_pr_fallbacks = vec![GrokPrFallback::default()];
 
-        let first = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+        let first = refresh(
+            &mut backends,
+            &mut last,
+            &mut cursors,
+            &mut grok_pr_fallbacks,
+            Some(&local),
+        );
 
         let lease_now = now_ms();
         let _lease = match lease_holder
@@ -2120,12 +2155,25 @@ mod tests {
             ListingCacheClaim::Claimed(lease) => lease,
             other => panic!("expected following refresh lease, got {other:?}"),
         };
-        let second = refresh(&mut backends, &mut last, &mut cursors, Some(&local));
+        let second = refresh(
+            &mut backends,
+            &mut last,
+            &mut cursors,
+            &mut grok_pr_fallbacks,
+            Some(&local),
+        );
 
         let plain_local = session(BackendKind::Codex, "plain local", 250, false);
         let mut plain_last = vec![vec![plain_local.clone()]];
         let mut plain_cursors = vec![RefreshCursor::default()];
-        let plain_error = refresh(&mut backends, &mut plain_last, &mut plain_cursors, None);
+        let mut plain_grok_pr_fallbacks = vec![GrokPrFallback::default()];
+        let plain_error = refresh(
+            &mut backends,
+            &mut plain_last,
+            &mut plain_cursors,
+            &mut plain_grok_pr_fallbacks,
+            None,
+        );
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(first.0, vec![cached.clone()]);
@@ -2163,6 +2211,7 @@ mod tests {
                 vec![session(BackendKind::Claude, "old claude", 1_000, false)],
             ],
             vec![RefreshCursor::default(), RefreshCursor::default()],
+            vec![GrokPrFallback::default(), GrokPrFallback::default()],
         );
         refresher.force();
 

@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use agent_viewer_core::{
-    AttachRefusal, Backend, BackendKind, Capabilities, Error, ListingCacheScope, Session,
-    SessionOrigin, SpawnResult, Status, ViewerDb, spawn::now_ms, state::LISTING_CACHE_FRESHNESS_MS,
+    AttachRefusal, Backend, BackendKind, Capabilities, Error, GrokPrFallback, ListingCacheRead,
+    ListingCacheScope, Session, SessionOrigin, SpawnResult, Status, ViewerDb, spawn::now_ms,
+    state::LISTING_CACHE_FRESHNESS_MS,
 };
 use agent_viewer_tui::shared_listing::{
     RefreshCursor, RefreshOutcome, TargetRequest, TargetResolution, authoritative_target,
@@ -216,12 +217,14 @@ fn fresh_shared_snapshot_skips_the_authoritative_source_across_viewers() {
     let mut follower = CountedBackend::sessions(BackendKind::Codex, &scope, Vec::new());
     let mut publisher_cursor = RefreshCursor::default();
     let mut follower_cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
     let initial = refresh_backend(
         Some(&first),
         &mut publisher,
         &[],
         &mut publisher_cursor,
+        &mut grok_pr_fallback,
         1_000,
     );
     let shared = refresh_backend(
@@ -229,6 +232,7 @@ fn fresh_shared_snapshot_skips_the_authoritative_source_across_viewers() {
         &mut follower,
         &[],
         &mut follower_cursor,
+        &mut grok_pr_fallback,
         2_999,
     );
 
@@ -248,12 +252,14 @@ fn unchanged_shared_generation_skips_decode_and_authoritative_source() {
     let mut follower = CountedBackend::sessions(BackendKind::Codex, &scope, Vec::new());
     let mut publisher_cursor = RefreshCursor::default();
     let mut follower_cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
     refresh_backend(
         Some(&publisher_db),
         &mut publisher,
         &[],
         &mut publisher_cursor,
+        &mut grok_pr_fallback,
         1_000,
     );
     let loaded = refresh_backend(
@@ -261,6 +267,7 @@ fn unchanged_shared_generation_skips_decode_and_authoritative_source() {
         &mut follower,
         &[],
         &mut follower_cursor,
+        &mut grok_pr_fallback,
         2_000,
     );
     let unchanged = refresh_backend(
@@ -268,6 +275,7 @@ fn unchanged_shared_generation_skips_decode_and_authoritative_source() {
         &mut follower,
         std::slice::from_ref(&expected),
         &mut follower_cursor,
+        &mut grok_pr_fallback,
         2_001,
     );
 
@@ -289,12 +297,14 @@ fn expired_snapshot_lists_once_then_the_other_viewer_uses_the_publication() {
         CountedBackend::sessions(BackendKind::Claude, &scope, vec![after_expiry.clone()]);
     let mut first_cursor = RefreshCursor::default();
     let mut second_cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
     refresh_backend(
         Some(&first),
         &mut first_backend,
         &[],
         &mut first_cursor,
+        &mut grok_pr_fallback,
         1_000,
     );
     let refreshed = refresh_backend(
@@ -302,6 +312,7 @@ fn expired_snapshot_lists_once_then_the_other_viewer_uses_the_publication() {
         &mut second_backend,
         &[],
         &mut second_cursor,
+        &mut grok_pr_fallback,
         3_000,
     );
     let shared = refresh_backend(
@@ -309,6 +320,7 @@ fn expired_snapshot_lists_once_then_the_other_viewer_uses_the_publication() {
         &mut first_backend,
         &[],
         &mut first_cursor,
+        &mut grok_pr_fallback,
         3_001,
     );
 
@@ -334,12 +346,14 @@ fn source_completion_time_keeps_a_delayed_publication_fresh_for_another_viewer()
     let mut publisher_cursor = RefreshCursor::default();
     let mut follower_cursor = RefreshCursor::default();
     let refresh_started_at = now_ms();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
     let published = refresh_backend(
         Some(&first),
         &mut publisher,
         &[],
         &mut publisher_cursor,
+        &mut grok_pr_fallback,
         refresh_started_at,
     );
     let shared = refresh_backend(
@@ -347,6 +361,7 @@ fn source_completion_time_keeps_a_delayed_publication_fresh_for_another_viewer()
         &mut follower,
         &[],
         &mut follower_cursor,
+        &mut grok_pr_fallback,
         now_ms(),
     );
 
@@ -365,8 +380,16 @@ fn missing_cache_calls_the_authoritative_source() {
     let expected = session(BackendKind::Claude, "ses_123", None, true);
     let mut backend = CountedBackend::sessions(BackendKind::Claude, &scope, vec![expected.clone()]);
     let mut cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
-    let outcome = refresh_backend(Some(&first), &mut backend, &[], &mut cursor, 1_000);
+    let outcome = refresh_backend(
+        Some(&first),
+        &mut backend,
+        &[],
+        &mut cursor,
+        &mut grok_pr_fallback,
+        1_000,
+    );
 
     assert!(
         matches!(outcome, RefreshOutcome::Authoritative { sessions } if sessions == vec![expected])
@@ -384,14 +407,30 @@ fn successful_empty_listing_replaces_rows_and_cached_error_keeps_notice() {
     let mut failing = CountedBackend::error(BackendKind::Codex, &scope, "source unavailable");
     let mut first_cursor = RefreshCursor::default();
     let mut second_cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
-    refresh_backend(Some(&first), &mut initial, &[], &mut first_cursor, 1_000);
-    let empty_outcome = refresh_backend(Some(&second), &mut empty, &[], &mut second_cursor, 3_000);
+    refresh_backend(
+        Some(&first),
+        &mut initial,
+        &[],
+        &mut first_cursor,
+        &mut grok_pr_fallback,
+        1_000,
+    );
+    let empty_outcome = refresh_backend(
+        Some(&second),
+        &mut empty,
+        &[],
+        &mut second_cursor,
+        &mut grok_pr_fallback,
+        3_000,
+    );
     let failed = refresh_backend(
         Some(&first),
         &mut failing,
         &[stale_row],
         &mut first_cursor,
+        &mut grok_pr_fallback,
         5_000,
     );
 
@@ -401,6 +440,119 @@ fn successful_empty_listing_replaces_rows_and_cached_error_keeps_notice() {
     assert!(
         matches!(failed, RefreshOutcome::CachedError { sessions, notice } if sessions.is_empty() && notice == "codex: command failed: source unavailable")
     );
+}
+
+#[test]
+fn authoritative_grok_listing_publishes_decorated_refs_to_followers() {
+    let (directory, first, second) = open_viewers();
+    let root = directory.path().join("grok-worktree");
+    let common_dir = directory.path().join("grok-common");
+    std::fs::create_dir_all(&root).expect("Grok worktree");
+    std::fs::create_dir_all(&common_dir).expect("Grok git common directory");
+    let root_text = root.to_str().expect("UTF8 Grok worktree");
+    let common_text = common_dir.to_str().expect("UTF8 Grok common directory");
+    let branch = "task/grok-next-target";
+    let seeded_at_ms = now_ms();
+    let identity = first
+        .claim_grok_worktree_identity(root_text, seeded_at_ms)
+        .expect("claim Grok identity")
+        .expect("unclaimed Grok identity");
+    assert!(
+        first
+            .complete_grok_worktree_identity(
+                &identity,
+                root_text,
+                Some(branch),
+                common_text,
+                seeded_at_ms,
+            )
+            .expect("complete Grok identity")
+    );
+    let inventory = r#"{"task/grok-next-target":[{"id":"2651","href":"https://github.com/TheConnMan/agent-viewer/pull/2651"}]}"#;
+    let repository = first
+        .claim_grok_repository_prs(common_text, seeded_at_ms)
+        .expect("claim Grok repository")
+        .expect("unclaimed Grok repository");
+    assert!(
+        first
+            .complete_grok_repository_prs(&repository, inventory, seeded_at_ms)
+            .expect("complete Grok repository")
+    );
+
+    let scope = scope(BackendKind::Grok);
+    let mut raw = session(BackendKind::Grok, "grok-session", None, false);
+    raw.cwd = root;
+    let mut publisher = CountedBackend::sessions(BackendKind::Grok, &scope, vec![raw]);
+    let mut follower = CountedBackend::sessions(BackendKind::Grok, &scope, Vec::new());
+    let mut publisher_cursor = RefreshCursor::default();
+    let mut follower_cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
+
+    let published = refresh_backend(
+        Some(&first),
+        &mut publisher,
+        &[],
+        &mut publisher_cursor,
+        &mut grok_pr_fallback,
+        1_000,
+    );
+    let shared = refresh_backend(
+        Some(&second),
+        &mut follower,
+        &[],
+        &mut follower_cursor,
+        &mut grok_pr_fallback,
+        1_001,
+    );
+
+    for outcome in [published, shared] {
+        let sessions = match outcome {
+            RefreshOutcome::Authoritative { sessions } | RefreshOutcome::Shared { sessions } => {
+                sessions
+            }
+            other => panic!("expected a published Grok listing, got {other:?}"),
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pr_refs.len(), 1);
+        assert_eq!(sessions[0].pr_refs[0].id, "2651");
+    }
+    assert_eq!(publisher.calls, 1);
+    assert_eq!(follower.calls, 0);
+
+    rusqlite::Connection::open(directory.path().join("viewer.sqlite"))
+        .expect("open schema breaker")
+        .execute_batch("DROP TABLE worktree_identity;")
+        .expect("drop identity table");
+    let failed = refresh_backend(
+        Some(&first),
+        &mut publisher,
+        &[],
+        &mut publisher_cursor,
+        &mut grok_pr_fallback,
+        5_000,
+    );
+
+    match failed {
+        RefreshOutcome::CachedError { sessions, notice } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].pr_refs.len(), 1);
+            assert_eq!(sessions[0].pr_refs[0].id, "2651");
+            assert!(notice.contains("grok"));
+        }
+        other => panic!("expected the warm Grok snapshot with an error, got {other:?}"),
+    }
+    assert_eq!(publisher.calls, 2);
+    match second
+        .read_listing_snapshot(&scope, 5_001)
+        .expect("read listing after decorator failure")
+    {
+        ListingCacheRead::Stale(snapshot) => {
+            assert_eq!(snapshot.sessions().len(), 1);
+            assert_eq!(snapshot.sessions()[0].pr_refs.len(), 1);
+            assert_eq!(snapshot.sessions()[0].pr_refs[0].id, "2651");
+        }
+        other => panic!("decorator failure replaced the warm snapshot: {other:?}"),
+    }
 }
 
 #[test]
@@ -496,8 +648,16 @@ fn a_fenced_publication_is_not_applied_to_the_display() {
         calls: 0,
     };
     let mut cursor = RefreshCursor::default();
+    let mut grok_pr_fallback = GrokPrFallback::default();
 
-    let fenced = refresh_backend(Some(&db), &mut backend, &last_good, &mut cursor, 1_000);
+    let fenced = refresh_backend(
+        Some(&db),
+        &mut backend,
+        &last_good,
+        &mut cursor,
+        &mut grok_pr_fallback,
+        1_000,
+    );
 
     assert_eq!(backend.calls, 1);
     assert!(
@@ -508,7 +668,14 @@ fn a_fenced_publication_is_not_applied_to_the_display() {
     // The very next refresh re-lists and publishes normally, so the fence costs one tick.
     backend.fence_next = false;
     backend.sessions = last_good.clone();
-    let republished = refresh_backend(Some(&db), &mut backend, &last_good, &mut cursor, 2_000);
+    let republished = refresh_backend(
+        Some(&db),
+        &mut backend,
+        &last_good,
+        &mut cursor,
+        &mut grok_pr_fallback,
+        2_000,
+    );
 
     assert_eq!(backend.calls, 2);
     assert!(

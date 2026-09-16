@@ -1,5 +1,5 @@
 use agent_viewer_core::{
-    Backend, BackendKind, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
+    Backend, BackendKind, GrokPrFallback, ListingCacheClaim, ListingCacheRead, ListingCacheScope,
     ListingCacheSnapshot, Session, ViewerDb,
     state::{LISTING_CACHE_FRESHNESS_MS, LISTING_CACHE_LEASE_MS},
 };
@@ -196,14 +196,17 @@ pub fn refresh_backend(
     backend: &mut dyn Backend,
     last_good: &[Session],
     cursor: &mut RefreshCursor,
+    grok_pr_fallback: &mut GrokPrFallback,
     now_ms: i64,
 ) -> RefreshOutcome {
     let kind = backend.kind();
     let scope = backend.listing_scope();
     let (outcome, has_shared_fallback) = match db {
-        Some(db) => {
-            refresh_scoped_inner(db, scope.as_ref(), kind, cursor, now_ms, || backend.list())
-        }
+        Some(db) => refresh_scoped_inner(db, scope.as_ref(), kind, cursor, now_ms, || {
+            let mut sessions = backend.list()?;
+            grok_pr_fallback.attach_branch_pr_refs(db, &mut sessions)?;
+            Ok(sessions)
+        }),
         None => source_only(kind, || backend.list()),
     };
     match outcome {

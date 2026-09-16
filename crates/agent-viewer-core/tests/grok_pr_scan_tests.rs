@@ -1,8 +1,8 @@
-//! Grok PR refs come from `chat_history.jsonl`: an explicit PR-creation tool call
-//! paired with its successful `tool_result` by `tool_call_id`. Grok records PRs
-//! nowhere else. These fixtures are the live JSONL shape (assistant `tool_calls`
-//! with `id`/`name`/`arguments`, and `tool_result` records with `tool_call_id` plus
-//! a `content` string). Reverting `list` to `pr_refs: Vec::new()` fails here.
+//! Grok transcript PR refs come from `chat_history.jsonl`: an explicit PR creation
+//! tool call paired with its successful `tool_result` by `tool_call_id`. These
+//! fixtures are the live JSONL shape. Transcript evidence is authoritative. Live
+//! branch attribution is a later viewer owned decorator and runs only when this
+//! scanner returns no refs. Reverting `list` to `pr_refs: Vec::new()` fails here.
 
 use agent_viewer_core::GrokLifecycle;
 use std::path::{Path, PathBuf};
@@ -29,13 +29,13 @@ fn find<'a>(rows: &'a [agent_viewer_core::Session], id: &str) -> &'a agent_viewe
         .unwrap_or_else(|| panic!("missing fixture session {id}"))
 }
 
-// The bug this module exists for: Grok session construction hardcoded
-// `pr_refs: Vec::new()`, so a session that successfully opened PRs showed no
-// badge. A successful `gh pr create` and a successful `create_pull_request`
-// connector call both populate Session.pr_refs, which the existing TUI badge
-// and live-status path already consume. Duplicate URLs and a `/files` suffix
-// collapse to the canonical href. Incidental PR links in the same history
-// (a prior `gh pr view`, user prose, grep of SPEC.md) are not a source.
+// This scanner protects direct transcript attribution. A successful `gh pr create`
+// and a successful `create_pull_request` connector call both populate
+// `Session.pr_refs`, which the existing TUI badge and live status path consume.
+// Duplicate URLs and a `/files` suffix collapse to the canonical href. Incidental
+// PR links in the same history, including a prior `gh pr view`, user prose, and a
+// grep of SPEC.md, are not evidence. The later branch decorator must preserve any
+// refs proved here and may act only when this result is empty.
 #[test]
 fn list_populates_pr_refs_from_successful_grok_pr_creates() {
     let rows = list_fixture_rows();
@@ -51,7 +51,7 @@ fn list_populates_pr_refs_from_successful_grok_pr_creates() {
     assert_eq!(created.pr_refs[1].id, "99");
 }
 
-// Failed, unpaired, and incidental-link histories must stay empty. A scanner
+// Failed, unpaired, and incidental link histories must stay empty. A scanner
 // that badges any github.com/.../pull/n URL, or that does not require a
 // matching successful creation, starts failing these four assertions.
 #[test]

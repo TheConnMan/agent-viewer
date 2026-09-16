@@ -1,4 +1,3 @@
-#[cfg(target_os = "linux")]
 use crate::backend::PrRef;
 use crate::backend::{
     Backend, BackendKind, Capabilities, ListingCacheScope, Session, SessionOrigin, SpawnResult,
@@ -543,8 +542,7 @@ const GROK_PR_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const GROK_PR_SCAN_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Most successfully created PRs kept per session. Each ref costs a live `gh`
 /// fetch in the TUI status cache.
-#[cfg(target_os = "linux")]
-const GROK_MAX_PR_REFS: usize = 4;
+pub(crate) const GROK_MAX_PR_REFS: usize = 4;
 
 #[cfg(target_os = "linux")]
 fn file_key_from_file(file: &std::fs::File) -> Option<FileKey> {
@@ -863,8 +861,7 @@ fn scan_pr_keys(text: &str, mut on_key: impl FnMut(String, String, u64)) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn push_capped_pr_ref(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) {
+pub(crate) fn push_capped_pr_ref(refs: &mut Vec<PrRef>, owner: String, repo: String, number: u64) {
     let href = format!("https://github.com/{owner}/{repo}/pull/{number}");
     if refs
         .iter()
