@@ -23,7 +23,7 @@ use agent_viewer_tui::shared_listing::{
 };
 use agent_viewer_tui::terminal_title::set_terminal_title;
 use agent_viewer_tui::ui::{self, AttachView, ListHit, Mode, Pulses};
-use agent_viewer_tui::{StartupAction, startup_action};
+use agent_viewer_tui::{StartupAction, run_cli, startup_action};
 
 use base64::Engine as _;
 use crossterm::event::{
@@ -792,9 +792,11 @@ fn startup_sprite(db: Option<&ViewerDb>) -> ui::SpriteKind {
 }
 
 fn main() -> io::Result<()> {
-    if startup_action(std::env::args_os().skip(1)) == StartupAction::PrintVersion {
-        writeln!(io::stdout(), "agent-viewer {}", env!("CARGO_PKG_VERSION"))?;
-        return Ok(());
+    let startup = startup_action(std::env::args_os().skip(1));
+    match startup {
+        StartupAction::RunTui => {}
+        StartupAction::RunCli(command) => return finish_cli(run_cli(command)),
+        StartupAction::Exit(output) => return finish_cli(output),
     }
 
     // Marks default to textual tags; AGENT_VIEWER_GLYPH_MARKS=1 opts into the brand glyphs.
@@ -976,6 +978,19 @@ fn main() -> io::Result<()> {
     };
     ratatui::restore();
     result
+}
+
+fn finish_cli(output: agent_viewer_tui::CliOutput) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    stdout.write_all(output.stdout.as_bytes())?;
+    stderr.write_all(output.stderr.as_bytes())?;
+    stdout.flush()?;
+    stderr.flush()?;
+    if output.code != 0 {
+        std::process::exit(i32::from(output.code));
+    }
+    Ok(())
 }
 
 fn run(
