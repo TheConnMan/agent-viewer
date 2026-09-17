@@ -87,6 +87,43 @@ cursor, reports the failure, and retries. The aggregator reports a backend as st
 not completed a refresh for ten seconds, so a stuck worker is visible instead of looking like an
 unchanged fleet. A forced refresh wakes every backend worker.
 
+## Command line boundary
+
+The `agent-viewer` command line interface is a presentation layer over the existing provider
+APIs. Argument parsing happens before provider initialization or terminal setup. `--help` and
+`--version` exit immediately before either occurs. No arguments enter the TUI; `--json` is
+shorthand for `list --json`, which initializes providers to list sessions. Subcommands likewise
+run through the CLI layer without starting the TUI. The provider APIs and their source authority
+remain unchanged.
+
+Listing uses the primary unarchived scope by default. It includes completed sessions and
+filters companions, subagents, missing cwds, and any session whose whole title is exactly
+`hold`, matched without regard to ASCII letter case. `--all` includes those rows. Provider,
+status, and exact normalized directory filters apply after provider listing. List output may
+carry viewer display overlays. CLI Grok `pr_refs` use transcript proof only; the TUI's viewer
+owned branch fallback is not used by this command. `show` returns fresh provider authoritative
+fields and capability flags without display only overlays.
+The JSON envelope is version 1 with `command: "list"`, a `sessions` array, and a provider
+observation array. Session fields are the stable fields documented in README. A Claude empty result is observed
+as `empty_or_unavailable`, an absent Codex source as `unavailable`, and another provider error
+is returned as a command error.
+
+Target resolution for `show`, `tail`, and mutations searches the full listing first, then uses a
+fresh `session_by_id` authority for the selected provider. Full and short ids win over prefixes.
+Mutations require either a qualified `provider:id` target or `--provider` with an id or unique
+prefix. They reject ambiguity and conflicting provider claims. Fresh source capabilities govern
+every mutation. A successful or failed mutation invalidates the shared listing scope. No
+presentation pid is an action authority.
+
+An initial provider backend error reports code 1. An initial missing target reports code 3 with
+not found or unavailable language. `wait` first obtains a provider list observation to resolve
+the target. After a target resolves positively, subsequent status checks use fresh
+`session_by_id` lookups. Claude transient lookup absence or `Err` is retried to the `wait`
+deadline because its core provider cannot distinguish an empty listing from a CLI failure. A
+timeout of zero performs the one provider bounded check; a positive timeout enables finite
+polling. Its terminal status and timeout mapping, JSON error envelope, mutation acceptance
+meaning, and exit codes are the README contract.
+
 ## Grok storage and lifecycle contract
 
 The Grok backend is supported only on Linux. Its official lifecycle transport uses Unix domain

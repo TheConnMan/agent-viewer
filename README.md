@@ -649,9 +649,63 @@ Linux retains the full measured runtime behavior. macOS and Windows can enumerat
 sessions, but do not claim Linux process status or Codex daemon controls. On those
 platforms, a rollout is `Done` only when its transcript proves
 completion; every other process dependent state is `Unknown`. Unsupported actions remain
-no ops with the existing footer notice. `agent-viewer --version` and `agent-viewer -V` print
-the version before terminal, filesystem, or backend startup, making them safe release smoke
-paths.
+no ops with the existing footer notice. `agent-viewer --help`, `agent-viewer --version`, and
+`agent-viewer -V` print and exit before terminal, filesystem, or provider startup, making them
+safe release smoke paths.
+
+## Command line interface
+
+The installed binary is `agent-viewer`. With no arguments it opens the TUI. `--json` is a
+shorthand for `list --json`, so scripts can use `agent-viewer --json` without starting the
+terminal UI.
+
+`list` accepts `--all`, `--provider codex|claude|grok`, `--status
+working|needs_input|idle|done|error|unknown`, and `--dir PATH`. The directory filter is
+normalized to one exact directory. The default is the primary unarchived set, including
+completed sessions and excluding companions, subagents, and missing working directories. A
+session whose whole title is exactly `hold`, matched without regard to ASCII letter case, is
+also excluded. `--all` includes those rows. JSON output is an object with
+`schema_version: 1`, `command: "list"`, a `sessions` array, and a `providers` observation
+array. Each session has `provider`, `id`, `target` (`provider:id`), `short_id`, `title`,
+`status`, `cwd`, `git_branch`, `summary`, `created_at_ms`, `updated_at_ms`, `hidden`, `companion`, `subagent`, `pr_refs`,
+`capabilities`, and `archive_mode`. An unavailable or empty provider remains represented in
+the observations: Claude reports `empty_or_unavailable`, while an absent Codex reports
+`unavailable`. Other provider errors fail the command. List rows include viewer display
+overlays. Grok `pr_refs` in this CLI come from transcript proof only; the TUI's viewer owned
+branch fallback is not used here. `show` returns fresh provider authoritative fields and
+capability flags without display only overlays.
+
+`show`, `tail`, and `wait` accept an id or unique prefix, optionally with a provider. The
+qualified form `provider:id` is also accepted. Exact full and short ids take precedence over
+prefixes, and hidden sessions are searchable. `show --json` returns one session. `tail` uses
+`--limit 20` by default and accepts positive values through 10000; JSON events use `user`,
+`agent`, or `tool` types.
+
+`archive`, `stop`, `rename`, and `unarchive` require a qualified `provider:id` target or
+`--provider` with an id or unique prefix. A provider option must agree with a qualified target;
+ambiguous or conflicting targets are refused. `rename <target> <name>` changes the provider
+name. Archive is reversible for Codex. For Claude, archive deletes the job and its worktree;
+for Grok, it deletes the provider record. These deleting archive modes require
+`--allow-delete`. Stop retains the row and transcript. Mutation output describes
+an accepted provider request, not a verified final state; use `show` or `wait` afterward.
+
+`wait` uses a finite `--timeout` in seconds, defaulting to 300. Zero performs one
+provider bounded check, while a positive value bounds all lookups. `done` and `needs_input`
+exit 0, `error` exits 1, and `idle` or `unknown` keep polling until the deadline. A deadline
+returns exit 124. With `--json`, errors go to stdout as
+`{"schema_version":1,"error":{"code":"...","message":"..."}}`; human mode uses
+plain diagnostic text. Exit codes are 2 for invalid arguments, 3 for missing targets, 4 for
+ambiguous targets, 5 for unsupported actions, 6 when archive requires `--allow-delete`, 1
+for backend errors or an error session, and 124 for timeout.
+
+Examples:
+
+```
+agent-viewer --json
+agent-viewer list --provider grok --status working --dir "$PWD"
+agent-viewer show --json codex:abc123
+agent-viewer tail --provider claude --limit 50 abc123
+```
 
 ## Phone companion
 
