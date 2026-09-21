@@ -443,6 +443,16 @@ impl Backend for GrokBackend {
         read_grok_tail(path, max_events)
     }
 
+    fn turn_activity(&self, session: &Session, window: std::time::Duration) -> Result<Vec<i64>> {
+        let Some(history) = session.rollout_path.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(directory) = history.parent() else {
+            return Ok(Vec::new());
+        };
+        read_grok_turn_activity(&directory.join("updates.jsonl"), &session.id, window)
+    }
+
     fn spawn(
         &self,
         dir: &Path,
@@ -1499,6 +1509,102 @@ fn merge_roster(
             daemon_hosted: entry.resident,
         });
     }
+}
+
+fn grok_timestamp_millis(record: &Value) -> Option<i64> {
+    match record.get("timestamp") {
+        Some(Value::String(text)) => crate::rfc3339_millis(text),
+        Some(Value::Number(number)) => {
+            let raw = number.as_i64()?;
+            // Live Grok writes unix seconds. Values that already look like epoch
+            // milliseconds stay as-is so a future unit change does not 1000x the ribbon.
+            if raw.abs() >= 100_000_000_000 {
+                Some(raw)
+            } else {
+                raw.checked_mul(1_000)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn grok_chunk_has_text(update: &Value) -> bool {
+    match update.get("content") {
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(content) => content
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        None => false,
+    }
+}
+
+fn grok_activity_kind(update: &Value) -> Option<&'static str> {
+    match crate::json_str(update, "sessionUpdate") {
+        Some("user_message_chunk") if grok_chunk_has_text(update) => Some("user_message_chunk"),
+        Some("agent_message_chunk") if grok_chunk_has_text(update) => Some("agent_message_chunk"),
+        Some("tool_call")
+            if crate::json_str(update, "title").is_some_and(|title| !title.is_empty()) =>
+        {
+            Some("tool_call")
+        }
+        _ => None,
+    }
+}
+
+/// Read turn timestamps from the full Grok updates history.
+fn read_grok_turn_activity(
+    path: &Path,
+    session_id: &str,
+    window: std::time::Duration,
+) -> Result<Vec<i64>> {
+    let file = match open_owned_regular(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let (cutoff, now) = crate::activity_window(window);
+    let mut timestamps = Vec::new();
+    let mut last_message: Option<(&'static str, i64)> = None;
+    let mut line = Vec::new();
+    loop {
+        match crate::read_capped_line(&mut reader, &mut line, crate::JSONL_LINE_MAX_BYTES)? {
+            crate::CappedLine::Eof => break,
+            crate::CappedLine::Skipped => continue,
+            crate::CappedLine::Complete => {}
+        }
+        let line = String::from_utf8_lossy(&line);
+        let Some(record) = crate::parse_json_line(&line) else {
+            continue;
+        };
+        let method = crate::json_str(&record, "method");
+        if !matches!(method, Some("session/update" | "_x.ai/session/update")) {
+            continue;
+        }
+        if record.pointer("/params/sessionId").and_then(Value::as_str) != Some(session_id) {
+            continue;
+        }
+        let Some(update) = record.pointer("/params/update") else {
+            continue;
+        };
+        let Some(kind) = grok_activity_kind(update) else {
+            continue;
+        };
+        let Some(timestamp) = grok_timestamp_millis(&record)
+            .filter(|timestamp| (*timestamp >= cutoff) && (*timestamp <= now))
+        else {
+            continue;
+        };
+        if kind != "tool_call" {
+            if last_message == Some((kind, timestamp)) {
+                continue;
+            }
+            last_message = Some((kind, timestamp));
+        }
+        timestamps.push(timestamp);
+    }
+    timestamps.sort_unstable();
+    Ok(timestamps)
 }
 
 fn read_grok_tail(path: &Path, max_events: usize) -> Result<Vec<TailEvent>> {

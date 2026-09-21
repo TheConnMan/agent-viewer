@@ -143,7 +143,16 @@ Grok home is a nonempty `GROK_HOME` value verbatim, otherwise `~/.grok`. Durable
 under its `sessions` child in a working directory bucket and then a session identity directory.
 Agent Viewer reads `summary.json` for identity, title, working directory, timestamps, and
 summary, reads `chat_history.jsonl` for PR refs, and reads `updates.jsonl` for durable turn
-status. Per-session PR refs and durable status are cached independently, each keyed by that
+status and the activity ribbon. The ribbon is the selected session's `updates.jsonl` only:
+Grok durable storage does not expose a recursive parent/child map the way Codex and Claude
+do. It walks complete lines of that file, never `chat_history.jsonl` (those records have no
+timestamps). Live timestamps are unix seconds; RFC 3339 strings from older fixtures are
+accepted too. Meaningful events are nonempty `user_message_chunk` and `agent_message_chunk`
+text and named `tool_call` titles. Consecutive same-second message chunks collapse so a
+streamed reply is one pulse, not one pulse per token. Thought chunks, hook execution,
+`tool_call_update`, `turn_completed`, empty text, empty titles, foreign `sessionId` values,
+and malformed or oversize lines are skipped. Missing or unreadable updates, including a
+symlink, leave the ribbon empty. Per-session PR refs and durable status are cached independently, each keyed by that
 file's (mtime, len) taken from an `openat2` handle, and re-read only when that key
 changes, shrinks, or vanishes. It never writes a durable
 Grok file. Missing files, torn final JSONL records, malformed objects, directories that vanish
@@ -320,7 +329,8 @@ Activity ribbons cover one hour and aggregate a row with its recursive descendan
 reads `parent_thread_id` from a subagent `thread_spawn` source. Claude treats the root's flat
 transcripts under its transcript stem `subagents` directory as descendants, then isolates child
 subtrees through sibling `.meta.json` `parentAgentId` links. A child row remains isolated to
-its own subtree. Missing
+its own subtree. Grok has no equivalent descendant walk: the ribbon is that row's
+`updates.jsonl`. Missing
 or malformed child data is best effort and never removes readable root activity. The hierarchy
 cache rereads every thirty seconds.
 
@@ -1082,9 +1092,9 @@ Cargo workspace, three crates plus one vendored dependency. Live-refresh the reg
 - `claude.rs` is the Claude backend: `claude agents --json --all`, `state.json` enrichment, the
   trust bootstrap, and spawn/attach/archive/stop/delete/rename.
 - `grok.rs` is the Grok backend and the reusable public `GrokLifecycle`: read only durable
-  discovery, bounded transcript tails, PR refs from successful chat-history creation pairs,
-  leader registration and framing, roster precedence, lifecycle requests, diagnostics, model
-  fallback, and exact official attach construction.
+  discovery, bounded transcript tails, activity timestamps from `updates.jsonl`, PR refs from
+  successful chat-history creation pairs, leader registration and framing, roster precedence,
+  lifecycle requests, diagnostics, model fallback, and exact official attach construction.
 - `router.rs` is the `agent-router` shell out used for ordinary tasks and text commands by Auto
   and by pinned Codex or Claude when
   the binary is installed. It deliberately is not a `Backend`: it enumerates nothing and owns
