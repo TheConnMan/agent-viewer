@@ -421,12 +421,15 @@ Live `chat_history.jsonl` records (verified 2026-08-22) carry assistant `tool_ca
 
 An unpaired or failed command does not badge a PR, and URLs in messages, `gh pr view` /
 research output, grep/read of other files, or other calls are incidental and are excluded.
-Grok fleets are tens of sessions and a few megabytes of history, so a cache miss does a
-bounded full parse of each `chat_history.jsonl` (2 MiB per file, 32 MiB aggregate, complete
-lines only) rather than Codex's per-file offset scanner. A warm listing with an unchanged
-history file key skips that read; an updates-file change does not re-parse history.
-`MAX_REFS` is 4, keeping the most recent successful refs. Roster-only rows with no durable
-history keep empty `pr_refs`.
+Each job has its own `chat_history.jsonl` (median ~200 KiB on this box, none past 2 MiB).
+A cache miss does a bounded full parse of that one file (2 MiB per file, complete lines
+only) rather than Codex's per-file offset scanner. Unread files in one listing pass are
+tried newest-first, and only those reads count against a 32 MiB per-tick cap, so a cold
+tick badges recent jobs instead of whatever sorts first on disk. A warm listing with an
+unchanged history file key republishes the stored refs at zero cost; that is what lets
+later ticks scan the files the first pass did not reach. An updates-file change does not
+re-parse history. `MAX_REFS` is 4, keeping the most recent successful refs. Roster-only
+rows with no durable history keep empty `pr_refs`.
 
 ### Grok branch fallback
 

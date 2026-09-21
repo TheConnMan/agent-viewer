@@ -540,14 +540,15 @@ const GROK_DURABLE_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const GROK_STATUS_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const GROK_DURABLE_STATUS_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Per-file ceiling for the chat-history PR scan. Live Grok histories on this box
-/// top out around 1 MiB; a file past this is skipped rather than truncated, because
+/// top out around 1.4 MiB; a file past this is skipped rather than truncated, because
 /// a cut through a PR URL would mint a sticky truncated number.
 #[cfg(target_os = "linux")]
 const GROK_PR_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
-/// Aggregate chat-history bytes the listing may scan for PR refs in one pass,
-/// matching the durable summary and status ceilings. A cache miss still does a
-/// bounded full parse; a hit skips the read. Skipping a session's refs when the
-/// budget is gone is the safe fallback.
+/// Bytes of unread chat history a listing may parse for PR refs in one pass.
+/// Each session is its own `chat_history.jsonl`. Cache hits publish stored refs
+/// at zero cost so a later tick can scan files this pass did not reach. Unread
+/// files are tried newest-first so a cold tick badges recent jobs instead of
+/// whatever sorts first on disk.
 #[cfg(target_os = "linux")]
 const GROK_PR_SCAN_LIST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Most successfully created PRs kept per session. Each ref costs a live `gh`
@@ -564,16 +565,15 @@ fn file_key_from_file(file: &std::fs::File) -> Option<FileKey> {
     })
 }
 
-/// Apply the per-pass PR-scan budget to a cached parse without re-reading.
+/// Return cached PR refs without charging the per-pass read budget. A hit
+/// means the file was already parsed; hiding those refs when later sessions
+/// still need budget is what left recent jobs unbadged on a warm listing.
 #[cfg(target_os = "linux")]
-fn budgeted_pr_refs(file_len: u64, remaining_bytes: u64, cached: &[PrRef]) -> (Vec<PrRef>, u64) {
-    if remaining_bytes == 0 {
+fn cached_pr_refs(file_len: u64, cached: &[PrRef]) -> (Vec<PrRef>, u64) {
+    if file_len == 0 || file_len > GROK_PR_SCAN_MAX_BYTES {
         return (Vec::new(), 0);
     }
-    if file_len == 0 || file_len > GROK_PR_SCAN_MAX_BYTES || file_len > remaining_bytes {
-        return (Vec::new(), 0);
-    }
-    (cached.to_vec(), file_len)
+    (cached.to_vec(), 0)
 }
 
 /// Apply the per-pass status-tail budget to a cached parse without re-reading.
@@ -604,7 +604,7 @@ fn cached_or_read_pr_refs(
     if let Some((cached_key, refs)) = cache.pr_refs.get(session_id)
         && *cached_key == key
     {
-        return budgeted_pr_refs(key.1, remaining_bytes, refs);
+        return cached_pr_refs(key.1, refs);
     }
     let (refs, used) = read_durable_pr_refs(file, remaining_bytes);
     if used == key.1 {
@@ -669,6 +669,7 @@ fn read_durable_sessions(lifecycle: &GrokLifecycle) -> Result<Vec<Session>> {
     let mut status_bytes_read = 0_u64;
     let mut pr_bytes_read = 0_u64;
     let mut seen_ids = HashSet::new();
+    let mut pending_pr = Vec::new();
     for cwd_name in cwd_names {
         let Ok(cwd_directory) = sessions_directory.open_directory(&cwd_name) else {
             continue;
@@ -752,17 +753,21 @@ fn read_durable_sessions(lifecycle: &GrokLifecycle) -> Result<Vec<Session>> {
                 .join(&session_name)
                 .join("chat_history.jsonl");
             let mut cache = lifecycle.durable_cache.borrow_mut();
-            let remaining = GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read);
-            let (history, pr_refs, pr_used) =
+            let history =
                 match session_directory.open_regular(std::ffi::OsStr::new("chat_history.jsonl")) {
-                    Ok(file) => {
-                        let (refs, used) =
-                            cached_or_read_pr_refs(&mut cache, &summary.info.id, file, remaining);
-                        (Some(history_path), refs, used)
+                    Ok(_) => {
+                        pending_pr.push((
+                            sessions.len(),
+                            updated_at_ms,
+                            cwd_name.clone(),
+                            session_name.clone(),
+                            summary.info.id.clone(),
+                        ));
+                        Some(history_path)
                     }
                     Err(_) => {
                         cache.pr_refs.remove(&summary.info.id);
-                        (None, Vec::new(), 0)
+                        None
                     }
                 };
             let (status, status_used) =
@@ -778,7 +783,6 @@ fn read_durable_sessions(lifecycle: &GrokLifecycle) -> Result<Vec<Session>> {
                         (Status::Unknown, 0)
                     }
                 };
-            pr_bytes_read = pr_bytes_read.saturating_add(pr_used);
             status_bytes_read = status_bytes_read.saturating_add(status_used);
             seen_ids.insert(summary.info.id.clone());
             sessions.push(Session {
@@ -802,12 +806,35 @@ fn read_durable_sessions(lifecycle: &GrokLifecycle) -> Result<Vec<Session>> {
                 summary: summary_text,
                 pid: None,
                 rollout_path: history,
-                pr_refs,
+                pr_refs: Vec::new(),
                 daemon_hosted: false,
             });
         }
     }
+    pending_pr.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     let mut cache = lifecycle.durable_cache.borrow_mut();
+    for (index, _, cwd_name, session_name, session_id) in pending_pr {
+        let remaining = GROK_PR_SCAN_LIST_MAX_BYTES.saturating_sub(pr_bytes_read);
+        let opened = sessions_directory
+            .open_directory(&cwd_name)
+            .ok()
+            .and_then(|cwd_directory| cwd_directory.open_directory(&session_name).ok())
+            .and_then(|session_directory| {
+                session_directory
+                    .open_regular(std::ffi::OsStr::new("chat_history.jsonl"))
+                    .ok()
+            });
+        match opened {
+            Some(file) => {
+                let (refs, used) = cached_or_read_pr_refs(&mut cache, &session_id, file, remaining);
+                pr_bytes_read = pr_bytes_read.saturating_add(used);
+                sessions[index].pr_refs = refs;
+            }
+            None => {
+                cache.pr_refs.remove(&session_id);
+            }
+        }
+    }
     cache.pr_refs.retain(|id, _| seen_ids.contains(id));
     cache.status.retain(|id, _| seen_ids.contains(id));
     Ok(sessions)
