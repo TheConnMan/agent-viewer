@@ -134,6 +134,9 @@ enum class PrBadgeColor {
     @SerialName("Default")
     DEFAULT,
 
+    @SerialName("Failing")
+    FAILING,
+
     @SerialName("Attention")
     ATTENTION,
 

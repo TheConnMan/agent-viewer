@@ -93,9 +93,9 @@ cold fill is gradual because fallback refreshes run at most one command per list
 Successful fallback data is fresh for 60 seconds and remains visible while a refresh is skipped
 or fails. A fresh viewer fills Codex badges in over its first few seconds (Grok parses each chat
 history on listing and reuses the result until that file changes). The badge is
-colored by the PR's live GitHub status: yellow when checks
-are pending or failing or a review is requested, green when checks have passed, purple when
-merged, grey when a draft or closed, and the flat accent color when the status is unknown or
+colored by the PR's live GitHub status: red when checks are failing, yellow when checks
+are pending or a review is requested, green when checks have passed, purple when
+merged, muted when a PR is draft or closed, and the flat accent color when the status is unknown or
 unresolvable.
 
 Wide rows also show a one hour activity ribbon. Codex and Claude include meaningful activity
@@ -726,8 +726,8 @@ the composing. **Long-pressing a session** opens its action sheet, with status, 
 and age at the top and every action the backend advertises for that row underneath: open
 terminal, stop, archive (Codex hides reversibly; Claude and Grok stop and delete, and the sheet
 says which), and rename. The `#315` chip on the list row and the sheet is colored by the same
-live GitHub status the TUI uses (yellow pending or failing, green passing, purple merged, grey
-draft or closed, accent when unknown), so a merged PR is distinguishable from an open one when
+live GitHub status the TUI uses (red failing, yellow pending or requested review, green passing,
+purple merged, muted draft or closed, accent when unknown), so a merged PR is distinguishable from an open one when
 you are deciding whether to archive. A backend that cannot be attached from the phone (Grok) answers a tap
 with a footer notice, and its long press still works. Android's back button leaves the terminal
 for the list; the session keeps running under its grace window (below). The list shows visible

@@ -7,7 +7,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PrBadgeColor {
     Default,
-    Attention, // checks pending OR failing OR review requested
+    Failing,   // checks failing
+    Attention, // checks pending OR review requested
     Passed,    // checks passed
     Merged,    // merged
     Muted,     // draft OR closed
@@ -121,7 +122,10 @@ pub fn pr_color(facts: &PrStatusFacts) -> PrBadgeColor {
     if state == "CLOSED" || facts.is_draft {
         return PrBadgeColor::Muted;
     }
-    if facts.checks == CheckState::Failing || facts.checks == CheckState::Pending {
+    if facts.checks == CheckState::Failing {
+        return PrBadgeColor::Failing;
+    }
+    if facts.checks == CheckState::Pending {
         return PrBadgeColor::Attention;
     }
     if facts.review_decision.as_deref() == Some("REVIEW_REQUIRED") || facts.review_requested {
@@ -133,9 +137,10 @@ pub fn pr_color(facts: &PrStatusFacts) -> PrBadgeColor {
     PrBadgeColor::Default
 }
 
-/// Rank a color for aggregation: higher wins. Attention > Passed > Merged > Muted > Default.
+/// Rank a color for aggregation: higher wins. Failing > Attention > Passed > Merged > Muted > Default.
 fn color_rank(c: PrBadgeColor) -> u8 {
     match c {
+        PrBadgeColor::Failing => 5,
         PrBadgeColor::Attention => 4,
         PrBadgeColor::Passed => 3,
         PrBadgeColor::Merged => 2,

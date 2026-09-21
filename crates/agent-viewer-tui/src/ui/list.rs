@@ -179,6 +179,7 @@ pub(super) fn pr_badge(pr_refs: &[PrRef]) -> String {
 pub(super) fn pr_badge_theme_color(color: PrBadgeColor, theme: &Theme) -> ratatui::style::Color {
     match color {
         PrBadgeColor::Default => theme.accent,
+        PrBadgeColor::Failing => theme.err,
         PrBadgeColor::Attention => theme.warn,
         PrBadgeColor::Passed => theme.ok,
         PrBadgeColor::Merged => theme.merged,
@@ -508,6 +509,19 @@ mod age_ramp_tests {
         assert_eq!(color_of(&cells, "#42"), theme.accent);
         // ... while the row around it has receded.
         assert_eq!(color_of(&cells, TITLE), theme.faint);
+    }
+
+    #[test]
+    fn failing_pr_badge_uses_error_while_attention_uses_warning() {
+        let theme = amber(false);
+        assert_eq!(
+            super::pr_badge_theme_color(agent_viewer_core::PrBadgeColor::Failing, &theme),
+            theme.err
+        );
+        assert_eq!(
+            super::pr_badge_theme_color(agent_viewer_core::PrBadgeColor::Attention, &theme),
+            theme.warn
+        );
     }
 }
 
