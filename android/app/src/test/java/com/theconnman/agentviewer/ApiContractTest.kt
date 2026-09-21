@@ -67,9 +67,16 @@ class ApiContractTest {
                 "\"updated_at_ms\": 1724151000000, \"pr_color\": \"Merged\"",
             ),
         )
+        val failing = ApiJson.json.decodeFromString<Session>(
+            sessionJson("thread-failing", "Codex").replace(
+                "\"updated_at_ms\": 1724151000000",
+                "\"updated_at_ms\": 1724151000000, \"pr_color\": \"Failing\"",
+            ),
+        )
         val legacy = ApiJson.json.decodeFromString<Session>(sessionJson("thread-legacy", "Codex"))
 
         assertEquals(PrBadgeColor.MERGED, merged.prColor)
+        assertEquals(PrBadgeColor.FAILING, failing.prColor)
         assertEquals(PrBadgeColor.DEFAULT, legacy.prColor)
     }
 
@@ -77,6 +84,7 @@ class ApiContractTest {
     fun `PR badge colors match the TUI theme tokens`() {
         val colors = AppTheme.ANALOG_AMBER.colors
         assertEquals(colors.accent, prBadgeThemeColor(PrBadgeColor.DEFAULT, colors))
+        assertEquals(colors.err, prBadgeThemeColor(PrBadgeColor.FAILING, colors))
         assertEquals(colors.warn, prBadgeThemeColor(PrBadgeColor.ATTENTION, colors))
         assertEquals(colors.ok, prBadgeThemeColor(PrBadgeColor.PASSED, colors))
         assertEquals(colors.merged, prBadgeThemeColor(PrBadgeColor.MERGED, colors))

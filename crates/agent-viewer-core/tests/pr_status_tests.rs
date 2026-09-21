@@ -120,7 +120,7 @@ fn parse_pr_url_not_a_url() {
 }
 
 // ===========================================================================
-// B) pr_color — precedence: merged > closed > draft > checks(fail/pending) >
+// B) pr_color — precedence: merged > closed > draft > failing > pending >
 //    review_required > checks(passing) > default
 // ===========================================================================
 
@@ -166,13 +166,24 @@ fn pr_color_draft_beats_passing() {
 }
 
 #[test]
-fn pr_color_open_failing_is_attention() {
+fn pr_color_open_failing_is_failing() {
     let f = PrStatusFacts {
         state: "OPEN".to_string(),
         checks: CheckState::Failing,
         ..facts()
     };
-    assert_eq!(pr_color(&f), PrBadgeColor::Attention);
+    assert_eq!(pr_color(&f), PrBadgeColor::Failing);
+}
+
+#[test]
+fn pr_color_open_failing_beats_review_attention() {
+    let f = PrStatusFacts {
+        state: "OPEN".to_string(),
+        checks: CheckState::Failing,
+        review_decision: Some("REVIEW_REQUIRED".to_string()),
+        ..facts()
+    };
+    assert_eq!(pr_color(&f), PrBadgeColor::Failing);
 }
 
 #[test]
@@ -393,7 +404,7 @@ fn rollup_neutral_and_skipped_are_passing() {
 }
 
 // ===========================================================================
-// D) aggregate_color — priority: Attention > Passed > Merged > Muted > Default
+// D) aggregate_color — priority: Failing > Attention > Passed > Merged > Muted > Default
 // ===========================================================================
 
 #[test]
@@ -406,6 +417,21 @@ fn aggregate_passed_and_attention_is_attention() {
     assert_eq!(
         aggregate_color(&[PrBadgeColor::Passed, PrBadgeColor::Attention]),
         PrBadgeColor::Attention
+    );
+}
+
+#[test]
+fn aggregate_failing_dominates_all_other_colors() {
+    assert_eq!(
+        aggregate_color(&[
+            PrBadgeColor::Default,
+            PrBadgeColor::Muted,
+            PrBadgeColor::Merged,
+            PrBadgeColor::Passed,
+            PrBadgeColor::Attention,
+            PrBadgeColor::Failing,
+        ]),
+        PrBadgeColor::Failing
     );
 }
 
@@ -445,6 +471,7 @@ fn aggregate_single_merged_passthrough() {
 fn badge_color_serializes_as_pascal_case_for_the_phone() {
     for (color, wire) in [
         (PrBadgeColor::Default, "Default"),
+        (PrBadgeColor::Failing, "Failing"),
         (PrBadgeColor::Attention, "Attention"),
         (PrBadgeColor::Passed, "Passed"),
         (PrBadgeColor::Merged, "Merged"),

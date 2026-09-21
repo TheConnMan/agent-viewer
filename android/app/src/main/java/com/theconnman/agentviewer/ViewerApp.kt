@@ -101,10 +101,11 @@ data class ViewerColors(
     val cx: Color,
 )
 
-/** Same mapping the TUI uses: unknown is accent, pending/failing is warn, passing is ok,
- * merged is purple, draft/closed is muted. */
+/** Same mapping the TUI uses: unknown is accent, failing is error, pending and review
+ * attention are warn, passing is ok, merged is purple, draft/closed is muted. */
 internal fun prBadgeThemeColor(color: PrBadgeColor, colors: ViewerColors): Color = when (color) {
     PrBadgeColor.DEFAULT -> colors.accent
+    PrBadgeColor.FAILING -> colors.err
     PrBadgeColor.ATTENTION -> colors.warn
     PrBadgeColor.PASSED -> colors.ok
     PrBadgeColor.MERGED -> colors.merged
