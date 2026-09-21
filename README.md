@@ -98,9 +98,11 @@ are pending or failing or a review is requested, green when checks have passed, 
 merged, grey when a draft or closed, and the flat accent color when the status is unknown or
 unresolvable.
 
-Wide rows also show a one hour activity ribbon. A session's ribbon includes meaningful activity
-from its own recursive subagent subtree, so a parent remains visibly active while its descendants
-work. A child row shows only its own subtree.
+Wide rows also show a one hour activity ribbon. Codex and Claude include meaningful activity
+from the session's own recursive subagent subtree, so a parent remains visibly active while its
+descendants work; a child row shows only its own subtree. Grok fills the same ribbon from that
+session's `updates.jsonl` (user and assistant text, named tool calls) and does not walk
+descendants.
 
 Set `AGENT_VIEWER_GLYPH_MARKS=1` to use brand glyph marks instead of the textual tags:
 `✳` Claude, `◆` Codex, and `X` Grok (only if your terminal font renders them). This applies to the fallback

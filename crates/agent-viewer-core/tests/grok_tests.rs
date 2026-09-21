@@ -1,8 +1,13 @@
+mod common;
+
 use agent_viewer_core::{
     Backend, BackendKind, GrokBackend, GrokLifecycle, Session, SessionOrigin, Status, TailEvent,
 };
+use common::rfc3339_at;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static GROK_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -293,12 +298,34 @@ fn write_durable_grok_session(home: &Path, session_id: &str, updates: &[String])
 }
 
 fn grok_session_update(session_id: &str, method: &str, update: serde_json::Value) -> String {
+    grok_activity_update_at(session_id, serde_json::json!(1787330130), method, update)
+}
+
+fn grok_activity_update_at(
+    session_id: &str,
+    timestamp: serde_json::Value,
+    method: &str,
+    update: serde_json::Value,
+) -> String {
     serde_json::json!({
-        "timestamp":1787330130,
+        "timestamp":timestamp,
         "method":method,
         "params":{"sessionId":session_id,"update":update}
     })
     .to_string()
+}
+
+fn grok_activity_files(dir: &Path, session_id: &str, updates: &[String]) -> Session {
+    std::fs::write(dir.join("chat_history.jsonl"), "").expect("history placeholder");
+    std::fs::write(dir.join("updates.jsonl"), updates.join("\n")).expect("activity updates");
+    session(session_id, Some(dir.join("chat_history.jsonl")))
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn grok_turn_completed(session_id: &str, prompt_id: &str, stop_reason: &str) -> String {
@@ -602,6 +629,315 @@ fn transcript_tail_rejects_a_symlink_instead_of_following_it() {
     assert!(
         result.is_err(),
         "a Grok transcript symlink must be rejected without reading its target"
+    );
+}
+
+#[test]
+fn grok_turn_activity_missing_is_empty() {
+    let backend = GrokBackend::new();
+    let dir = tempfile::tempdir().expect("temporary activity directory");
+    let history_only = dir.path().join("chat_history.jsonl");
+    std::fs::write(&history_only, "").expect("history without updates");
+    assert!(
+        backend
+            .turn_activity(&session("session-activity", None), Duration::MAX)
+            .expect("no transcript")
+            .is_empty()
+    );
+    assert!(
+        backend
+            .turn_activity(
+                &session("session-activity", Some(history_only)),
+                Duration::MAX
+            )
+            .expect("missing updates")
+            .is_empty()
+    );
+    assert!(
+        backend
+            .turn_activity(
+                &session(
+                    "session-activity",
+                    Some(PathBuf::from("/missing/chat_history.jsonl"))
+                ),
+                Duration::MAX
+            )
+            .expect("missing transcript")
+            .is_empty()
+    );
+}
+
+#[test]
+fn grok_turn_activity_reads_unix_and_rfc3339_and_meaningful_events() {
+    let dir = tempfile::tempdir().expect("temporary activity directory");
+    let now = unix_now_secs();
+    let early_user = now - 50;
+    let call = now - 40;
+    let streamed = now - 20;
+    let later_agent = now - 10;
+    let rfc_user = now - 30;
+    let session_id = "session-activity";
+    let updates = vec![
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(early_user),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"before padding"}
+            }),
+        ),
+        "x".repeat(128 * 1024),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(rfc3339_at(rfc_user)),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"rfc3339 user"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(call),
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionUpdate":"tool_call",
+                "title":"read_file"
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(call),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"tool_call",
+                "title":"run_terminal_command"
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(streamed),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"stream one"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(streamed),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"stream two"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(later_agent),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"after padding"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 35),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"tool_call",
+                "title":""
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 34),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":""}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 33),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"agent_thought_chunk",
+                "content":{"type":"text","text":"thinking"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 32),
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionUpdate":"hook_execution",
+                "event_name":"PreToolUse"
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 31),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"tool_call_update",
+                "title":"read_file"
+            }),
+        ),
+        grok_turn_completed(session_id, "prompt-one", "end_turn"),
+        grok_activity_update_at(
+            "other-session",
+            serde_json::json!(now - 8),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"foreign"}
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!("not-a-timestamp"),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"bad time"}
+            }),
+        ),
+        "{not json".to_string(),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now + 3_600),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"tool_call",
+                "title":"read_file"
+            }),
+        ),
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(now - 7_200),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"expired"}
+            }),
+        ),
+    ];
+    let session = grok_activity_files(dir.path(), session_id, &updates);
+    let backend = GrokBackend::new();
+    assert_eq!(
+        backend
+            .turn_activity(&session, Duration::from_secs(60 * 60))
+            .expect("full activity"),
+        vec![
+            early_user * 1_000,
+            call * 1_000,
+            call * 1_000,
+            rfc_user * 1_000,
+            streamed * 1_000,
+            later_agent * 1_000,
+        ]
+    );
+    assert!(
+        backend
+            .turn_activity(&session, Duration::ZERO)
+            .expect("old turns excluded")
+            .is_empty()
+    );
+}
+
+#[test]
+fn grok_turn_activity_skips_an_oversize_line_and_keeps_neighbors() {
+    let dir = tempfile::tempdir().expect("temporary activity directory");
+    let now = unix_now_secs();
+    let early = now - 40;
+    let later = now - 10;
+    let session_id = "session-activity";
+    let mut file = std::fs::File::create(dir.path().join("updates.jsonl")).expect("updates");
+    writeln!(
+        file,
+        "{}",
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(early),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"before blob"}
+            }),
+        )
+    )
+    .unwrap();
+    file.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    writeln!(file).unwrap();
+    writeln!(
+        file,
+        "{}",
+        grok_activity_update_at(
+            session_id,
+            serde_json::json!(later),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"after blob"}
+            }),
+        )
+    )
+    .unwrap();
+    drop(file);
+    std::fs::write(dir.path().join("chat_history.jsonl"), "").expect("history placeholder");
+
+    let backend = GrokBackend::new();
+    assert_eq!(
+        backend
+            .turn_activity(
+                &session(session_id, Some(dir.path().join("chat_history.jsonl"))),
+                Duration::from_secs(60 * 60)
+            )
+            .expect("activity around an oversize line"),
+        vec![early * 1_000, later * 1_000]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn grok_turn_activity_rejects_a_symlink_instead_of_following_it() {
+    let directory = tempfile::tempdir().expect("temporary activity directory");
+    let now = unix_now_secs();
+    let external = directory.path().join("external-updates.jsonl");
+    std::fs::write(
+        &external,
+        grok_activity_update_at(
+            "session-symlinked-activity",
+            serde_json::json!(now - 5),
+            "session/update",
+            serde_json::json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"must not cross the symlink boundary"}
+            }),
+        ),
+    )
+    .expect("external updates");
+    std::fs::write(directory.path().join("chat_history.jsonl"), "").expect("history placeholder");
+    std::os::unix::fs::symlink(&external, directory.path().join("updates.jsonl"))
+        .expect("updates symlink");
+
+    let backend = GrokBackend::new();
+    let timestamps = backend
+        .turn_activity(
+            &session(
+                "session-symlinked-activity",
+                Some(directory.path().join("chat_history.jsonl")),
+            ),
+            Duration::MAX,
+        )
+        .expect("symlink activity degrades empty");
+    assert!(
+        timestamps.is_empty(),
+        "a Grok updates symlink must be rejected without reading its target"
     );
 }
 
