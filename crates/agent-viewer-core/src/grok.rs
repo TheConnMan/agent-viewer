@@ -1413,14 +1413,25 @@ fn open_at_no_symlinks(
     };
     if descriptor < 0 {
         let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) {
-            return Err(Error::Unsupported(
-                "secure Grok storage requires openat2 on Linux kernel 5.6 or newer",
-            ));
+        if let Some(reason) = error.raw_os_error().and_then(openat2_unsupported_reason) {
+            return Err(Error::Unsupported(reason));
         }
         return Err(error.into());
     }
     Ok(unsafe { std::fs::File::from_raw_fd(descriptor as libc::c_int) })
+}
+
+/// Operator-facing reason for an `openat2` errno that means the syscall is
+/// unusable. EPERM is kept apart from ENOSYS because it is normally a seccomp
+/// filter on this process, not an old kernel.
+fn openat2_unsupported_reason(errno: i32) -> Option<&'static str> {
+    match errno {
+        libc::ENOSYS => Some("secure Grok storage requires openat2 on Linux kernel 5.6 or newer"),
+        libc::EPERM => Some(
+            "secure Grok storage could not use openat2: the syscall was denied (EPERM), usually by a seccomp sandbox around this process",
+        ),
+        _ => None,
+    }
 }
 
 fn sanitize_terminal_text(text: &str) -> String {
@@ -2129,6 +2140,25 @@ fn write_frame(stream: &mut std::os::unix::net::UnixStream, value: &Value) -> Re
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openat2_enosys_blames_the_kernel() {
+        let reason = openat2_unsupported_reason(libc::ENOSYS).unwrap();
+        assert!(reason.contains("Linux kernel 5.6"));
+    }
+
+    #[test]
+    fn openat2_eperm_blames_the_sandbox_not_the_kernel() {
+        let reason = openat2_unsupported_reason(libc::EPERM).unwrap();
+        assert!(reason.contains("EPERM"));
+        assert!(reason.contains("seccomp"));
+        assert!(!reason.contains("5.6"));
+    }
+
+    #[test]
+    fn openat2_other_errno_falls_through() {
+        assert_eq!(openat2_unsupported_reason(libc::EACCES), None);
+    }
 
     #[test]
     fn peer_uid_equality_accepts_current_and_rejects_foreign_safely() {
